@@ -1,0 +1,16 @@
+{
+  "name": "fangzhen",
+  "module": "index.ts",
+  "type": "module",
+  "private": true,
+  "scripts": {
+    "db:setup": "bun run scripts/db-setup.ts"
+  },
+  "devDependencies": {
+    "@types/bun": "latest",
+    "mysql2": "^3.14.2"
+  },
+  "peerDependencies": {
+    "typescript": "^5"
+  }
+}
