@@ -20,7 +20,7 @@ INSERT IGNORE INTO `users` (`user_id`, `username`, `password_hash`, `full_name`,
 (2, 'teacher01', '$2b$10$your_secure_hash_here', '张老师', 'teacher01@example.com', '10000000001', 'Teacher'),
 (3, 'assistant01', '$2b$10$your_secure_hash_here', '李助教', 'assistant01@example.com', '10000000002', 'Assistant'),
 (4, 'student01', '$2b$10$your_secure_hash_here', '王小明', 'student01@example.com', '10000000003', 'Student'),
-(5, 'yuxiang', '$2b$10$IugK3IDtW44SFJ2SWFePEe1ZEZlw9ytIbX81UOx/bgEMjGU9LEVeG', 'YUxiangLuo', 'yuxiang@example.com', NULL, 'Admin');
+(5, 'yuxiang', '$2b$10$PfE4NPtcBMH62sz49P.Dpu8iKP7oBM/7yKc7AnFfDlc26mTrspuS2', 'YUxiangLuo', 'yuxiang@example.com', NULL, 'Admin');
 
 -- 2. 插入班级数据 (Classes)
 INSERT IGNORE INTO `classes` (`class_id`, `class_name`, `class_code`, `teacher_id`) VALUES

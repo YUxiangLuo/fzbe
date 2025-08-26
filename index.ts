@@ -1,8 +1,8 @@
 import { Hono } from "hono";
 import type { Context, Next } from "hono";
 import { HTTPException } from "hono/http-exception";
-import { jwt } from "hono/jwt";
-import { sign } from "hono/jwt";
+import { jwt, sign } from "hono/jwt";
+import { cors } from "hono/cors";
 import mysql from "mysql2/promise";
 import { z } from "zod";
 import { zValidator } from "@hono/zod-validator";
@@ -88,7 +88,9 @@ const enrollSchema = z.object({
 const app = new Hono();
 
 // --- 中间件 ---
-app.use("*", timestampedLogger);
+//app.use("*", timestampedLogger);
+app.use(timestampedLogger);
+app.use(cors());
 
 // --- 路由 ---
 
