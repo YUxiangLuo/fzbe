@@ -146,12 +146,15 @@ CREATE TABLE IF NOT EXISTS `experiment_manuals` (
   `manual_id` INT AUTO_INCREMENT PRIMARY KEY,
   `file_name` VARCHAR(255) NOT NULL,
   `file_path` VARCHAR(255) NOT NULL,
+  `description` TEXT,
   `is_active` BOOLEAN DEFAULT false,
-  `uploaded_at` TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+  `uploader_id` INT,
+  `uploaded_at` TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  FOREIGN KEY (`uploader_id`) REFERENCES `users`(`user_id`) ON DELETE SET NULL
 );
 
-CREATE TABLE IF NOT EXISTS `system_data` (
-  `data_id` INT AUTO_INCREMENT PRIMARY KEY,
+CREATE TABLE IF NOT EXISTS `datasets` (
+  `dataset_id` INT AUTO_INCREMENT PRIMARY KEY,
   `data_name` VARCHAR(255) NOT NULL,
   `file_path` VARCHAR(255) NOT NULL,
   `description` TEXT,

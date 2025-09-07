@@ -44,12 +44,18 @@ INSERT IGNORE INTO `question_bank` (`question_id`, `knowledge_point`, `question_
 INSERT IGNORE INTO `grade_weights` (`weight_id`, `class_id`, `experiment_flow`, `knowledge_tests`, `model_selection`, `experiment_report`, `detailed_step_weights`) VALUES
 (1, 1, 40, 20, 10, 30, '{"data_preparation": 5, "descriptive_statistics": 5, "model_choice": 10, "prediction_generation": 20}');
 
--- 7. 插入默认实验手册和数据 (ExperimentManuals & SystemData)
-INSERT IGNORE INTO `experiment_manuals` (`manual_id`, `file_name`, `file_path`, `is_active`) VALUES
-(1, '虚拟仿真实验手册V1.0.pdf', '/manuals/manual_v1.pdf', 1); -- MariaDB/MySQL 中布尔值通常用 1/0
+-- 7. 插入默认实验手册和数据 (ExperimentManuals & Datasets)
+-- 注意: experiment_manuals 表结构已更新，以下是一个旧的示例，请参考下面的新示例。
+-- INSERT IGNORE INTO `experiment_manuals` (`manual_id`, `file_name`, `file_path`, `is_active`) VALUES
+-- (1, '虚拟仿真实验手册V1.0.pdf', '/manuals/manual_v1.pdf', 1);
 
-INSERT IGNORE INTO `system_data` (`data_id`, `data_name`, `file_path`, `description`) VALUES
+INSERT IGNORE INTO `datasets` (`dataset_id`, `data_name`, `file_path`, `description`) VALUES
 (1, '某产品历史销售数据', '/data/sales_data_product_a.csv', '包含2022-2024年某产品的月度销售量、销售额和平均价格等信息。');
+
+
+-- 新的 experiment_manuals 插入表示例 (请取消注释并根据需要修改):
+-- INSERT IGNORE INTO `experiment_manuals` (`manual_id`, `file_name`, `file_path`, `description`, `is_active`, `uploader_id`) VALUES
+-- (1, '虚拟仿真实验手册V2.0.pdf', '/uploads/manuals/1678886400000-manual_v2.pdf', '这是2025年春季学期使用的最新版实验手册。', 1, 1);
 
 
 -- 重置 AUTO_INCREMENT 值 (可选)

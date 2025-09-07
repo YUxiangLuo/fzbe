@@ -10,7 +10,7 @@
   },
   "private": true,
   "scripts": {
-    "start": "bun run index.ts",
+    "start": "bun run src/index.ts",
     "db:setup": "bun run scripts/db-setup.ts",
     "hash-password": "bun run scripts/hash-password.ts"
   },
