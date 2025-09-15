@@ -29,8 +29,22 @@ const updateUserSchema = z
     message: "Either full_name or phone_number must be provided",
   });
 
+const changePasswordSchema = z.object({
+  currentPassword: z.string().min(1, { message: "Current password is required" }),
+  newPassword: z.string().min(6, { message: "New password must be at least 6 characters long" }),
+});
+
+const adminChangePasswordSchema = z.object({
+  newPassword: z.string().min(6, { message: "New password must be at least 6 characters long" }),
+});
+
 const paramsSchema = z.object({
   id: z.string().regex(/^\d+$/, { message: "ID must be a number" }),
+});
+
+const paginationQuerySchema = z.object({
+  page: z.coerce.number().int().min(1).optional().default(1),
+  limit: z.coerce.number().int().min(1).max(100).optional().default(10),
 });
 
 export default (pool: Pool, JWT_SECRET: string) => {
@@ -78,21 +92,47 @@ export default (pool: Pool, JWT_SECRET: string) => {
   // --- User Management Routes ---
 
   // Get all users (Admin only)
-  usersApi.get("/users", jwt({ secret: JWT_SECRET }), async (c) => {
-    try {
-      const payload = c.get("jwtPayload");
-      if (payload.role !== "Admin") {
-        return c.json({ error: "Forbidden" }, 403);
+  usersApi.get(
+    "/users",
+    jwt({ secret: JWT_SECRET }),
+    zValidator("query", paginationQuerySchema),
+    async (c) => {
+      try {
+        const payload = c.get("jwtPayload");
+        if (payload.role !== "Admin") {
+          return c.json({ error: "Forbidden" }, 403);
+        }
+
+        const { page, limit } = c.req.valid("query");
+        const offset = (page - 1) * limit;
+
+        // Perform two queries in parallel: one for the total count, one for the paginated data
+        const [totalResult, rows] = await Promise.all([
+          pool.query("SELECT COUNT(*) as total FROM users"),
+          pool.query(
+            "SELECT user_id, username, full_name, email, role, created_at FROM users ORDER BY user_id ASC LIMIT ? OFFSET ?",
+            [limit, offset],
+          ),
+        ]);
+
+        const totalItems = (totalResult[0] as any)[0].total;
+        const totalPages = Math.ceil(totalItems / limit);
+
+        return c.json({
+          data: rows[0],
+          pagination: {
+            currentPage: page,
+            pageSize: limit,
+            totalItems,
+            totalPages,
+          },
+        });
+      } catch (error) {
+        console.error("Error fetching users:", error);
+        throw error;
       }
-      const [rows] = await pool.query(
-        "SELECT user_id, username, full_name, email, role, created_at FROM users",
-      );
-      return c.json(rows);
-    } catch (error) {
-      console.error("Error fetching users:", error);
-      throw error;
-    }
-  });
+    },
+  );
 
   // Register a new user
   usersApi.post(
@@ -102,7 +142,10 @@ export default (pool: Pool, JWT_SECRET: string) => {
       try {
         const { username, password, full_name, email, role } =
           c.req.valid("json");
-        const password_hash = await Bun.password.hash(password);
+        const password_hash = await Bun.password.hash(password, {
+          algorithm: "bcrypt",
+          cost: 10,
+        });
 
         const [result]: any = await pool.query(
           "INSERT INTO users (username, password_hash, full_name, email, role) VALUES (?, ?, ?, ?, ?)",
@@ -187,6 +230,57 @@ export default (pool: Pool, JWT_SECRET: string) => {
     },
   );
 
+  // Change current user's password
+  usersApi.put(
+    "/users/me/password",
+    jwt({ secret: JWT_SECRET }),
+    zValidator("json", changePasswordSchema),
+    async (c) => {
+      try {
+        const payload = c.get("jwtPayload");
+        const userId = payload.sub;
+        const { currentPassword, newPassword } = c.req.valid("json");
+
+        // 1. Fetch user's current hash
+        const [rows]: any[] = await pool.query(
+          "SELECT password_hash FROM users WHERE user_id = ?",
+          [userId],
+        );
+        const user = rows[0];
+
+        if (!user) {
+          // This case should ideally not be reached if JWT is valid
+          return c.json({ error: "User not found" }, 404);
+        }
+
+        // 2. Verify current password
+        const passwordMatch = await Bun.password.verify(
+          currentPassword,
+          user.password_hash,
+        );
+
+        if (!passwordMatch) {
+          return c.json({ error: "Invalid current password" }, 401);
+        }
+
+        // 3. Hash new password and update database
+        const newPasswordHash = await Bun.password.hash(newPassword, {
+          algorithm: "bcrypt",
+          cost: 10,
+        });
+        await pool.query(
+          "UPDATE users SET password_hash = ? WHERE user_id = ?",
+          [newPasswordHash, userId],
+        );
+
+        return c.json({ message: "Password updated successfully" });
+      } catch (error) {
+        console.error("Error changing password:", error);
+        throw error;
+      }
+    },
+  );
+
   // Get user by ID
   usersApi.get(
     "/users/:id",
@@ -217,6 +311,91 @@ export default (pool: Pool, JWT_SECRET: string) => {
         return c.json(user);
       } catch (error) {
         console.error("Error fetching user by ID:", error);
+        throw error;
+      }
+    },
+  );
+
+  // Admin: Force change user's password
+  usersApi.put(
+    "/users/:id/password",
+    jwt({ secret: JWT_SECRET }),
+    zValidator("param", paramsSchema),
+    zValidator("json", adminChangePasswordSchema),
+    async (c) => {
+      try {
+        const requesterPayload = c.get("jwtPayload");
+        if (requesterPayload.role !== "Admin") {
+          return c.json({ error: "Forbidden" }, 403);
+        }
+
+        const { id } = c.req.valid("param");
+        const targetUserId = parseInt(id, 10);
+        const { newPassword } = c.req.valid("json");
+
+        if (requesterPayload.sub === targetUserId) {
+          return c.json(
+            {
+              error:
+                "Admins should use the /users/me/password route to change their own password.",
+            },
+            400,
+          );
+        }
+
+        const newPasswordHash = await Bun.password.hash(newPassword, {
+          algorithm: "bcrypt",
+          cost: 10,
+        });
+
+        const [result]: any = await pool.query(
+          "UPDATE users SET password_hash = ? WHERE user_id = ?",
+          [newPasswordHash, targetUserId],
+        );
+
+        if (result.affectedRows === 0) {
+          return c.json({ error: "User not found" }, 404);
+        }
+
+        return c.json({ message: "Password updated successfully for user" });
+      } catch (error) {
+        console.error("Error force changing password:", error);
+        throw error;
+      }
+    },
+  );
+
+  // Delete user by ID (Admin only)
+  usersApi.delete(
+    "/users/:id",
+    jwt({ secret: JWT_SECRET }),
+    zValidator("param", paramsSchema),
+    async (c) => {
+      try {
+        const requesterPayload = c.get("jwtPayload");
+        const { id } = c.req.valid("param");
+        const targetUserId = parseInt(id, 10);
+
+        if (requesterPayload.role !== "Admin") {
+          return c.json({ error: "Forbidden" }, 403);
+        }
+
+        if (requesterPayload.sub === targetUserId) {
+          return c.json({ error: "Admin cannot delete themselves" }, 400);
+        }
+
+        const [result]: any = await pool.query(
+          "DELETE FROM users WHERE user_id = ?",
+          [targetUserId],
+        );
+
+        if (result.affectedRows === 0) {
+          return c.json({ error: "User not found" }, 404);
+        }
+
+        return c.json({ message: "User deleted successfully" });
+      } catch (error) {
+        console.error("Error deleting user:", error);
         throw error;
       }
     },
