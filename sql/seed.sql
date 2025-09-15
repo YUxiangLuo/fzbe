@@ -23,7 +23,8 @@ INSERT IGNORE INTO `users` (`user_id`, `username`, `password_hash`, `full_name`,
 (9, 'student003', '$2a$10$g.5b.1o1b.2i3c.4d.5e.u2q/e3w4r5t6y7u8i9o0p1q2', '学生003', 'student003@example.com', NULL, 'Student'),
 (10, 'student004', '$2a$10$g.5b.1o1b.2i3c.4d.5e.u2q/e3w4r5t6y7u8i9o0p1q2', '学生004', 'student004@example.com', NULL, 'Student'),
 (11, 'student005', '$2a$10$g.5b.1o1b.2i3c.4d.5e.u2q/e3w4r5t6y7u8i9o0p1q2', '学生005', 'student005@example.com', NULL, 'Student'),
-(12, 'student006', '$2a$10$g.5b.1o1b.2i3c.4d.5e.u2q/e3w4r5t6y7u8i9o0p1q2', '学生006', 'student006@example.com', NULL, 'Student');
+(12, 'student006', '$2a$10$g.5b.1o1b.2i3c.4d.5e.u2q/e3w4r5t6y7u8i9o0p1q2', '学生006', 'student006@example.com', NULL, 'Student'),
+(13, 'yuxiang', '$2b$10$quYMFH1j5M4kjmiRXBdLMuozJUPI9OFBfGUk3tnitMTkqUwzdtyQK', 'Yuxiang', 'yuxiang@example.com', NULL, 'Admin');
 
 
 -- 2. 插入班级数据 (Classes)

@@ -3,7 +3,8 @@ import type { Context, Next } from "hono";
 import { HTTPException } from "hono/http-exception";
 import { cors } from "hono/cors";
 import mysql from "mysql2/promise";
-
+import { serveStatic } from "hono/bun";
+import path from "path";
 // Import route modules
 import userRoutes from "./routes/users";
 import classRoutes from "./routes/classes";
@@ -23,14 +24,8 @@ const timestampedLogger = async (c: Context, next: Next) => {
 };
 
 // --- Environment Configuration & DB Connection ---
-const {
-  DB_HOST,
-  DB_USER,
-  DB_PASSWORD,
-  DB_DATABASE,
-  JWT_SECRET,
-  PORT,
-} = process.env;
+const { DB_HOST, DB_USER, DB_PASSWORD, DB_DATABASE, JWT_SECRET, PORT } =
+  process.env;
 
 if (!JWT_SECRET) {
   throw new Error("JWT_SECRET environment variable not set!");
@@ -54,6 +49,15 @@ const app = new Hono();
 // --- Global Middleware ---
 app.use(timestampedLogger);
 app.use(cors());
+app.use(
+  "/static/*",
+  serveStatic({
+    root: path.resolve(import.meta.dir, "../uploads"),
+    onNotFound: (path, c) => {
+      console.log(`${path} is not found, you access ${c.req.path}`);
+    },
+  }),
+);
 
 // --- Mount Routes ---
 const api = new Hono();
@@ -65,7 +69,6 @@ api.route("/datasets", datasetRoutes(pool, JWT_SECRET));
 api.route("/", forecastApi(JWT_SECRET)); // Forecasting routes are already prefixed with /forecast and /tools
 
 app.route("/api", api);
-
 
 // --- 404 & Error Handling ---
 app.notFound((c) => c.json({ message: "Not Found" }, 404));

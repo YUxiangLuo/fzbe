@@ -5,6 +5,7 @@ import { zValidator } from "@hono/zod-validator";
 import { unlink } from "node:fs/promises";
 import { join } from "node:path";
 import type { Pool } from "mysql2/promise";
+import path from "path";
 
 // Zod Schemas for Validation
 const paramsSchema = z.object({
@@ -42,22 +43,26 @@ export default (pool: Pool, JWT_SECRET: string) => {
       }
 
       const uniqueFilename = `${Date.now()}-${file.name}`;
-      const uploadPath = join(import.meta.dir, "../../uploads", "manuals", uniqueFilename);
-      const dbPath = `/uploads/manuals/${uniqueFilename}`;
+      const uploadPath = path.resolve(
+        import.meta.dir,
+        "../../uploads",
+        "static",
+        uniqueFilename,
+      );
 
       await Bun.write(uploadPath, file);
 
       const [result]: any = await pool.query(
         "INSERT INTO experiment_manuals (file_name, file_path, description, uploader_id) VALUES (?, ?, ?, ?)",
-        [fileName, dbPath, description || null, uploaderId],
+        [fileName, uploadPath, description || null, uploaderId],
       );
 
       const [rows]: any[] = await pool.query(
-          `SELECT m.*, u.full_name as uploader_name 
-           FROM experiment_manuals m 
-           LEFT JOIN users u ON m.uploader_id = u.user_id 
+        `SELECT m.*, u.full_name as uploader_name
+           FROM experiment_manuals m
+           LEFT JOIN users u ON m.uploader_id = u.user_id
            WHERE m.manual_id = ?`,
-          [result.insertId]
+        [result.insertId],
       );
 
       return c.json(rows[0], 201);
@@ -75,9 +80,9 @@ export default (pool: Pool, JWT_SECRET: string) => {
         return c.json({ error: "Forbidden" }, 403);
       }
       const [rows] = await pool.query(`
-          SELECT m.*, u.full_name as uploader_name 
-          FROM experiment_manuals m 
-          LEFT JOIN users u ON m.uploader_id = u.user_id 
+          SELECT m.*, u.full_name as uploader_name
+          FROM experiment_manuals m
+          LEFT JOIN users u ON m.uploader_id = u.user_id
           ORDER BY m.uploaded_at DESC
       `);
       return c.json(rows);
@@ -91,10 +96,10 @@ export default (pool: Pool, JWT_SECRET: string) => {
   manualsApi.get("/active", async (c) => {
     try {
       const [rows]: any[] = await pool.query(`
-          SELECT m.*, u.full_name as uploader_name 
-          FROM experiment_manuals m 
-          LEFT JOIN users u ON m.uploader_id = u.user_id 
-          WHERE m.is_active = true 
+          SELECT m.*, u.full_name as uploader_name
+          FROM experiment_manuals m
+          LEFT JOIN users u ON m.uploader_id = u.user_id
+          WHERE m.is_active = true
           LIMIT 1
       `);
       const manual = rows[0];
@@ -141,7 +146,7 @@ export default (pool: Pool, JWT_SECRET: string) => {
           fields.push("file_name = ?");
           values.push(file_name);
         }
-         if (description !== undefined) {
+        if (description !== undefined) {
           fields.push("description = ?");
           values.push(description);
         }
@@ -167,9 +172,9 @@ export default (pool: Pool, JWT_SECRET: string) => {
         await connection.commit();
 
         const [rows]: any[] = await connection.query(
-          `SELECT m.*, u.full_name as uploader_name 
-           FROM experiment_manuals m 
-           LEFT JOIN users u ON m.uploader_id = u.user_id 
+          `SELECT m.*, u.full_name as uploader_name
+           FROM experiment_manuals m
+           LEFT JOIN users u ON m.uploader_id = u.user_id
            WHERE m.manual_id = ?`,
           [manualId],
         );
@@ -209,14 +214,15 @@ export default (pool: Pool, JWT_SECRET: string) => {
           return c.json({ error: "Manual not found" }, 404);
         }
 
-        const filePath = join(import.meta.dir, "../../uploads", manual.file_path.replace('/uploads', ''));
         try {
-          await unlink(filePath);
+          await unlink(manual.file_path);
         } catch (fsError: any) {
-          if (fsError.code !== 'ENOENT') {
+          if (fsError.code !== "ENOENT") {
             throw fsError;
           }
-          console.warn(`File not found, but proceeding with DB deletion: ${filePath}`);
+          console.warn(
+            `File not found, but proceeding with DB deletion: ${manual.file_path}`,
+          );
         }
 
         await pool.query("DELETE FROM experiment_manuals WHERE manual_id = ?", [
@@ -232,4 +238,4 @@ export default (pool: Pool, JWT_SECRET: string) => {
   );
 
   return manualsApi;
-}
+};
