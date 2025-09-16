@@ -18,24 +18,33 @@ const registerSchema = z.object({
   full_name: z.string().min(1),
   email: z.string().email(),
   role: z.enum(["Student", "Teacher", "Assistant", "Admin"]).default("Student"),
+  phone_number: z.string().optional(),
 });
 
 const updateUserSchema = z
   .object({
     full_name: z.string().min(1).optional(),
     phone_number: z.string().min(1).optional(),
+    email: z.string().email("Invalid email format").optional(),
   })
-  .refine((data) => data.full_name || data.phone_number, {
-    message: "Either full_name or phone_number must be provided",
+  .refine((data) => data.full_name || data.phone_number || data.email, {
+    message:
+      "At least one field (full_name, phone_number, or email) must be provided",
   });
 
 const changePasswordSchema = z.object({
-  currentPassword: z.string().min(1, { message: "Current password is required" }),
-  newPassword: z.string().min(6, { message: "New password must be at least 6 characters long" }),
+  currentPassword: z
+    .string()
+    .min(1, { message: "Current password is required" }),
+  newPassword: z
+    .string()
+    .min(6, { message: "New password must be at least 6 characters long" }),
 });
 
 const adminChangePasswordSchema = z.object({
-  newPassword: z.string().min(6, { message: "New password must be at least 6 characters long" }),
+  newPassword: z
+    .string()
+    .min(6, { message: "New password must be at least 6 characters long" }),
 });
 
 const paramsSchema = z.object({
@@ -46,6 +55,14 @@ const paginationQuerySchema = z.object({
   page: z.coerce.number().int().min(1).optional().default(1),
   limit: z.coerce.number().int().min(1).max(100).optional().default(10),
 });
+
+const createAssistantSchema = registerSchema
+  .extend({
+    class_ids: z
+      .array(z.number().int().min(1))
+      .min(1, "At least one class ID is required"),
+  })
+  .omit({ role: true }); // Role is fixed to 'Assistant', so we don't need it from the input.
 
 export default (pool: Pool, JWT_SECRET: string) => {
   const usersApi = new Hono();
@@ -91,6 +108,142 @@ export default (pool: Pool, JWT_SECRET: string) => {
 
   // --- User Management Routes ---
 
+  // Create an assistant and assign them to classes 前缀
+  usersApi.post(
+    "/assistants/create-and-assign",
+    jwt({ secret: JWT_SECRET }),
+    zValidator("json", createAssistantSchema),
+    async (c) => {
+      const payload = c.get("jwtPayload");
+      if (payload.role !== "Admin" && payload.role !== "Teacher") {
+        return c.json({ error: "Forbidden" }, 403);
+      }
+
+      const { username, password, full_name, email, phone_number, class_ids } =
+        c.req.valid("json");
+
+      const connection = await pool.getConnection();
+      try {
+        await connection.beginTransaction();
+
+        // 1. Validate class IDs
+        const placeholders = class_ids.map(() => "?").join(",");
+        const [classRows]: any[] = await connection.query(
+          `SELECT class_id, teacher_id FROM classes WHERE class_id IN (${placeholders})`,
+          class_ids,
+        );
+
+        if (classRows.length !== class_ids.length) {
+          await connection.rollback();
+          return c.json({ error: "One or more class IDs are invalid" }, 400);
+        }
+
+        // 2. If user is a teacher, verify they own all the classes
+        if (payload.role === "Teacher") {
+          const teacherId = payload.sub;
+          for (const row of classRows) {
+            if (row.teacher_id !== teacherId) {
+              await connection.rollback();
+              return c.json(
+                {
+                  error: `Forbidden to assign assistant to class ID ${row.class_id} which you do not own.`,
+                },
+                403,
+              );
+            }
+          }
+        }
+
+        // 3. Create the new user with 'Assistant' role
+        const password_hash = await Bun.password.hash(password, {
+          algorithm: "bcrypt",
+          cost: 10,
+        });
+        const [userResult]: any = await connection.query(
+          "INSERT INTO users (username, password_hash, full_name, email, role, phone_number) VALUES (?, ?, ?, ?, 'Assistant', ?)",
+          [username, password_hash, full_name, email, phone_number || null],
+        );
+        const newAssistantId = userResult.insertId;
+
+        // 4. Assign the new assistant to the classes
+        const assignmentValues = class_ids.map((classId) => [
+          classId,
+          newAssistantId,
+        ]);
+        await connection.query(
+          "INSERT INTO class_assistants (class_id, assistant_id) VALUES ?",
+          [assignmentValues],
+        );
+
+        await connection.commit();
+
+        const newUser = {
+          user_id: newAssistantId,
+          username,
+          full_name,
+          email,
+          phone_number: phone_number || null,
+          role: "Assistant",
+          assigned_classes: class_ids,
+        };
+        return c.json(newUser, 201);
+      } catch (error: any) {
+        await connection.rollback();
+        if (error.code === "ER_DUP_ENTRY") {
+          if (error.message.includes("users.username")) {
+            return c.json({ error: "Username already exists" }, 409);
+          }
+          if (error.message.includes("users.email")) {
+            return c.json({ error: "Email already exists" }, 409);
+          }
+        }
+        console.error("Error creating and assigning assistant:", error);
+        throw error;
+      } finally {
+        connection.release();
+      }
+    },
+  );
+
+  // Get all assistants associated with a specific teacher through their classes
+  usersApi.get(
+    "/teachers/:id/assistants",
+    jwt({ secret: JWT_SECRET }),
+    zValidator("param", paramsSchema),
+    async (c) => {
+      try {
+        const payload = c.get("jwtPayload");
+        const { id } = c.req.valid("param");
+        const teacherId = parseInt(id, 10);
+
+        // Authorization: Admin can see anyone's, teachers can only see their own.
+        if (payload.role !== "Admin" && payload.sub !== teacherId) {
+          return c.json({ error: "Forbidden" }, 403);
+        }
+
+        const sql = `
+          SELECT DISTINCT
+            u.user_id,
+            u.username,
+            u.full_name,
+            u.email,
+            u.phone_number
+          FROM users u
+          JOIN class_assistants ca ON u.user_id = ca.assistant_id
+          JOIN classes c ON ca.class_id = c.class_id
+          WHERE c.teacher_id = ? AND u.role = 'Assistant'
+        `;
+
+        const [assistantRows] = await pool.query(sql, [teacherId]);
+
+        return c.json(assistantRows);
+      } catch (error) {
+        console.error("Error fetching assistants for teacher:", error);
+        throw error;
+      }
+    },
+  );
+
   // Get all users (Admin only)
   usersApi.get(
     "/users",
@@ -134,13 +287,30 @@ export default (pool: Pool, JWT_SECRET: string) => {
     },
   );
 
+  // Get all assistants (Admin and Teacher only)
+  usersApi.get("/users/assistants", jwt({ secret: JWT_SECRET }), async (c) => {
+    try {
+      const payload = c.get("jwtPayload");
+      if (payload.role !== "Admin" && payload.role !== "Teacher") {
+        return c.json({ error: "Forbidden" }, 403);
+      }
+      const [rows] = await pool.query(
+        "SELECT user_id, username, full_name, email, phone_number, role, created_at FROM users WHERE role = 'Assistant'",
+      );
+      return c.json(rows);
+    } catch (error) {
+      console.error("Error fetching assistants:", error);
+      throw error;
+    }
+  });
+
   // Register a new user
   usersApi.post(
     "/users/register",
     zValidator("json", registerSchema),
     async (c) => {
       try {
-        const { username, password, full_name, email, role } =
+        const { username, password, full_name, email, role, phone_number } =
           c.req.valid("json");
         const password_hash = await Bun.password.hash(password, {
           algorithm: "bcrypt",
@@ -148,8 +318,15 @@ export default (pool: Pool, JWT_SECRET: string) => {
         });
 
         const [result]: any = await pool.query(
-          "INSERT INTO users (username, password_hash, full_name, email, role) VALUES (?, ?, ?, ?, ?)",
-          [username, password_hash, full_name, email, role],
+          "INSERT INTO users (username, password_hash, full_name, email, role, phone_number) VALUES (?, ?, ?, ?, ?, ?)",
+          [
+            username,
+            password_hash,
+            full_name,
+            email,
+            role,
+            phone_number || null,
+          ],
         );
 
         const newUser = {
@@ -158,6 +335,7 @@ export default (pool: Pool, JWT_SECRET: string) => {
           full_name,
           email,
           role,
+          phone_number: phone_number || null,
         };
         return c.json(newUser, 201);
       } catch (error: any) {
@@ -177,7 +355,7 @@ export default (pool: Pool, JWT_SECRET: string) => {
       const userId = payload.sub;
 
       const [rows]: any[] = await pool.query(
-        "SELECT user_id, username, full_name, email, role, created_at FROM users WHERE user_id = ?",
+        "SELECT user_id, username, full_name, email, phone_number, role, created_at FROM users WHERE user_id = ?",
         [userId],
       );
       const user = rows[0];
@@ -201,7 +379,7 @@ export default (pool: Pool, JWT_SECRET: string) => {
       try {
         const payload = c.get("jwtPayload");
         const userId = payload.sub;
-        const { full_name, phone_number } = c.req.valid("json");
+        const { full_name, phone_number, email } = c.req.valid("json");
 
         const fields = [];
         const values = [];
@@ -213,6 +391,10 @@ export default (pool: Pool, JWT_SECRET: string) => {
           fields.push("phone_number = ?");
           values.push(phone_number);
         }
+        if (email) {
+          fields.push("email = ?");
+          values.push(email);
+        }
         values.push(userId);
 
         const sql = `UPDATE users SET ${fields.join(", ")} WHERE user_id = ?`;
@@ -223,7 +405,10 @@ export default (pool: Pool, JWT_SECRET: string) => {
           [userId],
         );
         return c.json(rows[0]);
-      } catch (error) {
+      } catch (error: any) {
+        if (error.code === "ER_DUP_ENTRY") {
+          return c.json({ error: "Email already exists" }, 409);
+        }
         console.error("Error updating user:", error);
         throw error;
       }
@@ -402,4 +587,4 @@ export default (pool: Pool, JWT_SECRET: string) => {
   );
 
   return usersApi;
-}
+};

@@ -35,6 +35,18 @@ CREATE TABLE IF NOT EXISTS `enrollments` (
   UNIQUE KEY `student_class_unique` (`student_id`, `class_id`)
 );
 
+-- 新表: 用于将助教直接分配给班级
+CREATE TABLE IF NOT EXISTS `class_assistants` (
+  `assignment_id` INT AUTO_INCREMENT PRIMARY KEY,
+  `assistant_id` INT NOT NULL,
+  `class_id` INT NOT NULL,
+  FOREIGN KEY (`assistant_id`) REFERENCES `users`(`user_id`) ON DELETE CASCADE,
+  FOREIGN KEY (`class_id`) REFERENCES `classes`(`class_id`) ON DELETE CASCADE,
+  UNIQUE KEY `assistant_class_unique` (`assistant_id`, `class_id`)
+);
+
+/*
+-- 旧的助教分配表 (已弃用)
 CREATE TABLE IF NOT EXISTS `assistant_assignments` (
   `assignment_id` INT AUTO_INCREMENT PRIMARY KEY,
   `assistant_id` INT NOT NULL,
@@ -42,6 +54,7 @@ CREATE TABLE IF NOT EXISTS `assistant_assignments` (
   FOREIGN KEY (`assistant_id`) REFERENCES `users`(`user_id`) ON DELETE CASCADE,
   FOREIGN KEY (`teacher_id`) REFERENCES `users`(`user_id`) ON DELETE CASCADE
 );
+*/
 
 --
 -- 2. 实验与生产计划管理

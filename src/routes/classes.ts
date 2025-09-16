@@ -18,6 +18,10 @@ const enrollSchema = z.object({
   class_code: z.string().min(1, { message: "Class code is required" }),
 });
 
+const addAssistantSchema = z.object({
+  assistant_id: z.number().int().min(1),
+});
+
 export default (pool: Pool, JWT_SECRET: string) => {
   const classesApi = new Hono();
 
@@ -183,5 +187,170 @@ export default (pool: Pool, JWT_SECRET: string) => {
     },
   );
 
+  // 获取指定教师创建的所有班级 前缀 /classes
+  classesApi.get(
+    "/teacher/:id/classes",
+    jwt({ secret: JWT_SECRET }),
+    zValidator("param", paramsSchema),
+    async (c) => {
+      try {
+        const payload = c.get("jwtPayload");
+        const { id } = c.req.valid("param");
+        const teacherId = parseInt(id, 10);
+
+        // Authorization check
+        if (payload.role !== "Admin" && payload.sub !== teacherId) {
+          return c.json({ error: "Forbidden" }, 403);
+        }
+
+        // Check if the user is actually a teacher
+        const [teacherRows]: any[] = await pool.query(
+          "SELECT role FROM users WHERE user_id = ? AND role = 'Teacher'",
+          [teacherId],
+        );
+
+        if (teacherRows.length === 0 && payload.role !== "Admin") {
+          // Allow admin to query even if the ID is not a teacher,
+          // but a teacher must be a teacher.
+          return c.json({ error: "Target user is not a teacher" }, 404);
+        }
+
+        const [classRows] = await pool.query(
+          "SELECT * FROM classes WHERE teacher_id = ?",
+          [teacherId],
+        );
+
+        return c.json(classRows);
+      } catch (error) {
+        console.error("Error fetching classes for teacher:", error);
+        throw error;
+      }
+    },
+  );
+
+  // --- Assistant Management for a Class ---
+
+  // Add an assistant to a class
+  classesApi.post(
+    "/:id/assistants",
+    jwt({ secret: JWT_SECRET }),
+    zValidator("param", paramsSchema),
+    zValidator("json", addAssistantSchema),
+    async (c) => {
+      try {
+        const payload = c.get("jwtPayload");
+        const { id } = c.req.valid("param");
+        const classId = parseInt(id, 10);
+        const { assistant_id } = c.req.valid("json");
+
+        // 1. Verify class exists and user is the teacher or admin
+        const [classRows]: any[] = await pool.query(
+          "SELECT teacher_id FROM classes WHERE class_id = ?",
+          [classId],
+        );
+        if (classRows.length === 0) {
+          return c.json({ error: "Class not found" }, 404);
+        }
+        if (payload.role !== "Admin" && payload.sub !== classRows[0].teacher_id) {
+          return c.json({ error: "Forbidden" }, 403);
+        }
+
+        // 2. Verify the user to be added is an assistant
+        const [userRows]: any[] = await pool.query(
+          "SELECT role FROM users WHERE user_id = ?",
+          [assistant_id],
+        );
+        if (userRows.length === 0 || userRows[0].role !== "Assistant") {
+          return c.json({ error: "User is not an assistant" }, 400);
+        }
+
+        // 3. Insert the assignment
+        await pool.query(
+          "INSERT INTO class_assistants (class_id, assistant_id) VALUES (?, ?)",
+          [classId, assistant_id],
+        );
+
+        return c.json({ message: "Assistant added successfully" }, 201);
+      } catch (error: any) {
+        if (error.code === "ER_DUP_ENTRY") {
+          return c.json({ error: "Assistant already assigned to this class" }, 409);
+        }
+        console.error("Error adding assistant to class:", error);
+        throw error;
+      }
+    },
+  );
+
+  // Remove an assistant from a class
+  classesApi.delete(
+    "/:class_id/assistants/:assistant_id",
+    jwt({ secret: JWT_SECRET }),
+    zValidator("param", z.object({
+        class_id: z.string().regex(/^\d+$/),
+        assistant_id: z.string().regex(/^\d+$/),
+    })),
+    async (c) => {
+      try {
+        const payload = c.get("jwtPayload");
+        const { class_id, assistant_id } = c.req.valid("param");
+        const classId = parseInt(class_id, 10);
+        const assistantId = parseInt(assistant_id, 10);
+
+        // 1. Verify class exists and user is the teacher or admin
+        const [classRows]: any[] = await pool.query(
+          "SELECT teacher_id FROM classes WHERE class_id = ?",
+          [classId],
+        );
+        if (classRows.length === 0) {
+          return c.json({ error: "Class not found" }, 404);
+        }
+        if (payload.role !== "Admin" && payload.sub !== classRows[0].teacher_id) {
+          return c.json({ error: "Forbidden" }, 403);
+        }
+
+        // 2. Delete the assignment
+        const [result]: any = await pool.query(
+          "DELETE FROM class_assistants WHERE class_id = ? AND assistant_id = ?",
+          [classId, assistantId],
+        );
+
+        if (result.affectedRows === 0) {
+          return c.json({ error: "Assignment not found" }, 404);
+        }
+
+        return c.json({ message: "Assistant removed successfully" });
+      } catch (error) {
+        console.error("Error removing assistant from class:", error);
+        throw error;
+      }
+    },
+  );
+
+  // Get all assistants for a class
+  classesApi.get(
+    "/:id/assistants",
+    jwt({ secret: JWT_SECRET }),
+    zValidator("param", paramsSchema),
+    async (c) => {
+      try {
+        const { id } = c.req.valid("param");
+        const classId = parseInt(id, 10);
+
+        const [rows] = await pool.query(
+          `SELECT u.user_id, u.username, u.full_name, u.email 
+           FROM users u 
+           JOIN class_assistants ca ON u.user_id = ca.assistant_id 
+           WHERE ca.class_id = ?`,
+          [classId],
+        );
+
+        return c.json(rows);
+      } catch (error) {
+        console.error("Error fetching assistants for class:", error);
+        throw error;
+      }
+    },
+  );
+
   return classesApi;
-}
+};

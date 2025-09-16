@@ -24,7 +24,8 @@ INSERT IGNORE INTO `users` (`user_id`, `username`, `password_hash`, `full_name`,
 (10, 'student004', '$2a$10$g.5b.1o1b.2i3c.4d.5e.u2q/e3w4r5t6y7u8i9o0p1q2', '学生004', 'student004@example.com', NULL, 'Student'),
 (11, 'student005', '$2a$10$g.5b.1o1b.2i3c.4d.5e.u2q/e3w4r5t6y7u8i9o0p1q2', '学生005', 'student005@example.com', NULL, 'Student'),
 (12, 'student006', '$2a$10$g.5b.1o1b.2i3c.4d.5e.u2q/e3w4r5t6y7u8i9o0p1q2', '学生006', 'student006@example.com', NULL, 'Student'),
-(13, 'yuxiang', '$2b$10$quYMFH1j5M4kjmiRXBdLMuozJUPI9OFBfGUk3tnitMTkqUwzdtyQK', 'Yuxiang', 'yuxiang@example.com', NULL, 'Admin');
+(13, 'yuxiang', '$2b$10$quYMFH1j5M4kjmiRXBdLMuozJUPI9OFBfGUk3tnitMTkqUwzdtyQK', 'Yuxiang', 'yuxiang@example.com', NULL, 'Admin'),
+(14, 'zhangsan', '$2b$10$54KLAJSweUD3Hw.u.nleKeXj9TgHXVT0QypclSG3/MY8yf7DVhfkO', '张三', 'zhangsan@example.com', NULL, 'Teacher');
 
 
 -- 2. 插入班级数据 (Classes)
@@ -50,10 +51,11 @@ INSERT IGNORE INTO `enrollments` (`student_id`, `class_id`) VALUES
 (11, 2), -- 代表学生加入班级2
 (12, 3); -- 代表学生加入班级3
 
--- 4. 插入助教分配数据 (AssistantAssignments)
-INSERT IGNORE INTO `assistant_assignments` (`assistant_id`, `teacher_id`) VALUES
-(3, 2),
-(3, 5);
+-- 4. 插入助教分配数据 (ClassAssistants) - 新结构
+INSERT IGNORE INTO `class_assistants` (`assistant_id`, `class_id`) VALUES
+(3, 1), -- 将助教1分配给班级1
+(3, 2); -- 将助教1分配给班级2
+
 
 -- 5. 插入题库数据 (QuestionBank)
 INSERT IGNORE INTO `question_bank` (`question_id`, `knowledge_point`, `question_type`, `question_text`, `options`, `correct_answer`, `creator_id`) VALUES
