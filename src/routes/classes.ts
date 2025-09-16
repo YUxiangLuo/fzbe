@@ -506,17 +506,12 @@ export default (pool: Pool, JWT_SECRET: string) => {
                   ese.experiment_id,
                   ese.student_id,
                   e.class_id,
-                  ese.step_code,
                   ese.step_order,
                   ese.event_type,
                   ese.event_timestamp,
-                  es.display_name,
-                  es.description,
                   u.username,
                   u.full_name
              FROM experiment_step_events ese
-             JOIN experiment_steps es ON es.step_code = ese.step_code
-             JOIN experiment_status ex ON ex.experiment_id = ese.experiment_id AND ex.student_id = ese.student_id
              JOIN enrollments e ON e.student_id = ese.student_id
              JOIN users u ON u.user_id = ese.student_id
             WHERE e.class_id = ?
@@ -530,54 +525,6 @@ export default (pool: Pool, JWT_SECRET: string) => {
         throw error;
       }
     },
-  );
-
-  const getStudentStepEvents = async (c: any) => {
-    const payload = c.get("jwtPayload");
-    const { studentId } = c.req.valid("param");
-    const studentIdNumber = Number.parseInt(studentId, 10);
-
-    if (payload.role === "Teacher") {
-      const [rows]: any[] = await pool.query(
-        `SELECT 1
-           FROM enrollments e
-           JOIN classes c ON e.class_id = c.class_id
-          WHERE e.student_id = ? AND c.teacher_id = ?
-          LIMIT 1`,
-        [studentIdNumber, payload.sub],
-      );
-      if (rows.length === 0) {
-        return c.json({ error: "Forbidden" }, 403);
-      }
-    } else if (payload.role !== "Admin") {
-      return c.json({ error: "Forbidden" }, 403);
-    }
-
-    const [stepEvents] = await pool.query(
-      `SELECT ese.event_id,
-              ese.experiment_id,
-              ese.student_id,
-              ese.step_code,
-              ese.step_order,
-              ese.event_type,
-              ese.event_timestamp,
-              es.display_name,
-              es.description
-         FROM experiment_step_events ese
-         JOIN experiment_steps es ON es.step_code = ese.step_code
-        WHERE ese.student_id = ?
-        ORDER BY ese.experiment_id ASC, ese.event_timestamp ASC`,
-      [studentIdNumber],
-    );
-
-    return c.json(stepEvents);
-  };
-
-  classesApi.get(
-    "/students/:studentId/step-events",
-    jwt({ secret: JWT_SECRET }),
-    zValidator("param", studentIdParamSchema),
-    getStudentStepEvents,
   );
 
   classesApi.delete(
