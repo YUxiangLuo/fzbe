@@ -61,17 +61,24 @@ CREATE TABLE IF NOT EXISTS `assistant_assignments` (
 -- 2. 实验与生产计划管理
 --
 
-CREATE TABLE IF NOT EXISTS `experiments` (
+CREATE TABLE IF NOT EXISTS `experiment_status` (
   `experiment_id` INT AUTO_INCREMENT PRIMARY KEY,
   `student_id` INT NOT NULL,
   `start_time` TIMESTAMP NULL,
   `completion_time` TIMESTAMP NULL,
-  `experiment_status` ENUM('In Progress', 'Completed') DEFAULT 'In Progress',
+  `status` ENUM('Not Started', 'In Progress', 'Completed') DEFAULT 'Not Started',
   `selected_industry` VARCHAR(255),
   `selected_company` VARCHAR(255),
   `selected_product` VARCHAR(255),
   `best_model` VARCHAR(255),
   FOREIGN KEY (`student_id`) REFERENCES `users`(`user_id`) ON DELETE CASCADE
+);
+
+CREATE TABLE IF NOT EXISTS `experiment_steps` (
+  `step_code` VARCHAR(50) PRIMARY KEY,
+  `step_order` INT NOT NULL UNIQUE,
+  `display_name` VARCHAR(255) NOT NULL,
+  `description` TEXT
 );
 
 CREATE TABLE IF NOT EXISTS `model_results` (
@@ -84,23 +91,28 @@ CREATE TABLE IF NOT EXISTS `model_results` (
   `r2` FLOAT,
   `mape` FLOAT,
   `prediction_output` JSON,
-  FOREIGN KEY (`experiment_id`) REFERENCES `experiments`(`experiment_id`) ON DELETE CASCADE
+  FOREIGN KEY (`experiment_id`) REFERENCES `experiment_status`(`experiment_id`) ON DELETE CASCADE
 );
 
 CREATE TABLE IF NOT EXISTS `production_plans` (
   `plan_id` INT AUTO_INCREMENT PRIMARY KEY,
   `experiment_id` INT NOT NULL,
   `plan_details` JSON,
-  FOREIGN KEY (`experiment_id`) REFERENCES `experiments`(`experiment_id`) ON DELETE CASCADE
+  FOREIGN KEY (`experiment_id`) REFERENCES `experiment_status`(`experiment_id`) ON DELETE CASCADE
 );
 
-CREATE TABLE IF NOT EXISTS `experiment_logs` (
-  `log_id` INT AUTO_INCREMENT PRIMARY KEY,
+CREATE TABLE IF NOT EXISTS `experiment_step_events` (
+  `event_id` INT AUTO_INCREMENT PRIMARY KEY,
   `experiment_id` INT NOT NULL,
-  `log_timestamp` TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-  `action` TEXT,
-  `duration` INT,
-  FOREIGN KEY (`experiment_id`) REFERENCES `experiments`(`experiment_id`) ON DELETE CASCADE
+  `student_id` INT NOT NULL,
+  `step_code` VARCHAR(50) NOT NULL,
+  `step_order` INT NOT NULL,
+  `event_type` ENUM('STARTED', 'COMPLETED') NOT NULL,
+  `event_timestamp` TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  FOREIGN KEY (`experiment_id`) REFERENCES `experiment_status`(`experiment_id`) ON DELETE CASCADE,
+  FOREIGN KEY (`student_id`) REFERENCES `users`(`user_id`) ON DELETE CASCADE,
+  FOREIGN KEY (`step_code`) REFERENCES `experiment_steps`(`step_code`) ON DELETE CASCADE,
+  INDEX `idx_experiment_step_order` (`experiment_id`, `step_order`, `event_timestamp`)
 );
 
 --
@@ -124,7 +136,7 @@ CREATE TABLE IF NOT EXISTS `student_responses` (
   `question_id` INT NOT NULL,
   `answer` TEXT,
   `is_correct` BOOLEAN,
-  FOREIGN KEY (`experiment_id`) REFERENCES `experiments`(`experiment_id`) ON DELETE CASCADE,
+  FOREIGN KEY (`experiment_id`) REFERENCES `experiment_status`(`experiment_id`) ON DELETE CASCADE,
   FOREIGN KEY (`question_id`) REFERENCES `question_bank`(`question_id`) ON DELETE CASCADE
 );
 
@@ -137,7 +149,7 @@ CREATE TABLE IF NOT EXISTS `experiment_reports` (
   `grade` FLOAT,
   `feedback` TEXT,
   `graded_by` INT,
-  FOREIGN KEY (`experiment_id`) REFERENCES `experiments`(`experiment_id`) ON DELETE CASCADE,
+  FOREIGN KEY (`experiment_id`) REFERENCES `experiment_status`(`experiment_id`) ON DELETE CASCADE,
   FOREIGN KEY (`graded_by`) REFERENCES `users`(`user_id`) ON DELETE SET NULL
 );
 

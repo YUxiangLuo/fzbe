@@ -18,6 +18,15 @@ const classAssistantParamSchema = z.object({
   assistantId: z.string().regex(/^\d+$/),
 });
 
+const studentIdParamSchema = z.object({
+  studentId: z.string().regex(/^\d+$/, { message: "studentId must be a number" }),
+});
+
+const classStudentParamSchema = z.object({
+  classId: z.string().regex(/^\d+$/),
+  studentId: z.string().regex(/^\d+$/),
+});
+
 const createClassSchema = z.object({
   class_name: z.string().min(1),
   class_code: z.string().optional(),
@@ -424,6 +433,153 @@ export default (pool: Pool, JWT_SECRET: string) => {
     },
   );
 
+  classesApi.get(
+    "/classes/:classId/students",
+    jwt({ secret: JWT_SECRET }),
+    zValidator("param", classIdParamSchema),
+    async (c) => {
+      try {
+        const payload = c.get("jwtPayload");
+        const { classId } = c.req.valid("param");
+        const classIdNumber = Number.parseInt(classId, 10);
+
+        const [classRows]: any[] = await pool.query(
+          "SELECT teacher_id FROM classes WHERE class_id = ?",
+          [classIdNumber],
+        );
+
+        if (classRows.length === 0) {
+          return c.json({ error: "Class not found" }, 404);
+        }
+
+        const classOwner = classRows[0].teacher_id;
+        if (payload.role !== "Admin" && payload.sub !== classOwner) {
+          return c.json({ error: "Forbidden" }, 403);
+        }
+
+        const [students] = await pool.query(
+          `SELECT u.user_id, u.username, u.full_name, u.email, u.phone_number, u.role, u.created_at
+             FROM users u
+             JOIN enrollments e ON u.user_id = e.student_id
+            WHERE e.class_id = ?
+            ORDER BY u.full_name ASC`,
+          [classIdNumber],
+        );
+
+        return c.json(students);
+      } catch (error) {
+        console.error("Error fetching students for class:", error);
+        throw error;
+      }
+    },
+  );
+
+  classesApi.get(
+    "/classes/:classId/step-events",
+    jwt({ secret: JWT_SECRET }),
+    zValidator("param", classIdParamSchema),
+    async (c) => {
+      try {
+        const payload = c.get("jwtPayload");
+        const { classId } = c.req.valid("param");
+        const classIdNumber = Number.parseInt(classId, 10);
+
+        const [classRows]: any[] = await pool.query(
+          "SELECT teacher_id FROM classes WHERE class_id = ?",
+          [classIdNumber],
+        );
+
+        if (classRows.length === 0) {
+          return c.json({ error: "Class not found" }, 404);
+        }
+
+        if (payload.role === "Teacher") {
+          if (payload.sub !== classRows[0].teacher_id) {
+            return c.json({ error: "Forbidden" }, 403);
+          }
+        } else if (payload.role !== "Admin") {
+          return c.json({ error: "Forbidden" }, 403);
+        }
+
+        const [events] = await pool.query(
+          `SELECT ese.event_id,
+                  ese.experiment_id,
+                  ese.student_id,
+                  e.class_id,
+                  ese.step_code,
+                  ese.step_order,
+                  ese.event_type,
+                  ese.event_timestamp,
+                  es.display_name,
+                  es.description,
+                  u.username,
+                  u.full_name
+             FROM experiment_step_events ese
+             JOIN experiment_steps es ON es.step_code = ese.step_code
+             JOIN experiment_status ex ON ex.experiment_id = ese.experiment_id AND ex.student_id = ese.student_id
+             JOIN enrollments e ON e.student_id = ese.student_id
+             JOIN users u ON u.user_id = ese.student_id
+            WHERE e.class_id = ?
+            ORDER BY ese.student_id ASC, ese.experiment_id ASC, ese.event_timestamp ASC`,
+          [classIdNumber],
+        );
+
+        return c.json(events);
+      } catch (error) {
+        console.error("Error fetching class step events:", error);
+        throw error;
+      }
+    },
+  );
+
+  const getStudentStepEvents = async (c: any) => {
+    const payload = c.get("jwtPayload");
+    const { studentId } = c.req.valid("param");
+    const studentIdNumber = Number.parseInt(studentId, 10);
+
+    if (payload.role === "Teacher") {
+      const [rows]: any[] = await pool.query(
+        `SELECT 1
+           FROM enrollments e
+           JOIN classes c ON e.class_id = c.class_id
+          WHERE e.student_id = ? AND c.teacher_id = ?
+          LIMIT 1`,
+        [studentIdNumber, payload.sub],
+      );
+      if (rows.length === 0) {
+        return c.json({ error: "Forbidden" }, 403);
+      }
+    } else if (payload.role !== "Admin") {
+      return c.json({ error: "Forbidden" }, 403);
+    }
+
+    const [stepEvents] = await pool.query(
+      `SELECT ese.event_id,
+              ese.experiment_id,
+              ese.student_id,
+              ese.step_code,
+              ese.step_order,
+              ese.event_type,
+              ese.event_timestamp,
+              es.display_name,
+              es.description
+         FROM experiment_step_events ese
+         JOIN experiment_steps es ON es.step_code = ese.step_code
+        WHERE ese.student_id = ?
+        ORDER BY ese.experiment_id ASC, ese.event_timestamp ASC`,
+      [studentIdNumber],
+    );
+
+    return c.json(stepEvents);
+  };
+
+  classesApi.get(
+    "/students/:studentId/step-events",
+    jwt({ secret: JWT_SECRET }),
+    zValidator("param", studentIdParamSchema),
+    getStudentStepEvents,
+  );
+
   classesApi.delete(
     "/classes/:classId",
     jwt({ secret: JWT_SECRET }),
@@ -492,6 +648,48 @@ export default (pool: Pool, JWT_SECRET: string) => {
         throw error;
       } finally {
         connection.release();
+      }
+    },
+  );
+
+  classesApi.delete(
+    "/classes/:classId/students/:studentId",
+    jwt({ secret: JWT_SECRET }),
+    zValidator("param", classStudentParamSchema),
+    async (c) => {
+      try {
+        const payload = c.get("jwtPayload");
+        const { classId, studentId } = c.req.valid("param");
+        const classIdNumber = Number.parseInt(classId, 10);
+        const studentIdNumber = Number.parseInt(studentId, 10);
+
+        const [classRows]: any[] = await pool.query(
+          "SELECT teacher_id FROM classes WHERE class_id = ?",
+          [classIdNumber],
+        );
+
+        if (classRows.length === 0) {
+          return c.json({ error: "Class not found" }, 404);
+        }
+
+        const classOwner = classRows[0].teacher_id;
+        if (payload.role !== "Admin" && payload.sub !== classOwner) {
+          return c.json({ error: "Forbidden" }, 403);
+        }
+
+        const [result]: any = await pool.query(
+          "DELETE FROM enrollments WHERE class_id = ? AND student_id = ?",
+          [classIdNumber, studentIdNumber],
+        );
+
+        if (result.affectedRows === 0) {
+          return c.json({ error: "Enrollment not found" }, 404);
+        }
+
+        return c.json({ message: "Student removed from class" });
+      } catch (error) {
+        console.error("Error removing student from class:", error);
+        throw error;
       }
     },
   );

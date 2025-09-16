@@ -73,36 +73,112 @@ INSERT IGNORE INTO `grade_weights` (`class_id`, `experiment_flow`, `knowledge_te
 (2, 30, 20, 20, 30, '{"data_preparation":8,"scenario_design":12,"presentation":10}'),
 (4, 40, 15, 15, 30, '{"data_preparation":12,"feature_engineering":13,"deployment":5}');
 
--- 7. 实验过程 (Experiments)
-INSERT IGNORE INTO `experiments` (`experiment_id`, `student_id`, `start_time`, `completion_time`, `experiment_status`, `selected_industry`, `selected_company`, `selected_product`, `best_model`) VALUES
-(1, 9,  '2025-03-01 09:00:00', '2025-03-01 10:30:00', 'Completed', '电子制造', '华夏电子',   '智能手环',     'ARIMA(2,1,1)'),
-(2, 10, '2025-03-02 13:00:00', '2025-03-02 15:10:00', 'Completed', '消费品',   '星光家居',   '空气净化器', 'LSTM'),
-(3, 12, '2025-03-03 09:30:00', NULL,                     'In Progress', '物流运输', '联合物流',   '冷链配送',   NULL),
-(4, 14, '2025-03-04 14:00:00', '2025-03-04 16:00:00', 'Completed', '食品饮料', '味来食品',   '果汁饮料',   'MovingAverage');
+-- 7. 实验步骤定义 (ExperimentSteps)
+INSERT IGNORE INTO `experiment_steps` (`step_code`, `step_order`, `display_name`, `description`) VALUES
+('industry_selection',   1, '选择行业',     '学生选择拟分析的目标行业'),
+('company_selection',    2, '选择企业',     '在行业内选择目标企业'),
+('product_selection',    3, '选择产品',     '指定企业下的核心产品'),
+('historical_data',      4, '历史数据准备', '导入并清洗历史运营/销售数据'),
+('forecast_model',       5, '预测模型构建', '选择并训练预测模型'),
+('result_evaluation',    6, '结果评估',     '评估预测结果及模型表现'),
+('production_plan',      7, '生产计划制定', '根据预测制定生产与资源计划');
 
--- 8. 实验模型结果 (ModelResults)
+-- 8. 实验状态 (ExperimentStatus)
+INSERT IGNORE INTO `experiment_status` (`experiment_id`, `student_id`, `start_time`, `completion_time`, `status`, `selected_industry`, `selected_company`, `selected_product`, `best_model`) VALUES
+(1, 9,  '2025-03-01 09:00:00', '2025-03-01 10:30:00', 'Completed',   '电子制造', '华夏电子',   '智能手环',     'ARIMA(2,1,1)'),
+(2, 10, '2025-03-02 13:00:00', '2025-03-02 15:10:00', 'Completed',   '消费品',   '星光家居',   '空气净化器', 'LSTM'),
+(3, 12, '2025-03-03 09:30:00', NULL,                   'In Progress', '物流运输', '联合物流',   '冷链配送',   NULL),
+(4, 14, '2025-03-04 14:00:00', '2025-03-04 16:00:00', 'Completed',   '食品饮料', '味来食品',   '果汁饮料',   'MovingAverage'),
+(5, 11, '2025-03-05 09:15:00', NULL,                   'In Progress', '智能制造', '未来工厂',   '协作机器人', NULL),
+(6, 13, '2025-03-06 10:00:00', NULL,                   'In Progress', '新能源',   '澜光能源',   '储能系统',   NULL),
+(7, 15, '2025-03-06 15:30:00', NULL,                   'Not Started', NULL,        NULL,        NULL,          NULL);
+
+-- 9. 实验步骤事件 (ExperimentStepEvents)
+INSERT IGNORE INTO `experiment_step_events` (`event_id`, `experiment_id`, `student_id`, `step_code`, `step_order`, `event_type`, `event_timestamp`) VALUES
+(1,  1, 9,  'industry_selection', 1, 'STARTED',   '2025-03-01 09:00:00'),
+(2,  1, 9,  'industry_selection', 1, 'COMPLETED', '2025-03-01 09:02:00'),
+(3,  1, 9,  'company_selection',  2, 'STARTED',   '2025-03-01 09:02:00'),
+(4,  1, 9,  'company_selection',  2, 'COMPLETED', '2025-03-01 09:05:00'),
+(5,  1, 9,  'product_selection',  3, 'STARTED',   '2025-03-01 09:05:00'),
+(6,  1, 9,  'product_selection',  3, 'COMPLETED', '2025-03-01 09:10:00'),
+(7,  1, 9,  'historical_data',    4, 'STARTED',   '2025-03-01 09:10:00'),
+(8,  1, 9,  'historical_data',    4, 'COMPLETED', '2025-03-01 09:25:00'),
+(9,  1, 9,  'forecast_model',     5, 'STARTED',   '2025-03-01 09:25:00'),
+(10, 1, 9,  'forecast_model',     5, 'COMPLETED', '2025-03-01 10:05:00'),
+(11, 1, 9,  'result_evaluation',  6, 'STARTED',   '2025-03-01 10:05:00'),
+(12, 1, 9,  'result_evaluation',  6, 'COMPLETED', '2025-03-01 10:20:00'),
+(13, 1, 9,  'production_plan',    7, 'STARTED',   '2025-03-01 10:20:00'),
+(14, 1, 9,  'production_plan',    7, 'COMPLETED', '2025-03-01 10:30:00'),
+(15, 2, 10, 'industry_selection', 1, 'STARTED',   '2025-03-02 13:00:00'),
+(16, 2, 10, 'industry_selection', 1, 'COMPLETED', '2025-03-02 13:03:00'),
+(17, 2, 10, 'company_selection',  2, 'STARTED',   '2025-03-02 13:03:00'),
+(18, 2, 10, 'company_selection',  2, 'COMPLETED', '2025-03-02 13:08:00'),
+(19, 2, 10, 'product_selection',  3, 'STARTED',   '2025-03-02 13:08:00'),
+(20, 2, 10, 'product_selection',  3, 'COMPLETED', '2025-03-02 13:12:00'),
+(21, 2, 10, 'historical_data',    4, 'STARTED',   '2025-03-02 13:12:00'),
+(22, 2, 10, 'historical_data',    4, 'COMPLETED', '2025-03-02 13:35:00'),
+(23, 2, 10, 'forecast_model',     5, 'STARTED',   '2025-03-02 13:35:00'),
+(24, 2, 10, 'forecast_model',     5, 'COMPLETED', '2025-03-02 14:40:00'),
+(25, 2, 10, 'result_evaluation',  6, 'STARTED',   '2025-03-02 14:40:00'),
+(26, 2, 10, 'result_evaluation',  6, 'COMPLETED', '2025-03-02 14:55:00'),
+(27, 2, 10, 'production_plan',    7, 'STARTED',   '2025-03-02 14:55:00'),
+(28, 2, 10, 'production_plan',    7, 'COMPLETED', '2025-03-02 15:10:00'),
+(29, 3, 12, 'industry_selection', 1, 'STARTED',   '2025-03-03 09:30:00'),
+(30, 3, 12, 'industry_selection', 1, 'COMPLETED', '2025-03-03 09:32:00'),
+(31, 3, 12, 'company_selection',  2, 'STARTED',   '2025-03-03 09:32:00'),
+(32, 3, 12, 'company_selection',  2, 'COMPLETED', '2025-03-03 09:34:00'),
+(33, 3, 12, 'product_selection',  3, 'STARTED',   '2025-03-03 09:34:00'),
+(34, 3, 12, 'product_selection',  3, 'COMPLETED', '2025-03-03 09:38:00'),
+(35, 3, 12, 'historical_data',    4, 'STARTED',   '2025-03-03 09:38:00'),
+(36, 3, 12, 'historical_data',    4, 'COMPLETED', '2025-03-03 09:48:00'),
+(37, 3, 12, 'forecast_model',     5, 'STARTED',   '2025-03-03 09:50:00'),
+(38, 4, 14, 'industry_selection', 1, 'STARTED',   '2025-03-04 14:00:00'),
+(39, 4, 14, 'industry_selection', 1, 'COMPLETED', '2025-03-04 14:02:00'),
+(40, 4, 14, 'company_selection',  2, 'STARTED',   '2025-03-04 14:02:00'),
+(41, 4, 14, 'company_selection',  2, 'COMPLETED', '2025-03-04 14:05:00'),
+(42, 4, 14, 'product_selection',  3, 'STARTED',   '2025-03-04 14:05:00'),
+(43, 4, 14, 'product_selection',  3, 'COMPLETED', '2025-03-04 14:08:00'),
+(44, 4, 14, 'historical_data',    4, 'STARTED',   '2025-03-04 14:08:00'),
+(45, 4, 14, 'historical_data',    4, 'COMPLETED', '2025-03-04 14:18:00'),
+(46, 4, 14, 'forecast_model',     5, 'STARTED',   '2025-03-04 14:18:00'),
+(47, 4, 14, 'forecast_model',     5, 'COMPLETED', '2025-03-04 15:20:00'),
+(48, 4, 14, 'result_evaluation',  6, 'STARTED',   '2025-03-04 15:20:00'),
+(49, 4, 14, 'result_evaluation',  6, 'COMPLETED', '2025-03-04 15:35:00'),
+(50, 4, 14, 'production_plan',    7, 'STARTED',   '2025-03-04 15:35:00'),
+(51, 4, 14, 'production_plan',    7, 'COMPLETED', '2025-03-04 16:00:00'),
+-- Experiment 5 (In Progress)
+(52, 5, 11, 'industry_selection', 1, 'STARTED',   '2025-03-05 09:15:00'),
+(53, 5, 11, 'industry_selection', 1, 'COMPLETED', '2025-03-05 09:17:00'),
+(54, 5, 11, 'company_selection',  2, 'STARTED',   '2025-03-05 09:17:00'),
+(55, 5, 11, 'company_selection',  2, 'COMPLETED', '2025-03-05 09:22:00'),
+(56, 5, 11, 'product_selection',  3, 'STARTED',   '2025-03-05 09:22:00'),
+(57, 5, 11, 'product_selection',  3, 'COMPLETED', '2025-03-05 09:28:00'),
+(58, 5, 11, 'historical_data',    4, 'STARTED',   '2025-03-05 09:28:00'),
+(59, 5, 11, 'historical_data',    4, 'COMPLETED', '2025-03-05 09:45:00'),
+(60, 5, 11, 'forecast_model',     5, 'STARTED',   '2025-03-05 09:50:00'),
+
+-- Experiment 6 (In Progress)
+(61, 6, 13, 'industry_selection', 1, 'STARTED',   '2025-03-06 10:00:00'),
+(62, 6, 13, 'industry_selection', 1, 'COMPLETED', '2025-03-06 10:03:00'),
+(63, 6, 13, 'company_selection',  2, 'STARTED',   '2025-03-06 10:03:00'),
+(64, 6, 13, 'company_selection',  2, 'COMPLETED', '2025-03-06 10:08:00'),
+(65, 6, 13, 'product_selection',  3, 'STARTED',   '2025-03-06 10:08:00'),
+(66, 6, 13, 'product_selection',  3, 'COMPLETED', '2025-03-06 10:15:00'),
+(67, 6, 13, 'historical_data',    4, 'STARTED',   '2025-03-06 10:15:00'),
+
+-- Experiment 7 (Not Started)
+(68, 7, 15, 'industry_selection', 1, 'STARTED',   '2025-03-06 15:30:00');
+
 INSERT IGNORE INTO `model_results` (`result_id`, `experiment_id`, `model_name`, `model_parameters`, `rmse`, `mae`, `r2`, `mape`, `prediction_output`) VALUES
 (1, 1, 'ARIMA',               '{"p":2,"d":1,"q":1}',        8.52, 6.30, 0.87, 4.10, '{"forecast":[128,133,139,145]}'),
 (2, 1, 'ExponentialSmoothing','{"alpha":0.3}',               10.40, 7.90, 0.79, 5.35, '{"forecast":[126,131,135,140]}'),
 (3, 2, 'LSTM',                '{"epochs":50,"layers":2}',    6.12, 4.85, 0.91, 3.72, '{"forecast":[215,221,229,236]}'),
 (4, 4, 'MovingAverage',       '{"window":3}',                 9.35, 7.21, 0.83, 4.85, '{"forecast":[182,185,189,192]}');
 
--- 9. 生产计划 (ProductionPlans)
 INSERT IGNORE INTO `production_plans` (`plan_id`, `experiment_id`, `plan_details`) VALUES
 (1, 1, '{"horizon_weeks":4,"lines":2,"safety_stock":320,"notes":"结合 ARIMA 预测调整排产节奏"}'),
 (2, 2, '{"horizon_weeks":6,"lines":3,"safety_stock":180,"notes":"LSTM 预测显示节假日前需求激增"}'),
 (3, 4, '{"horizon_weeks":3,"lines":1,"safety_stock":90,"notes":"采用移动平均模型稳定生产"}');
-
--- 10. 实验日志 (ExperimentLogs)
-INSERT IGNORE INTO `experiment_logs` (`log_id`, `experiment_id`, `log_timestamp`, `action`, `duration`) VALUES
-(1, 1, '2025-03-01 09:05:00', '导入 24 个月销售数据并完成缺失值处理', 10),
-(2, 1, '2025-03-01 09:20:00', '完成差分检验与平稳性分析', 20),
-(3, 1, '2025-03-01 09:45:00', '调优 ARIMA 参数并生成预测', 25),
-(4, 2, '2025-03-02 13:10:00', '构造时间滞后与节假日特征', 25),
-(5, 2, '2025-03-02 13:45:00', '训练 LSTM 模型并验证', 40),
-(6, 3, '2025-03-03 09:40:00', '搭建数据预处理流程，等待教师审核', 15),
-(7, 4, '2025-03-04 14:10:00', '应用移动平均模型获取滚动预测', 18);
-
 -- 11. 学生答题记录 (StudentResponses)
 INSERT IGNORE INTO `student_responses` (`response_id`, `experiment_id`, `question_id`, `answer`, `is_correct`) VALUES
 (1, 1, 1, 'B',    TRUE),
