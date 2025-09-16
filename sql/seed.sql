@@ -2,75 +2,132 @@
 -- 虚拟仿真系统数据库种子文件 (Seed File)
 -- 适用于 MariaDB / MySQL
 -- --------------------------------------------------------
--- 注意: 此文件用于提供基础数据。
--- 如需大规模生成用户和班级，请使用 `scripts/` 目录下的 bun 脚本。
+-- 说明:
+--   1. 通过 INSERT IGNORE 保障重复执行脚本时不会报错。
+--   2. 所有示例账号的默认密码均为 password123 (bcrypt:
+--      $2b$10$DVZtxD9Efhm/j8.LSWMFx.hfdpk81iHO4Tv0fUaDr1LlW/mFrgXrG)。
+--   3. 数据覆盖了典型业务流程: 用户/班级、助教、实验过程、题库、评分
+--      以及资料/数据集上传，方便做端到端联调测试。
 -- --------------------------------------------------------
 
--- 1. 插入核心用户数据 (Users)
--- 默认密码均为 'password123'，哈希值由 `Bun.password.hash('password123', { algorithm: 'bcrypt', cost: 10 })` 生成。
--- 使用 INSERT IGNORE 来避免重复插入时出错。
+-- 1. 核心用户 (Users)
 INSERT IGNORE INTO `users` (`user_id`, `username`, `password_hash`, `full_name`, `email`, `phone_number`, `role`) VALUES
-(1, 'admin', '$2a$10$g.5b.1o1b.2i3c.4d.5e.u2q/e3w4r5t6y7u8i9o0p1q2', '系统管理员', 'admin@example.com', '10000000000', 'Admin'),
-(2, 'teacher01', '$2a$10$g.5b.1o1b.2i3c.4d.5e.u2q/e3w4r5t6y7u8i9o0p1q2', '张老师', 'teacher01@example.com', '10000000001', 'Teacher'),
-(3, 'assistant01', '$2a$10$g.5b.1o1b.2i3c.4d.5e.u2q/e3w4r5t6y7u8i9o0p1q2', '李助教', 'assistant01@example.com', '10000000002', 'Assistant'),
-(4, 'student01', '$2a$10$g.5b.1o1b.2i3c.4d.5e.u2q/e3w4r5t6y7u8i9o0p1q2', '王小明', 'student01@example.com', '10000000003', 'Student'),
--- 额外添加的教师
-(5, 'teacher02', '$2a$10$g.5b.1o1b.2i3c.4d.5e.u2q/e3w4r5t6y7u8i9o0p1q2', '刘老师', 'teacher02@example.com', NULL, 'Teacher'),
-(6, 'teacher03', '$2a$10$g.5b.1o1b.2i3c.4d.5e.u2q/e3w4r5t6y7u8i9o0p1q2', '陈老师', 'teacher03@example.com', NULL, 'Teacher'),
-(7, 'teacher04', '$2a$10$g.5b.1o1b.2i3c.4d.5e.u2q/e3w4r5t6y7u8i9o0p1q2', '赵老师', 'teacher04@example.com', NULL, 'Teacher'),
--- 额外添加的学生 (代表)
-(8, 'student002', '$2a$10$g.5b.1o1b.2i3c.4d.5e.u2q/e3w4r5t6y7u8i9o0p1q2', '学生002', 'student002@example.com', NULL, 'Student'),
-(9, 'student003', '$2a$10$g.5b.1o1b.2i3c.4d.5e.u2q/e3w4r5t6y7u8i9o0p1q2', '学生003', 'student003@example.com', NULL, 'Student'),
-(10, 'student004', '$2a$10$g.5b.1o1b.2i3c.4d.5e.u2q/e3w4r5t6y7u8i9o0p1q2', '学生004', 'student004@example.com', NULL, 'Student'),
-(11, 'student005', '$2a$10$g.5b.1o1b.2i3c.4d.5e.u2q/e3w4r5t6y7u8i9o0p1q2', '学生005', 'student005@example.com', NULL, 'Student'),
-(12, 'student006', '$2a$10$g.5b.1o1b.2i3c.4d.5e.u2q/e3w4r5t6y7u8i9o0p1q2', '学生006', 'student006@example.com', NULL, 'Student'),
-(13, 'yuxiang', '$2b$10$quYMFH1j5M4kjmiRXBdLMuozJUPI9OFBfGUk3tnitMTkqUwzdtyQK', 'Yuxiang', 'yuxiang@example.com', NULL, 'Admin'),
-(14, 'zhangsan', '$2b$10$54KLAJSweUD3Hw.u.nleKeXj9TgHXVT0QypclSG3/MY8yf7DVhfkO', '张三', 'zhangsan@example.com', NULL, 'Teacher');
+(1,  'admin',         '$2b$10$DVZtxD9Efhm/j8.LSWMFx.hfdpk81iHO4Tv0fUaDr1LlW/mFrgXrG', '系统管理员', 'admin@example.com',       '10000000000', 'Admin'),
+(2,  'admin_yuxiang', '$2b$10$DVZtxD9Efhm/j8.LSWMFx.hfdpk81iHO4Tv0fUaDr1LlW/mFrgXrG', '余翔',       'yuxiang@example.com',    '10000000001', 'Admin'),
+(3,  'teacher_liu',   '$2b$10$DVZtxD9Efhm/j8.LSWMFx.hfdpk81iHO4Tv0fUaDr1LlW/mFrgXrG', '刘老师',     'teacher.liu@example.com','13800138000', 'Teacher'),
+(4,  'teacher_chen',  '$2b$10$DVZtxD9Efhm/j8.LSWMFx.hfdpk81iHO4Tv0fUaDr1LlW/mFrgXrG', '陈老师',     'teacher.chen@example.com','13800138001','Teacher'),
+(5,  'teacher_zhao',  '$2b$10$DVZtxD9Efhm/j8.LSWMFx.hfdpk81iHO4Tv0fUaDr1LlW/mFrgXrG', '赵老师',     'teacher.zhao@example.com','13800138002','Teacher'),
+(6,  'teacher_wang',  '$2b$10$DVZtxD9Efhm/j8.LSWMFx.hfdpk81iHO4Tv0fUaDr1LlW/mFrgXrG', '王老师',     'teacher.wang@example.com','13800138003','Teacher'),
+(7,  'assistant_li',  '$2b$10$DVZtxD9Efhm/j8.LSWMFx.hfdpk81iHO4Tv0fUaDr1LlW/mFrgXrG', '李助教',     'assistant.li@example.com','13900139000','Assistant'),
+(8,  'assistant_sun', '$2b$10$DVZtxD9Efhm/j8.LSWMFx.hfdpk81iHO4Tv0fUaDr1LlW/mFrgXrG', '孙助教',     'assistant.sun@example.com','13900139001','Assistant'),
+(9,  'student_zhang', '$2b$10$DVZtxD9Efhm/j8.LSWMFx.hfdpk81iHO4Tv0fUaDr1LlW/mFrgXrG', '张小明',     'zhangxm@example.com',    NULL,           'Student'),
+(10, 'student_li',    '$2b$10$DVZtxD9Efhm/j8.LSWMFx.hfdpk81iHO4Tv0fUaDr1LlW/mFrgXrG', '李晓丽',     'lixl@example.com',       NULL,           'Student'),
+(11, 'student_wu',    '$2b$10$DVZtxD9Efhm/j8.LSWMFx.hfdpk81iHO4Tv0fUaDr1LlW/mFrgXrG', '吴嘉禾',     'wujh@example.com',       NULL,           'Student'),
+(12, 'student_zhao',  '$2b$10$DVZtxD9Efhm/j8.LSWMFx.hfdpk81iHO4Tv0fUaDr1LlW/mFrgXrG', '赵梓涵',     'zhaozh@example.com',     NULL,           'Student'),
+(13, 'student_chen',  '$2b$10$DVZtxD9Efhm/j8.LSWMFx.hfdpk81iHO4Tv0fUaDr1LlW/mFrgXrG', '陈语桐',     'chenyt@example.com',     NULL,           'Student'),
+(14, 'student_liu',   '$2b$10$DVZtxD9Efhm/j8.LSWMFx.hfdpk81iHO4Tv0fUaDr1LlW/mFrgXrG', '刘博文',     'liubw@example.com',      NULL,           'Student'),
+(15, 'student_sun',   '$2b$10$DVZtxD9Efhm/j8.LSWMFx.hfdpk81iHO4Tv0fUaDr1LlW/mFrgXrG', '孙晨曦',     'suncx@example.com',      NULL,           'Student');
 
-
--- 2. 插入班级数据 (Classes)
+-- 2. 班级 (Classes)
 INSERT IGNORE INTO `classes` (`class_id`, `class_name`, `class_code`, `teacher_id`) VALUES
-(1, '生产决策仿真2025春季班', 'PM2025S', 2),
-(2, '先进制造仿真实验班', 'AM2025A', 5),
-(3, '供应链管理虚拟仿真', 'SCM2025', 6),
-(4, '工业工程综合实验2025', 'IE2025', 7),
-(5, '数据驱动决策模拟', 'DDS2025', 2),
-(6, '智能生产系统规划', 'IPSP2025', 5),
-(7, '物流与仓储管理仿真', 'LWM2025', 6),
-(8, '企业资源计划(ERP)模拟', 'ERP2025', 7),
-(9, '市场营销决策仿真', 'MDM2025', 2),
-(10, '项目管理虚拟实践', 'PMVP2025', 5),
-(11, '金融投资与风险模拟', 'FIRM2025', 6);
+(1, '工业工程综合实验2025',   'IE2025', 3),
+(2, '供应链协同仿真班',       'SCM2025',4),
+(3, '智能制造实践小班',       'IM2025', 5),
+(4, '数据驱动决策班',         'DDD2025',6),
+(5, 'ERP实施实训班',         'ERP2025',3),
+(6, '物流系统优化班',         'LSO2025',4);
 
--- 3. 插入学生分班数据 (Enrollments)
-INSERT IGNORE INTO `enrollments` (`student_id`, `class_id`) VALUES
-(4, 1), -- 原始数据
-(8, 1), -- 代表学生加入班级1
-(9, 1), -- 代表学生加入班级1
-(10, 2), -- 代表学生加入班级2
-(11, 2), -- 代表学生加入班级2
-(12, 3); -- 代表学生加入班级3
-
--- 4. 插入助教分配数据 (ClassAssistants) - 新结构
+-- 3. 助教与班级关联 (ClassAssistants)
 INSERT IGNORE INTO `class_assistants` (`assistant_id`, `class_id`) VALUES
-(3, 1), -- 将助教1分配给班级1
-(3, 2); -- 将助教1分配给班级2
+(7, 1),
+(7, 5),
+(8, 2),
+(8, 6);
 
+-- 4. 学生选课 (Enrollments)
+INSERT IGNORE INTO `enrollments` (`student_id`, `class_id`) VALUES
+(9, 1),
+(10,1),
+(11,1),
+(12,2),
+(13,2),
+(14,3),
+(15,3),
+(9, 4),
+(12,4),
+(10,5),
+(13,5),
+(11,6),
+(14,6);
 
--- 5. 插入题库数据 (QuestionBank)
+-- 5. 题库 (QuestionBank)
 INSERT IGNORE INTO `question_bank` (`question_id`, `knowledge_point`, `question_type`, `question_text`, `options`, `correct_answer`, `creator_id`) VALUES
-(1, '需求预测', 'Single Choice', '在ARIMA模型中，"d"参数代表什么？', '{"A": "自回归项数", "B": "移动平均项数", "C": "差分阶数", "D": "季节性周期"}', 'C', 2),
-(2, '生产计划', 'True/False', '安全库存的主要目的是为了应对市场需求的不确定性。', NULL, 'True', 2),
-(3, '融合模型', 'Multiple Choice', '以下哪些属于融合预测模型？', '{"A": "移动平均法", "B": "Boosting融合模型", "C": "Stacking融合模型", "D": "指数平滑法"}', '["B", "C"]', 2);
+(1, '需求预测基础', 'Single Choice', '在 ARIMA 模型中，"d" 参数的含义是?', '{"A":"自回归项数","B":"差分阶数","C":"移动平均项数","D":"季节周期"}', 'B', 3),
+(2, '时间序列预处理', 'Multiple Choice', '以下哪些步骤常用于时间序列数据预处理?', '{"A":"缺失值填补","B":"标准化","C":"图像增强","D":"滞后特征构造"}', '["A","B","D"]', 3),
+(3, '生产计划', 'True/False', '安全库存可以帮助降低缺货风险。', NULL, 'True', 4),
+(4, '融合模型', 'Single Choice', '使用多个模型结果加权得到最终预测值的方式称为？', '{"A":"合成预测","B":"模型选择","C":"模型集成","D":"模型融合"}', 'C', 4);
 
--- 6. 插入默认成绩权重 (GradeWeights)
+-- 6. 成绩权重 (GradeWeights)
 INSERT IGNORE INTO `grade_weights` (`class_id`, `experiment_flow`, `knowledge_tests`, `model_selection`, `experiment_report`, `detailed_step_weights`) VALUES
-(1, 40, 20, 10, 30, '{"data_preparation": 5, "descriptive_statistics": 5, "model_choice": 10, "prediction_generation": 20}'),
-(2, 35, 25, 15, 25, '{"data_preparation": 5, "descriptive_statistics": 5, "model_choice": 15, "prediction_generation": 15}');
+(1, 35, 25, 10, 30, '{"data_preparation":10,"model_training":10,"reporting":10}'),
+(2, 30, 20, 20, 30, '{"data_preparation":8,"scenario_design":12,"presentation":10}'),
+(4, 40, 15, 15, 30, '{"data_preparation":12,"feature_engineering":13,"deployment":5}');
 
--- 7. 插入默认实验手册和数据集 (ExperimentManuals & Datasets)
+-- 7. 实验过程 (Experiments)
+INSERT IGNORE INTO `experiments` (`experiment_id`, `student_id`, `start_time`, `completion_time`, `experiment_status`, `selected_industry`, `selected_company`, `selected_product`, `best_model`) VALUES
+(1, 9,  '2025-03-01 09:00:00', '2025-03-01 10:30:00', 'Completed', '电子制造', '华夏电子',   '智能手环',     'ARIMA(2,1,1)'),
+(2, 10, '2025-03-02 13:00:00', '2025-03-02 15:10:00', 'Completed', '消费品',   '星光家居',   '空气净化器', 'LSTM'),
+(3, 12, '2025-03-03 09:30:00', NULL,                     'In Progress', '物流运输', '联合物流',   '冷链配送',   NULL),
+(4, 14, '2025-03-04 14:00:00', '2025-03-04 16:00:00', 'Completed', '食品饮料', '味来食品',   '果汁饮料',   'MovingAverage');
+
+-- 8. 实验模型结果 (ModelResults)
+INSERT IGNORE INTO `model_results` (`result_id`, `experiment_id`, `model_name`, `model_parameters`, `rmse`, `mae`, `r2`, `mape`, `prediction_output`) VALUES
+(1, 1, 'ARIMA',               '{"p":2,"d":1,"q":1}',        8.52, 6.30, 0.87, 4.10, '{"forecast":[128,133,139,145]}'),
+(2, 1, 'ExponentialSmoothing','{"alpha":0.3}',               10.40, 7.90, 0.79, 5.35, '{"forecast":[126,131,135,140]}'),
+(3, 2, 'LSTM',                '{"epochs":50,"layers":2}',    6.12, 4.85, 0.91, 3.72, '{"forecast":[215,221,229,236]}'),
+(4, 4, 'MovingAverage',       '{"window":3}',                 9.35, 7.21, 0.83, 4.85, '{"forecast":[182,185,189,192]}');
+
+-- 9. 生产计划 (ProductionPlans)
+INSERT IGNORE INTO `production_plans` (`plan_id`, `experiment_id`, `plan_details`) VALUES
+(1, 1, '{"horizon_weeks":4,"lines":2,"safety_stock":320,"notes":"结合 ARIMA 预测调整排产节奏"}'),
+(2, 2, '{"horizon_weeks":6,"lines":3,"safety_stock":180,"notes":"LSTM 预测显示节假日前需求激增"}'),
+(3, 4, '{"horizon_weeks":3,"lines":1,"safety_stock":90,"notes":"采用移动平均模型稳定生产"}');
+
+-- 10. 实验日志 (ExperimentLogs)
+INSERT IGNORE INTO `experiment_logs` (`log_id`, `experiment_id`, `log_timestamp`, `action`, `duration`) VALUES
+(1, 1, '2025-03-01 09:05:00', '导入 24 个月销售数据并完成缺失值处理', 10),
+(2, 1, '2025-03-01 09:20:00', '完成差分检验与平稳性分析', 20),
+(3, 1, '2025-03-01 09:45:00', '调优 ARIMA 参数并生成预测', 25),
+(4, 2, '2025-03-02 13:10:00', '构造时间滞后与节假日特征', 25),
+(5, 2, '2025-03-02 13:45:00', '训练 LSTM 模型并验证', 40),
+(6, 3, '2025-03-03 09:40:00', '搭建数据预处理流程，等待教师审核', 15),
+(7, 4, '2025-03-04 14:10:00', '应用移动平均模型获取滚动预测', 18);
+
+-- 11. 学生答题记录 (StudentResponses)
+INSERT IGNORE INTO `student_responses` (`response_id`, `experiment_id`, `question_id`, `answer`, `is_correct`) VALUES
+(1, 1, 1, 'B',    TRUE),
+(2, 1, 2, '["A","B","D"]', TRUE),
+(3, 2, 1, 'A',    FALSE),
+(4, 2, 3, 'True', TRUE),
+(5, 4, 4, 'C',    TRUE);
+
+-- 12. 实验报告 (ExperimentReports)
+INSERT IGNORE INTO `experiment_reports` (`report_id`, `experiment_id`, `report_content`, `pdf_file_path`, `submitted_at`, `grade`, `feedback`, `graded_by`) VALUES
+(1, 1, '基于 ARIMA 模型的智能手环需求预测分析。', '/uploads/reports/exp1-report.pdf', '2025-03-01 21:30:00', 92.5, '模型选择合理，报告结构清晰。', 3),
+(2, 2, 'LSTM 模型捕捉到季节特征并提升预测准确率。', '/uploads/reports/exp2-report.pdf', '2025-03-02 22:15:00', 88.0, '建议增加模型可解释性讨论。', 4),
+(3, 4, '移动平均模型用于饮料需求预测的快速实践。', '/uploads/reports/exp4-report.pdf', '2025-03-04 20:05:00', 85.0, '适合入门演示，可尝试更多模型比较。', 5);
+
+-- 13. 实验手册 (ExperimentManuals)
 INSERT IGNORE INTO `experiment_manuals` (`manual_id`, `file_name`, `file_path`, `description`, `is_active`, `uploader_id`) VALUES
-(1, '虚拟仿真实验手册V2.0.pdf', '/uploads/manuals/placeholder-manual.pdf', '这是2025年春季学期使用的最新版实验手册。', 1, 1);
+(1, '虚拟仿真实验手册 V2.0.pdf', '/uploads/static/manuals/virtual-lab-v2.pdf', '2025 春季学期使用，包含实验流程与评分标准。', TRUE, 1),
+(2, '教师操作速查表.pdf',       '/uploads/static/manuals/teacher-quickstart.pdf', '教师端重点功能速览。', FALSE, 2);
 
+-- 14. 数据集 (Datasets)
 INSERT IGNORE INTO `datasets` (`dataset_id`, `data_name`, `file_path`, `description`) VALUES
-(1, '某产品历史销售数据', '/data/sales_data_product_a.csv', '包含2022-2024年某产品的月度销售量、销售额和平均价格等信息。');
+(1, '电子产品销售月度数据', '/uploads/static/datasets/electronics-monthly.csv', '包含 2022-2024 年月度销量、收入、均价。'),
+(2, '家电行业节假日销量', '/uploads/static/datasets/home-appliance-holidays.csv', '节假日前后 60 天的日销量及促销活动标签。'),
+(3, '冷链物流温控数据', '/uploads/static/datasets/cold-chain-temp.csv', '多线路冷链配送的温度与到货时效监控数据。');
+
+-- --------------------------------------------------------
+-- 结束
+-- --------------------------------------------------------

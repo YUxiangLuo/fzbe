@@ -5,14 +5,32 @@ import { zValidator } from "@hono/zod-validator";
 import type { Pool } from "mysql2/promise";
 
 // Zod Schemas for Validation
-const paramsSchema = z.object({
-  id: z.string().regex(/^\d+$/, { message: "ID must be a number" }),
+const classIdParamSchema = z.object({
+  classId: z.string().regex(/^\d+$/, { message: "classId must be a number" }),
+});
+
+const teacherIdParamSchema = z.object({
+  teacherId: z.string().regex(/^\d+$/, { message: "teacherId must be a number" }),
+});
+
+const classAssistantParamSchema = z.object({
+  classId: z.string().regex(/^\d+$/),
+  assistantId: z.string().regex(/^\d+$/),
 });
 
 const createClassSchema = z.object({
   class_name: z.string().min(1),
   class_code: z.string().optional(),
 });
+
+const updateClassSchema = z
+  .object({
+    class_name: z.string().min(1).optional(),
+    class_code: z.string().optional(),
+  })
+  .refine((data) => data.class_name !== undefined || data.class_code !== undefined, {
+    message: "At least one field (class_name or class_code) must be provided",
+  });
 
 const enrollSchema = z.object({
   class_code: z.string().min(1, { message: "Class code is required" }),
@@ -27,7 +45,7 @@ export default (pool: Pool, JWT_SECRET: string) => {
 
   // 受保护的路由: 创建新班级
   classesApi.post(
-    "/",
+    "/classes",
     jwt({ secret: JWT_SECRET }),
     zValidator("json", createClassSchema),
     async (c) => {
@@ -45,13 +63,12 @@ export default (pool: Pool, JWT_SECRET: string) => {
           [class_name, class_code || null, teacher_id],
         );
 
-        const newClass = {
-          class_id: result.insertId,
-          class_name,
-          class_code,
-          teacher_id,
-        };
-        return c.json(newClass, 201);
+        const [newClassRows]: any[] = await pool.query(
+          "SELECT c.*, u.full_name as teacher_name FROM classes c JOIN users u ON c.teacher_id = u.user_id WHERE c.class_id = ?",
+          [result.insertId],
+        );
+
+        return c.json(newClassRows[0], 201);
       } catch (error: any) {
         if (error.code === "ER_DUP_ENTRY") {
           return c.json({ error: "Class code already exists" }, 409);
@@ -64,7 +81,7 @@ export default (pool: Pool, JWT_SECRET: string) => {
 
   // 受保护的路由: 学生使用班级代码加入班级
   classesApi.post(
-    "/enroll",
+    "/classes/enroll",
     jwt({ secret: JWT_SECRET }),
     zValidator("json", enrollSchema),
     async (c) => {
@@ -103,31 +120,16 @@ export default (pool: Pool, JWT_SECRET: string) => {
   );
 
   // 受保护的路由: 获取班级列表
-  classesApi.get("/", jwt({ secret: JWT_SECRET }), async (c) => {
+  classesApi.get("/classes", jwt({ secret: JWT_SECRET }), async (c) => {
     try {
       const payload = c.get("jwtPayload");
-      let query = "";
-      const params: (string | number)[] = [payload.sub];
-
-      switch (payload.role) {
-        case "Admin":
-          query =
-            "SELECT c.*, u.full_name as teacher_name FROM classes c JOIN users u ON c.teacher_id = u.user_id";
-          params.pop();
-          break;
-        case "Teacher":
-          query =
-            "SELECT c.*, u.full_name as teacher_name FROM classes c JOIN users u ON c.teacher_id = u.user_id WHERE c.teacher_id = ?";
-          break;
-        case "Student":
-          query =
-            "SELECT c.*, u.full_name as teacher_name FROM classes c JOIN enrollments e ON c.class_id = e.class_id JOIN users u ON c.teacher_id = u.user_id WHERE e.student_id = ?";
-          break;
-        default:
-          return c.json({ error: "Forbidden" }, 403);
+      if (payload.role !== "Admin") {
+        return c.json({ error: "Forbidden" }, 403);
       }
 
-      const [rows] = await pool.query(query, params);
+      const [rows] = await pool.query(
+        "SELECT c.*, u.full_name as teacher_name FROM classes c JOIN users u ON c.teacher_id = u.user_id",
+      );
       return c.json(rows);
     } catch (error) {
       console.error("Error fetching classes:", error);
@@ -137,18 +139,18 @@ export default (pool: Pool, JWT_SECRET: string) => {
 
   // 受保护的路由: 获取单个班级详情 (包括学生列表)
   classesApi.get(
-    "/:id",
+    "/classes/:classId",
     jwt({ secret: JWT_SECRET }),
-    zValidator("param", paramsSchema),
+    zValidator("param", classIdParamSchema),
     async (c) => {
       try {
         const payload = c.get("jwtPayload");
-        const { id } = c.req.valid("param");
-        const classId = parseInt(id, 10);
+        const { classId } = c.req.valid("param");
+        const classIdNumber = Number.parseInt(classId, 10);
 
         const [classRows]: any[] = await pool.query(
           "SELECT c.*, u.full_name as teacher_name FROM classes c JOIN users u ON c.teacher_id = u.user_id WHERE c.class_id = ?",
-          [classId],
+          [classIdNumber],
         );
         const classInfo = classRows[0];
 
@@ -162,7 +164,7 @@ export default (pool: Pool, JWT_SECRET: string) => {
         } else if (payload.role === "Student") {
           const [enrollmentRows]: any[] = await pool.query(
             "SELECT enrollment_id FROM enrollments WHERE student_id = ? AND class_id = ?",
-            [payload.sub, classId],
+            [payload.sub, classIdNumber],
           );
           if (enrollmentRows.length > 0) {
             isAllowed = true;
@@ -175,10 +177,18 @@ export default (pool: Pool, JWT_SECRET: string) => {
 
         const [studentRows] = await pool.query(
           "SELECT u.user_id, u.username, u.full_name, u.email FROM users u JOIN enrollments e ON u.user_id = e.student_id WHERE e.class_id = ?",
-          [classId],
+          [classIdNumber],
         );
 
-        const response = { ...classInfo, students: studentRows };
+        const [assistantRows] = await pool.query(
+          `SELECT u.user_id, u.username, u.full_name, u.email
+             FROM users u
+             JOIN class_assistants ca ON u.user_id = ca.assistant_id
+            WHERE ca.class_id = ?`,
+          [classIdNumber],
+        );
+
+        const response = { ...classInfo, students: studentRows, assistants: assistantRows };
         return c.json(response);
       } catch (error) {
         console.error("Error fetching class details:", error);
@@ -187,26 +197,91 @@ export default (pool: Pool, JWT_SECRET: string) => {
     },
   );
 
-  // 获取指定教师创建的所有班级 前缀 /classes
-  classesApi.get(
-    "/teacher/:id/classes",
+  classesApi.put(
+    "/classes/:classId",
     jwt({ secret: JWT_SECRET }),
-    zValidator("param", paramsSchema),
+    zValidator("param", classIdParamSchema),
+    zValidator("json", updateClassSchema),
     async (c) => {
       try {
         const payload = c.get("jwtPayload");
-        const { id } = c.req.valid("param");
-        const teacherId = parseInt(id, 10);
+        const { classId } = c.req.valid("param");
+        const classIdNumber = Number.parseInt(classId, 10);
+        const { class_name, class_code } = c.req.valid("json");
+
+        const [classRows]: any[] = await pool.query(
+          "SELECT teacher_id FROM classes WHERE class_id = ?",
+          [classIdNumber],
+        );
+        if (classRows.length === 0) {
+          return c.json({ error: "Class not found" }, 404);
+        }
+
+        const classOwner = classRows[0].teacher_id;
+        if (payload.role !== "Admin" && payload.sub !== classOwner) {
+          return c.json({ error: "Forbidden" }, 403);
+        }
+
+        const fields: string[] = [];
+        const values: (string | number | null)[] = [];
+        if (class_name !== undefined) {
+          fields.push("class_name = ?");
+          values.push(class_name);
+        }
+        if (class_code !== undefined) {
+          fields.push("class_code = ?");
+          values.push(class_code || null);
+        }
+
+        if (fields.length === 0) {
+          return c.json({ error: "No fields to update" }, 400);
+        }
+
+        values.push(classIdNumber);
+
+        try {
+          const sql = `UPDATE classes SET ${fields.join(", ")} WHERE class_id = ?`;
+          await pool.query(sql, values);
+        } catch (error: any) {
+          if (error.code === "ER_DUP_ENTRY") {
+            return c.json({ error: "Class code already exists" }, 409);
+          }
+          throw error;
+        }
+
+        const [updatedRows]: any[] = await pool.query(
+          "SELECT c.*, u.full_name as teacher_name FROM classes c JOIN users u ON c.teacher_id = u.user_id WHERE c.class_id = ?",
+          [classIdNumber],
+        );
+
+        return c.json(updatedRows[0]);
+      } catch (error) {
+        console.error("Error updating class:", error);
+        throw error;
+      }
+    },
+  );
+
+  // 获取指定教师创建的所有班级
+  classesApi.get(
+    "/teachers/:teacherId/classes",
+    jwt({ secret: JWT_SECRET }),
+    zValidator("param", teacherIdParamSchema),
+    async (c) => {
+      try {
+        const payload = c.get("jwtPayload");
+        const { teacherId } = c.req.valid("param");
+        const teacherIdNumber = Number.parseInt(teacherId, 10);
 
         // Authorization check
-        if (payload.role !== "Admin" && payload.sub !== teacherId) {
+        if (payload.role !== "Admin" && payload.sub !== teacherIdNumber) {
           return c.json({ error: "Forbidden" }, 403);
         }
 
         // Check if the user is actually a teacher
         const [teacherRows]: any[] = await pool.query(
           "SELECT role FROM users WHERE user_id = ? AND role = 'Teacher'",
-          [teacherId],
+          [teacherIdNumber],
         );
 
         if (teacherRows.length === 0 && payload.role !== "Admin") {
@@ -216,8 +291,8 @@ export default (pool: Pool, JWT_SECRET: string) => {
         }
 
         const [classRows] = await pool.query(
-          "SELECT * FROM classes WHERE teacher_id = ?",
-          [teacherId],
+          "SELECT c.*, u.full_name as teacher_name FROM classes c JOIN users u ON c.teacher_id = u.user_id WHERE c.teacher_id = ?",
+          [teacherIdNumber],
         );
 
         return c.json(classRows);
@@ -232,21 +307,21 @@ export default (pool: Pool, JWT_SECRET: string) => {
 
   // Add an assistant to a class
   classesApi.post(
-    "/:id/assistants",
+    "/classes/:classId/assistants",
     jwt({ secret: JWT_SECRET }),
-    zValidator("param", paramsSchema),
+    zValidator("param", classIdParamSchema),
     zValidator("json", addAssistantSchema),
     async (c) => {
       try {
         const payload = c.get("jwtPayload");
-        const { id } = c.req.valid("param");
-        const classId = parseInt(id, 10);
+        const { classId } = c.req.valid("param");
+        const classIdNumber = Number.parseInt(classId, 10);
         const { assistant_id } = c.req.valid("json");
 
         // 1. Verify class exists and user is the teacher or admin
         const [classRows]: any[] = await pool.query(
           "SELECT teacher_id FROM classes WHERE class_id = ?",
-          [classId],
+          [classIdNumber],
         );
         if (classRows.length === 0) {
           return c.json({ error: "Class not found" }, 404);
@@ -267,7 +342,7 @@ export default (pool: Pool, JWT_SECRET: string) => {
         // 3. Insert the assignment
         await pool.query(
           "INSERT INTO class_assistants (class_id, assistant_id) VALUES (?, ?)",
-          [classId, assistant_id],
+          [classIdNumber, assistant_id],
         );
 
         return c.json({ message: "Assistant added successfully" }, 201);
@@ -283,23 +358,20 @@ export default (pool: Pool, JWT_SECRET: string) => {
 
   // Remove an assistant from a class
   classesApi.delete(
-    "/:class_id/assistants/:assistant_id",
+    "/classes/:classId/assistants/:assistantId",
     jwt({ secret: JWT_SECRET }),
-    zValidator("param", z.object({
-        class_id: z.string().regex(/^\d+$/),
-        assistant_id: z.string().regex(/^\d+$/),
-    })),
+    zValidator("param", classAssistantParamSchema),
     async (c) => {
       try {
         const payload = c.get("jwtPayload");
-        const { class_id, assistant_id } = c.req.valid("param");
-        const classId = parseInt(class_id, 10);
-        const assistantId = parseInt(assistant_id, 10);
+        const { classId, assistantId } = c.req.valid("param");
+        const classIdNumber = Number.parseInt(classId, 10);
+        const assistantIdNumber = Number.parseInt(assistantId, 10);
 
         // 1. Verify class exists and user is the teacher or admin
         const [classRows]: any[] = await pool.query(
           "SELECT teacher_id FROM classes WHERE class_id = ?",
-          [classId],
+          [classIdNumber],
         );
         if (classRows.length === 0) {
           return c.json({ error: "Class not found" }, 404);
@@ -311,7 +383,7 @@ export default (pool: Pool, JWT_SECRET: string) => {
         // 2. Delete the assignment
         const [result]: any = await pool.query(
           "DELETE FROM class_assistants WHERE class_id = ? AND assistant_id = ?",
-          [classId, assistantId],
+          [classIdNumber, assistantIdNumber],
         );
 
         if (result.affectedRows === 0) {
@@ -328,26 +400,98 @@ export default (pool: Pool, JWT_SECRET: string) => {
 
   // Get all assistants for a class
   classesApi.get(
-    "/:id/assistants",
+    "/classes/:classId/assistants",
     jwt({ secret: JWT_SECRET }),
-    zValidator("param", paramsSchema),
+    zValidator("param", classIdParamSchema),
     async (c) => {
       try {
-        const { id } = c.req.valid("param");
-        const classId = parseInt(id, 10);
+        const { classId } = c.req.valid("param");
+        const classIdNumber = Number.parseInt(classId, 10);
 
         const [rows] = await pool.query(
           `SELECT u.user_id, u.username, u.full_name, u.email 
            FROM users u 
            JOIN class_assistants ca ON u.user_id = ca.assistant_id 
            WHERE ca.class_id = ?`,
-          [classId],
+          [classIdNumber],
         );
 
         return c.json(rows);
       } catch (error) {
         console.error("Error fetching assistants for class:", error);
         throw error;
+      }
+    },
+  );
+
+  classesApi.delete(
+    "/classes/:classId",
+    jwt({ secret: JWT_SECRET }),
+    zValidator("param", classIdParamSchema),
+    async (c) => {
+      const payload = c.get("jwtPayload");
+      const { classId } = c.req.valid("param");
+      const classIdNumber = Number.parseInt(classId, 10);
+
+      const connection = await pool.getConnection();
+      try {
+        await connection.beginTransaction();
+
+        const [classRows]: any[] = await connection.query(
+          "SELECT teacher_id FROM classes WHERE class_id = ?",
+          [classIdNumber],
+        );
+
+        if (classRows.length === 0) {
+          await connection.rollback();
+          return c.json({ error: "Class not found" }, 404);
+        }
+
+        const classOwner = classRows[0].teacher_id;
+        if (payload.role !== "Admin" && payload.sub !== classOwner) {
+          await connection.rollback();
+          return c.json({ error: "Forbidden" }, 403);
+        }
+
+        const [[assistantCountRow]]: any[] = await connection.query(
+          "SELECT COUNT(*) as count FROM class_assistants WHERE class_id = ?",
+          [classIdNumber],
+        );
+        const [[enrollmentCountRow]]: any[] = await connection.query(
+          "SELECT COUNT(*) as count FROM enrollments WHERE class_id = ?",
+          [classIdNumber],
+        );
+        const [[gradeWeightCountRow]]: any[] = await connection.query(
+          "SELECT COUNT(*) as count FROM grade_weights WHERE class_id = ?",
+          [classIdNumber],
+        );
+
+        const [deleteResult]: any = await connection.query(
+          "DELETE FROM classes WHERE class_id = ?",
+          [classIdNumber],
+        );
+
+        if (deleteResult.affectedRows === 0) {
+          await connection.rollback();
+          return c.json({ error: "Class not found" }, 404);
+        }
+
+        await connection.commit();
+
+        return c.json({
+          message: "Class deleted successfully",
+          cleanup: {
+            removedAssistants: assistantCountRow.count,
+            removedEnrollments: enrollmentCountRow.count,
+            removedGradeWeights: gradeWeightCountRow.count,
+          },
+        });
+      } catch (error) {
+        await connection.rollback();
+        console.error("Error deleting class:", error);
+        throw error;
+      } finally {
+        connection.release();
       }
     },
   );

@@ -8,8 +8,8 @@ import type { Pool } from "mysql2/promise";
 import path from "path";
 
 // Zod Schemas for Validation
-const paramsSchema = z.object({
-  id: z.string().regex(/^\d+$/, { message: "ID must be a number" }),
+const manualIdParamSchema = z.object({
+  manualId: z.string().regex(/^\d+$/, { message: "manualId must be a number" }),
 });
 
 const updateManualSchema = z.object({
@@ -22,7 +22,7 @@ export default (pool: Pool, JWT_SECRET: string) => {
   const manualsApi = new Hono();
 
   // 管理员: 上传新的实验手册
-  manualsApi.post("/", jwt({ secret: JWT_SECRET }), async (c) => {
+  manualsApi.post("/manuals", jwt({ secret: JWT_SECRET }), async (c) => {
     try {
       const payload = c.get("jwtPayload");
       if (payload.role !== "Admin") {
@@ -73,7 +73,7 @@ export default (pool: Pool, JWT_SECRET: string) => {
   });
 
   // 管理员: 获取所有实验手册列表
-  manualsApi.get("/", jwt({ secret: JWT_SECRET }), async (c) => {
+  manualsApi.get("/manuals", jwt({ secret: JWT_SECRET }), async (c) => {
     try {
       const payload = c.get("jwtPayload");
       if (payload.role !== "Admin") {
@@ -93,7 +93,7 @@ export default (pool: Pool, JWT_SECRET: string) => {
   });
 
   // 任何人: 获取当前激活的实验手册
-  manualsApi.get("/active", async (c) => {
+  manualsApi.get("/manuals/active", async (c) => {
     try {
       const [rows]: any[] = await pool.query(`
           SELECT m.*, u.full_name as uploader_name
@@ -115,9 +115,9 @@ export default (pool: Pool, JWT_SECRET: string) => {
 
   // 管理员: 更新实验手册信息 (名称, 描述, 激活状态)
   manualsApi.put(
-    "/:id",
+    "/manuals/:manualId",
     jwt({ secret: JWT_SECRET }),
-    zValidator("param", paramsSchema),
+    zValidator("param", manualIdParamSchema),
     zValidator("json", updateManualSchema),
     async (c) => {
       const payload = c.get("jwtPayload");
@@ -125,8 +125,8 @@ export default (pool: Pool, JWT_SECRET: string) => {
         return c.json({ error: "Forbidden" }, 403);
       }
 
-      const { id } = c.req.valid("param");
-      const manualId = parseInt(id, 10);
+      const { manualId } = c.req.valid("param");
+      const manualIdNumber = parseInt(manualId, 10);
       const { file_name, description, is_active } = c.req.valid("json");
 
       const connection = await pool.getConnection();
@@ -136,7 +136,7 @@ export default (pool: Pool, JWT_SECRET: string) => {
         if (is_active === true) {
           await connection.query(
             "UPDATE experiment_manuals SET is_active = false WHERE manual_id != ?",
-            [manualId],
+            [manualIdNumber],
           );
         }
 
@@ -160,7 +160,7 @@ export default (pool: Pool, JWT_SECRET: string) => {
           return c.json({ error: "No fields to update" }, 400);
         }
 
-        values.push(manualId);
+        values.push(manualIdNumber);
         const sql = `UPDATE experiment_manuals SET ${fields.join(", ")} WHERE manual_id = ?`;
         const [result]: any = await connection.query(sql, values);
 
@@ -176,7 +176,7 @@ export default (pool: Pool, JWT_SECRET: string) => {
            FROM experiment_manuals m
            LEFT JOIN users u ON m.uploader_id = u.user_id
            WHERE m.manual_id = ?`,
-          [manualId],
+          [manualIdNumber],
         );
         return c.json(rows[0]);
       } catch (error) {
@@ -191,9 +191,9 @@ export default (pool: Pool, JWT_SECRET: string) => {
 
   // 管理员: 删除实验手册
   manualsApi.delete(
-    "/:id",
+    "/manuals/:manualId",
     jwt({ secret: JWT_SECRET }),
-    zValidator("param", paramsSchema),
+    zValidator("param", manualIdParamSchema),
     async (c) => {
       try {
         const payload = c.get("jwtPayload");
@@ -201,12 +201,12 @@ export default (pool: Pool, JWT_SECRET: string) => {
           return c.json({ error: "Forbidden" }, 403);
         }
 
-        const { id } = c.req.valid("param");
-        const manualId = parseInt(id, 10);
+        const { manualId } = c.req.valid("param");
+        const manualIdNumber = parseInt(manualId, 10);
 
         const [rows]: any[] = await pool.query(
           "SELECT file_path FROM experiment_manuals WHERE manual_id = ?",
-          [manualId],
+          [manualIdNumber],
         );
         const manual = rows[0];
 
@@ -226,7 +226,7 @@ export default (pool: Pool, JWT_SECRET: string) => {
         }
 
         await pool.query("DELETE FROM experiment_manuals WHERE manual_id = ?", [
-          manualId,
+          manualIdNumber,
         ]);
 
         return c.json({ message: "Manual deleted successfully" });

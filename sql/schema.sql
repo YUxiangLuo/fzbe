@@ -23,6 +23,7 @@ CREATE TABLE IF NOT EXISTS `classes` (
   `class_name` VARCHAR(255) NOT NULL,
   `class_code` VARCHAR(255) UNIQUE,
   `teacher_id` INT NOT NULL,
+  `created_at` TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
   FOREIGN KEY (`teacher_id`) REFERENCES `users`(`user_id`) ON DELETE CASCADE
 );
 

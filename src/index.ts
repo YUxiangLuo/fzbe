@@ -63,9 +63,9 @@ app.use(
 const api = new Hono();
 
 api.route("/", userRoutes(pool, JWT_SECRET));
-api.route("/classes", classRoutes(pool, JWT_SECRET));
-api.route("/manuals", manualRoutes(pool, JWT_SECRET));
-api.route("/datasets", datasetRoutes(pool, JWT_SECRET));
+api.route("/", classRoutes(pool, JWT_SECRET));
+api.route("/", manualRoutes(pool, JWT_SECRET));
+api.route("/", datasetRoutes(pool, JWT_SECRET));
 api.route("/", forecastApi(JWT_SECRET)); // Forecasting routes are already prefixed with /forecast and /tools
 
 app.route("/api", api);

@@ -47,8 +47,12 @@ const adminChangePasswordSchema = z.object({
     .min(6, { message: "New password must be at least 6 characters long" }),
 });
 
-const paramsSchema = z.object({
-  id: z.string().regex(/^\d+$/, { message: "ID must be a number" }),
+const userIdParamSchema = z.object({
+  userId: z.string().regex(/^\d+$/, { message: "userId must be a number" }),
+});
+
+const teacherIdParamSchema = z.object({
+  teacherId: z.string().regex(/^\d+$/, { message: "teacherId must be a number" }),
 });
 
 const paginationQuerySchema = z.object({
@@ -108,9 +112,9 @@ export default (pool: Pool, JWT_SECRET: string) => {
 
   // --- User Management Routes ---
 
-  // Create an assistant and assign them to classes 前缀
+  // Create an assistant and assign them to classes
   usersApi.post(
-    "/assistants/create-and-assign",
+    "/assistants",
     jwt({ secret: JWT_SECRET }),
     zValidator("json", createAssistantSchema),
     async (c) => {
@@ -207,17 +211,17 @@ export default (pool: Pool, JWT_SECRET: string) => {
 
   // Get all assistants associated with a specific teacher through their classes
   usersApi.get(
-    "/teachers/:id/assistants",
+    "/teachers/:teacherId/assistants",
     jwt({ secret: JWT_SECRET }),
-    zValidator("param", paramsSchema),
+    zValidator("param", teacherIdParamSchema),
     async (c) => {
       try {
         const payload = c.get("jwtPayload");
-        const { id } = c.req.valid("param");
-        const teacherId = parseInt(id, 10);
+        const { teacherId } = c.req.valid("param");
+        const teacherIdNumber = parseInt(teacherId, 10);
 
         // Authorization: Admin can see anyone's, teachers can only see their own.
-        if (payload.role !== "Admin" && payload.sub !== teacherId) {
+        if (payload.role !== "Admin" && payload.sub !== teacherIdNumber) {
           return c.json({ error: "Forbidden" }, 403);
         }
 
@@ -234,7 +238,7 @@ export default (pool: Pool, JWT_SECRET: string) => {
           WHERE c.teacher_id = ? AND u.role = 'Assistant'
         `;
 
-        const [assistantRows] = await pool.query(sql, [teacherId]);
+        const [assistantRows] = await pool.query(sql, [teacherIdNumber]);
 
         return c.json(assistantRows);
       } catch (error) {
@@ -288,7 +292,7 @@ export default (pool: Pool, JWT_SECRET: string) => {
   );
 
   // Get all assistants (Admin and Teacher only)
-  usersApi.get("/users/assistants", jwt({ secret: JWT_SECRET }), async (c) => {
+  usersApi.get("/assistants", jwt({ secret: JWT_SECRET }), async (c) => {
     try {
       const payload = c.get("jwtPayload");
       if (payload.role !== "Admin" && payload.role !== "Teacher") {
@@ -306,7 +310,7 @@ export default (pool: Pool, JWT_SECRET: string) => {
 
   // Register a new user
   usersApi.post(
-    "/users/register",
+    "/users",
     zValidator("json", registerSchema),
     async (c) => {
       try {
@@ -468,14 +472,14 @@ export default (pool: Pool, JWT_SECRET: string) => {
 
   // Get user by ID
   usersApi.get(
-    "/users/:id",
+    "/users/:userId",
     jwt({ secret: JWT_SECRET }),
-    zValidator("param", paramsSchema),
+    zValidator("param", userIdParamSchema),
     async (c) => {
       try {
         const requesterPayload = c.get("jwtPayload");
-        const { id } = c.req.valid("param");
-        const targetUserId = parseInt(id, 10);
+        const { userId } = c.req.valid("param");
+        const targetUserId = parseInt(userId, 10);
 
         if (
           requesterPayload.role !== "Admin" &&
@@ -503,9 +507,9 @@ export default (pool: Pool, JWT_SECRET: string) => {
 
   // Admin: Force change user's password
   usersApi.put(
-    "/users/:id/password",
+    "/users/:userId/password",
     jwt({ secret: JWT_SECRET }),
-    zValidator("param", paramsSchema),
+    zValidator("param", userIdParamSchema),
     zValidator("json", adminChangePasswordSchema),
     async (c) => {
       try {
@@ -514,8 +518,8 @@ export default (pool: Pool, JWT_SECRET: string) => {
           return c.json({ error: "Forbidden" }, 403);
         }
 
-        const { id } = c.req.valid("param");
-        const targetUserId = parseInt(id, 10);
+        const { userId } = c.req.valid("param");
+        const targetUserId = parseInt(userId, 10);
         const { newPassword } = c.req.valid("json");
 
         if (requesterPayload.sub === targetUserId) {
@@ -552,14 +556,14 @@ export default (pool: Pool, JWT_SECRET: string) => {
 
   // Delete user by ID (Admin only)
   usersApi.delete(
-    "/users/:id",
+    "/users/:userId",
     jwt({ secret: JWT_SECRET }),
-    zValidator("param", paramsSchema),
+    zValidator("param", userIdParamSchema),
     async (c) => {
       try {
         const requesterPayload = c.get("jwtPayload");
-        const { id } = c.req.valid("param");
-        const targetUserId = parseInt(id, 10);
+        const { userId } = c.req.valid("param");
+        const targetUserId = parseInt(userId, 10);
 
         if (requesterPayload.role !== "Admin") {
           return c.json({ error: "Forbidden" }, 403);
@@ -569,16 +573,84 @@ export default (pool: Pool, JWT_SECRET: string) => {
           return c.json({ error: "Admin cannot delete themselves" }, 400);
         }
 
-        const [result]: any = await pool.query(
-          "DELETE FROM users WHERE user_id = ?",
-          [targetUserId],
-        );
+        const connection = await pool.getConnection();
+        try {
+          await connection.beginTransaction();
 
-        if (result.affectedRows === 0) {
-          return c.json({ error: "User not found" }, 404);
+          const [userRows]: any[] = await connection.query(
+            "SELECT role FROM users WHERE user_id = ?",
+            [targetUserId],
+          );
+
+          const userRecord = userRows[0];
+          if (!userRecord) {
+            await connection.rollback();
+            return c.json({ error: "User not found" }, 404);
+          }
+
+          const cleanupSummary: { deletedClasses?: number; removedAssistantAssignments?: number; removedEnrollments?: number } = {};
+
+          switch (userRecord.role) {
+            case "Teacher": {
+              const [classRows]: any[] = await connection.query(
+                "SELECT class_id FROM classes WHERE teacher_id = ?",
+                [targetUserId],
+              );
+              if (classRows.length > 0) {
+                await connection.query("DELETE FROM classes WHERE teacher_id = ?", [
+                  targetUserId,
+                ]);
+                cleanupSummary.deletedClasses = classRows.length;
+              }
+              break;
+            }
+            case "Assistant": {
+              const [assignmentRows]: any[] = await connection.query(
+                "SELECT class_id FROM class_assistants WHERE assistant_id = ?",
+                [targetUserId],
+              );
+              if (assignmentRows.length > 0) {
+                await connection.query(
+                  "DELETE FROM class_assistants WHERE assistant_id = ?",
+                  [targetUserId],
+                );
+                cleanupSummary.removedAssistantAssignments = assignmentRows.length;
+              }
+              break;
+            }
+            case "Student": {
+              const [enrollmentRows]: any[] = await connection.query(
+                "SELECT class_id FROM enrollments WHERE student_id = ?",
+                [targetUserId],
+              );
+              if (enrollmentRows.length > 0) {
+                await connection.query(
+                  "DELETE FROM enrollments WHERE student_id = ?",
+                  [targetUserId],
+                );
+                cleanupSummary.removedEnrollments = enrollmentRows.length;
+              }
+              break;
+            }
+            default:
+              break;
+          }
+
+          await connection.query("DELETE FROM users WHERE user_id = ?", [targetUserId]);
+
+          await connection.commit();
+
+          return c.json({
+            message: "User deleted successfully",
+            cleanup: cleanupSummary,
+          });
+        } catch (error) {
+          await connection.rollback();
+          console.error("Error deleting user with cleanup:", error);
+          throw error;
+        } finally {
+          connection.release();
         }
-
-        return c.json({ message: "User deleted successfully" });
       } catch (error) {
         console.error("Error deleting user:", error);
         throw error;

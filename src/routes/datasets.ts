@@ -8,8 +8,8 @@ import path from "path";
 import type { Pool } from "mysql2/promise";
 
 // Zod Schemas for Validation
-const paramsSchema = z.object({
-  id: z.string().regex(/^\d+$/, { message: "ID must be a number" }),
+const datasetIdParamSchema = z.object({
+  datasetId: z.string().regex(/^\d+$/, { message: "datasetId must be a number" }),
 });
 
 const updateDatasetSchema = z.object({
@@ -21,7 +21,7 @@ export default (pool: Pool, JWT_SECRET: string) => {
   const datasetsApi = new Hono();
 
   // 管理员: 上传新的数据集
-  datasetsApi.post("/", jwt({ secret: JWT_SECRET }), async (c) => {
+  datasetsApi.post("/datasets", jwt({ secret: JWT_SECRET }), async (c) => {
     try {
       const payload = c.get("jwtPayload");
       if (payload.role !== "Admin") {
@@ -69,7 +69,7 @@ export default (pool: Pool, JWT_SECRET: string) => {
   });
 
   // 登录用户: 获取所有数据集列表
-  datasetsApi.get("/", jwt({ secret: JWT_SECRET }), async (c) => {
+  datasetsApi.get("/datasets", jwt({ secret: JWT_SECRET }), async (c) => {
     try {
       const [rows] = await pool.query(
         "SELECT * FROM datasets ORDER BY uploaded_at DESC",
@@ -83,15 +83,15 @@ export default (pool: Pool, JWT_SECRET: string) => {
 
   // 登录用户: 获取单个数据集
   datasetsApi.get(
-    "/:id",
+    "/datasets/:datasetId",
     jwt({ secret: JWT_SECRET }),
-    zValidator("param", paramsSchema),
+    zValidator("param", datasetIdParamSchema),
     async (c) => {
       try {
-        const { id } = c.req.valid("param");
+        const { datasetId } = c.req.valid("param");
         const [rows]: any[] = await pool.query(
           "SELECT * FROM datasets WHERE dataset_id = ?",
-          [id],
+          [datasetId],
         );
         if (rows.length === 0) {
           return c.json({ error: "Dataset not found" }, 404);
@@ -106,9 +106,9 @@ export default (pool: Pool, JWT_SECRET: string) => {
 
   // 管理员: 更新数据集信息
   datasetsApi.put(
-    "/:id",
+    "/datasets/:datasetId",
     jwt({ secret: JWT_SECRET }),
-    zValidator("param", paramsSchema),
+    zValidator("param", datasetIdParamSchema),
     zValidator("json", updateDatasetSchema),
     async (c) => {
       const payload = c.get("jwtPayload");
@@ -116,7 +116,7 @@ export default (pool: Pool, JWT_SECRET: string) => {
         return c.json({ error: "Forbidden" }, 403);
       }
 
-      const { id } = c.req.valid("param");
+      const { datasetId } = c.req.valid("param");
       const { data_name, description } = c.req.valid("json");
 
       const fields = [];
@@ -134,7 +134,7 @@ export default (pool: Pool, JWT_SECRET: string) => {
         return c.json({ error: "No fields to update" }, 400);
       }
 
-      values.push(id);
+      values.push(datasetId);
       const sql = `UPDATE datasets SET ${fields.join(", ")} WHERE dataset_id = ?`;
       const [result]: any = await pool.query(sql, values);
 
@@ -144,7 +144,7 @@ export default (pool: Pool, JWT_SECRET: string) => {
 
       const [rows]: any[] = await pool.query(
         "SELECT * FROM datasets WHERE dataset_id = ?",
-        [id],
+        [datasetId],
       );
       return c.json(rows[0]);
     },
@@ -152,9 +152,9 @@ export default (pool: Pool, JWT_SECRET: string) => {
 
   // 管理员: 删除数据集
   datasetsApi.delete(
-    "/:id",
+    "/datasets/:datasetId",
     jwt({ secret: JWT_SECRET }),
-    zValidator("param", paramsSchema),
+    zValidator("param", datasetIdParamSchema),
     async (c) => {
       try {
         const payload = c.get("jwtPayload");
@@ -162,11 +162,11 @@ export default (pool: Pool, JWT_SECRET: string) => {
           return c.json({ error: "Forbidden" }, 403);
         }
 
-        const { id } = c.req.valid("param");
+        const { datasetId } = c.req.valid("param");
 
         const [rows]: any[] = await pool.query(
           "SELECT file_path FROM datasets WHERE dataset_id = ?",
-          [id],
+          [datasetId],
         );
         const dataset = rows[0];
 
@@ -185,7 +185,7 @@ export default (pool: Pool, JWT_SECRET: string) => {
           );
         }
 
-        await pool.query("DELETE FROM datasets WHERE dataset_id = ?", [id]);
+        await pool.query("DELETE FROM datasets WHERE dataset_id = ?", [datasetId]);
 
         return c.json({ message: "Dataset deleted successfully" });
       } catch (error) {
