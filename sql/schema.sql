@@ -147,15 +147,48 @@ CREATE TABLE IF NOT EXISTS `experiment_reports` (
   FOREIGN KEY (`graded_by`) REFERENCES `users`(`user_id`) ON DELETE SET NULL
 );
 
-CREATE TABLE IF NOT EXISTS `grade_weights` (
+DROP TABLE IF EXISTS `grade_weights`;
+CREATE TABLE `grade_weights` (
   `weight_id` INT AUTO_INCREMENT PRIMARY KEY,
-  `class_id` INT NOT NULL UNIQUE,
-  `experiment_flow` FLOAT DEFAULT 0,
-  `knowledge_tests` FLOAT DEFAULT 0,
-  `model_selection` FLOAT DEFAULT 0,
-  `experiment_report` FLOAT DEFAULT 0,
-  `detailed_step_weights` JSON,
-  FOREIGN KEY (`class_id`) REFERENCES `classes`(`class_id`) ON DELETE CASCADE
+  `teacher_id` INT NOT NULL UNIQUE,
+  `exp_flow` FLOAT DEFAULT 0,
+  `exp_flow_demand_data_preparation` FLOAT DEFAULT 0,
+  `exp_flow_demand_descriptive_stats` FLOAT DEFAULT 0,
+  `exp_flow_demand_model_selection` FLOAT DEFAULT 0,
+  `exp_flow_demand_generate_results` FLOAT DEFAULT 0,
+  `exp_flow_production_inventory_calc` FLOAT DEFAULT 0,
+  `exp_flow_production_service_level` FLOAT DEFAULT 0,
+  `exp_flow_production_variable_calc` FLOAT DEFAULT 0,
+  `exp_flow_production_plan_creation` FLOAT DEFAULT 0,
+  `exp_flow_report_submission` FLOAT DEFAULT 0,
+  `knowledge_test` FLOAT DEFAULT 0,
+  `model_quality` FLOAT DEFAULT 0,
+  `report_quality` FLOAT DEFAULT 0,
+  FOREIGN KEY (`teacher_id`) REFERENCES `users`(`user_id`) ON DELETE CASCADE
+);
+
+DROP TABLE IF EXISTS `experiment_grade`;
+CREATE TABLE `experiment_grade` (
+  `grade_id` INT AUTO_INCREMENT PRIMARY KEY,
+  `experiment_id` INT NOT NULL,
+  `student_id` INT NOT NULL,
+  `grader_id` INT,
+  `exp_flow_demand_data_preparation` FLOAT DEFAULT 0,
+  `exp_flow_demand_descriptive_stats` FLOAT DEFAULT 0,
+  `exp_flow_demand_model_selection` FLOAT DEFAULT 0,
+  `exp_flow_demand_generate_results` FLOAT DEFAULT 0,
+  `exp_flow_production_inventory_calc` FLOAT DEFAULT 0,
+  `exp_flow_production_service_level` FLOAT DEFAULT 0,
+  `exp_flow_production_variable_calc` FLOAT DEFAULT 0,
+  `exp_flow_production_plan_creation` FLOAT DEFAULT 0,
+  `exp_flow_report_submission` FLOAT DEFAULT 0,
+  `knowledge_test` FLOAT DEFAULT 0,
+  `model_quality` FLOAT DEFAULT 0,
+  `report_quality` FLOAT DEFAULT 0,
+  `created_at` TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  FOREIGN KEY (`experiment_id`) REFERENCES `experiment_status`(`experiment_id`) ON DELETE CASCADE,
+  FOREIGN KEY (`student_id`) REFERENCES `users`(`user_id`) ON DELETE CASCADE,
+  FOREIGN KEY (`grader_id`) REFERENCES `users`(`user_id`) ON DELETE SET NULL
 );
 
 --

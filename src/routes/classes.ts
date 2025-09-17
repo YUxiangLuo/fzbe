@@ -71,6 +71,63 @@ const optionsSchema = z.union([
   z.array(z.string().min(1)),
 ]);
 
+const gradeWeightNumeric = z.coerce.number().min(0);
+
+const expFlowKeys = [
+  "exp_flow_demand_data_preparation",
+  "exp_flow_demand_descriptive_stats",
+  "exp_flow_demand_model_selection",
+  "exp_flow_demand_generate_results",
+  "exp_flow_production_inventory_calc",
+  "exp_flow_production_service_level",
+  "exp_flow_production_variable_calc",
+  "exp_flow_production_plan_creation",
+  "exp_flow_report_submission",
+];
+
+const gradeWeightFieldNames = [
+  "exp_flow",
+  ...expFlowKeys,
+  "knowledge_test",
+  "model_quality",
+  "report_quality",
+];
+
+const gradeWeightsBaseSchema = z
+  .object(
+    gradeWeightFieldNames.reduce((acc, key) => {
+      acc[key] = gradeWeightNumeric;
+      return acc;
+    }, {} as Record<string, z.ZodTypeAny>),
+  )
+  .refine((data) => {
+    const expFlowSum = expFlowKeys.reduce((sum, key) => sum + Number(data[key as keyof typeof data] ?? 0), 0);
+    return Math.abs(expFlowSum - 100) < 0.0001;
+  }, {
+    message: "所有实验流程子权重之和必须等于 100",
+    path: ["exp_flow"],
+  })
+  .refine((data) => {
+    const flowSum = Number(data.exp_flow ?? 0);
+    const otherSum = Number(data.knowledge_test ?? 0) + Number(data.model_quality ?? 0) + Number(data.report_quality ?? 0);
+    return Math.abs(flowSum + otherSum - 100) < 0.0001;
+  }, {
+    message: "实验流程 + 知识点测试 + 模型质量 + 实验报告质量之和必须等于 100",
+    path: ["exp_flow"],
+  });
+
+const gradeWeightsCreateSchema = gradeWeightsBaseSchema.extend({
+  teacher_id: z.coerce.number().int().min(1).optional(),
+});
+
+const gradeWeightsUpdateSchema = gradeWeightsBaseSchema.extend({
+  teacher_id: z.coerce.number().int().min(1).optional(),
+});
+
+const gradeWeightsQuerySchema = z.object({
+  teacherId: z.coerce.number().int().min(1).optional(),
+});
+
 const createQuestionSchema = z
   .object({
     knowledge_point: z.string().trim().min(1).optional(),
@@ -182,6 +239,14 @@ const normalizeQuestionRow = (row: any) => {
         : null,
     correct_answers: Array.isArray(parsedAnswers) ? parsedAnswers : [],
   };
+};
+
+const normalizeGradeWeightRow = (row: any) => {
+  const result: Record<string, number | null> = { teacher_id: row.teacher_id };
+  for (const field of gradeWeightFieldNames) {
+    result[field] = row[field] !== null && row[field] !== undefined ? Number(row[field]) : null;
+  }
+  return result;
 };
 
 export default (pool: Pool, JWT_SECRET: string) => {
@@ -761,6 +826,168 @@ export default (pool: Pool, JWT_SECRET: string) => {
     },
   );
 
+  classesApi.get(
+    "/grade-weights",
+    jwt({ secret: JWT_SECRET }),
+    zValidator("query", gradeWeightsQuerySchema),
+    async (c) => {
+      try {
+        const payload = c.get("jwtPayload");
+        const { teacherId } = c.req.valid("query");
+
+        let targetTeacherId: number;
+
+        if (payload.role === "Teacher") {
+          targetTeacherId = payload.sub;
+          if (teacherId && teacherId !== targetTeacherId) {
+            return c.json({ error: "Forbidden" }, 403);
+          }
+        } else if (payload.role === "Admin") {
+          if (!teacherId) {
+            return c.json({ error: "teacherId is required for admin" }, 400);
+          }
+          targetTeacherId = teacherId;
+        } else {
+          return c.json({ error: "Forbidden" }, 403);
+        }
+
+        const [rows] = await pool.query(
+          `SELECT teacher_id, ${gradeWeightFieldNames.join(", ")}
+             FROM grade_weights
+            WHERE teacher_id = ?
+            LIMIT 1`,
+          [targetTeacherId],
+        );
+
+        const record = (rows as any[])[0];
+        if (!record) {
+          return c.json({ error: "Grade weights not found" }, 404);
+        }
+
+        return c.json(normalizeGradeWeightRow(record));
+      } catch (error) {
+        console.error("Error fetching grade weights:", error);
+        throw error;
+      }
+    },
+  );
+
+  classesApi.post(
+    "/grade-weights",
+    jwt({ secret: JWT_SECRET }),
+    zValidator("json", gradeWeightsCreateSchema),
+    async (c) => {
+      try {
+        const payload = c.get("jwtPayload");
+        const body = c.req.valid("json");
+
+        let teacherId = body.teacher_id;
+
+        if (payload.role === "Teacher") {
+          teacherId = payload.sub;
+          if (body.teacher_id && body.teacher_id !== teacherId) {
+            return c.json({ error: "Forbidden" }, 403);
+          }
+        } else if (payload.role === "Admin") {
+          if (!teacherId) {
+            return c.json({ error: "teacher_id is required" }, 400);
+          }
+        } else {
+          return c.json({ error: "Forbidden" }, 403);
+        }
+
+        if (!teacherId) {
+          return c.json({ error: "teacher_id is required" }, 400);
+        }
+
+        const [[existingRow]]: any[] = await pool.query(
+          "SELECT teacher_id FROM grade_weights WHERE teacher_id = ?",
+          [teacherId],
+        );
+        if (existingRow) {
+          return c.json({ error: "Grade weights already exist" }, 409);
+        }
+
+        const insertSql = `INSERT INTO grade_weights (teacher_id, ${gradeWeightFieldNames.join(", ")}) VALUES (${["?", ...gradeWeightFieldNames.map(() => "?")].join(", ")})`;
+
+        const values = [teacherId, ...gradeWeightFieldNames.map((field) => Number(body[field as keyof typeof body]))];
+
+        await pool.query(insertSql, values);
+
+        const [rows] = await pool.query(
+          `SELECT teacher_id, ${gradeWeightFieldNames.join(", ")}
+             FROM grade_weights
+            WHERE teacher_id = ?
+            LIMIT 1`,
+          [teacherId],
+        );
+
+        return c.json(normalizeGradeWeightRow((rows as any[])[0]), 201);
+      } catch (error) {
+        console.error("Error creating grade weights:", error);
+        throw error;
+      }
+    },
+  );
+
+  classesApi.put(
+    "/grade-weights",
+    jwt({ secret: JWT_SECRET }),
+    zValidator("json", gradeWeightsUpdateSchema),
+    async (c) => {
+      try {
+        const payload = c.get("jwtPayload");
+        const body = c.req.valid("json");
+
+        let teacherId = body.teacher_id;
+
+        if (payload.role === "Teacher") {
+          teacherId = payload.sub;
+          if (body.teacher_id && body.teacher_id !== teacherId) {
+            return c.json({ error: "Forbidden" }, 403);
+          }
+        } else if (payload.role === "Admin") {
+          if (!teacherId) {
+            return c.json({ error: "teacher_id is required" }, 400);
+          }
+        } else {
+          return c.json({ error: "Forbidden" }, 403);
+        }
+
+        if (!teacherId) {
+          return c.json({ error: "teacher_id is required" }, 400);
+        }
+
+        const [[existingRow]]: any[] = await pool.query(
+          "SELECT teacher_id FROM grade_weights WHERE teacher_id = ?",
+          [teacherId],
+        );
+
+        if (!existingRow) {
+          return c.json({ error: "Grade weights not found" }, 404);
+        }
+
+        const updateSql = `UPDATE grade_weights SET ${gradeWeightFieldNames.map((field) => `${field} = ?`).join(", ")} WHERE teacher_id = ?`;
+        const values = [...gradeWeightFieldNames.map((field) => Number(body[field as keyof typeof body])), teacherId];
+
+        await pool.query(updateSql, values);
+
+        const [rows] = await pool.query(
+          `SELECT teacher_id, ${gradeWeightFieldNames.join(", ")}
+             FROM grade_weights
+            WHERE teacher_id = ?
+            LIMIT 1`,
+          [teacherId],
+        );
+
+        return c.json(normalizeGradeWeightRow((rows as any[])[0]));
+      } catch (error) {
+        console.error("Error updating grade weights:", error);
+        throw error;
+      }
+    },
+  );
+
   classesApi.post(
     "/question-bank",
     jwt({ secret: JWT_SECRET }),
@@ -1105,11 +1332,6 @@ export default (pool: Pool, JWT_SECRET: string) => {
           "SELECT COUNT(*) as count FROM enrollments WHERE class_id = ?",
           [classIdNumber],
         );
-        const [[gradeWeightCountRow]]: any[] = await connection.query(
-          "SELECT COUNT(*) as count FROM grade_weights WHERE class_id = ?",
-          [classIdNumber],
-        );
-
         const [deleteResult]: any = await connection.query(
           "DELETE FROM classes WHERE class_id = ?",
           [classIdNumber],
@@ -1127,7 +1349,7 @@ export default (pool: Pool, JWT_SECRET: string) => {
           cleanup: {
             removedAssistants: assistantCountRow.count,
             removedEnrollments: enrollmentCountRow.count,
-            removedGradeWeights: gradeWeightCountRow.count,
+            removedGradeWeights: 0,
           },
         });
       } catch (error) {

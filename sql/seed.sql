@@ -68,10 +68,49 @@ INSERT IGNORE INTO `question_bank` (`question_id`, `knowledge_point`, `question_
 (4, '融合模型', 'Single Choice', '使用多个模型结果加权得到最终预测值的方式称为？', '{"A":"合成预测","B":"模型选择","C":"模型集成","D":"模型融合"}', '["C"]', 4);
 
 -- 6. 成绩权重 (GradeWeights)
-INSERT IGNORE INTO `grade_weights` (`class_id`, `experiment_flow`, `knowledge_tests`, `model_selection`, `experiment_report`, `detailed_step_weights`) VALUES
-(1, 35, 25, 10, 30, '{"data_preparation":10,"model_training":10,"reporting":10}'),
-(2, 30, 20, 20, 30, '{"data_preparation":8,"scenario_design":12,"presentation":10}'),
-(4, 40, 15, 15, 30, '{"data_preparation":12,"feature_engineering":13,"deployment":5}');
+INSERT IGNORE INTO `grade_weights` (
+  `teacher_id`,
+  `exp_flow`,
+  `exp_flow_demand_data_preparation`,
+  `exp_flow_demand_descriptive_stats`,
+  `exp_flow_demand_model_selection`,
+  `exp_flow_demand_generate_results`,
+  `exp_flow_production_inventory_calc`,
+  `exp_flow_production_service_level`,
+  `exp_flow_production_variable_calc`,
+  `exp_flow_production_plan_creation`,
+  `exp_flow_report_submission`,
+  `knowledge_test`,
+  `model_quality`,
+  `report_quality`
+) VALUES
+(3, 40, 12, 10, 8, 10, 10, 10, 10, 15, 15, 20, 20, 20),
+(4, 40, 12, 10, 8, 10, 10, 10, 10, 15, 15, 20, 20, 20),
+(5, 40, 12, 10, 8, 10, 10, 10, 10, 15, 15, 20, 20, 20),
+(6, 40, 12, 10, 8, 10, 10, 10, 10, 15, 15, 20, 20, 20);
+
+-- 6.1 实验评分记录 (ExperimentGrade)
+INSERT IGNORE INTO `experiment_grade` (
+  `grade_id`,
+  `experiment_id`,
+  `student_id`,
+  `grader_id`,
+  `exp_flow_demand_data_preparation`,
+  `exp_flow_demand_descriptive_stats`,
+  `exp_flow_demand_model_selection`,
+  `exp_flow_demand_generate_results`,
+  `exp_flow_production_inventory_calc`,
+  `exp_flow_production_service_level`,
+  `exp_flow_production_variable_calc`,
+  `exp_flow_production_plan_creation`,
+  `exp_flow_report_submission`,
+  `knowledge_test`,
+  `model_quality`,
+  `report_quality`
+) VALUES
+(1, 1, 9, 3, 8.5, 8.0, 8.5, 9.0, 8.0, 7.5, 8.0, 8.5, 9.0, 12.0, 11.5, 12.5),
+(2, 2, 10, 4, 7.5, 7.0, 7.5, 8.0, 7.5, 7.0, 7.5, 8.0, 8.5, 13.0, 10.5, 11.0),
+(3, 4, 14, 5, 6.5, 6.0, 6.5, 7.0, 8.0, 7.5, 8.0, 8.5, 8.0, 11.5, 10.0, 10.5);
 
 -- 7. 实验状态 (ExperimentStatus)
 INSERT IGNORE INTO `experiment_status` (
