@@ -173,6 +173,7 @@ CREATE TABLE `experiment_grade` (
   `experiment_id` INT NOT NULL,
   `student_id` INT NOT NULL,
   `grader_id` INT,
+  `exp_flow` FLOAT DEFAULT 0,
   `exp_flow_demand_data_preparation` FLOAT DEFAULT 0,
   `exp_flow_demand_descriptive_stats` FLOAT DEFAULT 0,
   `exp_flow_demand_model_selection` FLOAT DEFAULT 0,

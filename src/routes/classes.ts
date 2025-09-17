@@ -249,6 +249,25 @@ const normalizeGradeWeightRow = (row: any) => {
   return result;
 };
 
+const normalizeExperimentGradeRow = (row: any) => {
+  const normalized: Record<string, any> = {
+    grade_id: Number(row.grade_id),
+    experiment_id: Number(row.experiment_id),
+    student_id: Number(row.student_id),
+    student_username: row.student_username,
+    student_full_name: row.student_full_name,
+    grader_id: row.grader_id !== null && row.grader_id !== undefined ? Number(row.grader_id) : null,
+    grader_name: row.grader_name ?? null,
+    created_at: row.created_at,
+  };
+
+  for (const field of gradeWeightFieldNames) {
+    normalized[field] = row[field] !== null && row[field] !== undefined ? Number(row[field]) : null;
+  }
+
+  return normalized;
+};
+
 export default (pool: Pool, JWT_SECRET: string) => {
   const classesApi = new Hono();
 
@@ -983,6 +1002,76 @@ export default (pool: Pool, JWT_SECRET: string) => {
         return c.json(normalizeGradeWeightRow((rows as any[])[0]));
       } catch (error) {
         console.error("Error updating grade weights:", error);
+        throw error;
+      }
+    },
+  );
+
+  classesApi.get(
+    "/classes/:classId/latest-grades",
+    jwt({ secret: JWT_SECRET }),
+    zValidator("param", classIdParamSchema),
+    async (c) => {
+      try {
+        const payload = c.get("jwtPayload");
+        const { classId } = c.req.valid("param");
+        const classIdNumber = Number.parseInt(classId, 10);
+
+        const [classRows]: any[] = await pool.query(
+          "SELECT teacher_id FROM classes WHERE class_id = ?",
+          [classIdNumber],
+        );
+
+        if (classRows.length === 0) {
+          return c.json({ error: "Class not found" }, 404);
+        }
+
+        const classOwner = classRows[0].teacher_id;
+        if (payload.role !== "Admin" && payload.sub !== classOwner) {
+          return c.json({ error: "Forbidden" }, 403);
+        }
+
+        const [rows] = await pool.query(
+          `SELECT eg.grade_id,
+                  eg.experiment_id,
+                  eg.student_id,
+                  student.username AS student_username,
+                  student.full_name AS student_full_name,
+                  eg.grader_id,
+                  grader.full_name AS grader_name,
+                  eg.created_at,
+                  ${gradeWeightFieldNames.map((field) => `eg.${field}`).join(", ")}
+             FROM experiment_grade eg
+             JOIN experiment_status es
+               ON es.experiment_id = eg.experiment_id
+             JOIN enrollments e
+               ON e.student_id = es.student_id
+             JOIN users student
+               ON student.user_id = eg.student_id
+             LEFT JOIN users grader
+               ON grader.user_id = eg.grader_id
+             JOIN (
+                  SELECT eg.student_id,
+                         MAX(eg.created_at) AS latest_created
+                    FROM experiment_grade eg
+                    JOIN experiment_status es
+                      ON es.experiment_id = eg.experiment_id
+                    JOIN enrollments e
+                      ON e.student_id = es.student_id
+                   WHERE e.class_id = ?
+                   GROUP BY eg.student_id
+             ) latest
+               ON latest.student_id = eg.student_id
+              AND latest.latest_created = eg.created_at
+            WHERE e.class_id = ?
+            ORDER BY eg.student_id ASC`,
+          [classIdNumber, classIdNumber],
+        );
+
+        const normalized = (rows as any[]).map(normalizeExperimentGradeRow);
+        return c.json(normalized);
+      } catch (error) {
+        console.error("Error fetching latest experiment grades:", error);
         throw error;
       }
     },
