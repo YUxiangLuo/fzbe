@@ -46,7 +46,7 @@ export default (pool: Pool, JWT_SECRET: string) => {
       const uploadPath = path.resolve(
         import.meta.dir,
         "../../uploads",
-        "static",
+        "manuals",
         uniqueFilename,
       );
 

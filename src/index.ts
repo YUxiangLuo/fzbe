@@ -50,12 +50,21 @@ const app = new Hono();
 app.use(timestampedLogger);
 app.use(cors());
 app.use(
-  "/static/*",
+  "/manuals/*",
   serveStatic({
     root: path.resolve(import.meta.dir, "../uploads"),
-    onNotFound: (path, c) => {
-      console.log(`${path} is not found, you access ${c.req.path}`);
-    },
+  }),
+);
+app.use(
+  "/datasets/*",
+  serveStatic({
+    root: path.resolve(import.meta.dir, "../uploads"),
+  }),
+);
+app.use(
+  "/reports/*",
+  serveStatic({
+    root: path.resolve(import.meta.dir, "../uploads"),
   }),
 );
 

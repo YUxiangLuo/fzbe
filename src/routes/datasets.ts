@@ -9,7 +9,9 @@ import type { Pool } from "mysql2/promise";
 
 // Zod Schemas for Validation
 const datasetIdParamSchema = z.object({
-  datasetId: z.string().regex(/^\d+$/, { message: "datasetId must be a number" }),
+  datasetId: z
+    .string()
+    .regex(/^\d+$/, { message: "datasetId must be a number" }),
 });
 
 const updateDatasetSchema = z.object({
@@ -44,7 +46,7 @@ export default (pool: Pool, JWT_SECRET: string) => {
       const uploadPath = path.resolve(
         import.meta.dir,
         "../../uploads",
-        "static",
+        "datasets",
         uniqueFilename,
       );
 
@@ -185,7 +187,9 @@ export default (pool: Pool, JWT_SECRET: string) => {
           );
         }
 
-        await pool.query("DELETE FROM datasets WHERE dataset_id = ?", [datasetId]);
+        await pool.query("DELETE FROM datasets WHERE dataset_id = ?", [
+          datasetId,
+        ]);
 
         return c.json({ message: "Dataset deleted successfully" });
       } catch (error) {

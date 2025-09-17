@@ -66,6 +66,7 @@ CREATE TABLE IF NOT EXISTS `experiment_status` (
   `student_id` INT NOT NULL,
   `start_time` TIMESTAMP NULL,
   `completion_time` TIMESTAMP NULL,
+  `last_activity_at` TIMESTAMP NULL,
   `status` ENUM('Not Started', 'In Progress', 'Completed') DEFAULT 'Not Started',
   `selected_industry` VARCHAR(255),
   `selected_company` VARCHAR(255),
@@ -134,6 +135,7 @@ CREATE TABLE IF NOT EXISTS `student_responses` (
 CREATE TABLE IF NOT EXISTS `experiment_reports` (
   `report_id` INT AUTO_INCREMENT PRIMARY KEY,
   `experiment_id` INT NOT NULL,
+  `student_id` INT NOT NULL,
   `report_content` TEXT,
   `pdf_file_path` VARCHAR(255),
   `submitted_at` TIMESTAMP NULL,
@@ -141,6 +143,7 @@ CREATE TABLE IF NOT EXISTS `experiment_reports` (
   `feedback` TEXT,
   `graded_by` INT,
   FOREIGN KEY (`experiment_id`) REFERENCES `experiment_status`(`experiment_id`) ON DELETE CASCADE,
+  FOREIGN KEY (`student_id`) REFERENCES `users`(`user_id`) ON DELETE CASCADE,
   FOREIGN KEY (`graded_by`) REFERENCES `users`(`user_id`) ON DELETE SET NULL
 );
 

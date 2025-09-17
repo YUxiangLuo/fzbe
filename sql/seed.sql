@@ -74,14 +74,27 @@ INSERT IGNORE INTO `grade_weights` (`class_id`, `experiment_flow`, `knowledge_te
 (4, 40, 15, 15, 30, '{"data_preparation":12,"feature_engineering":13,"deployment":5}');
 
 -- 7. 实验状态 (ExperimentStatus)
-INSERT IGNORE INTO `experiment_status` (`experiment_id`, `student_id`, `start_time`, `completion_time`, `status`, `selected_industry`, `selected_company`, `selected_product`, `best_model`) VALUES
-(1, 9,  '2025-03-01 09:00:00', '2025-03-01 10:30:00', 'Completed',   '电子制造', '华夏电子',   '智能手环',     'ARIMA(2,1,1)'),
-(2, 10, '2025-03-02 13:00:00', '2025-03-02 15:10:00', 'Completed',   '消费品',   '星光家居',   '空气净化器', 'LSTM'),
-(3, 12, '2025-03-03 09:30:00', NULL,                   'In Progress', '物流运输', '联合物流',   '冷链配送',   NULL),
-(4, 14, '2025-03-04 14:00:00', '2025-03-04 16:00:00', 'Completed',   '食品饮料', '味来食品',   '果汁饮料',   'MovingAverage'),
-(5, 11, '2025-03-05 09:15:00', NULL,                   'In Progress', '智能制造', '未来工厂',   '协作机器人', NULL),
-(6, 13, '2025-03-06 10:00:00', NULL,                   'In Progress', '新能源',   '澜光能源',   '储能系统',   NULL),
-(7, 15, '2025-03-06 15:30:00', NULL,                   'Not Started', NULL,        NULL,        NULL,          NULL);
+INSERT IGNORE INTO `experiment_status` (
+  `experiment_id`,
+  `student_id`,
+  `start_time`,
+  `completion_time`,
+  `last_activity_at`,
+  `status`,
+  `selected_industry`,
+  `selected_company`,
+  `selected_product`,
+  `best_model`
+) VALUES
+(1, 9,  '2025-03-01 09:00:00', '2025-03-01 10:30:00', '2025-03-01 10:30:00', 'Completed',   '电子制造', '华夏电子',   '智能手环',     'ARIMA(2,1,1)'),
+(2, 10, '2025-03-02 13:00:00', '2025-03-02 15:10:00', '2025-03-02 15:10:00', 'Completed',   '消费品',   '星光家居',   '空气净化器', 'LSTM'),
+(3, 12, '2025-03-03 09:30:00', NULL,                   '2025-03-09 19:45:00', 'In Progress', '物流运输', '联合物流',   '冷链配送',   NULL),
+(4, 14, '2025-03-04 14:00:00', '2025-03-04 16:00:00', '2025-03-04 16:00:00', 'Completed',   '食品饮料', '味来食品',   '果汁饮料',   'MovingAverage'),
+(5, 11, '2025-03-05 09:15:00', NULL,                   '2025-03-10 10:10:00', 'In Progress', '智能制造', '未来工厂',   '协作机器人', NULL),
+(6, 13, '2025-03-06 10:00:00', NULL,                   '2025-03-11 09:30:00', 'In Progress', '新能源',   '澜光能源',   '储能系统',   NULL),
+(7, 15, '2025-03-06 15:30:00', NULL,                   '2025-03-06 15:30:00', 'Not Started', NULL,        NULL,        NULL,          NULL),
+(8, 9,  '2025-03-08 13:00:00', '2025-03-08 15:45:00', '2025-03-08 15:45:00', 'Completed',   '消费电子', '凌云科技',   '智能眼镜',   'Prophet'),
+(9, 9,  '2025-03-12 09:00:00', NULL,                   '2025-03-12 11:20:00', 'In Progress', '智慧零售', '华联超市',   '即时配送',   NULL);
 
 -- 9. 实验步骤事件 (ExperimentStepEvents)
 INSERT IGNORE INTO `experiment_step_events` (`event_id`, `experiment_id`, `student_id`, `step_order`, `event_type`, `event_timestamp`) VALUES
@@ -173,10 +186,18 @@ INSERT IGNORE INTO `student_responses` (`response_id`, `experiment_id`, `questio
 (5, 4, 4, 'C',    TRUE);
 
 -- 12. 实验报告 (ExperimentReports)
-INSERT IGNORE INTO `experiment_reports` (`report_id`, `experiment_id`, `report_content`, `pdf_file_path`, `submitted_at`, `grade`, `feedback`, `graded_by`) VALUES
-(1, 1, '基于 ARIMA 模型的智能手环需求预测分析。', '/uploads/reports/exp1-report.pdf', '2025-03-01 21:30:00', 92.5, '模型选择合理，报告结构清晰。', 3),
-(2, 2, 'LSTM 模型捕捉到季节特征并提升预测准确率。', '/uploads/reports/exp2-report.pdf', '2025-03-02 22:15:00', 88.0, '建议增加模型可解释性讨论。', 4),
-(3, 4, '移动平均模型用于饮料需求预测的快速实践。', '/uploads/reports/exp4-report.pdf', '2025-03-04 20:05:00', 85.0, '适合入门演示，可尝试更多模型比较。', 5);
+INSERT IGNORE INTO `experiment_reports` (`report_id`, `experiment_id`, `student_id`, `report_content`, `pdf_file_path`, `submitted_at`, `grade`, `feedback`, `graded_by`) VALUES
+(1, 1, 9,  '基于 ARIMA 模型的智能手环需求预测分析。', '/uploads/reports/exp1-report.pdf', '2025-03-01 21:30:00', 92.5, '模型选择合理，报告结构清晰。', 3),
+(2, 2, 10, 'LSTM 模型捕捉到季节特征并提升预测准确率。', '/uploads/reports/exp2-report.pdf', '2025-03-02 22:15:00', 88.0, '建议增加模型可解释性讨论。', 4),
+(3, 4, 14, '移动平均模型用于饮料需求预测的快速实践。', '/uploads/reports/exp4-report.pdf', '2025-03-04 20:05:00', 85.0, '适合入门演示，可尝试更多模型比较。', 5),
+(4, 1, 9,  'ARIMA 模型的多情景预测与库存策略优化。', '/uploads/reports/exp1-report-v2.pdf', '2025-03-06 18:45:00', 96.0, '扩展了情景分析，建议分享给全班同学参考。', 3),
+(5, 5, 11, '协作机器人实验阶段性小结。', '/uploads/reports/exp5-draft.pdf', '2025-03-07 17:20:00', NULL, NULL, NULL),
+(6, 5, 11, '协作机器人实验最终报告。', '/uploads/reports/exp5-final.pdf', '2025-03-10 10:10:00', 78.5, '按照评分标准补充实验数据分析。', 3),
+(7, 3, 12, '冷链配送模型预分析。', '/uploads/reports/exp3-draft.pdf', '2025-03-05 11:05:00', NULL, '等待完整数据后再评分。', NULL),
+(8, 3, 12, '冷链配送模型最终报告。', '/uploads/reports/exp3-final.pdf', '2025-03-09 19:45:00', 90.0, '场景描述全面，值得分享。', 4),
+(9, 6, 13, '储能系统实验初稿。', '/uploads/reports/exp6-draft.pdf', '2025-03-08 15:00:00', NULL, '请补充温控实验数据。', NULL),
+(10, 6, 13, '储能系统实验优化方案。', '/uploads/reports/exp6-iteration.pdf', '2025-03-11 09:30:00', 82.0, '改进了能效对比，继续跟踪。', 4),
+(11, 7, 15, '供应链协同仿真体验记录。', '/uploads/reports/exp7-prep.pdf', '2025-03-07 12:00:00', NULL, NULL, NULL);
 
 -- 13. 实验手册 (ExperimentManuals)
 INSERT IGNORE INTO `experiment_manuals` (`manual_id`, `file_name`, `file_path`, `description`, `is_active`, `uploader_id`) VALUES

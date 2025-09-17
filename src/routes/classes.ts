@@ -27,6 +27,10 @@ const classStudentParamSchema = z.object({
   studentId: z.string().regex(/^\d+$/),
 });
 
+const reportIdParamSchema = z.object({
+  reportId: z.string().regex(/^\d+$/),
+});
+
 const createClassSchema = z.object({
   class_name: z.string().min(1),
   class_code: z.string().optional(),
@@ -48,6 +52,15 @@ const enrollSchema = z.object({
 const addAssistantSchema = z.object({
   assistant_id: z.number().int().min(1),
 });
+
+const updateReportSchema = z
+  .object({
+    grade: z.number().min(0).max(100).optional(),
+    feedback: z.string().trim().max(2000).optional(),
+  })
+  .refine((data) => data.grade !== undefined || data.feedback !== undefined, {
+    message: "At least one of grade or feedback must be provided",
+  });
 
 export default (pool: Pool, JWT_SECRET: string) => {
   const classesApi = new Hono();
@@ -469,6 +482,236 @@ export default (pool: Pool, JWT_SECRET: string) => {
         return c.json(students);
       } catch (error) {
         console.error("Error fetching students for class:", error);
+        throw error;
+      }
+    },
+  );
+
+  classesApi.get(
+    "/classes/:classId/reports",
+    jwt({ secret: JWT_SECRET }),
+    zValidator("param", classIdParamSchema),
+    async (c) => {
+      try {
+        const payload = c.get("jwtPayload");
+        const { classId } = c.req.valid("param");
+        const classIdNumber = Number.parseInt(classId, 10);
+
+        const [classRows]: any[] = await pool.query(
+          "SELECT teacher_id FROM classes WHERE class_id = ?",
+          [classIdNumber],
+        );
+
+        if (classRows.length === 0) {
+          return c.json({ error: "Class not found" }, 404);
+        }
+
+        const classOwner = classRows[0].teacher_id;
+        if (payload.role !== "Admin" && payload.sub !== classOwner) {
+          return c.json({ error: "Forbidden" }, 403);
+        }
+
+        const [reports] = await pool.query(
+          `SELECT er.report_id,
+                  er.experiment_id,
+                  er.student_id,
+                  student.username AS student_username,
+                  student.full_name AS student_full_name,
+                  er.report_content,
+                  er.pdf_file_path,
+                  er.submitted_at,
+                  er.grade,
+                  er.feedback,
+                  er.graded_by,
+                  grader.full_name AS graded_by_full_name,
+                  es.status AS experiment_status,
+                  es.selected_industry,
+                  es.selected_company,
+                  es.selected_product
+             FROM experiment_reports er
+             JOIN experiment_status es
+               ON er.experiment_id = es.experiment_id
+              AND er.student_id = es.student_id
+             JOIN enrollments e
+               ON e.student_id = er.student_id
+             JOIN users student
+               ON student.user_id = er.student_id
+             LEFT JOIN users grader
+               ON grader.user_id = er.graded_by
+            WHERE e.class_id = ?
+            ORDER BY er.student_id ASC, er.submitted_at DESC`,
+          [classIdNumber],
+        );
+
+        return c.json(reports);
+      } catch (error) {
+        console.error("Error fetching class reports:", error);
+        throw error;
+      }
+    },
+  );
+
+  classesApi.get(
+    "/classes/:classId/experiment-status",
+    jwt({ secret: JWT_SECRET }),
+    zValidator("param", classIdParamSchema),
+    async (c) => {
+      try {
+        const payload = c.get("jwtPayload");
+        const { classId } = c.req.valid("param");
+        const classIdNumber = Number.parseInt(classId, 10);
+
+        const [classRows]: any[] = await pool.query(
+          "SELECT teacher_id FROM classes WHERE class_id = ?",
+          [classIdNumber],
+        );
+
+        if (classRows.length === 0) {
+          return c.json({ error: "Class not found" }, 404);
+        }
+
+        const classOwner = classRows[0].teacher_id;
+        if (payload.role !== "Admin" && payload.sub !== classOwner) {
+          return c.json({ error: "Forbidden" }, 403);
+        }
+
+        const [statuses] = await pool.query(
+          `SELECT es.experiment_id,
+                  es.student_id,
+                  student.username AS student_username,
+                  student.full_name AS student_full_name,
+                  es.start_time,
+                  es.completion_time,
+                  es.last_activity_at,
+                  es.status,
+                  es.selected_industry,
+                  es.selected_company,
+                  es.selected_product,
+                  es.best_model
+             FROM experiment_status es
+             JOIN enrollments e
+               ON e.student_id = es.student_id
+             JOIN users student
+               ON student.user_id = es.student_id
+            WHERE e.class_id = ?
+            ORDER BY es.student_id ASC, es.start_time DESC`,
+          [classIdNumber],
+        );
+
+        return c.json(statuses);
+      } catch (error) {
+        console.error("Error fetching class experiment status:", error);
+        throw error;
+      }
+    },
+  );
+
+  classesApi.put(
+    "/reports/:reportId",
+    jwt({ secret: JWT_SECRET }),
+    zValidator("param", reportIdParamSchema),
+    zValidator("json", updateReportSchema),
+    async (c) => {
+      try {
+        const payload = c.get("jwtPayload");
+        if (payload.role !== "Admin" && payload.role !== "Teacher") {
+          return c.json({ error: "Forbidden" }, 403);
+        }
+
+        const { reportId } = c.req.valid("param");
+        const reportIdNumber = Number.parseInt(reportId, 10);
+
+        const [reportRows]: any[] = await pool.query(
+          "SELECT report_id, experiment_id, student_id FROM experiment_reports WHERE report_id = ?",
+          [reportIdNumber],
+        );
+
+        if (reportRows.length === 0) {
+          return c.json({ error: "Report not found" }, 404);
+        }
+
+        const reportStudentId = reportRows[0].student_id;
+
+        if (payload.role === "Teacher") {
+          const [authRows]: any[] = await pool.query(
+            `SELECT 1
+               FROM classes c
+               JOIN enrollments e ON e.class_id = c.class_id
+              WHERE c.teacher_id = ?
+                AND e.student_id = ?
+              LIMIT 1`,
+            [payload.sub, reportStudentId],
+          );
+
+          if (authRows.length === 0) {
+            return c.json({ error: "Forbidden" }, 403);
+          }
+        }
+
+        const { grade, feedback } = c.req.valid("json");
+        const updateFields: string[] = [];
+        const updateValues: (number | string | null)[] = [];
+
+        if (grade !== undefined) {
+          updateFields.push("grade = ?");
+          updateValues.push(grade);
+        }
+        if (feedback !== undefined) {
+          updateFields.push("feedback = ?");
+          updateValues.push(feedback);
+        }
+
+        updateFields.push("graded_by = ?");
+        updateValues.push(payload.sub);
+
+        updateValues.push(reportIdNumber);
+
+        const updateSql = `
+          UPDATE experiment_reports
+             SET ${updateFields.join(", ")}
+           WHERE report_id = ?
+        `;
+
+        const [updateResult]: any = await pool.query(updateSql, updateValues);
+
+        if (updateResult.affectedRows === 0) {
+          return c.json({ error: "Report not found or not updated" }, 404);
+        }
+
+        const [updatedRows] = await pool.query(
+          `SELECT er.report_id,
+                  er.experiment_id,
+                  er.student_id,
+                  student.username AS student_username,
+                  student.full_name AS student_full_name,
+                  er.report_content,
+                  er.pdf_file_path,
+                  er.submitted_at,
+                  er.grade,
+                  er.feedback,
+                  er.graded_by,
+                  grader.full_name AS graded_by_full_name,
+                  es.status AS experiment_status,
+                  es.selected_industry,
+                  es.selected_company,
+                  es.selected_product
+             FROM experiment_reports er
+             JOIN experiment_status es
+               ON er.experiment_id = es.experiment_id
+              AND er.student_id = es.student_id
+             JOIN users student
+               ON student.user_id = er.student_id
+             LEFT JOIN users grader
+               ON grader.user_id = er.graded_by
+            WHERE er.report_id = ?
+            LIMIT 1`,
+          [reportIdNumber],
+        );
+
+        const updatedReport = (updatedRows as any[])[0];
+        return c.json(updatedReport);
+      } catch (error) {
+        console.error("Error updating class report grading:", error);
         throw error;
       }
     },
