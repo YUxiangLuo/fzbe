@@ -117,7 +117,7 @@ CREATE TABLE IF NOT EXISTS `question_bank` (
   `question_type` ENUM('Single Choice', 'Multiple Choice', 'True/False') NOT NULL,
   `question_text` TEXT NOT NULL,
   `options` JSON,
-  `correct_answer` VARCHAR(255) NOT NULL,
+  `correct_answers` JSON NOT NULL,
   `creator_id` INT,
   FOREIGN KEY (`creator_id`) REFERENCES `users`(`user_id`) ON DELETE SET NULL
 );

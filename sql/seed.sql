@@ -61,11 +61,11 @@ INSERT IGNORE INTO `enrollments` (`student_id`, `class_id`) VALUES
 (14,6);
 
 -- 5. 题库 (QuestionBank)
-INSERT IGNORE INTO `question_bank` (`question_id`, `knowledge_point`, `question_type`, `question_text`, `options`, `correct_answer`, `creator_id`) VALUES
-(1, '需求预测基础', 'Single Choice', '在 ARIMA 模型中，"d" 参数的含义是?', '{"A":"自回归项数","B":"差分阶数","C":"移动平均项数","D":"季节周期"}', 'B', 3),
+INSERT IGNORE INTO `question_bank` (`question_id`, `knowledge_point`, `question_type`, `question_text`, `options`, `correct_answers`, `creator_id`) VALUES
+(1, '需求预测基础', 'Single Choice', '在 ARIMA 模型中，"d" 参数的含义是?', '{"A":"自回归项数","B":"差分阶数","C":"移动平均项数","D":"季节周期"}', '["B"]', 3),
 (2, '时间序列预处理', 'Multiple Choice', '以下哪些步骤常用于时间序列数据预处理?', '{"A":"缺失值填补","B":"标准化","C":"图像增强","D":"滞后特征构造"}', '["A","B","D"]', 3),
-(3, '生产计划', 'True/False', '安全库存可以帮助降低缺货风险。', NULL, 'True', 4),
-(4, '融合模型', 'Single Choice', '使用多个模型结果加权得到最终预测值的方式称为？', '{"A":"合成预测","B":"模型选择","C":"模型集成","D":"模型融合"}', 'C', 4);
+(3, '生产计划', 'True/False', '安全库存可以帮助降低缺货风险。', '["正确","错误"]', '["正确"]', 4),
+(4, '融合模型', 'Single Choice', '使用多个模型结果加权得到最终预测值的方式称为？', '{"A":"合成预测","B":"模型选择","C":"模型集成","D":"模型融合"}', '["C"]', 4);
 
 -- 6. 成绩权重 (GradeWeights)
 INSERT IGNORE INTO `grade_weights` (`class_id`, `experiment_flow`, `knowledge_tests`, `model_selection`, `experiment_report`, `detailed_step_weights`) VALUES
@@ -182,7 +182,7 @@ INSERT IGNORE INTO `student_responses` (`response_id`, `experiment_id`, `questio
 (1, 1, 1, 'B',    TRUE),
 (2, 1, 2, '["A","B","D"]', TRUE),
 (3, 2, 1, 'A',    FALSE),
-(4, 2, 3, 'True', TRUE),
+(4, 2, 3, '正确', TRUE),
 (5, 4, 4, 'C',    TRUE);
 
 -- 12. 实验报告 (ExperimentReports)
