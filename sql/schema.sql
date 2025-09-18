@@ -65,12 +65,15 @@ CREATE TABLE IF NOT EXISTS `experiment_status` (
   `experiment_id` INT AUTO_INCREMENT PRIMARY KEY,
   `student_id` INT NOT NULL,
   `start_time` TIMESTAMP NULL,
-  `completion_time` TIMESTAMP NULL,
   `last_activity_at` TIMESTAMP NULL,
+  `completion_time` TIMESTAMP NULL,
   `status` ENUM('Not Started', 'In Progress', 'Completed') DEFAULT 'Not Started',
+  `highest_completed_step` INT UNSIGNED NOT NULL DEFAULT 0,
+  `current_step` INT UNSIGNED NOT NULL DEFAULT 1,
   `selected_industry` VARCHAR(255),
   `selected_company` VARCHAR(255),
   `selected_product` VARCHAR(255),
+  `model_runs` JSON,
   `best_model` VARCHAR(255),
   FOREIGN KEY (`student_id`) REFERENCES `users`(`user_id`) ON DELETE CASCADE
 );

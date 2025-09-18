@@ -67,6 +67,12 @@ app.use(
     root: path.resolve(import.meta.dir, "../uploads"),
   }),
 );
+app.use(
+  "/js/*",
+  serveStatic({
+    root: path.resolve(import.meta.dir, "../uploads"),
+  }),
+);
 
 // --- Mount Routes ---
 const api = new Hono();
