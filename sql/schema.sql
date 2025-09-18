@@ -214,3 +214,17 @@ CREATE TABLE IF NOT EXISTS `datasets` (
   `description` TEXT,
   `uploaded_at` TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
+
+CREATE TABLE IF NOT EXISTS `dataset_segments` (
+  `segment_id` INT AUTO_INCREMENT PRIMARY KEY,
+  `dataset_id` INT NOT NULL,
+  `industry_name` VARCHAR(255) NOT NULL,
+  `company_name` VARCHAR(255) NOT NULL,
+  `product_name` VARCHAR(255) NOT NULL,
+  `start_row` INT NOT NULL,
+  `end_row` INT NOT NULL,
+  `file_path` VARCHAR(512) NOT NULL,
+  FOREIGN KEY (`dataset_id`) REFERENCES `datasets`(`dataset_id`) ON DELETE CASCADE,
+  INDEX `idx_dataset_segments_dataset_id` (`dataset_id`),
+  UNIQUE KEY `uniq_dataset_segments_product` (`industry_name`, `company_name`, `product_name`)
+);

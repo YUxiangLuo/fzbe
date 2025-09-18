@@ -3,9 +3,18 @@ import { jwt } from "hono/jwt";
 import { z } from "zod";
 import { zValidator } from "@hono/zod-validator";
 import { unlink } from "node:fs/promises";
-import { join } from "node:path";
 import path from "path";
-import type { Pool } from "mysql2/promise";
+import type { Pool, ResultSetHeader, RowDataPacket } from "mysql2/promise";
+import { parseCsvSegments } from "../utils";
+
+const industryParamSchema = z.object({
+  industry: z.string().min(1),
+});
+
+const industryAndCompanyParamSchema = z.object({
+  industry: z.string().min(1),
+  company: z.string().min(1),
+});
 
 // Zod Schemas for Validation
 const datasetIdParamSchema = z.object({
@@ -19,11 +28,46 @@ const updateDatasetSchema = z.object({
   description: z.string().optional(),
 });
 
+type DatasetRow = RowDataPacket & {
+  dataset_id: number;
+  data_name: string;
+  file_path: string;
+  description: string | null;
+  uploaded_at: Date;
+};
+
+type DatasetFileRow = RowDataPacket & {
+  file_path: string;
+};
+
+type SegmentIdentityRow = RowDataPacket & {
+  industry_name: string;
+  company_name: string;
+  product_name: string;
+};
+
+type IndustryRow = RowDataPacket & {
+  industry_name: string;
+};
+
+type CompanyRow = RowDataPacket & {
+  company_name: string;
+};
+
+type ProductRow = RowDataPacket & {
+  product_name: string;
+};
+
+const isNodeError = (error: unknown): error is NodeJS.ErrnoException => {
+  return typeof error === "object" && error !== null && "code" in error;
+};
+
 export default (pool: Pool, JWT_SECRET: string) => {
   const datasetsApi = new Hono();
 
   // 管理员: 上传新的数据集
   datasetsApi.post("/datasets", jwt({ secret: JWT_SECRET }), async (c) => {
+    let uploadPath: string | null = null;
     try {
       const payload = c.get("jwtPayload");
       if (payload.role !== "Admin") {
@@ -34,7 +78,6 @@ export default (pool: Pool, JWT_SECRET: string) => {
       const file = body["file"];
       const dataName = body["data_name"];
       const description = body["description"];
-
       if (!(file instanceof File)) {
         return c.json({ error: "File is required" }, 400);
       }
@@ -43,7 +86,7 @@ export default (pool: Pool, JWT_SECRET: string) => {
       }
 
       const uniqueFilename = `${Date.now()}-${file.name}`;
-      const uploadPath = path.resolve(
+      uploadPath = path.resolve(
         import.meta.dir,
         "../../uploads",
         "datasets",
@@ -52,20 +95,132 @@ export default (pool: Pool, JWT_SECRET: string) => {
 
       await Bun.write(uploadPath, file);
 
-      const [result]: any = await pool.query(
-        "INSERT INTO datasets (data_name, file_path, description) VALUES (?, ?, ?)",
-        [dataName, uploadPath, description || null],
-      );
+      const connection = await pool.getConnection();
+      try {
+        await connection.beginTransaction();
 
-      const [rows]: any[] = await pool.query(
-        "SELECT * FROM datasets WHERE dataset_id = ?",
-        [result.insertId],
-      );
+        const segments = await parseCsvSegments(uploadPath);
 
-      // Return the complete object, which now includes `uploaded_at`
-      return c.json(rows[0], 201);
+        const uniqueKeysMap = new Map<string, (typeof segments)[number]>();
+        for (const segment of segments) {
+          const key = `${segment["行业名称"]}|${segment["公司名称"]}|${segment["产品名称"]}`;
+          if (!uniqueKeysMap.has(key)) {
+            uniqueKeysMap.set(key, segment);
+          }
+        }
+
+        if (uniqueKeysMap.size > 0) {
+          const duplicateConditions = Array.from({ length: uniqueKeysMap.size })
+            .map(
+              () =>
+                "(industry_name = ? AND company_name = ? AND product_name = ?)",
+            )
+            .join(" OR ");
+
+          const duplicateValues = Array.from(uniqueKeysMap.values()).flatMap(
+            (segment) => [
+              segment["行业名称"],
+              segment["公司名称"],
+              segment["产品名称"],
+            ],
+          );
+
+          const [existing] = await connection.query<SegmentIdentityRow[]>(
+            `SELECT industry_name, company_name, product_name FROM dataset_segments WHERE ${duplicateConditions}`,
+            duplicateValues,
+          );
+
+          if (existing.length > 0) {
+            const preview = existing
+              .slice(0, 5)
+              .map(
+                (row) =>
+                  `${row.industry_name}/${row.company_name}/${row.product_name}`,
+              )
+              .join(", ");
+            const suffix = existing.length > 5 ? "..." : "";
+            await connection.rollback();
+            if (uploadPath) {
+              try {
+                await unlink(uploadPath);
+              } catch (fsError: unknown) {
+                if (isNodeError(fsError) && fsError.code !== "ENOENT") {
+                  console.warn(
+                    `Failed to clean up uploaded file ${uploadPath}:`,
+                    fsError,
+                  );
+                }
+              }
+              uploadPath = null;
+            }
+            return c.json(
+              {
+                error: `数据库已经存在相同产品的销售数据: ${preview}${suffix}`,
+              },
+              409,
+            );
+          }
+        }
+
+        const [result] = await connection.query<ResultSetHeader>(
+          "INSERT INTO datasets (data_name, file_path, description) VALUES (?, ?, ?)",
+          [dataName, uploadPath, description || null],
+        );
+
+        const datasetId: number = result.insertId;
+
+        if (segments.length > 0) {
+          const segmentPlaceholders = segments
+            .map(() => "(?, ?, ?, ?, ?, ?, ?)")
+            .join(", ");
+          const segmentValues = segments.flatMap((segment) => [
+            datasetId,
+            segment["行业名称"],
+            segment["公司名称"],
+            segment["产品名称"],
+            segment["起始位置"],
+            segment["结束位置"],
+            segment.filePath,
+          ]);
+
+          await connection.query(
+            `INSERT INTO dataset_segments (dataset_id, industry_name, company_name, product_name, start_row, end_row, file_path) VALUES ${segmentPlaceholders}`,
+            segmentValues,
+          );
+        }
+
+        await connection.commit();
+
+        const [rows] = await connection.query<DatasetRow[]>(
+          "SELECT * FROM datasets WHERE dataset_id = ?",
+          [datasetId],
+        );
+
+        return c.json(rows[0], 201);
+      } catch (dbError) {
+        try {
+          await connection.rollback();
+        } catch (rollbackError) {
+          console.error("Rollback failed:", rollbackError);
+        }
+        throw dbError;
+      } finally {
+        connection.release();
+      }
     } catch (error) {
       console.error("Error uploading dataset:", error);
+      if (typeof uploadPath === "string") {
+        try {
+          await unlink(uploadPath);
+        } catch (fsError: unknown) {
+          if (isNodeError(fsError) && fsError.code !== "ENOENT") {
+            console.warn(
+              `Failed to clean up uploaded file ${uploadPath}:`,
+              fsError,
+            );
+          }
+        }
+      }
       throw error;
     }
   });
@@ -73,7 +228,7 @@ export default (pool: Pool, JWT_SECRET: string) => {
   // 登录用户: 获取所有数据集列表
   datasetsApi.get("/datasets", jwt({ secret: JWT_SECRET }), async (c) => {
     try {
-      const [rows] = await pool.query(
+      const [rows] = await pool.query<DatasetRow[]>(
         "SELECT * FROM datasets ORDER BY uploaded_at DESC",
       );
       return c.json(rows);
@@ -91,7 +246,7 @@ export default (pool: Pool, JWT_SECRET: string) => {
     async (c) => {
       try {
         const { datasetId } = c.req.valid("param");
-        const [rows]: any[] = await pool.query(
+        const [rows] = await pool.query<DatasetRow[]>(
           "SELECT * FROM datasets WHERE dataset_id = ?",
           [datasetId],
         );
@@ -138,13 +293,13 @@ export default (pool: Pool, JWT_SECRET: string) => {
 
       values.push(datasetId);
       const sql = `UPDATE datasets SET ${fields.join(", ")} WHERE dataset_id = ?`;
-      const [result]: any = await pool.query(sql, values);
+      const [result] = await pool.query<ResultSetHeader>(sql, values);
 
       if (result.affectedRows === 0) {
         return c.json({ error: "Dataset not found" }, 404);
       }
 
-      const [rows]: any[] = await pool.query(
+      const [rows] = await pool.query<DatasetRow[]>(
         "SELECT * FROM datasets WHERE dataset_id = ?",
         [datasetId],
       );
@@ -166,7 +321,7 @@ export default (pool: Pool, JWT_SECRET: string) => {
 
         const { datasetId } = c.req.valid("param");
 
-        const [rows]: any[] = await pool.query(
+        const [rows] = await pool.query<DatasetFileRow[]>(
           "SELECT file_path FROM datasets WHERE dataset_id = ?",
           [datasetId],
         );
@@ -178,8 +333,8 @@ export default (pool: Pool, JWT_SECRET: string) => {
 
         try {
           await unlink(dataset.file_path);
-        } catch (fsError: any) {
-          if (fsError.code !== "ENOENT") {
+        } catch (fsError: unknown) {
+          if (isNodeError(fsError) && fsError.code !== "ENOENT") {
             throw fsError;
           }
           console.warn(
@@ -187,13 +342,75 @@ export default (pool: Pool, JWT_SECRET: string) => {
           );
         }
 
-        await pool.query("DELETE FROM datasets WHERE dataset_id = ?", [
-          datasetId,
-        ]);
+        const [result] = await pool.query<ResultSetHeader>(
+          "DELETE FROM datasets WHERE dataset_id = ?",
+          [datasetId],
+        );
+
+        if (result.affectedRows === 0) {
+          return c.json({ error: "Dataset not found" }, 404);
+        }
 
         return c.json({ message: "Dataset deleted successfully" });
       } catch (error) {
         console.error("Error deleting dataset:", error);
+        throw error;
+      }
+    },
+  );
+
+  datasetsApi.get(
+    "/datasets/industries",
+    jwt({ secret: JWT_SECRET }),
+    async (c) => {
+      try {
+        const [rows] = await pool.query<IndustryRow[]>(
+          "SELECT DISTINCT industry_name FROM dataset_segments ORDER BY industry_name ASC",
+        );
+        return c.json(rows.map((row) => row.industry_name));
+      } catch (error) {
+        console.error("Error fetching industries:", error);
+        throw error;
+      }
+    },
+  );
+
+  datasetsApi.get(
+    "/datasets/industries/:industry/companies",
+    jwt({ secret: JWT_SECRET }),
+    zValidator("param", industryParamSchema),
+    async (c) => {
+      try {
+        const { industry } = c.req.valid("param");
+        const [rows] = await pool.query<CompanyRow[]>(
+          "SELECT DISTINCT company_name FROM dataset_segments WHERE industry_name = ? ORDER BY company_name ASC",
+          [industry],
+        );
+        return c.json(rows.map((row) => row.company_name));
+      } catch (error) {
+        console.error("Error fetching companies by industry:", error);
+        throw error;
+      }
+    },
+  );
+
+  datasetsApi.get(
+    "/datasets/industries/:industry/companies/:company/products",
+    jwt({ secret: JWT_SECRET }),
+    zValidator("param", industryAndCompanyParamSchema),
+    async (c) => {
+      try {
+        const { industry, company } = c.req.valid("param");
+        const [rows] = await pool.query<ProductRow[]>(
+          `SELECT DISTINCT product_name
+             FROM dataset_segments
+            WHERE industry_name = ? AND company_name = ?
+            ORDER BY product_name ASC`,
+          [industry, company],
+        );
+        return c.json(rows.map((row) => row.product_name));
+      } catch (error) {
+        console.error("Error fetching products by industry and company:", error);
         throw error;
       }
     },
