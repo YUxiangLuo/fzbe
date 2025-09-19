@@ -90,6 +90,9 @@ app.notFound((c) => c.json({ message: "Not Found" }, 404));
 
 app.onError((err, c) => {
   console.error("Global error handler:", err);
+  if (err instanceof HTTPException) {
+    return c.json({ error: err.message }, err.status);
+  }
   return c.json({ error: "Internal Server Error" }, 500);
 });
 
