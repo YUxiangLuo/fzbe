@@ -1,16 +1,16 @@
 -- --------------------------------------------------------
--- 虚拟仿真系统数据库结构文件 (Schema)
--- 适用于 MariaDB / MySQL
+-- Virtual Simulation System Database Schema File
+-- Compatible with MariaDB / MySQL
 -- --------------------------------------------------------
 
 --
--- 1. 用户与班级管理
+-- 1. User and Class Management
 --
 
 CREATE TABLE IF NOT EXISTS `users` (
   `user_id` INT AUTO_INCREMENT PRIMARY KEY,
   `username` VARCHAR(255) NOT NULL UNIQUE,
-  -- 所有用户的密码固定为$2b$10$DVZtxD9Efhm/j8.LSWMFx.hfdpk81iHO4Tv0fUaDr1LlW/mFrgXrG
+  -- All users' passwords are fixed to $2b$10$DVZtxD9Efhm/j8.LSWMFx.hfdpk81iHO4Tv0fUaDr1LlW/mFrgXrG
   `password_hash` VARCHAR(255) NOT NULL,
   `full_name` VARCHAR(255) NOT NULL,
   `email` VARCHAR(255) NOT NULL UNIQUE,
@@ -47,7 +47,7 @@ CREATE TABLE IF NOT EXISTS `class_assistants` (
 );
 
 --
--- 2. 实验与生产计划管理
+-- 2. Experiment and Production Planning Management
 --
 
 CREATE TABLE IF NOT EXISTS `experiment_status` (
@@ -58,10 +58,10 @@ CREATE TABLE IF NOT EXISTS `experiment_status` (
   `completion_time` TIMESTAMP NULL,
   `status` ENUM('Not Started', 'In Progress', 'Completed') DEFAULT 'Not Started',
 
-  -- 默认值为0，代表还没有完成任何步骤
+  -- Default value is 0, indicating no steps have been completed yet
   `highest_completed_step` INT UNSIGNED NOT NULL DEFAULT 0,
 
-  -- 取值范围为1-7，代表共有七个步骤
+  -- Values range from 1-7, representing a total of seven steps
   `current_step` INT UNSIGNED NOT NULL DEFAULT 1,
   `selected_industry` VARCHAR(255),
   `selected_company` VARCHAR(255),
@@ -96,32 +96,30 @@ CREATE TABLE IF NOT EXISTS `experiment_status` (
   -- ]
   `arima_adf_stationarity` JSON,
 
-
   `lstm_completed` BOOLEAN DEFAULT NULL,
   `lstm_normalization` ENUM('minmax', 'zscore'),
-  -- csv文件列名组成的数组：['月份', '销售金额', '是否促销']
+  -- CSV file column names array: ['Month', 'Sales Amount', 'Is Promotion']
   `lstm_features` JSON,
   `lstm_metrics_rmse` FLOAT,
   `lstm_metrics_mae` FLOAT,
   `lstm_metrics_r2` FLOAT,
 
   `ensemble_weighted_completed` BOOLEAN DEFAULT NULL,
-  -- 基础模型的缩写组成的数组：['ma', 'exp', 'arima', 'lstm']
+  -- Array of base model abbreviations: ['ma', 'exp', 'arima', 'lstm']
   `ensemble_weighted_base_models` JSON,
   `ensemble_weighted_metrics_rmse` FLOAT,
   `ensemble_weighted_metrics_mae` FLOAT,
   `ensemble_weighted_metrics_r2` FLOAT,
 
   `ensemble_boosting_completed` BOOLEAN DEFAULT NULL,
-  -- 基础模型的缩写组成的数组：['ma', 'exp', 'arima', 'lstm']
+  -- Array of base model abbreviations: ['ma', 'exp', 'arima', 'lstm']
   `ensemble_boosting_base_models` JSON,
   `ensemble_boosting_metrics_rmse` FLOAT,
   `ensemble_boosting_metrics_mae` FLOAT,
   `ensemble_boosting_metrics_r2` FLOAT,
 
-
   `ensemble_stacking_completed` BOOLEAN DEFAULT NULL,
-  -- 基础模型的缩写组成的数组：['ma', 'exp', 'arima', 'lstm']
+  -- Array of base model abbreviations: ['ma', 'exp', 'arima', 'lstm']
   `ensemble_stacking_base_models` JSON,
   `ensemble_stacking_metrics_rmse` FLOAT,
   `ensemble_stacking_metrics_mae` FLOAT,
@@ -132,12 +130,11 @@ CREATE TABLE IF NOT EXISTS `experiment_status` (
   FOREIGN KEY (`student_id`) REFERENCES `users`(`user_id`) ON DELETE CASCADE
 );
 
-
 CREATE TABLE IF NOT EXISTS `experiment_step_events` (
   `event_id` INT AUTO_INCREMENT PRIMARY KEY,
   `experiment_id` INT NOT NULL,
   `student_id` INT NOT NULL,
-  -- 取值范围为1-7
+  -- Values range from 1-7
   `step_order` INT NOT NULL,
   `event_type` ENUM('STARTED', 'COMPLETED') NOT NULL,
   `event_timestamp` TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
@@ -147,7 +144,7 @@ CREATE TABLE IF NOT EXISTS `experiment_step_events` (
 );
 
 --
--- 3. 考核与评分
+-- 3. Assessment and Grading
 --
 
 CREATE TABLE IF NOT EXISTS `question_bank` (
@@ -156,21 +153,20 @@ CREATE TABLE IF NOT EXISTS `question_bank` (
   `question_type` ENUM('Single Choice', 'Multiple Choice', 'True/False') NOT NULL,
   `question_text` TEXT NOT NULL,
 
-  -- {"A":"自回归项数","B":"差分阶数","C":"移动平均项数","D":"季节周期"}/["正确","错误"]
+  -- {"A":"Autoregressive order","B":"Differencing order","C":"Moving average order","D":"Seasonal period"} / ["True","False"]
   `options` JSON,
-  --["A","B","D"]/["正确"]
+  -- ["A","B","D"] / ["True"]
   `correct_answers` JSON NOT NULL,
   `creator_id` INT,
   FOREIGN KEY (`creator_id`) REFERENCES `users`(`user_id`) ON DELETE SET NULL
 );
-
 
 CREATE TABLE IF NOT EXISTS `experiment_reports` (
   `report_id` INT AUTO_INCREMENT PRIMARY KEY,
   `experiment_id` INT NOT NULL,
   `student_id` INT NOT NULL,
   `report_content` TEXT,
-  -- absolute path on linux that end's with .pdf
+  -- Absolute path on Linux that ends with .pdf
   `pdf_file_path` VARCHAR(255),
   `submitted_at` TIMESTAMP NULL,
   -- 0-100
@@ -182,12 +178,13 @@ CREATE TABLE IF NOT EXISTS `experiment_reports` (
   FOREIGN KEY (`graded_by`) REFERENCES `users`(`user_id`) ON DELETE SET NULL
 );
 
+-- Drop table if exists to ensure clean creation
 DROP TABLE IF EXISTS `grade_weights`;
 CREATE TABLE `grade_weights` (
   `weight_id` INT AUTO_INCREMENT PRIMARY KEY,
   `teacher_id` INT NOT NULL UNIQUE,
 
-  -- exp_flow_开头的字段和必须是100
+  -- Fields starting with exp_flow_ and must sum to 100
   `exp_flow_demand_data_preparation` FLOAT DEFAULT 0,
   `exp_flow_demand_descriptive_stats` FLOAT DEFAULT 0,
   `exp_flow_demand_model_selection` FLOAT DEFAULT 0,
@@ -198,7 +195,7 @@ CREATE TABLE `grade_weights` (
   `exp_flow_production_plan_creation` FLOAT DEFAULT 0,
   `exp_flow_report_submission` FLOAT DEFAULT 0,
 
-  -- exp_flow+knowledge_test+model_quality+report_quality的和必须是100
+  -- Sum of exp_flow + knowledge_test + model_quality + report_quality must be 100
   `exp_flow` FLOAT DEFAULT 0,
   `knowledge_test` FLOAT DEFAULT 0,
   `model_quality` FLOAT DEFAULT 0,
@@ -206,6 +203,7 @@ CREATE TABLE `grade_weights` (
   FOREIGN KEY (`teacher_id`) REFERENCES `users`(`user_id`) ON DELETE CASCADE
 );
 
+-- Drop table if exists to ensure clean creation
 DROP TABLE IF EXISTS `experiment_grade`;
 CREATE TABLE `experiment_grade` (
   `grade_id` INT AUTO_INCREMENT PRIMARY KEY,
@@ -216,7 +214,7 @@ CREATE TABLE `experiment_grade` (
   -- 0-100
   `exp_flow` FLOAT DEFAULT 0,
 
-  -- 以下所有字段的取值都是0-100，暂时先不考虑exp_flow_开头的字段的和加权平均得到exp_flow的值这个约束
+  -- All following fields have values from 0-100, temporarily not considering the constraint that exp_flow_ fields' weighted average equals exp_flow value
   `exp_flow_demand_data_preparation` FLOAT DEFAULT 0,
   `exp_flow_demand_descriptive_stats` FLOAT DEFAULT 0,
   `exp_flow_demand_model_selection` FLOAT DEFAULT 0,
@@ -236,14 +234,14 @@ CREATE TABLE `experiment_grade` (
 );
 
 --
--- 4. 系统管理
+-- 4. System Management
 --
 
 CREATE TABLE IF NOT EXISTS `experiment_manuals` (
   `manual_id` INT AUTO_INCREMENT PRIMARY KEY,
   `file_name` VARCHAR(255) NOT NULL,
 
-  -- absolute linux path ends with .pdf
+  -- Absolute Linux path that ends with .pdf
   `file_path` VARCHAR(255) NOT NULL,
   `description` TEXT,
   `is_active` BOOLEAN DEFAULT false,
@@ -256,7 +254,7 @@ CREATE TABLE IF NOT EXISTS `datasets` (
   `dataset_id` INT AUTO_INCREMENT PRIMARY KEY,
   `data_name` VARCHAR(255) NOT NULL,
 
-  -- absolute linux path ends with .csv
+  -- Absolute Linux path that ends with .csv
   `file_path` VARCHAR(255) NOT NULL,
   `description` TEXT,
   `uploaded_at` TIMESTAMP DEFAULT CURRENT_TIMESTAMP
@@ -271,7 +269,7 @@ CREATE TABLE IF NOT EXISTS `dataset_segments` (
   `start_row` INT NOT NULL,
   `end_row` INT NOT NULL,
 
-  -- absolute linux path ends with .csv
+  -- Absolute Linux path that ends with .csv
   `file_path` VARCHAR(512) NOT NULL,
   FOREIGN KEY (`dataset_id`) REFERENCES `datasets`(`dataset_id`) ON DELETE CASCADE,
   INDEX `idx_dataset_segments_dataset_id` (`dataset_id`),

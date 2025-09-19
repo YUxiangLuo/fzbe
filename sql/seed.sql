@@ -1,573 +1,410 @@
 -- --------------------------------------------------------
--- 虚拟仿真系统数据库种子文件 (Seed File)
+-- 虚拟仿真系统数据库初始化数据 (Seed Data)
 -- 适用于 MariaDB / MySQL
 -- --------------------------------------------------------
--- 说明:
---   1. 通过 INSERT IGNORE 保障重复执行脚本时不会报错。
---   2. 所有示例账号的默认密码均为 password123 (bcrypt:
---      $2b$10$DVZtxD9Efhm/j8.LSWMFx.hfdpk81iHO4Tv0fUaDr1LlW/mFrgXrG)。
---   3. 数据覆盖了典型业务流程: 用户/班级、助教、实验过程、题库、评分
---      以及资料/数据集上传，方便做端到端联调测试。
--- --------------------------------------------------------
 
--- 1. 核心用户 (Users)
-INSERT IGNORE INTO `users` (`user_id`, `username`, `password_hash`, `full_name`, `email`, `phone_number`, `role`) VALUES
-(1,  'admin',         '$2b$10$DVZtxD9Efhm/j8.LSWMFx.hfdpk81iHO4Tv0fUaDr1LlW/mFrgXrG', '系统管理员', 'admin@example.com',       '10000000000', 'Admin'),
-(2,  'admin_yuxiang', '$2b$10$DVZtxD9Efhm/j8.LSWMFx.hfdpk81iHO4Tv0fUaDr1LlW/mFrgXrG', '余翔',       'yuxiang@example.com',    '10000000001', 'Admin'),
-(3,  'teacher_liu',   '$2b$10$DVZtxD9Efhm/j8.LSWMFx.hfdpk81iHO4Tv0fUaDr1LlW/mFrgXrG', '刘老师',     'teacher.liu@example.com','13800138000', 'Teacher'),
-(4,  'teacher_chen',  '$2b$10$DVZtxD9Efhm/j8.LSWMFx.hfdpk81iHO4Tv0fUaDr1LlW/mFrgXrG', '陈老师',     'teacher.chen@example.com','13800138001','Teacher'),
-(5,  'teacher_zhao',  '$2b$10$DVZtxD9Efhm/j8.LSWMFx.hfdpk81iHO4Tv0fUaDr1LlW/mFrgXrG', '赵老师',     'teacher.zhao@example.com','13800138002','Teacher'),
-(6,  'teacher_wang',  '$2b$10$DVZtxD9Efhm/j8.LSWMFx.hfdpk81iHO4Tv0fUaDr1LlW/mFrgXrG', '王老师',     'teacher.wang@example.com','13800138003','Teacher'),
-(7,  'assistant_li',  '$2b$10$DVZtxD9Efhm/j8.LSWMFx.hfdpk81iHO4Tv0fUaDr1LlW/mFrgXrG', '李助教',     'assistant.li@example.com','13900139000','Assistant'),
-(8,  'assistant_sun', '$2b$10$DVZtxD9Efhm/j8.LSWMFx.hfdpk81iHO4Tv0fUaDr1LlW/mFrgXrG', '孙助教',     'assistant.sun@example.com','13900139001','Assistant'),
-(9,  'student_zhang', '$2b$10$DVZtxD9Efhm/j8.LSWMFx.hfdpk81iHO4Tv0fUaDr1LlW/mFrgXrG', '张小明',     'zhangxm@example.com',    NULL,           'Student'),
-(10, 'student_li',    '$2b$10$DVZtxD9Efhm/j8.LSWMFx.hfdpk81iHO4Tv0fUaDr1LlW/mFrgXrG', '李晓丽',     'lixl@example.com',       NULL,           'Student'),
-(11, 'student_wu',    '$2b$10$DVZtxD9Efhm/j8.LSWMFx.hfdpk81iHO4Tv0fUaDr1LlW/mFrgXrG', '吴嘉禾',     'wujh@example.com',       NULL,           'Student'),
-(12, 'student_zhao',  '$2b$10$DVZtxD9Efhm/j8.LSWMFx.hfdpk81iHO4Tv0fUaDr1LlW/mFrgXrG', '赵梓涵',     'zhaozh@example.com',     NULL,           'Student'),
-(13, 'student_chen',  '$2b$10$DVZtxD9Efhm/j8.LSWMFx.hfdpk81iHO4Tv0fUaDr1LlW/mFrgXrG', '陈语桐',     'chenyt@example.com',     NULL,           'Student'),
-(14, 'student_liu',   '$2b$10$DVZtxD9Efhm/j8.LSWMFx.hfdpk81iHO4Tv0fUaDr1LlW/mFrgXrG', '刘博文',     'liubw@example.com',      NULL,           'Student'),
-(15, 'student_sun',   '$2b$10$DVZtxD9Efhm/j8.LSWMFx.hfdpk81iHO4Tv0fUaDr1LlW/mFrgXrG', '孙晨曦',     'suncx@example.com',      NULL,           'Student'),
-(16,  'student_extra01',  '$2b$10$DVZtxD9Efhm/j8.LSWMFx.hfdpk81iHO4Tv0fUaDr1LlW/mFrgXrG', '测试学员01', 'student.extra01@example.com',      NULL,           'Student'),
-(17,  'student_extra02',  '$2b$10$DVZtxD9Efhm/j8.LSWMFx.hfdpk81iHO4Tv0fUaDr1LlW/mFrgXrG', '测试学员02', 'student.extra02@example.com',      NULL,           'Student'),
-(18,  'student_extra03',  '$2b$10$DVZtxD9Efhm/j8.LSWMFx.hfdpk81iHO4Tv0fUaDr1LlW/mFrgXrG', '测试学员03', 'student.extra03@example.com',      NULL,           'Student'),
-(19,  'student_extra04',  '$2b$10$DVZtxD9Efhm/j8.LSWMFx.hfdpk81iHO4Tv0fUaDr1LlW/mFrgXrG', '测试学员04', 'student.extra04@example.com',      NULL,           'Student'),
-(20,  'student_extra05',  '$2b$10$DVZtxD9Efhm/j8.LSWMFx.hfdpk81iHO4Tv0fUaDr1LlW/mFrgXrG', '测试学员05', 'student.extra05@example.com',      NULL,           'Student'),
-(21,  'student_extra06',  '$2b$10$DVZtxD9Efhm/j8.LSWMFx.hfdpk81iHO4Tv0fUaDr1LlW/mFrgXrG', '测试学员06', 'student.extra06@example.com',      NULL,           'Student'),
-(22,  'student_extra07',  '$2b$10$DVZtxD9Efhm/j8.LSWMFx.hfdpk81iHO4Tv0fUaDr1LlW/mFrgXrG', '测试学员07', 'student.extra07@example.com',      NULL,           'Student'),
-(23,  'student_extra08',  '$2b$10$DVZtxD9Efhm/j8.LSWMFx.hfdpk81iHO4Tv0fUaDr1LlW/mFrgXrG', '测试学员08', 'student.extra08@example.com',      NULL,           'Student'),
-(24,  'student_extra09',  '$2b$10$DVZtxD9Efhm/j8.LSWMFx.hfdpk81iHO4Tv0fUaDr1LlW/mFrgXrG', '测试学员09', 'student.extra09@example.com',      NULL,           'Student'),
-(25,  'student_extra10',  '$2b$10$DVZtxD9Efhm/j8.LSWMFx.hfdpk81iHO4Tv0fUaDr1LlW/mFrgXrG', '测试学员10', 'student.extra10@example.com',      NULL,           'Student'),
-(26,  'student_extra11',  '$2b$10$DVZtxD9Efhm/j8.LSWMFx.hfdpk81iHO4Tv0fUaDr1LlW/mFrgXrG', '测试学员11', 'student.extra11@example.com',      NULL,           'Student'),
-(27,  'student_extra12',  '$2b$10$DVZtxD9Efhm/j8.LSWMFx.hfdpk81iHO4Tv0fUaDr1LlW/mFrgXrG', '测试学员12', 'student.extra12@example.com',      NULL,           'Student'),
-(28,  'student_extra13',  '$2b$10$DVZtxD9Efhm/j8.LSWMFx.hfdpk81iHO4Tv0fUaDr1LlW/mFrgXrG', '测试学员13', 'student.extra13@example.com',      NULL,           'Student'),
-(29,  'student_extra14',  '$2b$10$DVZtxD9Efhm/j8.LSWMFx.hfdpk81iHO4Tv0fUaDr1LlW/mFrgXrG', '测试学员14', 'student.extra14@example.com',      NULL,           'Student'),
-(30,  'student_extra15',  '$2b$10$DVZtxD9Efhm/j8.LSWMFx.hfdpk81iHO4Tv0fUaDr1LlW/mFrgXrG', '测试学员15', 'student.extra15@example.com',      NULL,           'Student'),
-(31,  'student_extra16',  '$2b$10$DVZtxD9Efhm/j8.LSWMFx.hfdpk81iHO4Tv0fUaDr1LlW/mFrgXrG', '测试学员16', 'student.extra16@example.com',      NULL,           'Student'),
-(32,  'student_extra17',  '$2b$10$DVZtxD9Efhm/j8.LSWMFx.hfdpk81iHO4Tv0fUaDr1LlW/mFrgXrG', '测试学员17', 'student.extra17@example.com',      NULL,           'Student'),
-(33,  'student_extra18',  '$2b$10$DVZtxD9Efhm/j8.LSWMFx.hfdpk81iHO4Tv0fUaDr1LlW/mFrgXrG', '测试学员18', 'student.extra18@example.com',      NULL,           'Student'),
-(34,  'student_extra19',  '$2b$10$DVZtxD9Efhm/j8.LSWMFx.hfdpk81iHO4Tv0fUaDr1LlW/mFrgXrG', '测试学员19', 'student.extra19@example.com',      NULL,           'Student'),
-(35,  'student_extra20',  '$2b$10$DVZtxD9Efhm/j8.LSWMFx.hfdpk81iHO4Tv0fUaDr1LlW/mFrgXrG', '测试学员20', 'student.extra20@example.com',      NULL,           'Student'),
-(36,  'student_extra21',  '$2b$10$DVZtxD9Efhm/j8.LSWMFx.hfdpk81iHO4Tv0fUaDr1LlW/mFrgXrG', '测试学员21', 'student.extra21@example.com',      NULL,           'Student'),
-(37,  'student_extra22',  '$2b$10$DVZtxD9Efhm/j8.LSWMFx.hfdpk81iHO4Tv0fUaDr1LlW/mFrgXrG', '测试学员22', 'student.extra22@example.com',      NULL,           'Student'),
-(38,  'student_extra23',  '$2b$10$DVZtxD9Efhm/j8.LSWMFx.hfdpk81iHO4Tv0fUaDr1LlW/mFrgXrG', '测试学员23', 'student.extra23@example.com',      NULL,           'Student'),
-(39,  'student_extra24',  '$2b$10$DVZtxD9Efhm/j8.LSWMFx.hfdpk81iHO4Tv0fUaDr1LlW/mFrgXrG', '测试学员24', 'student.extra24@example.com',      NULL,           'Student'),
-(40,  'student_extra25',  '$2b$10$DVZtxD9Efhm/j8.LSWMFx.hfdpk81iHO4Tv0fUaDr1LlW/mFrgXrG', '测试学员25', 'student.extra25@example.com',      NULL,           'Student'),
-(41,  'student_extra26',  '$2b$10$DVZtxD9Efhm/j8.LSWMFx.hfdpk81iHO4Tv0fUaDr1LlW/mFrgXrG', '测试学员26', 'student.extra26@example.com',      NULL,           'Student'),
-(42,  'student_extra27',  '$2b$10$DVZtxD9Efhm/j8.LSWMFx.hfdpk81iHO4Tv0fUaDr1LlW/mFrgXrG', '测试学员27', 'student.extra27@example.com',      NULL,           'Student'),
-(43,  'student_extra28',  '$2b$10$DVZtxD9Efhm/j8.LSWMFx.hfdpk81iHO4Tv0fUaDr1LlW/mFrgXrG', '测试学员28', 'student.extra28@example.com',      NULL,           'Student'),
-(44,  'student_extra29',  '$2b$10$DVZtxD9Efhm/j8.LSWMFx.hfdpk81iHO4Tv0fUaDr1LlW/mFrgXrG', '测试学员29', 'student.extra29@example.com',      NULL,           'Student'),
-(45,  'student_extra30',  '$2b$10$DVZtxD9Efhm/j8.LSWMFx.hfdpk81iHO4Tv0fUaDr1LlW/mFrgXrG', '测试学员30', 'student.extra30@example.com',      NULL,           'Student'),
-(46,  'student_extra31',  '$2b$10$DVZtxD9Efhm/j8.LSWMFx.hfdpk81iHO4Tv0fUaDr1LlW/mFrgXrG', '测试学员31', 'student.extra31@example.com',      NULL,           'Student'),
-(47,  'student_extra32',  '$2b$10$DVZtxD9Efhm/j8.LSWMFx.hfdpk81iHO4Tv0fUaDr1LlW/mFrgXrG', '测试学员32', 'student.extra32@example.com',      NULL,           'Student'),
-(48,  'student_extra33',  '$2b$10$DVZtxD9Efhm/j8.LSWMFx.hfdpk81iHO4Tv0fUaDr1LlW/mFrgXrG', '测试学员33', 'student.extra33@example.com',      NULL,           'Student'),
-(49,  'student_extra34',  '$2b$10$DVZtxD9Efhm/j8.LSWMFx.hfdpk81iHO4Tv0fUaDr1LlW/mFrgXrG', '测试学员34', 'student.extra34@example.com',      NULL,           'Student'),
-(50,  'student_extra35',  '$2b$10$DVZtxD9Efhm/j8.LSWMFx.hfdpk81iHO4Tv0fUaDr1LlW/mFrgXrG', '测试学员35', 'student.extra35@example.com',      NULL,           'Student'),
-(51,  'student_extra36',  '$2b$10$DVZtxD9Efhm/j8.LSWMFx.hfdpk81iHO4Tv0fUaDr1LlW/mFrgXrG', '测试学员36', 'student.extra36@example.com',      NULL,           'Student'),
-(52,  'student_extra37',  '$2b$10$DVZtxD9Efhm/j8.LSWMFx.hfdpk81iHO4Tv0fUaDr1LlW/mFrgXrG', '测试学员37', 'student.extra37@example.com',      NULL,           'Student'),
-(53,  'student_extra38',  '$2b$10$DVZtxD9Efhm/j8.LSWMFx.hfdpk81iHO4Tv0fUaDr1LlW/mFrgXrG', '测试学员38', 'student.extra38@example.com',      NULL,           'Student'),
-(54,  'student_extra39',  '$2b$10$DVZtxD9Efhm/j8.LSWMFx.hfdpk81iHO4Tv0fUaDr1LlW/mFrgXrG', '测试学员39', 'student.extra39@example.com',      NULL,           'Student'),
-(55,  'student_extra40',  '$2b$10$DVZtxD9Efhm/j8.LSWMFx.hfdpk81iHO4Tv0fUaDr1LlW/mFrgXrG', '测试学员40', 'student.extra40@example.com',      NULL,           'Student'),
-(56,  'student_extra41',  '$2b$10$DVZtxD9Efhm/j8.LSWMFx.hfdpk81iHO4Tv0fUaDr1LlW/mFrgXrG', '测试学员41', 'student.extra41@example.com',      NULL,           'Student'),
-(57,  'student_extra42',  '$2b$10$DVZtxD9Efhm/j8.LSWMFx.hfdpk81iHO4Tv0fUaDr1LlW/mFrgXrG', '测试学员42', 'student.extra42@example.com',      NULL,           'Student'),
-(58,  'student_extra43',  '$2b$10$DVZtxD9Efhm/j8.LSWMFx.hfdpk81iHO4Tv0fUaDr1LlW/mFrgXrG', '测试学员43', 'student.extra43@example.com',      NULL,           'Student'),
-(59,  'student_extra44',  '$2b$10$DVZtxD9Efhm/j8.LSWMFx.hfdpk81iHO4Tv0fUaDr1LlW/mFrgXrG', '测试学员44', 'student.extra44@example.com',      NULL,           'Student'),
-(60,  'student_extra45',  '$2b$10$DVZtxD9Efhm/j8.LSWMFx.hfdpk81iHO4Tv0fUaDr1LlW/mFrgXrG', '测试学员45', 'student.extra45@example.com',      NULL,           'Student'),
-(61,  'student_extra46',  '$2b$10$DVZtxD9Efhm/j8.LSWMFx.hfdpk81iHO4Tv0fUaDr1LlW/mFrgXrG', '测试学员46', 'student.extra46@example.com',      NULL,           'Student'),
-(62,  'student_extra47',  '$2b$10$DVZtxD9Efhm/j8.LSWMFx.hfdpk81iHO4Tv0fUaDr1LlW/mFrgXrG', '测试学员47', 'student.extra47@example.com',      NULL,           'Student'),
-(63,  'student_extra48',  '$2b$10$DVZtxD9Efhm/j8.LSWMFx.hfdpk81iHO4Tv0fUaDr1LlW/mFrgXrG', '测试学员48', 'student.extra48@example.com',      NULL,           'Student'),
-(64,  'student_extra49',  '$2b$10$DVZtxD9Efhm/j8.LSWMFx.hfdpk81iHO4Tv0fUaDr1LlW/mFrgXrG', '测试学员49', 'student.extra49@example.com',      NULL,           'Student'),
-(65,  'student_extra50',  '$2b$10$DVZtxD9Efhm/j8.LSWMFx.hfdpk81iHO4Tv0fUaDr1LlW/mFrgXrG', '测试学员50', 'student.extra50@example.com',      NULL,           'Student');
+-- 清空所有表并重置自增ID（按外键依赖顺序）
+SET FOREIGN_KEY_CHECKS = 0;
 
--- 2. 班级 (Classes)
-INSERT IGNORE INTO `classes` (`class_id`, `class_name`, `class_code`, `teacher_id`) VALUES
-(1, '工业工程综合实验2025',   'IE2025', 3),
-(2, '供应链协同仿真班',       'SCM2025',4),
-(3, '智能制造实践小班',       'IM2025', 5),
-(4, '数据驱动决策班',         'DDD2025',6),
-(5, 'ERP实施实训班',         'ERP2025',3),
-(6, '物流系统优化班',         'LSO2025',4);
+TRUNCATE TABLE `experiment_reports`;
+TRUNCATE TABLE `experiment_grade`;
+TRUNCATE TABLE `grade_weights`;
+TRUNCATE TABLE `experiment_step_events`;
+TRUNCATE TABLE `experiment_status`;
+TRUNCATE TABLE `dataset_segments`;
+TRUNCATE TABLE `datasets`;
+TRUNCATE TABLE `experiment_manuals`;
+TRUNCATE TABLE `question_bank`;
+TRUNCATE TABLE `class_assistants`;
+TRUNCATE TABLE `enrollments`;
+TRUNCATE TABLE `classes`;
+TRUNCATE TABLE `users`;
 
--- 3. 助教与班级关联 (ClassAssistants)
-INSERT IGNORE INTO `class_assistants` (`assistant_id`, `class_id`) VALUES
-(7, 1),
-(7, 5),
-(8, 2),
-(8, 6);
+ALTER TABLE `users` AUTO_INCREMENT = 1;
+ALTER TABLE `classes` AUTO_INCREMENT = 1;
+ALTER TABLE `enrollments` AUTO_INCREMENT = 1;
+ALTER TABLE `class_assistants` AUTO_INCREMENT = 1;
+ALTER TABLE `experiment_status` AUTO_INCREMENT = 1;
+ALTER TABLE `experiment_step_events` AUTO_INCREMENT = 1;
+ALTER TABLE `question_bank` AUTO_INCREMENT = 1;
+ALTER TABLE `experiment_reports` AUTO_INCREMENT = 1;
+ALTER TABLE `experiment_grade` AUTO_INCREMENT = 1;
+ALTER TABLE `experiment_manuals` AUTO_INCREMENT = 1;
+ALTER TABLE `datasets` AUTO_INCREMENT = 1;
+ALTER TABLE `dataset_segments` AUTO_INCREMENT = 1;
 
--- 4. 学生选课 (Enrollments)
-INSERT IGNORE INTO `enrollments` (`student_id`, `class_id`) VALUES
-(9, 1),
-(10,1),
-(11,1),
-(12,2),
-(13,2),
-(14,3),
-(15,3),
-(9, 4),
-(12,4),
-(10,5),
-(13,5),
-(11,6),
-(14,6),
-(16, 1),
-(17, 1),
-(18, 1),
-(19, 1),
-(20, 1),
-(21, 1),
-(22, 1),
-(23, 1),
-(24, 1),
-(25, 1),
-(26, 1),
-(27, 1),
-(28, 1),
-(29, 1),
-(30, 1),
-(31, 1),
-(32, 1),
-(33, 1),
-(34, 1),
-(35, 1),
-(36, 1),
-(37, 1),
-(38, 1),
-(39, 1),
-(40, 1),
-(41, 1),
-(42, 1),
-(43, 1),
-(44, 1),
-(45, 1),
-(46, 1),
-(47, 1),
-(48, 1),
-(49, 1),
-(50, 1),
-(51, 1),
-(52, 1),
-(53, 1),
-(54, 1),
-(55, 1),
-(56, 1),
-(57, 1),
-(58, 1),
-(59, 1),
-(60, 1),
-(61, 1),
-(62, 1),
-(63, 1),
-(64, 1),
-(65, 1);
+SET FOREIGN_KEY_CHECKS = 1;
 
--- 5. 题库 (QuestionBank)
-INSERT IGNORE INTO `question_bank` (`question_id`, `knowledge_point`, `question_type`, `question_text`, `options`, `correct_answers`, `creator_id`) VALUES
-(1, '需求预测基础', 'Single Choice', '在 ARIMA 模型中，"d" 参数的含义是?', '{"A":"自回归项数","B":"差分阶数","C":"移动平均项数","D":"季节周期"}', '["B"]', 3),
-(2, '时间序列预处理', 'Multiple Choice', '以下哪些步骤常用于时间序列数据预处理?', '{"A":"缺失值填补","B":"标准化","C":"图像增强","D":"滞后特征构造"}', '["A","B","D"]', 3),
-(3, '生产计划', 'True/False', '安全库存可以帮助降低缺货风险。', '["正确","错误"]', '["正确"]', 4),
-(4, '融合模型', 'Single Choice', '使用多个模型结果加权得到最终预测值的方式称为？', '{"A":"合成预测","B":"模型选择","C":"模型集成","D":"模型融合"}', '["C"]', 4);
+--
+-- 1. 用户与班级管理 - 插入测试用户
+--
 
--- 6. 成绩权重 (GradeWeights)
-INSERT IGNORE INTO `grade_weights` (
-  `teacher_id`,
-  `exp_flow`,
-  `exp_flow_demand_data_preparation`,
-  `exp_flow_demand_descriptive_stats`,
-  `exp_flow_demand_model_selection`,
-  `exp_flow_demand_generate_results`,
-  `exp_flow_production_inventory_calc`,
-  `exp_flow_production_service_level`,
-  `exp_flow_production_variable_calc`,
-  `exp_flow_production_plan_creation`,
-  `exp_flow_report_submission`,
-  `knowledge_test`,
-  `model_quality`,
-  `report_quality`
-) VALUES
-(3, 40, 12, 10, 8, 10, 10, 10, 10, 15, 15, 20, 20, 20),
-(4, 40, 12, 10, 8, 10, 10, 10, 10, 15, 15, 20, 20, 20),
-(5, 40, 12, 10, 8, 10, 10, 10, 10, 15, 15, 20, 20, 20),
-(6, 40, 12, 10, 8, 10, 10, 10, 10, 15, 15, 20, 20, 20);
+INSERT INTO `users` (`username`, `password_hash`, `full_name`, `email`, `phone_number`, `role`) VALUES
+('admin', '$2b$10$DVZtxD9Efhm/j8.LSWMFx.hfdpk81iHO4Tv0fUaDr1LlW/mFrgXrG', '系统管理员', 'admin@system.com', '13800138000', 'Admin'),
+('teacher1', '$2b$10$DVZtxD9Efhm/j8.LSWMFx.hfdpk81iHO4Tv0fUaDr1LlW/mFrgXrG', '张老师', 'zhang.teacher@university.edu', '13800138001', 'Teacher'),
+('teacher2', '$2b$10$DVZtxD9Efhm/j8.LSWMFx.hfdpk81iHO4Tv0fUaDr1LlW/mFrgXrG', '李老师', 'li.teacher@university.edu', '13800138002', 'Teacher'),
+('assistant1', '$2b$10$DVZtxD9Efhm/j8.LSWMFx.hfdpk81iHO4Tv0fUaDr1LlW/mFrgXrG', '王助教', 'wang.assistant@university.edu', '13800138003', 'Assistant'),
+('student1', '$2b$10$DVZtxD9Efhm/j8.LSWMFx.hfdpk81iHO4Tv0fUaDr1LlW/mFrgXrG', '赵明', 'zhao.ming@student.university.edu', '13800138004', 'Student'),
+('student2', '$2b$10$DVZtxD9Efhm/j8.LSWMFx.hfdpk81iHO4Tv0fUaDr1LlW/mFrgXrG', '钱丽', 'qian.li@student.university.edu', '13800138005', 'Student'),
+('student3', '$2b$10$DVZtxD9Efhm/j8.LSWMFx.hfdpk81iHO4Tv0fUaDr1LlW/mFrgXrG', '孙伟', 'sun.wei@student.university.edu', '13800138006', 'Student'),
+('student4', '$2b$10$DVZtxD9Efhm/j8.LSWMFx.hfdpk81iHO4Tv0fUaDr1LlW/mFrgXrG', '周芳', 'zhou.fang@student.university.edu', '13800138007', 'Student');
 
--- 6.1 实验评分记录 (ExperimentGrade)
-INSERT IGNORE INTO `experiment_grade` (
-  `grade_id`,
-  `experiment_id`,
-  `student_id`,
-  `grader_id`,
-  `exp_flow`,
-  `exp_flow_demand_data_preparation`,
-  `exp_flow_demand_descriptive_stats`,
-  `exp_flow_demand_model_selection`,
-  `exp_flow_demand_generate_results`,
-  `exp_flow_production_inventory_calc`,
-  `exp_flow_production_service_level`,
-  `exp_flow_production_variable_calc`,
-  `exp_flow_production_plan_creation`,
-  `exp_flow_report_submission`,
-  `knowledge_test`,
-  `model_quality`,
-  `report_quality`
-) VALUES
-(1, 1, 9, 3, 40, 12.00, 10.00, 8.50, 9.50, 10.00, 9.00, 9.50, 14.00, 14.50, 20.00, 18.00, 19.00),
-(2, 2, 10, 4, 40, 11.00, 9.00, 8.00, 9.00, 9.50, 9.00, 9.00, 14.50, 15.00, 20.00, 17.50, 18.00),
-(3, 4, 14, 5, 40, 10.50, 9.00, 7.50, 8.50, 9.00, 9.00, 9.50, 16.00, 16.50, 20.00, 16.00, 17.00),
-(4, 10, 16, 3, 24, 2.88, 2.40, 1.92, 2.40, 2.40, 2.40, 2.40, 3.60, 3.60, 12.00, 14.00, 16.00),
-(5, 11, 17, 4, 28, 3.36, 2.80, 2.24, 2.80, 2.80, 2.80, 2.80, 4.20, 4.20, 14.00, 16.00, 18.00),
-(6, 12, 18, 5, 32, 3.84, 3.20, 2.56, 3.20, 3.20, 3.20, 3.20, 4.80, 4.80, 16.00, 18.00, 20.00),
-(7, 13, 19, 3, 36, 4.32, 3.60, 2.88, 3.60, 3.60, 3.60, 3.60, 5.40, 5.40, 18.00, 20.00, 12.00),
-(8, 14, 20, 4, 40, 4.80, 4.00, 3.20, 4.00, 4.00, 4.00, 4.00, 6.00, 6.00, 20.00, 12.00, 14.00),
-(9, 15, 21, 5, 24, 2.88, 2.40, 1.92, 2.40, 2.40, 2.40, 2.40, 3.60, 3.60, 12.00, 14.00, 16.00),
-(10, 16, 22, 3, 28, 3.36, 2.80, 2.24, 2.80, 2.80, 2.80, 2.80, 4.20, 4.20, 14.00, 16.00, 18.00),
-(11, 17, 23, 4, 32, 3.84, 3.20, 2.56, 3.20, 3.20, 3.20, 3.20, 4.80, 4.80, 16.00, 18.00, 20.00),
-(12, 18, 24, 5, 36, 4.32, 3.60, 2.88, 3.60, 3.60, 3.60, 3.60, 5.40, 5.40, 18.00, 20.00, 12.00),
-(13, 19, 25, 3, 40, 4.80, 4.00, 3.20, 4.00, 4.00, 4.00, 4.00, 6.00, 6.00, 20.00, 12.00, 14.00),
-(14, 20, 26, 4, 24, 2.88, 2.40, 1.92, 2.40, 2.40, 2.40, 2.40, 3.60, 3.60, 12.00, 14.00, 16.00),
-(15, 21, 27, 5, 28, 3.36, 2.80, 2.24, 2.80, 2.80, 2.80, 2.80, 4.20, 4.20, 14.00, 16.00, 18.00),
-(16, 22, 28, 3, 32, 3.84, 3.20, 2.56, 3.20, 3.20, 3.20, 3.20, 4.80, 4.80, 16.00, 18.00, 20.00),
-(17, 23, 29, 4, 36, 4.32, 3.60, 2.88, 3.60, 3.60, 3.60, 3.60, 5.40, 5.40, 18.00, 20.00, 12.00),
-(18, 24, 30, 5, 40, 4.80, 4.00, 3.20, 4.00, 4.00, 4.00, 4.00, 6.00, 6.00, 20.00, 12.00, 14.00),
-(19, 25, 31, 3, 24, 2.88, 2.40, 1.92, 2.40, 2.40, 2.40, 2.40, 3.60, 3.60, 12.00, 14.00, 16.00),
-(20, 26, 32, 4, 28, 3.36, 2.80, 2.24, 2.80, 2.80, 2.80, 2.80, 4.20, 4.20, 14.00, 16.00, 18.00),
-(21, 27, 33, 5, 32, 3.84, 3.20, 2.56, 3.20, 3.20, 3.20, 3.20, 4.80, 4.80, 16.00, 18.00, 20.00),
-(22, 28, 34, 3, 36, 4.32, 3.60, 2.88, 3.60, 3.60, 3.60, 3.60, 5.40, 5.40, 18.00, 20.00, 12.00),
-(23, 29, 35, 4, 40, 4.80, 4.00, 3.20, 4.00, 4.00, 4.00, 4.00, 6.00, 6.00, 20.00, 12.00, 14.00),
-(24, 30, 36, 5, 24, 2.88, 2.40, 1.92, 2.40, 2.40, 2.40, 2.40, 3.60, 3.60, 12.00, 14.00, 16.00),
-(25, 31, 37, 3, 28, 3.36, 2.80, 2.24, 2.80, 2.80, 2.80, 2.80, 4.20, 4.20, 14.00, 16.00, 18.00),
-(26, 32, 38, 4, 32, 3.84, 3.20, 2.56, 3.20, 3.20, 3.20, 3.20, 4.80, 4.80, 16.00, 18.00, 20.00),
-(27, 33, 39, 5, 36, 4.32, 3.60, 2.88, 3.60, 3.60, 3.60, 3.60, 5.40, 5.40, 18.00, 20.00, 12.00),
-(28, 34, 40, 3, 40, 4.80, 4.00, 3.20, 4.00, 4.00, 4.00, 4.00, 6.00, 6.00, 20.00, 12.00, 14.00),
-(29, 35, 41, 4, 24, 2.88, 2.40, 1.92, 2.40, 2.40, 2.40, 2.40, 3.60, 3.60, 12.00, 14.00, 16.00),
-(30, 36, 42, 5, 28, 3.36, 2.80, 2.24, 2.80, 2.80, 2.80, 2.80, 4.20, 4.20, 14.00, 16.00, 18.00),
-(31, 37, 43, 3, 32, 3.84, 3.20, 2.56, 3.20, 3.20, 3.20, 3.20, 4.80, 4.80, 16.00, 18.00, 20.00),
-(32, 38, 44, 4, 36, 4.32, 3.60, 2.88, 3.60, 3.60, 3.60, 3.60, 5.40, 5.40, 18.00, 20.00, 12.00),
-(33, 39, 45, 5, 40, 4.80, 4.00, 3.20, 4.00, 4.00, 4.00, 4.00, 6.00, 6.00, 20.00, 12.00, 14.00),
-(34, 40, 46, 3, 24, 2.88, 2.40, 1.92, 2.40, 2.40, 2.40, 2.40, 3.60, 3.60, 12.00, 14.00, 16.00),
-(35, 41, 47, 4, 28, 3.36, 2.80, 2.24, 2.80, 2.80, 2.80, 2.80, 4.20, 4.20, 14.00, 16.00, 18.00),
-(36, 42, 48, 5, 32, 3.84, 3.20, 2.56, 3.20, 3.20, 3.20, 3.20, 4.80, 4.80, 16.00, 18.00, 20.00),
-(37, 43, 49, 3, 36, 4.32, 3.60, 2.88, 3.60, 3.60, 3.60, 3.60, 5.40, 5.40, 18.00, 20.00, 12.00),
-(38, 44, 50, 4, 40, 4.80, 4.00, 3.20, 4.00, 4.00, 4.00, 4.00, 6.00, 6.00, 20.00, 12.00, 14.00),
-(39, 45, 51, 5, 24, 2.88, 2.40, 1.92, 2.40, 2.40, 2.40, 2.40, 3.60, 3.60, 12.00, 14.00, 16.00),
-(40, 46, 52, 3, 28, 3.36, 2.80, 2.24, 2.80, 2.80, 2.80, 2.80, 4.20, 4.20, 14.00, 16.00, 18.00),
-(41, 47, 53, 4, 32, 3.84, 3.20, 2.56, 3.20, 3.20, 3.20, 3.20, 4.80, 4.80, 16.00, 18.00, 20.00),
-(42, 48, 54, 5, 36, 4.32, 3.60, 2.88, 3.60, 3.60, 3.60, 3.60, 5.40, 5.40, 18.00, 20.00, 12.00),
-(43, 49, 55, 3, 40, 4.80, 4.00, 3.20, 4.00, 4.00, 4.00, 4.00, 6.00, 6.00, 20.00, 12.00, 14.00),
-(44, 50, 56, 4, 24, 2.88, 2.40, 1.92, 2.40, 2.40, 2.40, 2.40, 3.60, 3.60, 12.00, 14.00, 16.00),
-(45, 51, 57, 5, 28, 3.36, 2.80, 2.24, 2.80, 2.80, 2.80, 2.80, 4.20, 4.20, 14.00, 16.00, 18.00),
-(46, 52, 58, 3, 32, 3.84, 3.20, 2.56, 3.20, 3.20, 3.20, 3.20, 4.80, 4.80, 16.00, 18.00, 20.00),
-(47, 53, 59, 4, 36, 4.32, 3.60, 2.88, 3.60, 3.60, 3.60, 3.60, 5.40, 5.40, 18.00, 20.00, 12.00),
-(48, 54, 60, 5, 40, 4.80, 4.00, 3.20, 4.00, 4.00, 4.00, 4.00, 6.00, 6.00, 20.00, 12.00, 14.00),
-(49, 55, 61, 3, 24, 2.88, 2.40, 1.92, 2.40, 2.40, 2.40, 2.40, 3.60, 3.60, 12.00, 14.00, 16.00),
-(50, 56, 62, 4, 28, 3.36, 2.80, 2.24, 2.80, 2.80, 2.80, 2.80, 4.20, 4.20, 14.00, 16.00, 18.00),
-(51, 57, 63, 5, 32, 3.84, 3.20, 2.56, 3.20, 3.20, 3.20, 3.20, 4.80, 4.80, 16.00, 18.00, 20.00),
-(52, 58, 64, 3, 36, 4.32, 3.60, 2.88, 3.60, 3.60, 3.60, 3.60, 5.40, 5.40, 18.00, 20.00, 12.00),
-(53, 59, 65, 4, 40, 4.80, 4.00, 3.20, 4.00, 4.00, 4.00, 4.00, 6.00, 6.00, 20.00, 12.00, 14.00);
+-- 插入班级数据
+INSERT INTO `classes` (`class_name`, `class_code`, `teacher_id`) VALUES
+('数据分析与预测2023秋', 'DAF2023A', 2),
+('数据分析与预测2023春', 'DAF2023S', 3),
+('高级时间序列分析', 'ATSA2023', 2);
 
--- 7. 实验状态 (ExperimentStatus)
-INSERT IGNORE INTO `experiment_status` (
-  `experiment_id`,
-  `student_id`,
-  `start_time`,
-  `last_activity_at`,
-  `completion_time`,
-  `status`,
-  `highest_completed_step`,
-  `current_step`,
-  `selected_industry`,
-  `selected_company`,
-  `selected_product`,
-  `moving_average_completed`,
-  `moving_average_window`,
-  `moving_average_metrics_rmse`,
-  `moving_average_metrics_mae`,
-  `moving_average_metrics_r2`,
-  `exponential_smoothing_completed`,
-  `exponential_smoothing_alpha`,
-  `exponential_smoothing_metrics_rmse`,
-  `exponential_smoothing_metrics_mae`,
-  `exponential_smoothing_metrics_r2`,
-  `arima_completed`,
-  `arima_p`,
-  `arima_d`,
-  `arima_q`,
-  `arima_metrics_rmse`,
-  `arima_metrics_mae`,
-  `arima_metrics_r2`,
+-- 插入学生选课数据
+INSERT INTO `enrollments` (`student_id`, `class_id`) VALUES
+(5, 1), (6, 1), (7, 1), (8, 1),
+(5, 2), (6, 2),
+(7, 3);
+
+-- 插入助教分配数据
+INSERT INTO `class_assistants` (`assistant_id`, `class_id`) VALUES
+(4, 1),
+(4, 2);
+
+--
+-- 2. 实验与生产计划管理
+--
+
+-- 插入实验状态数据（学生1在第一门课中的实验进度）
+INSERT INTO `experiment_status` (
+  `student_id`, `start_time`, `last_activity_at`, `completion_time`,
+  `status`, `highest_completed_step`, `current_step`,
+  `selected_industry`, `selected_company`, `selected_product`,
+  `moving_average_completed`, `moving_average_window`,
+  `moving_average_metrics_rmse`, `moving_average_metrics_mae`, `moving_average_metrics_r2`,
+  `exponential_smoothing_completed`, `exponential_smoothing_alpha`,
+  `exponential_smoothing_metrics_rmse`, `exponential_smoothing_metrics_mae`, `exponential_smoothing_metrics_r2`,
+  `arima_completed`, `arima_p`, `arima_d`, `arima_q`,
+  `arima_metrics_rmse`, `arima_metrics_mae`, `arima_metrics_r2`,
   `arima_adf_stationarity`,
-  `lstm_completed`,
-  `lstm_normalization`,
-  `lstm_features`,
-  `lstm_metrics_rmse`,
-  `lstm_metrics_mae`,
-  `lstm_metrics_r2`,
-  `ensemble_weighted_completed`,
-  `ensemble_weighted_base_models`,
-  `ensemble_weighted_metrics_rmse`,
-  `ensemble_weighted_metrics_mae`,
-  `ensemble_weighted_metrics_r2`,
-  `ensemble_boosting_completed`,
-  `ensemble_boosting_base_models`,
-  `ensemble_boosting_metrics_rmse`,
-  `ensemble_boosting_metrics_mae`,
-  `ensemble_boosting_metrics_r2`,
-  `ensemble_stacking_completed`,
-  `ensemble_stacking_base_models`,
-  `ensemble_stacking_metrics_rmse`,
-  `ensemble_stacking_metrics_mae`,
-  `ensemble_stacking_metrics_r2`,
+  `lstm_completed`, `lstm_normalization`, `lstm_features`,
+  `lstm_metrics_rmse`, `lstm_metrics_mae`, `lstm_metrics_r2`,
+  `ensemble_weighted_completed`, `ensemble_weighted_base_models`,
+  `ensemble_weighted_metrics_rmse`, `ensemble_weighted_metrics_mae`, `ensemble_weighted_metrics_r2`,
+  `ensemble_boosting_completed`, `ensemble_boosting_base_models`,
+  `ensemble_boosting_metrics_rmse`, `ensemble_boosting_metrics_mae`, `ensemble_boosting_metrics_r2`,
+  `ensemble_stacking_completed`, `ensemble_stacking_base_models`,
+  `ensemble_stacking_metrics_rmse`, `ensemble_stacking_metrics_mae`, `ensemble_stacking_metrics_r2`,
   `best_model`
-) VALUES
-  (1, 9, '2025-03-01 09:00:00', '2025-03-01 10:30:00', '2025-03-01 10:30:00', 'Completed', 7, 7, '电子制造', '华夏电子', '智能手环', true, 4, 12.3, 9.8, 0.82, true, 0.5, 11.5, 8.7, 0.85, true, 2, 1, 3, 10.8, 7.9, 0.88, '[{"diff_order":0,"statistic":-1.876,"p_value":0.640,"stationary":false,"critical_values":{"1%":-3.500,"5%":-2.890,"10%":-2.580}},{"diff_order":1,"statistic":-3.954,"p_value":0.002,"stationary":true,"critical_values":{"1%":-3.500,"5%":-2.890,"10%":-2.580}},{"diff_order":2,"statistic":-5.102,"p_value":0.000,"stationary":true,"critical_values":{"1%":-3.500,"5%":-2.890,"10%":-2.580}}]', true, 'minmax', '["日期", "销售数量", "价格"]', 9.5, 7.1, 0.91, true, '["MovingAverage", "ExponentialSmoothing", "ARIMA"]', 8.9, 6.5, 0.94, true, '["ARIMA", "LSTM"]', 8.4, 6.1, 0.95, true, '["MovingAverage", "ARIMA", "LSTM"]', 8.1, 5.8, 0.96, 'ARIMA(2,1,1)'),
-  (2, 10, '2025-03-02 13:00:00', '2025-03-02 15:10:00', '2025-03-02 15:10:00', 'Completed', 7, 7, '消费品', '星光家居', '空气净化器', true, 5, 12.3, 9.8, 0.82, true, 0.55, 11.5, 8.7, 0.85, true, 3, 2, 1, 10.8, 7.9, 0.88, '[{"diff_order":0,"statistic":-1.876,"p_value":0.640,"stationary":false,"critical_values":{"1%":-3.500,"5%":-2.890,"10%":-2.580}},{"diff_order":1,"statistic":-3.954,"p_value":0.002,"stationary":true,"critical_values":{"1%":-3.500,"5%":-2.890,"10%":-2.580}},{"diff_order":2,"statistic":-5.102,"p_value":0.000,"stationary":true,"critical_values":{"1%":-3.500,"5%":-2.890,"10%":-2.580}}]', true, 'zscore', '["日期", "销售数量", "价格"]', 9.5, 7.1, 0.91, true, '["MovingAverage", "ExponentialSmoothing", "ARIMA"]', 8.9, 6.5, 0.94, true, '["ARIMA", "LSTM"]', 8.4, 6.1, 0.95, true, '["MovingAverage", "ARIMA", "LSTM"]', 8.1, 5.8, 0.96, 'LSTM'),
-  (3, 12, '2025-03-03 09:30:00', '2025-03-09 19:45:00', NULL, 'In Progress', 3, 4, '物流运输', '联合物流', '冷链配送', true, 4, 18.2, 14.5, 0.68, true, 0.4, 16.9, 12.3, 0.7, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL),
-  (4, 14, '2025-03-04 14:00:00', '2025-03-04 16:00:00', '2025-03-04 16:00:00', 'Completed', 7, 7, '食品饮料', '味来食品', '果汁饮料', true, 3, 12.3, 9.8, 0.82, true, 0.65, 11.5, 8.7, 0.85, true, 2, 1, 3, 10.8, 7.9, 0.88, '[{"diff_order":0,"statistic":-1.876,"p_value":0.640,"stationary":false,"critical_values":{"1%":-3.500,"5%":-2.890,"10%":-2.580}},{"diff_order":1,"statistic":-3.954,"p_value":0.002,"stationary":true,"critical_values":{"1%":-3.500,"5%":-2.890,"10%":-2.580}},{"diff_order":2,"statistic":-5.102,"p_value":0.000,"stationary":true,"critical_values":{"1%":-3.500,"5%":-2.890,"10%":-2.580}}]', true, 'zscore', '["日期", "销售数量", "价格"]', 9.5, 7.1, 0.91, true, '["MovingAverage", "ExponentialSmoothing", "ARIMA"]', 8.9, 6.5, 0.94, true, '["ARIMA", "LSTM"]', 8.4, 6.1, 0.95, true, '["MovingAverage", "ARIMA", "LSTM"]', 8.1, 5.8, 0.96, 'MovingAverage'),
-  (5, 11, '2025-03-05 09:15:00', '2025-03-10 10:10:00', NULL, 'In Progress', 5, 6, '智能制造', '未来工厂', '协作机器人', true, 4, 18.2, 14.5, 0.68, true, 0.4, 16.9, 12.3, 0.7, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL),
-  (6, 13, '2025-03-06 10:00:00', '2025-03-11 09:30:00', NULL, 'In Progress', 3, 4, '新能源', '澜光能源', '储能系统', true, 4, 18.2, 14.5, 0.68, true, 0.4, 16.9, 12.3, 0.7, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL),
-  (7, 15, '2025-03-06 15:30:00', '2025-03-06 15:30:00', NULL, 'Not Started', 0, 1, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL),
-  (8, 9, '2025-03-08 13:00:00', '2025-03-08 15:45:00', '2025-03-08 15:45:00', 'Completed', 7, 7, '消费电子', '凌云科技', '智能眼镜', true, 3, 12.3, 9.8, 0.82, true, 0.6, 11.5, 8.7, 0.85, true, 3, 2, 1, 10.8, 7.9, 0.88, '[{"diff_order":0,"statistic":-1.876,"p_value":0.640,"stationary":false,"critical_values":{"1%":-3.500,"5%":-2.890,"10%":-2.580}},{"diff_order":1,"statistic":-3.954,"p_value":0.002,"stationary":true,"critical_values":{"1%":-3.500,"5%":-2.890,"10%":-2.580}},{"diff_order":2,"statistic":-5.102,"p_value":0.000,"stationary":true,"critical_values":{"1%":-3.500,"5%":-2.890,"10%":-2.580}}]', true, 'zscore', '["日期", "销售数量", "价格"]', 9.5, 7.1, 0.91, true, '["MovingAverage", "ExponentialSmoothing", "ARIMA"]', 8.9, 6.5, 0.94, true, '["ARIMA", "LSTM"]', 8.4, 6.1, 0.95, true, '["MovingAverage", "ARIMA", "LSTM"]', 8.1, 5.8, 0.96, 'Prophet'),
-  (9, 9, '2025-03-12 09:00:00', '2025-03-12 11:20:00', NULL, 'In Progress', 3, 4, '智慧零售', '华联超市', '即时配送', true, 4, 18.2, 14.5, 0.68, true, 0.4, 16.9, 12.3, 0.7, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL),
-  (10, 16, '2025-03-10 08:00:00', '2025-03-10 09:00:00', '2025-03-10 09:00:00', 'Completed', 7, 7, '行业组1', '企业组1', '产品线1', true, 5, 12.3, 9.8, 0.82, true, 0.45, 11.5, 8.7, 0.85, true, 2, 1, 3, 10.8, 7.9, 0.88, '[{"diff_order":0,"statistic":-1.876,"p_value":0.640,"stationary":false,"critical_values":{"1%":-3.500,"5%":-2.890,"10%":-2.580}},{"diff_order":1,"statistic":-3.954,"p_value":0.002,"stationary":true,"critical_values":{"1%":-3.500,"5%":-2.890,"10%":-2.580}},{"diff_order":2,"statistic":-5.102,"p_value":0.000,"stationary":true,"critical_values":{"1%":-3.500,"5%":-2.890,"10%":-2.580}}]', true, 'zscore', '["日期", "销售数量", "价格"]', 9.5, 7.1, 0.91, true, '["MovingAverage", "ExponentialSmoothing", "ARIMA"]', 8.9, 6.5, 0.94, true, '["ARIMA", "LSTM"]', 8.4, 6.1, 0.95, true, '["MovingAverage", "ARIMA", "LSTM"]', 8.1, 5.8, 0.96, 'Model-1'),
-  (11, 17, '2025-03-10 08:15:00', '2025-03-10 09:15:00', '2025-03-10 09:15:00', 'Completed', 7, 7, '行业组2', '企业组2', '产品线2', true, 6, 12.3, 9.8, 0.82, true, 0.5, 11.5, 8.7, 0.85, true, 3, 2, 1, 10.8, 7.9, 0.88, '[{"diff_order":0,"statistic":-1.876,"p_value":0.640,"stationary":false,"critical_values":{"1%":-3.500,"5%":-2.890,"10%":-2.580}},{"diff_order":1,"statistic":-3.954,"p_value":0.002,"stationary":true,"critical_values":{"1%":-3.500,"5%":-2.890,"10%":-2.580}},{"diff_order":2,"statistic":-5.102,"p_value":0.000,"stationary":true,"critical_values":{"1%":-3.500,"5%":-2.890,"10%":-2.580}}]', true, 'minmax', '["日期", "销售数量", "价格"]', 9.5, 7.1, 0.91, true, '["MovingAverage", "ExponentialSmoothing", "ARIMA"]', 8.9, 6.5, 0.94, true, '["ARIMA", "LSTM"]', 8.4, 6.1, 0.95, true, '["MovingAverage", "ARIMA", "LSTM"]', 8.1, 5.8, 0.96, 'Model-2'),
-  (12, 18, '2025-03-10 08:30:00', '2025-03-10 09:30:00', '2025-03-10 09:30:00', 'Completed', 7, 7, '行业组3', '企业组3', '产品线3', true, 3, 12.3, 9.8, 0.82, true, 0.55, 11.5, 8.7, 0.85, true, 1, 0, 2, 10.8, 7.9, 0.88, '[{"diff_order":0,"statistic":-1.876,"p_value":0.640,"stationary":false,"critical_values":{"1%":-3.500,"5%":-2.890,"10%":-2.580}},{"diff_order":1,"statistic":-3.954,"p_value":0.002,"stationary":true,"critical_values":{"1%":-3.500,"5%":-2.890,"10%":-2.580}},{"diff_order":2,"statistic":-5.102,"p_value":0.000,"stationary":true,"critical_values":{"1%":-3.500,"5%":-2.890,"10%":-2.580}}]', true, 'zscore', '["日期", "销售数量", "价格"]', 9.5, 7.1, 0.91, true, '["MovingAverage", "ExponentialSmoothing", "ARIMA"]', 8.9, 6.5, 0.94, true, '["ARIMA", "LSTM"]', 8.4, 6.1, 0.95, true, '["MovingAverage", "ARIMA", "LSTM"]', 8.1, 5.8, 0.96, 'Model-3'),
-  (13, 19, '2025-03-10 08:45:00', '2025-03-10 09:45:00', '2025-03-10 09:45:00', 'Completed', 7, 7, '行业组4', '企业组4', '产品线4', true, 4, 12.3, 9.8, 0.82, true, 0.6, 11.5, 8.7, 0.85, true, 2, 1, 3, 10.8, 7.9, 0.88, '[{"diff_order":0,"statistic":-1.876,"p_value":0.640,"stationary":false,"critical_values":{"1%":-3.500,"5%":-2.890,"10%":-2.580}},{"diff_order":1,"statistic":-3.954,"p_value":0.002,"stationary":true,"critical_values":{"1%":-3.500,"5%":-2.890,"10%":-2.580}},{"diff_order":2,"statistic":-5.102,"p_value":0.000,"stationary":true,"critical_values":{"1%":-3.500,"5%":-2.890,"10%":-2.580}}]', true, 'minmax', '["日期", "销售数量", "价格"]', 9.5, 7.1, 0.91, true, '["MovingAverage", "ExponentialSmoothing", "ARIMA"]', 8.9, 6.5, 0.94, true, '["ARIMA", "LSTM"]', 8.4, 6.1, 0.95, true, '["MovingAverage", "ARIMA", "LSTM"]', 8.1, 5.8, 0.96, 'Model-4'),
-  (14, 20, '2025-03-10 09:00:00', '2025-03-10 10:00:00', '2025-03-10 10:00:00', 'Completed', 7, 7, '行业组5', '企业组5', '产品线5', true, 5, 12.3, 9.8, 0.82, true, 0.65, 11.5, 8.7, 0.85, true, 3, 2, 1, 10.8, 7.9, 0.88, '[{"diff_order":0,"statistic":-1.876,"p_value":0.640,"stationary":false,"critical_values":{"1%":-3.500,"5%":-2.890,"10%":-2.580}},{"diff_order":1,"statistic":-3.954,"p_value":0.002,"stationary":true,"critical_values":{"1%":-3.500,"5%":-2.890,"10%":-2.580}},{"diff_order":2,"statistic":-5.102,"p_value":0.000,"stationary":true,"critical_values":{"1%":-3.500,"5%":-2.890,"10%":-2.580}}]', true, 'zscore', '["日期", "销售数量", "价格"]', 9.5, 7.1, 0.91, true, '["MovingAverage", "ExponentialSmoothing", "ARIMA"]', 8.9, 6.5, 0.94, true, '["ARIMA", "LSTM"]', 8.4, 6.1, 0.95, true, '["MovingAverage", "ARIMA", "LSTM"]', 8.1, 5.8, 0.96, 'Model-1'),
-  (15, 21, '2025-03-10 09:15:00', '2025-03-10 10:15:00', '2025-03-10 10:15:00', 'Completed', 7, 7, '行业组1', '企业组6', '产品线6', true, 6, 12.3, 9.8, 0.82, true, 0.45, 11.5, 8.7, 0.85, true, 1, 0, 2, 10.8, 7.9, 0.88, '[{"diff_order":0,"statistic":-1.876,"p_value":0.640,"stationary":false,"critical_values":{"1%":-3.500,"5%":-2.890,"10%":-2.580}},{"diff_order":1,"statistic":-3.954,"p_value":0.002,"stationary":true,"critical_values":{"1%":-3.500,"5%":-2.890,"10%":-2.580}},{"diff_order":2,"statistic":-5.102,"p_value":0.000,"stationary":true,"critical_values":{"1%":-3.500,"5%":-2.890,"10%":-2.580}}]', true, 'minmax', '["日期", "销售数量", "价格"]', 9.5, 7.1, 0.91, true, '["MovingAverage", "ExponentialSmoothing", "ARIMA"]', 8.9, 6.5, 0.94, true, '["ARIMA", "LSTM"]', 8.4, 6.1, 0.95, true, '["MovingAverage", "ARIMA", "LSTM"]', 8.1, 5.8, 0.96, 'Model-2'),
-  (16, 22, '2025-03-10 09:30:00', '2025-03-10 10:30:00', '2025-03-10 10:30:00', 'Completed', 7, 7, '行业组2', '企业组7', '产品线1', true, 3, 12.3, 9.8, 0.82, true, 0.5, 11.5, 8.7, 0.85, true, 2, 1, 3, 10.8, 7.9, 0.88, '[{"diff_order":0,"statistic":-1.876,"p_value":0.640,"stationary":false,"critical_values":{"1%":-3.500,"5%":-2.890,"10%":-2.580}},{"diff_order":1,"statistic":-3.954,"p_value":0.002,"stationary":true,"critical_values":{"1%":-3.500,"5%":-2.890,"10%":-2.580}},{"diff_order":2,"statistic":-5.102,"p_value":0.000,"stationary":true,"critical_values":{"1%":-3.500,"5%":-2.890,"10%":-2.580}}]', true, 'zscore', '["日期", "销售数量", "价格"]', 9.5, 7.1, 0.91, true, '["MovingAverage", "ExponentialSmoothing", "ARIMA"]', 8.9, 6.5, 0.94, true, '["ARIMA", "LSTM"]', 8.4, 6.1, 0.95, true, '["MovingAverage", "ARIMA", "LSTM"]', 8.1, 5.8, 0.96, 'Model-3'),
-  (17, 23, '2025-03-10 09:45:00', '2025-03-10 10:45:00', '2025-03-10 10:45:00', 'Completed', 7, 7, '行业组3', '企业组1', '产品线2', true, 4, 12.3, 9.8, 0.82, true, 0.55, 11.5, 8.7, 0.85, true, 3, 2, 1, 10.8, 7.9, 0.88, '[{"diff_order":0,"statistic":-1.876,"p_value":0.640,"stationary":false,"critical_values":{"1%":-3.500,"5%":-2.890,"10%":-2.580}},{"diff_order":1,"statistic":-3.954,"p_value":0.002,"stationary":true,"critical_values":{"1%":-3.500,"5%":-2.890,"10%":-2.580}},{"diff_order":2,"statistic":-5.102,"p_value":0.000,"stationary":true,"critical_values":{"1%":-3.500,"5%":-2.890,"10%":-2.580}}]', true, 'minmax', '["日期", "销售数量", "价格"]', 9.5, 7.1, 0.91, true, '["MovingAverage", "ExponentialSmoothing", "ARIMA"]', 8.9, 6.5, 0.94, true, '["ARIMA", "LSTM"]', 8.4, 6.1, 0.95, true, '["MovingAverage", "ARIMA", "LSTM"]', 8.1, 5.8, 0.96, 'Model-4'),
-  (18, 24, '2025-03-10 10:00:00', '2025-03-10 11:00:00', '2025-03-10 11:00:00', 'Completed', 7, 7, '行业组4', '企业组2', '产品线3', true, 5, 12.3, 9.8, 0.82, true, 0.6, 11.5, 8.7, 0.85, true, 1, 0, 2, 10.8, 7.9, 0.88, '[{"diff_order":0,"statistic":-1.876,"p_value":0.640,"stationary":false,"critical_values":{"1%":-3.500,"5%":-2.890,"10%":-2.580}},{"diff_order":1,"statistic":-3.954,"p_value":0.002,"stationary":true,"critical_values":{"1%":-3.500,"5%":-2.890,"10%":-2.580}},{"diff_order":2,"statistic":-5.102,"p_value":0.000,"stationary":true,"critical_values":{"1%":-3.500,"5%":-2.890,"10%":-2.580}}]', true, 'zscore', '["日期", "销售数量", "价格"]', 9.5, 7.1, 0.91, true, '["MovingAverage", "ExponentialSmoothing", "ARIMA"]', 8.9, 6.5, 0.94, true, '["ARIMA", "LSTM"]', 8.4, 6.1, 0.95, true, '["MovingAverage", "ARIMA", "LSTM"]', 8.1, 5.8, 0.96, 'Model-1'),
-  (19, 25, '2025-03-10 10:15:00', '2025-03-10 11:15:00', '2025-03-10 11:15:00', 'Completed', 7, 7, '行业组5', '企业组3', '产品线4', true, 6, 12.3, 9.8, 0.82, true, 0.65, 11.5, 8.7, 0.85, true, 2, 1, 3, 10.8, 7.9, 0.88, '[{"diff_order":0,"statistic":-1.876,"p_value":0.640,"stationary":false,"critical_values":{"1%":-3.500,"5%":-2.890,"10%":-2.580}},{"diff_order":1,"statistic":-3.954,"p_value":0.002,"stationary":true,"critical_values":{"1%":-3.500,"5%":-2.890,"10%":-2.580}},{"diff_order":2,"statistic":-5.102,"p_value":0.000,"stationary":true,"critical_values":{"1%":-3.500,"5%":-2.890,"10%":-2.580}}]', true, 'minmax', '["日期", "销售数量", "价格"]', 9.5, 7.1, 0.91, true, '["MovingAverage", "ExponentialSmoothing", "ARIMA"]', 8.9, 6.5, 0.94, true, '["ARIMA", "LSTM"]', 8.4, 6.1, 0.95, true, '["MovingAverage", "ARIMA", "LSTM"]', 8.1, 5.8, 0.96, 'Model-2'),
-  (20, 26, '2025-03-10 10:30:00', '2025-03-10 11:30:00', '2025-03-10 11:30:00', 'Completed', 7, 7, '行业组1', '企业组4', '产品线5', true, 3, 12.3, 9.8, 0.82, true, 0.45, 11.5, 8.7, 0.85, true, 3, 2, 1, 10.8, 7.9, 0.88, '[{"diff_order":0,"statistic":-1.876,"p_value":0.640,"stationary":false,"critical_values":{"1%":-3.500,"5%":-2.890,"10%":-2.580}},{"diff_order":1,"statistic":-3.954,"p_value":0.002,"stationary":true,"critical_values":{"1%":-3.500,"5%":-2.890,"10%":-2.580}},{"diff_order":2,"statistic":-5.102,"p_value":0.000,"stationary":true,"critical_values":{"1%":-3.500,"5%":-2.890,"10%":-2.580}}]', true, 'zscore', '["日期", "销售数量", "价格"]', 9.5, 7.1, 0.91, true, '["MovingAverage", "ExponentialSmoothing", "ARIMA"]', 8.9, 6.5, 0.94, true, '["ARIMA", "LSTM"]', 8.4, 6.1, 0.95, true, '["MovingAverage", "ARIMA", "LSTM"]', 8.1, 5.8, 0.96, 'Model-3'),
-  (21, 27, '2025-03-10 10:45:00', '2025-03-10 11:45:00', '2025-03-10 11:45:00', 'Completed', 7, 7, '行业组2', '企业组5', '产品线6', true, 4, 12.3, 9.8, 0.82, true, 0.5, 11.5, 8.7, 0.85, true, 1, 0, 2, 10.8, 7.9, 0.88, '[{"diff_order":0,"statistic":-1.876,"p_value":0.640,"stationary":false,"critical_values":{"1%":-3.500,"5%":-2.890,"10%":-2.580}},{"diff_order":1,"statistic":-3.954,"p_value":0.002,"stationary":true,"critical_values":{"1%":-3.500,"5%":-2.890,"10%":-2.580}},{"diff_order":2,"statistic":-5.102,"p_value":0.000,"stationary":true,"critical_values":{"1%":-3.500,"5%":-2.890,"10%":-2.580}}]', true, 'minmax', '["日期", "销售数量", "价格"]', 9.5, 7.1, 0.91, true, '["MovingAverage", "ExponentialSmoothing", "ARIMA"]', 8.9, 6.5, 0.94, true, '["ARIMA", "LSTM"]', 8.4, 6.1, 0.95, true, '["MovingAverage", "ARIMA", "LSTM"]', 8.1, 5.8, 0.96, 'Model-4'),
-  (22, 28, '2025-03-10 11:00:00', '2025-03-10 12:00:00', '2025-03-10 12:00:00', 'Completed', 7, 7, '行业组3', '企业组6', '产品线1', true, 5, 12.3, 9.8, 0.82, true, 0.55, 11.5, 8.7, 0.85, true, 2, 1, 3, 10.8, 7.9, 0.88, '[{"diff_order":0,"statistic":-1.876,"p_value":0.640,"stationary":false,"critical_values":{"1%":-3.500,"5%":-2.890,"10%":-2.580}},{"diff_order":1,"statistic":-3.954,"p_value":0.002,"stationary":true,"critical_values":{"1%":-3.500,"5%":-2.890,"10%":-2.580}},{"diff_order":2,"statistic":-5.102,"p_value":0.000,"stationary":true,"critical_values":{"1%":-3.500,"5%":-2.890,"10%":-2.580}}]', true, 'zscore', '["日期", "销售数量", "价格"]', 9.5, 7.1, 0.91, true, '["MovingAverage", "ExponentialSmoothing", "ARIMA"]', 8.9, 6.5, 0.94, true, '["ARIMA", "LSTM"]', 8.4, 6.1, 0.95, true, '["MovingAverage", "ARIMA", "LSTM"]', 8.1, 5.8, 0.96, 'Model-1'),
-  (23, 29, '2025-03-10 11:15:00', '2025-03-10 12:15:00', '2025-03-10 12:15:00', 'Completed', 7, 7, '行业组4', '企业组7', '产品线2', true, 6, 12.3, 9.8, 0.82, true, 0.6, 11.5, 8.7, 0.85, true, 3, 2, 1, 10.8, 7.9, 0.88, '[{"diff_order":0,"statistic":-1.876,"p_value":0.640,"stationary":false,"critical_values":{"1%":-3.500,"5%":-2.890,"10%":-2.580}},{"diff_order":1,"statistic":-3.954,"p_value":0.002,"stationary":true,"critical_values":{"1%":-3.500,"5%":-2.890,"10%":-2.580}},{"diff_order":2,"statistic":-5.102,"p_value":0.000,"stationary":true,"critical_values":{"1%":-3.500,"5%":-2.890,"10%":-2.580}}]', true, 'minmax', '["日期", "销售数量", "价格"]', 9.5, 7.1, 0.91, true, '["MovingAverage", "ExponentialSmoothing", "ARIMA"]', 8.9, 6.5, 0.94, true, '["ARIMA", "LSTM"]', 8.4, 6.1, 0.95, true, '["MovingAverage", "ARIMA", "LSTM"]', 8.1, 5.8, 0.96, 'Model-2'),
-  (24, 30, '2025-03-10 11:30:00', '2025-03-10 12:30:00', '2025-03-10 12:30:00', 'Completed', 7, 7, '行业组5', '企业组1', '产品线3', true, 3, 12.3, 9.8, 0.82, true, 0.65, 11.5, 8.7, 0.85, true, 1, 0, 2, 10.8, 7.9, 0.88, '[{"diff_order":0,"statistic":-1.876,"p_value":0.640,"stationary":false,"critical_values":{"1%":-3.500,"5%":-2.890,"10%":-2.580}},{"diff_order":1,"statistic":-3.954,"p_value":0.002,"stationary":true,"critical_values":{"1%":-3.500,"5%":-2.890,"10%":-2.580}},{"diff_order":2,"statistic":-5.102,"p_value":0.000,"stationary":true,"critical_values":{"1%":-3.500,"5%":-2.890,"10%":-2.580}}]', true, 'zscore', '["日期", "销售数量", "价格"]', 9.5, 7.1, 0.91, true, '["MovingAverage", "ExponentialSmoothing", "ARIMA"]', 8.9, 6.5, 0.94, true, '["ARIMA", "LSTM"]', 8.4, 6.1, 0.95, true, '["MovingAverage", "ARIMA", "LSTM"]', 8.1, 5.8, 0.96, 'Model-3'),
-  (25, 31, '2025-03-10 11:45:00', '2025-03-10 12:45:00', '2025-03-10 12:45:00', 'Completed', 7, 7, '行业组1', '企业组2', '产品线4', true, 4, 12.3, 9.8, 0.82, true, 0.45, 11.5, 8.7, 0.85, true, 2, 1, 3, 10.8, 7.9, 0.88, '[{"diff_order":0,"statistic":-1.876,"p_value":0.640,"stationary":false,"critical_values":{"1%":-3.500,"5%":-2.890,"10%":-2.580}},{"diff_order":1,"statistic":-3.954,"p_value":0.002,"stationary":true,"critical_values":{"1%":-3.500,"5%":-2.890,"10%":-2.580}},{"diff_order":2,"statistic":-5.102,"p_value":0.000,"stationary":true,"critical_values":{"1%":-3.500,"5%":-2.890,"10%":-2.580}}]', true, 'minmax', '["日期", "销售数量", "价格"]', 9.5, 7.1, 0.91, true, '["MovingAverage", "ExponentialSmoothing", "ARIMA"]', 8.9, 6.5, 0.94, true, '["ARIMA", "LSTM"]', 8.4, 6.1, 0.95, true, '["MovingAverage", "ARIMA", "LSTM"]', 8.1, 5.8, 0.96, 'Model-4'),
-  (26, 32, '2025-03-10 12:00:00', '2025-03-10 13:00:00', '2025-03-10 13:00:00', 'Completed', 7, 7, '行业组2', '企业组3', '产品线5', true, 5, 12.3, 9.8, 0.82, true, 0.5, 11.5, 8.7, 0.85, true, 3, 2, 1, 10.8, 7.9, 0.88, '[{"diff_order":0,"statistic":-1.876,"p_value":0.640,"stationary":false,"critical_values":{"1%":-3.500,"5%":-2.890,"10%":-2.580}},{"diff_order":1,"statistic":-3.954,"p_value":0.002,"stationary":true,"critical_values":{"1%":-3.500,"5%":-2.890,"10%":-2.580}},{"diff_order":2,"statistic":-5.102,"p_value":0.000,"stationary":true,"critical_values":{"1%":-3.500,"5%":-2.890,"10%":-2.580}}]', true, 'zscore', '["日期", "销售数量", "价格"]', 9.5, 7.1, 0.91, true, '["MovingAverage", "ExponentialSmoothing", "ARIMA"]', 8.9, 6.5, 0.94, true, '["ARIMA", "LSTM"]', 8.4, 6.1, 0.95, true, '["MovingAverage", "ARIMA", "LSTM"]', 8.1, 5.8, 0.96, 'Model-1'),
-  (27, 33, '2025-03-10 12:15:00', '2025-03-10 13:15:00', '2025-03-10 13:15:00', 'Completed', 7, 7, '行业组3', '企业组4', '产品线6', true, 6, 12.3, 9.8, 0.82, true, 0.55, 11.5, 8.7, 0.85, true, 1, 0, 2, 10.8, 7.9, 0.88, '[{"diff_order":0,"statistic":-1.876,"p_value":0.640,"stationary":false,"critical_values":{"1%":-3.500,"5%":-2.890,"10%":-2.580}},{"diff_order":1,"statistic":-3.954,"p_value":0.002,"stationary":true,"critical_values":{"1%":-3.500,"5%":-2.890,"10%":-2.580}},{"diff_order":2,"statistic":-5.102,"p_value":0.000,"stationary":true,"critical_values":{"1%":-3.500,"5%":-2.890,"10%":-2.580}}]', true, 'minmax', '["日期", "销售数量", "价格"]', 9.5, 7.1, 0.91, true, '["MovingAverage", "ExponentialSmoothing", "ARIMA"]', 8.9, 6.5, 0.94, true, '["ARIMA", "LSTM"]', 8.4, 6.1, 0.95, true, '["MovingAverage", "ARIMA", "LSTM"]', 8.1, 5.8, 0.96, 'Model-2'),
-  (28, 34, '2025-03-10 12:30:00', '2025-03-10 13:30:00', '2025-03-10 13:30:00', 'Completed', 7, 7, '行业组4', '企业组5', '产品线1', true, 3, 12.3, 9.8, 0.82, true, 0.6, 11.5, 8.7, 0.85, true, 2, 1, 3, 10.8, 7.9, 0.88, '[{"diff_order":0,"statistic":-1.876,"p_value":0.640,"stationary":false,"critical_values":{"1%":-3.500,"5%":-2.890,"10%":-2.580}},{"diff_order":1,"statistic":-3.954,"p_value":0.002,"stationary":true,"critical_values":{"1%":-3.500,"5%":-2.890,"10%":-2.580}},{"diff_order":2,"statistic":-5.102,"p_value":0.000,"stationary":true,"critical_values":{"1%":-3.500,"5%":-2.890,"10%":-2.580}}]', true, 'zscore', '["日期", "销售数量", "价格"]', 9.5, 7.1, 0.91, true, '["MovingAverage", "ExponentialSmoothing", "ARIMA"]', 8.9, 6.5, 0.94, true, '["ARIMA", "LSTM"]', 8.4, 6.1, 0.95, true, '["MovingAverage", "ARIMA", "LSTM"]', 8.1, 5.8, 0.96, 'Model-3'),
-  (29, 35, '2025-03-10 12:45:00', '2025-03-10 13:45:00', '2025-03-10 13:45:00', 'Completed', 7, 7, '行业组5', '企业组6', '产品线2', true, 4, 12.3, 9.8, 0.82, true, 0.65, 11.5, 8.7, 0.85, true, 3, 2, 1, 10.8, 7.9, 0.88, '[{"diff_order":0,"statistic":-1.876,"p_value":0.640,"stationary":false,"critical_values":{"1%":-3.500,"5%":-2.890,"10%":-2.580}},{"diff_order":1,"statistic":-3.954,"p_value":0.002,"stationary":true,"critical_values":{"1%":-3.500,"5%":-2.890,"10%":-2.580}},{"diff_order":2,"statistic":-5.102,"p_value":0.000,"stationary":true,"critical_values":{"1%":-3.500,"5%":-2.890,"10%":-2.580}}]', true, 'minmax', '["日期", "销售数量", "价格"]', 9.5, 7.1, 0.91, true, '["MovingAverage", "ExponentialSmoothing", "ARIMA"]', 8.9, 6.5, 0.94, true, '["ARIMA", "LSTM"]', 8.4, 6.1, 0.95, true, '["MovingAverage", "ARIMA", "LSTM"]', 8.1, 5.8, 0.96, 'Model-4'),
-  (30, 36, '2025-03-10 13:00:00', '2025-03-10 14:00:00', '2025-03-10 14:00:00', 'Completed', 7, 7, '行业组1', '企业组7', '产品线3', true, 5, 12.3, 9.8, 0.82, true, 0.45, 11.5, 8.7, 0.85, true, 1, 0, 2, 10.8, 7.9, 0.88, '[{"diff_order":0,"statistic":-1.876,"p_value":0.640,"stationary":false,"critical_values":{"1%":-3.500,"5%":-2.890,"10%":-2.580}},{"diff_order":1,"statistic":-3.954,"p_value":0.002,"stationary":true,"critical_values":{"1%":-3.500,"5%":-2.890,"10%":-2.580}},{"diff_order":2,"statistic":-5.102,"p_value":0.000,"stationary":true,"critical_values":{"1%":-3.500,"5%":-2.890,"10%":-2.580}}]', true, 'zscore', '["日期", "销售数量", "价格"]', 9.5, 7.1, 0.91, true, '["MovingAverage", "ExponentialSmoothing", "ARIMA"]', 8.9, 6.5, 0.94, true, '["ARIMA", "LSTM"]', 8.4, 6.1, 0.95, true, '["MovingAverage", "ARIMA", "LSTM"]', 8.1, 5.8, 0.96, 'Model-1'),
-  (31, 37, '2025-03-10 13:15:00', '2025-03-10 14:15:00', '2025-03-10 14:15:00', 'Completed', 7, 7, '行业组2', '企业组1', '产品线4', true, 6, 12.3, 9.8, 0.82, true, 0.5, 11.5, 8.7, 0.85, true, 2, 1, 3, 10.8, 7.9, 0.88, '[{"diff_order":0,"statistic":-1.876,"p_value":0.640,"stationary":false,"critical_values":{"1%":-3.500,"5%":-2.890,"10%":-2.580}},{"diff_order":1,"statistic":-3.954,"p_value":0.002,"stationary":true,"critical_values":{"1%":-3.500,"5%":-2.890,"10%":-2.580}},{"diff_order":2,"statistic":-5.102,"p_value":0.000,"stationary":true,"critical_values":{"1%":-3.500,"5%":-2.890,"10%":-2.580}}]', true, 'minmax', '["日期", "销售数量", "价格"]', 9.5, 7.1, 0.91, true, '["MovingAverage", "ExponentialSmoothing", "ARIMA"]', 8.9, 6.5, 0.94, true, '["ARIMA", "LSTM"]', 8.4, 6.1, 0.95, true, '["MovingAverage", "ARIMA", "LSTM"]', 8.1, 5.8, 0.96, 'Model-2'),
-  (32, 38, '2025-03-10 13:30:00', '2025-03-10 14:30:00', '2025-03-10 14:30:00', 'Completed', 7, 7, '行业组3', '企业组2', '产品线5', true, 3, 12.3, 9.8, 0.82, true, 0.55, 11.5, 8.7, 0.85, true, 3, 2, 1, 10.8, 7.9, 0.88, '[{"diff_order":0,"statistic":-1.876,"p_value":0.640,"stationary":false,"critical_values":{"1%":-3.500,"5%":-2.890,"10%":-2.580}},{"diff_order":1,"statistic":-3.954,"p_value":0.002,"stationary":true,"critical_values":{"1%":-3.500,"5%":-2.890,"10%":-2.580}},{"diff_order":2,"statistic":-5.102,"p_value":0.000,"stationary":true,"critical_values":{"1%":-3.500,"5%":-2.890,"10%":-2.580}}]', true, 'zscore', '["日期", "销售数量", "价格"]', 9.5, 7.1, 0.91, true, '["MovingAverage", "ExponentialSmoothing", "ARIMA"]', 8.9, 6.5, 0.94, true, '["ARIMA", "LSTM"]', 8.4, 6.1, 0.95, true, '["MovingAverage", "ARIMA", "LSTM"]', 8.1, 5.8, 0.96, 'Model-3'),
-  (33, 39, '2025-03-10 13:45:00', '2025-03-10 14:45:00', '2025-03-10 14:45:00', 'Completed', 7, 7, '行业组4', '企业组3', '产品线6', true, 4, 12.3, 9.8, 0.82, true, 0.6, 11.5, 8.7, 0.85, true, 1, 0, 2, 10.8, 7.9, 0.88, '[{"diff_order":0,"statistic":-1.876,"p_value":0.640,"stationary":false,"critical_values":{"1%":-3.500,"5%":-2.890,"10%":-2.580}},{"diff_order":1,"statistic":-3.954,"p_value":0.002,"stationary":true,"critical_values":{"1%":-3.500,"5%":-2.890,"10%":-2.580}},{"diff_order":2,"statistic":-5.102,"p_value":0.000,"stationary":true,"critical_values":{"1%":-3.500,"5%":-2.890,"10%":-2.580}}]', true, 'minmax', '["日期", "销售数量", "价格"]', 9.5, 7.1, 0.91, true, '["MovingAverage", "ExponentialSmoothing", "ARIMA"]', 8.9, 6.5, 0.94, true, '["ARIMA", "LSTM"]', 8.4, 6.1, 0.95, true, '["MovingAverage", "ARIMA", "LSTM"]', 8.1, 5.8, 0.96, 'Model-4'),
-  (34, 40, '2025-03-10 14:00:00', '2025-03-10 15:00:00', '2025-03-10 15:00:00', 'Completed', 7, 7, '行业组5', '企业组4', '产品线1', true, 5, 12.3, 9.8, 0.82, true, 0.65, 11.5, 8.7, 0.85, true, 2, 1, 3, 10.8, 7.9, 0.88, '[{"diff_order":0,"statistic":-1.876,"p_value":0.640,"stationary":false,"critical_values":{"1%":-3.500,"5%":-2.890,"10%":-2.580}},{"diff_order":1,"statistic":-3.954,"p_value":0.002,"stationary":true,"critical_values":{"1%":-3.500,"5%":-2.890,"10%":-2.580}},{"diff_order":2,"statistic":-5.102,"p_value":0.000,"stationary":true,"critical_values":{"1%":-3.500,"5%":-2.890,"10%":-2.580}}]', true, 'zscore', '["日期", "销售数量", "价格"]', 9.5, 7.1, 0.91, true, '["MovingAverage", "ExponentialSmoothing", "ARIMA"]', 8.9, 6.5, 0.94, true, '["ARIMA", "LSTM"]', 8.4, 6.1, 0.95, true, '["MovingAverage", "ARIMA", "LSTM"]', 8.1, 5.8, 0.96, 'Model-1'),
-  (35, 41, '2025-03-10 14:15:00', '2025-03-10 15:15:00', '2025-03-10 15:15:00', 'Completed', 7, 7, '行业组1', '企业组5', '产品线2', true, 6, 12.3, 9.8, 0.82, true, 0.45, 11.5, 8.7, 0.85, true, 3, 2, 1, 10.8, 7.9, 0.88, '[{"diff_order":0,"statistic":-1.876,"p_value":0.640,"stationary":false,"critical_values":{"1%":-3.500,"5%":-2.890,"10%":-2.580}},{"diff_order":1,"statistic":-3.954,"p_value":0.002,"stationary":true,"critical_values":{"1%":-3.500,"5%":-2.890,"10%":-2.580}},{"diff_order":2,"statistic":-5.102,"p_value":0.000,"stationary":true,"critical_values":{"1%":-3.500,"5%":-2.890,"10%":-2.580}}]', true, 'minmax', '["日期", "销售数量", "价格"]', 9.5, 7.1, 0.91, true, '["MovingAverage", "ExponentialSmoothing", "ARIMA"]', 8.9, 6.5, 0.94, true, '["ARIMA", "LSTM"]', 8.4, 6.1, 0.95, true, '["MovingAverage", "ARIMA", "LSTM"]', 8.1, 5.8, 0.96, 'Model-2'),
-  (36, 42, '2025-03-10 14:30:00', '2025-03-10 15:30:00', '2025-03-10 15:30:00', 'Completed', 7, 7, '行业组2', '企业组6', '产品线3', true, 3, 12.3, 9.8, 0.82, true, 0.5, 11.5, 8.7, 0.85, true, 1, 0, 2, 10.8, 7.9, 0.88, '[{"diff_order":0,"statistic":-1.876,"p_value":0.640,"stationary":false,"critical_values":{"1%":-3.500,"5%":-2.890,"10%":-2.580}},{"diff_order":1,"statistic":-3.954,"p_value":0.002,"stationary":true,"critical_values":{"1%":-3.500,"5%":-2.890,"10%":-2.580}},{"diff_order":2,"statistic":-5.102,"p_value":0.000,"stationary":true,"critical_values":{"1%":-3.500,"5%":-2.890,"10%":-2.580}}]', true, 'zscore', '["日期", "销售数量", "价格"]', 9.5, 7.1, 0.91, true, '["MovingAverage", "ExponentialSmoothing", "ARIMA"]', 8.9, 6.5, 0.94, true, '["ARIMA", "LSTM"]', 8.4, 6.1, 0.95, true, '["MovingAverage", "ARIMA", "LSTM"]', 8.1, 5.8, 0.96, 'Model-3'),
-  (37, 43, '2025-03-10 14:45:00', '2025-03-10 15:45:00', '2025-03-10 15:45:00', 'Completed', 7, 7, '行业组3', '企业组7', '产品线4', true, 4, 12.3, 9.8, 0.82, true, 0.55, 11.5, 8.7, 0.85, true, 2, 1, 3, 10.8, 7.9, 0.88, '[{"diff_order":0,"statistic":-1.876,"p_value":0.640,"stationary":false,"critical_values":{"1%":-3.500,"5%":-2.890,"10%":-2.580}},{"diff_order":1,"statistic":-3.954,"p_value":0.002,"stationary":true,"critical_values":{"1%":-3.500,"5%":-2.890,"10%":-2.580}},{"diff_order":2,"statistic":-5.102,"p_value":0.000,"stationary":true,"critical_values":{"1%":-3.500,"5%":-2.890,"10%":-2.580}}]', true, 'minmax', '["日期", "销售数量", "价格"]', 9.5, 7.1, 0.91, true, '["MovingAverage", "ExponentialSmoothing", "ARIMA"]', 8.9, 6.5, 0.94, true, '["ARIMA", "LSTM"]', 8.4, 6.1, 0.95, true, '["MovingAverage", "ARIMA", "LSTM"]', 8.1, 5.8, 0.96, 'Model-4'),
-  (38, 44, '2025-03-10 15:00:00', '2025-03-10 16:00:00', '2025-03-10 16:00:00', 'Completed', 7, 7, '行业组4', '企业组1', '产品线5', true, 5, 12.3, 9.8, 0.82, true, 0.6, 11.5, 8.7, 0.85, true, 3, 2, 1, 10.8, 7.9, 0.88, '[{"diff_order":0,"statistic":-1.876,"p_value":0.640,"stationary":false,"critical_values":{"1%":-3.500,"5%":-2.890,"10%":-2.580}},{"diff_order":1,"statistic":-3.954,"p_value":0.002,"stationary":true,"critical_values":{"1%":-3.500,"5%":-2.890,"10%":-2.580}},{"diff_order":2,"statistic":-5.102,"p_value":0.000,"stationary":true,"critical_values":{"1%":-3.500,"5%":-2.890,"10%":-2.580}}]', true, 'zscore', '["日期", "销售数量", "价格"]', 9.5, 7.1, 0.91, true, '["MovingAverage", "ExponentialSmoothing", "ARIMA"]', 8.9, 6.5, 0.94, true, '["ARIMA", "LSTM"]', 8.4, 6.1, 0.95, true, '["MovingAverage", "ARIMA", "LSTM"]', 8.1, 5.8, 0.96, 'Model-1'),
-  (39, 45, '2025-03-10 15:15:00', '2025-03-10 16:15:00', '2025-03-10 16:15:00', 'Completed', 7, 7, '行业组5', '企业组2', '产品线6', true, 6, 12.3, 9.8, 0.82, true, 0.65, 11.5, 8.7, 0.85, true, 1, 0, 2, 10.8, 7.9, 0.88, '[{"diff_order":0,"statistic":-1.876,"p_value":0.640,"stationary":false,"critical_values":{"1%":-3.500,"5%":-2.890,"10%":-2.580}},{"diff_order":1,"statistic":-3.954,"p_value":0.002,"stationary":true,"critical_values":{"1%":-3.500,"5%":-2.890,"10%":-2.580}},{"diff_order":2,"statistic":-5.102,"p_value":0.000,"stationary":true,"critical_values":{"1%":-3.500,"5%":-2.890,"10%":-2.580}}]', true, 'minmax', '["日期", "销售数量", "价格"]', 9.5, 7.1, 0.91, true, '["MovingAverage", "ExponentialSmoothing", "ARIMA"]', 8.9, 6.5, 0.94, true, '["ARIMA", "LSTM"]', 8.4, 6.1, 0.95, true, '["MovingAverage", "ARIMA", "LSTM"]', 8.1, 5.8, 0.96, 'Model-2'),
-  (40, 46, '2025-03-10 15:30:00', '2025-03-10 16:30:00', '2025-03-10 16:30:00', 'Completed', 7, 7, '行业组1', '企业组3', '产品线1', true, 3, 12.3, 9.8, 0.82, true, 0.45, 11.5, 8.7, 0.85, true, 2, 1, 3, 10.8, 7.9, 0.88, '[{"diff_order":0,"statistic":-1.876,"p_value":0.640,"stationary":false,"critical_values":{"1%":-3.500,"5%":-2.890,"10%":-2.580}},{"diff_order":1,"statistic":-3.954,"p_value":0.002,"stationary":true,"critical_values":{"1%":-3.500,"5%":-2.890,"10%":-2.580}},{"diff_order":2,"statistic":-5.102,"p_value":0.000,"stationary":true,"critical_values":{"1%":-3.500,"5%":-2.890,"10%":-2.580}}]', true, 'zscore', '["日期", "销售数量", "价格"]', 9.5, 7.1, 0.91, true, '["MovingAverage", "ExponentialSmoothing", "ARIMA"]', 8.9, 6.5, 0.94, true, '["ARIMA", "LSTM"]', 8.4, 6.1, 0.95, true, '["MovingAverage", "ARIMA", "LSTM"]', 8.1, 5.8, 0.96, 'Model-3'),
-  (41, 47, '2025-03-10 15:45:00', '2025-03-10 16:45:00', '2025-03-10 16:45:00', 'Completed', 7, 7, '行业组2', '企业组4', '产品线2', true, 4, 12.3, 9.8, 0.82, true, 0.5, 11.5, 8.7, 0.85, true, 3, 2, 1, 10.8, 7.9, 0.88, '[{"diff_order":0,"statistic":-1.876,"p_value":0.640,"stationary":false,"critical_values":{"1%":-3.500,"5%":-2.890,"10%":-2.580}},{"diff_order":1,"statistic":-3.954,"p_value":0.002,"stationary":true,"critical_values":{"1%":-3.500,"5%":-2.890,"10%":-2.580}},{"diff_order":2,"statistic":-5.102,"p_value":0.000,"stationary":true,"critical_values":{"1%":-3.500,"5%":-2.890,"10%":-2.580}}]', true, 'minmax', '["日期", "销售数量", "价格"]', 9.5, 7.1, 0.91, true, '["MovingAverage", "ExponentialSmoothing", "ARIMA"]', 8.9, 6.5, 0.94, true, '["ARIMA", "LSTM"]', 8.4, 6.1, 0.95, true, '["MovingAverage", "ARIMA", "LSTM"]', 8.1, 5.8, 0.96, 'Model-4'),
-  (42, 48, '2025-03-10 16:00:00', '2025-03-10 17:00:00', '2025-03-10 17:00:00', 'Completed', 7, 7, '行业组3', '企业组5', '产品线3', true, 5, 12.3, 9.8, 0.82, true, 0.55, 11.5, 8.7, 0.85, true, 1, 0, 2, 10.8, 7.9, 0.88, '[{"diff_order":0,"statistic":-1.876,"p_value":0.640,"stationary":false,"critical_values":{"1%":-3.500,"5%":-2.890,"10%":-2.580}},{"diff_order":1,"statistic":-3.954,"p_value":0.002,"stationary":true,"critical_values":{"1%":-3.500,"5%":-2.890,"10%":-2.580}},{"diff_order":2,"statistic":-5.102,"p_value":0.000,"stationary":true,"critical_values":{"1%":-3.500,"5%":-2.890,"10%":-2.580}}]', true, 'zscore', '["日期", "销售数量", "价格"]', 9.5, 7.1, 0.91, true, '["MovingAverage", "ExponentialSmoothing", "ARIMA"]', 8.9, 6.5, 0.94, true, '["ARIMA", "LSTM"]', 8.4, 6.1, 0.95, true, '["MovingAverage", "ARIMA", "LSTM"]', 8.1, 5.8, 0.96, 'Model-1'),
-  (43, 49, '2025-03-10 16:15:00', '2025-03-10 17:15:00', '2025-03-10 17:15:00', 'Completed', 7, 7, '行业组4', '企业组6', '产品线4', true, 6, 12.3, 9.8, 0.82, true, 0.6, 11.5, 8.7, 0.85, true, 2, 1, 3, 10.8, 7.9, 0.88, '[{"diff_order":0,"statistic":-1.876,"p_value":0.640,"stationary":false,"critical_values":{"1%":-3.500,"5%":-2.890,"10%":-2.580}},{"diff_order":1,"statistic":-3.954,"p_value":0.002,"stationary":true,"critical_values":{"1%":-3.500,"5%":-2.890,"10%":-2.580}},{"diff_order":2,"statistic":-5.102,"p_value":0.000,"stationary":true,"critical_values":{"1%":-3.500,"5%":-2.890,"10%":-2.580}}]', true, 'minmax', '["日期", "销售数量", "价格"]', 9.5, 7.1, 0.91, true, '["MovingAverage", "ExponentialSmoothing", "ARIMA"]', 8.9, 6.5, 0.94, true, '["ARIMA", "LSTM"]', 8.4, 6.1, 0.95, true, '["MovingAverage", "ARIMA", "LSTM"]', 8.1, 5.8, 0.96, 'Model-2'),
-  (44, 50, '2025-03-10 16:30:00', '2025-03-10 17:30:00', '2025-03-10 17:30:00', 'Completed', 7, 7, '行业组5', '企业组7', '产品线5', true, 3, 12.3, 9.8, 0.82, true, 0.65, 11.5, 8.7, 0.85, true, 3, 2, 1, 10.8, 7.9, 0.88, '[{"diff_order":0,"statistic":-1.876,"p_value":0.640,"stationary":false,"critical_values":{"1%":-3.500,"5%":-2.890,"10%":-2.580}},{"diff_order":1,"statistic":-3.954,"p_value":0.002,"stationary":true,"critical_values":{"1%":-3.500,"5%":-2.890,"10%":-2.580}},{"diff_order":2,"statistic":-5.102,"p_value":0.000,"stationary":true,"critical_values":{"1%":-3.500,"5%":-2.890,"10%":-2.580}}]', true, 'zscore', '["日期", "销售数量", "价格"]', 9.5, 7.1, 0.91, true, '["MovingAverage", "ExponentialSmoothing", "ARIMA"]', 8.9, 6.5, 0.94, true, '["ARIMA", "LSTM"]', 8.4, 6.1, 0.95, true, '["MovingAverage", "ARIMA", "LSTM"]', 8.1, 5.8, 0.96, 'Model-3'),
-  (45, 51, '2025-03-10 16:45:00', '2025-03-10 17:45:00', '2025-03-10 17:45:00', 'Completed', 7, 7, '行业组1', '企业组1', '产品线6', true, 4, 12.3, 9.8, 0.82, true, 0.45, 11.5, 8.7, 0.85, true, 1, 0, 2, 10.8, 7.9, 0.88, '[{"diff_order":0,"statistic":-1.876,"p_value":0.640,"stationary":false,"critical_values":{"1%":-3.500,"5%":-2.890,"10%":-2.580}},{"diff_order":1,"statistic":-3.954,"p_value":0.002,"stationary":true,"critical_values":{"1%":-3.500,"5%":-2.890,"10%":-2.580}},{"diff_order":2,"statistic":-5.102,"p_value":0.000,"stationary":true,"critical_values":{"1%":-3.500,"5%":-2.890,"10%":-2.580}}]', true, 'minmax', '["日期", "销售数量", "价格"]', 9.5, 7.1, 0.91, true, '["MovingAverage", "ExponentialSmoothing", "ARIMA"]', 8.9, 6.5, 0.94, true, '["ARIMA", "LSTM"]', 8.4, 6.1, 0.95, true, '["MovingAverage", "ARIMA", "LSTM"]', 8.1, 5.8, 0.96, 'Model-4'),
-  (46, 52, '2025-03-10 17:00:00', '2025-03-10 18:00:00', '2025-03-10 18:00:00', 'Completed', 7, 7, '行业组2', '企业组2', '产品线1', true, 5, 12.3, 9.8, 0.82, true, 0.5, 11.5, 8.7, 0.85, true, 2, 1, 3, 10.8, 7.9, 0.88, '[{"diff_order":0,"statistic":-1.876,"p_value":0.640,"stationary":false,"critical_values":{"1%":-3.500,"5%":-2.890,"10%":-2.580}},{"diff_order":1,"statistic":-3.954,"p_value":0.002,"stationary":true,"critical_values":{"1%":-3.500,"5%":-2.890,"10%":-2.580}},{"diff_order":2,"statistic":-5.102,"p_value":0.000,"stationary":true,"critical_values":{"1%":-3.500,"5%":-2.890,"10%":-2.580}}]', true, 'zscore', '["日期", "销售数量", "价格"]', 9.5, 7.1, 0.91, true, '["MovingAverage", "ExponentialSmoothing", "ARIMA"]', 8.9, 6.5, 0.94, true, '["ARIMA", "LSTM"]', 8.4, 6.1, 0.95, true, '["MovingAverage", "ARIMA", "LSTM"]', 8.1, 5.8, 0.96, 'Model-1'),
-  (47, 53, '2025-03-10 17:15:00', '2025-03-10 18:15:00', '2025-03-10 18:15:00', 'Completed', 7, 7, '行业组3', '企业组3', '产品线2', true, 6, 12.3, 9.8, 0.82, true, 0.55, 11.5, 8.7, 0.85, true, 3, 2, 1, 10.8, 7.9, 0.88, '[{"diff_order":0,"statistic":-1.876,"p_value":0.640,"stationary":false,"critical_values":{"1%":-3.500,"5%":-2.890,"10%":-2.580}},{"diff_order":1,"statistic":-3.954,"p_value":0.002,"stationary":true,"critical_values":{"1%":-3.500,"5%":-2.890,"10%":-2.580}},{"diff_order":2,"statistic":-5.102,"p_value":0.000,"stationary":true,"critical_values":{"1%":-3.500,"5%":-2.890,"10%":-2.580}}]', true, 'minmax', '["日期", "销售数量", "价格"]', 9.5, 7.1, 0.91, true, '["MovingAverage", "ExponentialSmoothing", "ARIMA"]', 8.9, 6.5, 0.94, true, '["ARIMA", "LSTM"]', 8.4, 6.1, 0.95, true, '["MovingAverage", "ARIMA", "LSTM"]', 8.1, 5.8, 0.96, 'Model-2'),
-  (48, 54, '2025-03-10 17:30:00', '2025-03-10 18:30:00', '2025-03-10 18:30:00', 'Completed', 7, 7, '行业组4', '企业组4', '产品线3', true, 3, 12.3, 9.8, 0.82, true, 0.6, 11.5, 8.7, 0.85, true, 1, 0, 2, 10.8, 7.9, 0.88, '[{"diff_order":0,"statistic":-1.876,"p_value":0.640,"stationary":false,"critical_values":{"1%":-3.500,"5%":-2.890,"10%":-2.580}},{"diff_order":1,"statistic":-3.954,"p_value":0.002,"stationary":true,"critical_values":{"1%":-3.500,"5%":-2.890,"10%":-2.580}},{"diff_order":2,"statistic":-5.102,"p_value":0.000,"stationary":true,"critical_values":{"1%":-3.500,"5%":-2.890,"10%":-2.580}}]', true, 'zscore', '["日期", "销售数量", "价格"]', 9.5, 7.1, 0.91, true, '["MovingAverage", "ExponentialSmoothing", "ARIMA"]', 8.9, 6.5, 0.94, true, '["ARIMA", "LSTM"]', 8.4, 6.1, 0.95, true, '["MovingAverage", "ARIMA", "LSTM"]', 8.1, 5.8, 0.96, 'Model-3'),
-  (49, 55, '2025-03-10 17:45:00', '2025-03-10 18:45:00', '2025-03-10 18:45:00', 'Completed', 7, 7, '行业组5', '企业组5', '产品线4', true, 4, 12.3, 9.8, 0.82, true, 0.65, 11.5, 8.7, 0.85, true, 2, 1, 3, 10.8, 7.9, 0.88, '[{"diff_order":0,"statistic":-1.876,"p_value":0.640,"stationary":false,"critical_values":{"1%":-3.500,"5%":-2.890,"10%":-2.580}},{"diff_order":1,"statistic":-3.954,"p_value":0.002,"stationary":true,"critical_values":{"1%":-3.500,"5%":-2.890,"10%":-2.580}},{"diff_order":2,"statistic":-5.102,"p_value":0.000,"stationary":true,"critical_values":{"1%":-3.500,"5%":-2.890,"10%":-2.580}}]', true, 'minmax', '["日期", "销售数量", "价格"]', 9.5, 7.1, 0.91, true, '["MovingAverage", "ExponentialSmoothing", "ARIMA"]', 8.9, 6.5, 0.94, true, '["ARIMA", "LSTM"]', 8.4, 6.1, 0.95, true, '["MovingAverage", "ARIMA", "LSTM"]', 8.1, 5.8, 0.96, 'Model-4'),
-  (50, 56, '2025-03-10 18:00:00', '2025-03-10 19:00:00', '2025-03-10 19:00:00', 'Completed', 7, 7, '行业组1', '企业组6', '产品线5', true, 5, 12.3, 9.8, 0.82, true, 0.45, 11.5, 8.7, 0.85, true, 3, 2, 1, 10.8, 7.9, 0.88, '[{"diff_order":0,"statistic":-1.876,"p_value":0.640,"stationary":false,"critical_values":{"1%":-3.500,"5%":-2.890,"10%":-2.580}},{"diff_order":1,"statistic":-3.954,"p_value":0.002,"stationary":true,"critical_values":{"1%":-3.500,"5%":-2.890,"10%":-2.580}},{"diff_order":2,"statistic":-5.102,"p_value":0.000,"stationary":true,"critical_values":{"1%":-3.500,"5%":-2.890,"10%":-2.580}}]', true, 'zscore', '["日期", "销售数量", "价格"]', 9.5, 7.1, 0.91, true, '["MovingAverage", "ExponentialSmoothing", "ARIMA"]', 8.9, 6.5, 0.94, true, '["ARIMA", "LSTM"]', 8.4, 6.1, 0.95, true, '["MovingAverage", "ARIMA", "LSTM"]', 8.1, 5.8, 0.96, 'Model-1'),
-  (51, 57, '2025-03-10 18:15:00', '2025-03-10 19:15:00', '2025-03-10 19:15:00', 'Completed', 7, 7, '行业组2', '企业组7', '产品线6', true, 6, 12.3, 9.8, 0.82, true, 0.5, 11.5, 8.7, 0.85, true, 1, 0, 2, 10.8, 7.9, 0.88, '[{"diff_order":0,"statistic":-1.876,"p_value":0.640,"stationary":false,"critical_values":{"1%":-3.500,"5%":-2.890,"10%":-2.580}},{"diff_order":1,"statistic":-3.954,"p_value":0.002,"stationary":true,"critical_values":{"1%":-3.500,"5%":-2.890,"10%":-2.580}},{"diff_order":2,"statistic":-5.102,"p_value":0.000,"stationary":true,"critical_values":{"1%":-3.500,"5%":-2.890,"10%":-2.580}}]', true, 'minmax', '["日期", "销售数量", "价格"]', 9.5, 7.1, 0.91, true, '["MovingAverage", "ExponentialSmoothing", "ARIMA"]', 8.9, 6.5, 0.94, true, '["ARIMA", "LSTM"]', 8.4, 6.1, 0.95, true, '["MovingAverage", "ARIMA", "LSTM"]', 8.1, 5.8, 0.96, 'Model-2'),
-  (52, 58, '2025-03-10 18:30:00', '2025-03-10 19:30:00', '2025-03-10 19:30:00', 'Completed', 7, 7, '行业组3', '企业组1', '产品线1', true, 3, 12.3, 9.8, 0.82, true, 0.55, 11.5, 8.7, 0.85, true, 2, 1, 3, 10.8, 7.9, 0.88, '[{"diff_order":0,"statistic":-1.876,"p_value":0.640,"stationary":false,"critical_values":{"1%":-3.500,"5%":-2.890,"10%":-2.580}},{"diff_order":1,"statistic":-3.954,"p_value":0.002,"stationary":true,"critical_values":{"1%":-3.500,"5%":-2.890,"10%":-2.580}},{"diff_order":2,"statistic":-5.102,"p_value":0.000,"stationary":true,"critical_values":{"1%":-3.500,"5%":-2.890,"10%":-2.580}}]', true, 'zscore', '["日期", "销售数量", "价格"]', 9.5, 7.1, 0.91, true, '["MovingAverage", "ExponentialSmoothing", "ARIMA"]', 8.9, 6.5, 0.94, true, '["ARIMA", "LSTM"]', 8.4, 6.1, 0.95, true, '["MovingAverage", "ARIMA", "LSTM"]', 8.1, 5.8, 0.96, 'Model-3'),
-  (53, 59, '2025-03-10 18:45:00', '2025-03-10 19:45:00', '2025-03-10 19:45:00', 'Completed', 7, 7, '行业组4', '企业组2', '产品线2', true, 4, 12.3, 9.8, 0.82, true, 0.6, 11.5, 8.7, 0.85, true, 3, 2, 1, 10.8, 7.9, 0.88, '[{"diff_order":0,"statistic":-1.876,"p_value":0.640,"stationary":false,"critical_values":{"1%":-3.500,"5%":-2.890,"10%":-2.580}},{"diff_order":1,"statistic":-3.954,"p_value":0.002,"stationary":true,"critical_values":{"1%":-3.500,"5%":-2.890,"10%":-2.580}},{"diff_order":2,"statistic":-5.102,"p_value":0.000,"stationary":true,"critical_values":{"1%":-3.500,"5%":-2.890,"10%":-2.580}}]', true, 'minmax', '["日期", "销售数量", "价格"]', 9.5, 7.1, 0.91, true, '["MovingAverage", "ExponentialSmoothing", "ARIMA"]', 8.9, 6.5, 0.94, true, '["ARIMA", "LSTM"]', 8.4, 6.1, 0.95, true, '["MovingAverage", "ARIMA", "LSTM"]', 8.1, 5.8, 0.96, 'Model-4'),
-  (54, 60, '2025-03-10 19:00:00', '2025-03-10 20:00:00', '2025-03-10 20:00:00', 'Completed', 7, 7, '行业组5', '企业组3', '产品线3', true, 5, 12.3, 9.8, 0.82, true, 0.65, 11.5, 8.7, 0.85, true, 1, 0, 2, 10.8, 7.9, 0.88, '[{"diff_order":0,"statistic":-1.876,"p_value":0.640,"stationary":false,"critical_values":{"1%":-3.500,"5%":-2.890,"10%":-2.580}},{"diff_order":1,"statistic":-3.954,"p_value":0.002,"stationary":true,"critical_values":{"1%":-3.500,"5%":-2.890,"10%":-2.580}},{"diff_order":2,"statistic":-5.102,"p_value":0.000,"stationary":true,"critical_values":{"1%":-3.500,"5%":-2.890,"10%":-2.580}}]', true, 'zscore', '["日期", "销售数量", "价格"]', 9.5, 7.1, 0.91, true, '["MovingAverage", "ExponentialSmoothing", "ARIMA"]', 8.9, 6.5, 0.94, true, '["ARIMA", "LSTM"]', 8.4, 6.1, 0.95, true, '["MovingAverage", "ARIMA", "LSTM"]', 8.1, 5.8, 0.96, 'Model-1'),
-  (55, 61, '2025-03-10 19:15:00', '2025-03-10 20:15:00', '2025-03-10 20:15:00', 'Completed', 7, 7, '行业组1', '企业组4', '产品线4', true, 6, 12.3, 9.8, 0.82, true, 0.45, 11.5, 8.7, 0.85, true, 2, 1, 3, 10.8, 7.9, 0.88, '[{"diff_order":0,"statistic":-1.876,"p_value":0.640,"stationary":false,"critical_values":{"1%":-3.500,"5%":-2.890,"10%":-2.580}},{"diff_order":1,"statistic":-3.954,"p_value":0.002,"stationary":true,"critical_values":{"1%":-3.500,"5%":-2.890,"10%":-2.580}},{"diff_order":2,"statistic":-5.102,"p_value":0.000,"stationary":true,"critical_values":{"1%":-3.500,"5%":-2.890,"10%":-2.580}}]', true, 'minmax', '["日期", "销售数量", "价格"]', 9.5, 7.1, 0.91, true, '["MovingAverage", "ExponentialSmoothing", "ARIMA"]', 8.9, 6.5, 0.94, true, '["ARIMA", "LSTM"]', 8.4, 6.1, 0.95, true, '["MovingAverage", "ARIMA", "LSTM"]', 8.1, 5.8, 0.96, 'Model-2'),
-  (56, 62, '2025-03-10 19:30:00', '2025-03-10 20:30:00', '2025-03-10 20:30:00', 'Completed', 7, 7, '行业组2', '企业组5', '产品线5', true, 3, 12.3, 9.8, 0.82, true, 0.5, 11.5, 8.7, 0.85, true, 3, 2, 1, 10.8, 7.9, 0.88, '[{"diff_order":0,"statistic":-1.876,"p_value":0.640,"stationary":false,"critical_values":{"1%":-3.500,"5%":-2.890,"10%":-2.580}},{"diff_order":1,"statistic":-3.954,"p_value":0.002,"stationary":true,"critical_values":{"1%":-3.500,"5%":-2.890,"10%":-2.580}},{"diff_order":2,"statistic":-5.102,"p_value":0.000,"stationary":true,"critical_values":{"1%":-3.500,"5%":-2.890,"10%":-2.580}}]', true, 'zscore', '["日期", "销售数量", "价格"]', 9.5, 7.1, 0.91, true, '["MovingAverage", "ExponentialSmoothing", "ARIMA"]', 8.9, 6.5, 0.94, true, '["ARIMA", "LSTM"]', 8.4, 6.1, 0.95, true, '["MovingAverage", "ARIMA", "LSTM"]', 8.1, 5.8, 0.96, 'Model-3'),
-  (57, 63, '2025-03-10 19:45:00', '2025-03-10 20:45:00', '2025-03-10 20:45:00', 'Completed', 7, 7, '行业组3', '企业组6', '产品线6', true, 4, 12.3, 9.8, 0.82, true, 0.55, 11.5, 8.7, 0.85, true, 1, 0, 2, 10.8, 7.9, 0.88, '[{"diff_order":0,"statistic":-1.876,"p_value":0.640,"stationary":false,"critical_values":{"1%":-3.500,"5%":-2.890,"10%":-2.580}},{"diff_order":1,"statistic":-3.954,"p_value":0.002,"stationary":true,"critical_values":{"1%":-3.500,"5%":-2.890,"10%":-2.580}},{"diff_order":2,"statistic":-5.102,"p_value":0.000,"stationary":true,"critical_values":{"1%":-3.500,"5%":-2.890,"10%":-2.580}}]', true, 'minmax', '["日期", "销售数量", "价格"]', 9.5, 7.1, 0.91, true, '["MovingAverage", "ExponentialSmoothing", "ARIMA"]', 8.9, 6.5, 0.94, true, '["ARIMA", "LSTM"]', 8.4, 6.1, 0.95, true, '["MovingAverage", "ARIMA", "LSTM"]', 8.1, 5.8, 0.96, 'Model-4'),
-  (58, 64, '2025-03-10 20:00:00', '2025-03-10 21:00:00', '2025-03-10 21:00:00', 'Completed', 7, 7, '行业组4', '企业组7', '产品线1', true, 5, 12.3, 9.8, 0.82, true, 0.6, 11.5, 8.7, 0.85, true, 2, 1, 3, 10.8, 7.9, 0.88, '[{"diff_order":0,"statistic":-1.876,"p_value":0.640,"stationary":false,"critical_values":{"1%":-3.500,"5%":-2.890,"10%":-2.580}},{"diff_order":1,"statistic":-3.954,"p_value":0.002,"stationary":true,"critical_values":{"1%":-3.500,"5%":-2.890,"10%":-2.580}},{"diff_order":2,"statistic":-5.102,"p_value":0.000,"stationary":true,"critical_values":{"1%":-3.500,"5%":-2.890,"10%":-2.580}}]', true, 'zscore', '["日期", "销售数量", "价格"]', 9.5, 7.1, 0.91, true, '["MovingAverage", "ExponentialSmoothing", "ARIMA"]', 8.9, 6.5, 0.94, true, '["ARIMA", "LSTM"]', 8.4, 6.1, 0.95, true, '["MovingAverage", "ARIMA", "LSTM"]', 8.1, 5.8, 0.96, 'Model-1'),
-  ((59, 65, '2025-03-10 20:15:00', '2025-03-10 21:15:00', '2025-03-10 21:15:00', 'Completed', 7, 7, '行业组5', '企业组1', '产品线2', true, 6, 12.3, 9.8, 0.82, true, 0.65, 11.5, 8.7, 0.85, true, 3, 2, 1, 10.8, 7.9, 0.88, '[{"diff_order":0,"statistic":-1.876,"p_value":0.640,"stationary":false,"critical_values":{"1%":-3.500,"5%":-2.890,"10%":-2.580}},{"diff_order":1,"statistic":-3.954,"p_value":0.002,"stationary":true,"critical_values":{"1%":-3.500,"5%":-2.890,"10%":-2.580}},{"diff_order":2,"statistic":-5.102,"p_value":0.000,"stationary":true,"critical_values":{"1%":-3.500,"5%":-2.890,"10%":-2.580}}]', true, 'minmax', '["日期", "销售数量", "价格"]', 9.5, 7.1, 0.91, true, '["MovingAverage", "ExponentialSmoothing", "ARIMA"]', 8.9, 6.5, 0.94, true, '["ARIMA", "LSTM"]', 8.4, 6.1, 0.95, true, '["MovingAverage", "ARIMA", "LSTM"]', 8.1, 5.8, 0.96, 'Model-2')
+) VALUES (
+  5,
+  '2023-09-01 09:00:00',
+  '2023-09-15 16:30:00',
+  '2023-09-15 17:00:00',
+  'Completed',
+  7,
+  7,
+  '电子消费品',
+  'XYZ科技公司',
+  '智能手机',
+  TRUE, 7,
+  125.50, 98.20, 0.785,
+  TRUE, 0.3,
+  110.25, 85.60, 0.823,
+  TRUE, 1, 1, 1,
+  95.80, 72.40, 0.891,
+  '[{"diff_order": 0, "statistic": -1.876, "p_value": 0.640, "stationary": false, "critical_values": {"1%": -3.500, "5%": -2.890, "10%": -2.580}}, {"diff_order": 1, "statistic": -3.954, "p_value": 0.002, "stationary": true, "critical_values": {"1%": -3.500, "5%": -2.890, "10%": -2.580}}, {"diff_order": 2, "statistic": -5.102, "p_value": 0.000, "stationary": true, "critical_values": {"1%": -3.500, "5%": -2.890, "10%": -2.580}}]',
+  TRUE, 'minmax',
+  '["月份", "销售金额", "是否促销"]',
+  88.45, 65.30, 0.912,
+  TRUE, '["ma", "exp", "arima", "lstm"]',
+  75.20, 58.90, 0.945,
+  TRUE, '["ma", "exp", "arima"]',
+  82.10, 64.50, 0.928,
+  TRUE, '["ma", "exp", "arima", "lstm"]',
+  70.85, 55.20, 0.956,
+  'ensemble_stacking'
 );
 
+-- 插入学生2的实验状态（进行中）
+INSERT INTO `experiment_status` (
+  `student_id`, `start_time`, `last_activity_at`,
+  `status`, `highest_completed_step`, `current_step`,
+  `selected_industry`, `selected_company`, `selected_product`,
+  `moving_average_completed`, `moving_average_window`,
+  `moving_average_metrics_rmse`, `moving_average_metrics_mae`, `moving_average_metrics_r2`,
+  `exponential_smoothing_completed`, `exponential_smoothing_alpha`
+) VALUES (
+  6,
+  '2023-09-02 10:15:00',
+  '2023-09-14 14:20:00',
+  'In Progress',
+  4,
+  5,
+  '服装纺织',
+  'ABC服饰有限公司',
+  '休闲装',
+  TRUE, 5,
+  210.75, 165.30, 0.623,
+  TRUE, 0.2
+);
 
--- 9.1 实验成绩 (ExperimentGrade)
-INSERT IGNORE INTO `experiment_grade` (
-  `grade_id`,
-  `experiment_id`,
-  `student_id`,
-  `grader_id`,
-  `exp_flow`,
-  `exp_flow_demand_data_preparation`,
-  `exp_flow_demand_descriptive_stats`,
-  `exp_flow_demand_model_selection`,
-  `exp_flow_demand_generate_results`,
-  `exp_flow_production_inventory_calc`,
-  `exp_flow_production_service_level`,
-  `exp_flow_production_variable_calc`,
-  `exp_flow_production_plan_creation`,
-  `exp_flow_report_submission`,
-  `knowledge_test`,
-  `model_quality`,
-  `report_quality`
+-- 插入学生3的实验状态（未开始）
+INSERT INTO `experiment_status` (
+  `student_id`, `status`, `highest_completed_step`, `current_step`
+) VALUES (
+  7,
+  'Not Started',
+  0,
+  1
+);
+
+-- 插入实验步骤事件记录
+INSERT INTO `experiment_step_events` (`experiment_id`, `student_id`, `step_order`, `event_type`, `event_timestamp`) VALUES
+(1, 5, 1, 'STARTED', '2023-09-01 09:00:00'),
+(1, 5, 1, 'COMPLETED', '2023-09-01 09:30:00'),
+(1, 5, 2, 'STARTED', '2023-09-01 09:35:00'),
+(1, 5, 2, 'COMPLETED', '2023-09-01 10:15:00'),
+(1, 5, 3, 'STARTED', '2023-09-01 10:20:00'),
+(1, 5, 3, 'COMPLETED', '2023-09-01 11:00:00'),
+(1, 5, 4, 'STARTED', '2023-09-03 14:00:00'),
+(1, 5, 4, 'COMPLETED', '2023-09-03 15:30:00'),
+(1, 5, 5, 'STARTED', '2023-09-05 09:00:00'),
+(1, 5, 5, 'COMPLETED', '2023-09-05 11:45:00'),
+(1, 5, 6, 'STARTED', '2023-09-10 13:30:00'),
+(1, 5, 6, 'COMPLETED', '2023-09-10 16:20:00'),
+(1, 5, 7, 'STARTED', '2023-09-12 09:15:00'),
+(1, 5, 7, 'COMPLETED', '2023-09-15 17:00:00'),
+(2, 6, 1, 'STARTED', '2023-09-02 10:15:00'),
+(2, 6, 1, 'COMPLETED', '2023-09-02 10:45:00'),
+(2, 6, 2, 'STARTED', '2023-09-02 11:00:00'),
+(2, 6, 2, 'COMPLETED', '2023-09-02 11:40:00'),
+(2, 6, 3, 'STARTED', '2023-09-04 14:30:00'),
+(2, 6, 3, 'COMPLETED', '2023-09-04 15:20:00'),
+(2, 6, 4, 'STARTED', '2023-09-06 09:00:00'),
+(2, 6, 4, 'COMPLETED', '2023-09-06 10:30:00'),
+(2, 6, 5, 'STARTED', '2023-09-14 14:20:00');
+
+--
+-- 3. 考核与评分
+--
+
+-- 插入题库数据
+INSERT INTO `question_bank` (
+  `knowledge_point`, `question_type`, `question_text`,
+  `options`, `correct_answers`, `creator_id`
 ) VALUES
-(1, 1, 9, 3, 40, 12.00, 10.00, 8.50, 9.50, 10.00, 9.00, 9.50, 14.00, 14.50, 20.00, 18.00, 19.00),
-(2, 2, 10, 4, 40, 11.00, 9.00, 8.00, 9.00, 9.50, 9.00, 9.00, 14.50, 15.00, 20.00, 17.50, 18.00),
-(3, 4, 14, 5, 40, 10.50, 9.00, 7.50, 8.50, 9.00, 9.00, 9.50, 16.00, 16.50, 20.00, 16.00, 17.00),
-(4, 10, 16, 3, 24, 2.88, 2.40, 1.92, 2.40, 2.40, 2.40, 2.40, 3.60, 3.60, 12.00, 14.00, 16.00),
-(5, 11, 17, 4, 28, 3.36, 2.80, 2.24, 2.80, 2.80, 2.80, 2.80, 4.20, 4.20, 14.00, 16.00, 18.00),
-(6, 12, 18, 5, 32, 3.84, 3.20, 2.56, 3.20, 3.20, 3.20, 3.20, 4.80, 4.80, 16.00, 18.00, 20.00),
-(7, 13, 19, 3, 36, 4.32, 3.60, 2.88, 3.60, 3.60, 3.60, 3.60, 5.40, 5.40, 18.00, 20.00, 12.00),
-(8, 14, 20, 4, 40, 4.80, 4.00, 3.20, 4.00, 4.00, 4.00, 4.00, 6.00, 6.00, 20.00, 12.00, 14.00),
-(9, 15, 21, 5, 24, 2.88, 2.40, 1.92, 2.40, 2.40, 2.40, 2.40, 3.60, 3.60, 12.00, 14.00, 16.00),
-(10, 16, 22, 3, 28, 3.36, 2.80, 2.24, 2.80, 2.80, 2.80, 2.80, 4.20, 4.20, 14.00, 16.00, 18.00),
-(11, 17, 23, 4, 32, 3.84, 3.20, 2.56, 3.20, 3.20, 3.20, 3.20, 4.80, 4.80, 16.00, 18.00, 20.00),
-(12, 18, 24, 5, 36, 4.32, 3.60, 2.88, 3.60, 3.60, 3.60, 3.60, 5.40, 5.40, 18.00, 20.00, 12.00),
-(13, 19, 25, 3, 40, 4.80, 4.00, 3.20, 4.00, 4.00, 4.00, 4.00, 6.00, 6.00, 20.00, 12.00, 14.00),
-(14, 20, 26, 4, 24, 2.88, 2.40, 1.92, 2.40, 2.40, 2.40, 2.40, 3.60, 3.60, 12.00, 14.00, 16.00),
-(15, 21, 27, 5, 28, 3.36, 2.80, 2.24, 2.80, 2.80, 2.80, 2.80, 4.20, 4.20, 14.00, 16.00, 18.00),
-(16, 22, 28, 3, 32, 3.84, 3.20, 2.56, 3.20, 3.20, 3.20, 3.20, 4.80, 4.80, 16.00, 18.00, 20.00),
-(17, 23, 29, 4, 36, 4.32, 3.60, 2.88, 3.60, 3.60, 3.60, 3.60, 5.40, 5.40, 18.00, 20.00, 12.00),
-(18, 24, 30, 5, 40, 4.80, 4.00, 3.20, 4.00, 4.00, 4.00, 4.00, 6.00, 6.00, 20.00, 12.00, 14.00),
-(19, 25, 31, 3, 24, 2.88, 2.40, 1.92, 2.40, 2.40, 2.40, 2.40, 3.60, 3.60, 12.00, 14.00, 16.00),
-(20, 26, 32, 4, 28, 3.36, 2.80, 2.24, 2.80, 2.80, 2.80, 2.80, 4.20, 4.20, 14.00, 16.00, 18.00),
-(21, 27, 33, 5, 32, 3.84, 3.20, 2.56, 3.20, 3.20, 3.20, 3.20, 4.80, 4.80, 16.00, 18.00, 20.00),
-(22, 28, 34, 3, 36, 4.32, 3.60, 2.88, 3.60, 3.60, 3.60, 3.60, 5.40, 5.40, 18.00, 20.00, 12.00),
-(23, 29, 35, 4, 40, 4.80, 4.00, 3.20, 4.00, 4.00, 4.00, 4.00, 6.00, 6.00, 20.00, 12.00, 14.00),
-(24, 30, 36, 5, 24, 2.88, 2.40, 1.92, 2.40, 2.40, 2.40, 2.40, 3.60, 3.60, 12.00, 14.00, 16.00),
-(25, 31, 37, 3, 28, 3.36, 2.80, 2.24, 2.80, 2.80, 2.80, 2.80, 4.20, 4.20, 14.00, 16.00, 18.00),
-(26, 32, 38, 4, 32, 3.84, 3.20, 2.56, 3.20, 3.20, 3.20, 3.20, 4.80, 4.80, 16.00, 18.00, 20.00),
-(27, 33, 39, 5, 36, 4.32, 3.60, 2.88, 3.60, 3.60, 3.60, 3.60, 5.40, 5.40, 18.00, 20.00, 12.00),
-(28, 34, 40, 3, 40, 4.80, 4.00, 3.20, 4.00, 4.00, 4.00, 4.00, 6.00, 6.00, 20.00, 12.00, 14.00),
-(29, 35, 41, 4, 24, 2.88, 2.40, 1.92, 2.40, 2.40, 2.40, 2.40, 3.60, 3.60, 12.00, 14.00, 16.00),
-(30, 36, 42, 5, 28, 3.36, 2.80, 2.24, 2.80, 2.80, 2.80, 2.80, 4.20, 4.20, 14.00, 16.00, 18.00),
-(31, 37, 43, 3, 32, 3.84, 3.20, 2.56, 3.20, 3.20, 3.20, 3.20, 4.80, 4.80, 16.00, 18.00, 20.00),
-(32, 38, 44, 4, 36, 4.32, 3.60, 2.88, 3.60, 3.60, 3.60, 3.60, 5.40, 5.40, 18.00, 20.00, 12.00),
-(33, 39, 45, 5, 40, 4.80, 4.00, 3.20, 4.00, 4.00, 4.00, 4.00, 6.00, 6.00, 20.00, 12.00, 14.00),
-(34, 40, 46, 3, 24, 2.88, 2.40, 1.92, 2.40, 2.40, 2.40, 2.40, 3.60, 3.60, 12.00, 14.00, 16.00),
-(35, 41, 47, 4, 28, 3.36, 2.80, 2.24, 2.80, 2.80, 2.80, 2.80, 4.20, 4.20, 14.00, 16.00, 18.00),
-(36, 42, 48, 5, 32, 3.84, 3.20, 2.56, 3.20, 3.20, 3.20, 3.20, 4.80, 4.80, 16.00, 18.00, 20.00),
-(37, 43, 49, 3, 36, 4.32, 3.60, 2.88, 3.60, 3.60, 3.60, 3.60, 5.40, 5.40, 18.00, 20.00, 12.00),
-(38, 44, 50, 4, 40, 4.80, 4.00, 3.20, 4.00, 4.00, 4.00, 4.00, 6.00, 6.00, 20.00, 12.00, 14.00),
-(39, 45, 51, 5, 24, 2.88, 2.40, 1.92, 2.40, 2.40, 2.40, 2.40, 3.60, 3.60, 12.00, 14.00, 16.00),
-(40, 46, 52, 3, 28, 3.36, 2.80, 2.24, 2.80, 2.80, 2.80, 2.80, 4.20, 4.20, 14.00, 16.00, 18.00),
-(41, 47, 53, 4, 32, 3.84, 3.20, 2.56, 3.20, 3.20, 3.20, 3.20, 4.80, 4.80, 16.00, 18.00, 20.00),
-(42, 48, 54, 5, 36, 4.32, 3.60, 2.88, 3.60, 3.60, 3.60, 3.60, 5.40, 5.40, 18.00, 20.00, 12.00),
-(43, 49, 55, 3, 40, 4.80, 4.00, 3.20, 4.00, 4.00, 4.00, 4.00, 6.00, 6.00, 20.00, 12.00, 14.00),
-(44, 50, 56, 4, 24, 2.88, 2.40, 1.92, 2.40, 2.40, 2.40, 2.40, 3.60, 3.60, 12.00, 14.00, 16.00),
-(45, 51, 57, 5, 28, 3.36, 2.80, 2.24, 2.80, 2.80, 2.80, 2.80, 4.20, 4.20, 14.00, 16.00, 18.00),
-(46, 52, 58, 3, 32, 3.84, 3.20, 2.56, 3.20, 3.20, 3.20, 3.20, 4.80, 4.80, 16.00, 18.00, 20.00),
-(47, 53, 59, 4, 36, 4.32, 3.60, 2.88, 3.60, 3.60, 3.60, 3.60, 5.40, 5.40, 18.00, 20.00, 12.00),
-(48, 54, 60, 5, 40, 4.80, 4.00, 3.20, 4.00, 4.00, 4.00, 4.00, 6.00, 6.00, 20.00, 12.00, 14.00),
-(49, 55, 61, 3, 24, 2.88, 2.40, 1.92, 2.40, 2.40, 2.40, 2.40, 3.60, 3.60, 12.00, 14.00, 16.00),
-(50, 56, 62, 4, 28, 3.36, 2.80, 2.24, 2.80, 2.80, 2.80, 2.80, 4.20, 4.20, 14.00, 16.00, 18.00),
-(51, 57, 63, 5, 32, 3.84, 3.20, 2.56, 3.20, 3.20, 3.20, 3.20, 4.80, 4.80, 16.00, 18.00, 20.00),
-(52, 58, 64, 3, 36, 4.32, 3.60, 2.88, 3.60, 3.60, 3.60, 3.60, 5.40, 5.40, 18.00, 20.00, 12.00),
-(53, 59, 65, 4, 40, 4.80, 4.00, 3.20, 4.00, 4.00, 4.00, 4.00, 6.00, 6.00, 20.00, 12.00, 14.00);
+-- 单选题1
+('时间序列平稳性', 'Single Choice', '在ARIMA模型中，d参数代表什么？',
+ '{"A": "自回归项数", "B": "差分阶数", "C": "移动平均项数", "D": "季节周期"}',
+ '["B"]',
+ 2),
 
--- 9. 实验步骤事件 (ExperimentStepEvents)
-INSERT IGNORE INTO `experiment_step_events` (`event_id`, `experiment_id`, `student_id`, `step_order`, `event_type`, `event_timestamp`) VALUES
-(1,  1, 9,  1, 'STARTED',   '2025-03-01 09:00:00'),
-(2,  1, 9,  1, 'COMPLETED', '2025-03-01 09:02:00'),
-(3,  1, 9,  2, 'STARTED',   '2025-03-01 09:02:00'),
-(4,  1, 9,  2, 'COMPLETED', '2025-03-01 09:05:00'),
-(5,  1, 9,  3, 'STARTED',   '2025-03-01 09:05:00'),
-(6,  1, 9,  3, 'COMPLETED', '2025-03-01 09:10:00'),
-(7,  1, 9,  4, 'STARTED',   '2025-03-01 09:10:00'),
-(8,  1, 9,  4, 'COMPLETED', '2025-03-01 09:25:00'),
-(9,  1, 9,  5, 'STARTED',   '2025-03-01 09:25:00'),
-(10, 1, 9,  5, 'COMPLETED', '2025-03-01 10:05:00'),
-(11, 1, 9,  6, 'STARTED',   '2025-03-01 10:05:00'),
-(12, 1, 9,  6, 'COMPLETED', '2025-03-01 10:20:00'),
-(13, 1, 9,  7, 'STARTED',   '2025-03-01 10:20:00'),
-(14, 1, 9,  7, 'COMPLETED', '2025-03-01 10:30:00'),
-(15, 2, 10, 1, 'STARTED',   '2025-03-02 13:00:00'),
-(16, 2, 10, 1, 'COMPLETED', '2025-03-02 13:03:00'),
-(17, 2, 10, 2, 'STARTED',   '2025-03-02 13:03:00'),
-(18, 2, 10, 2, 'COMPLETED', '2025-03-02 13:08:00'),
-(19, 2, 10, 3, 'STARTED',   '2025-03-02 13:08:00'),
-(20, 2, 10, 3, 'COMPLETED', '2025-03-02 13:12:00'),
-(21, 2, 10, 4, 'STARTED',   '2025-03-02 13:12:00'),
-(22, 2, 10, 4, 'COMPLETED', '2025-03-02 13:35:00'),
-(23, 2, 10, 5, 'STARTED',   '2025-03-02 13:35:00'),
-(24, 2, 10, 5, 'COMPLETED', '2025-03-02 14:40:00'),
-(25, 2, 10, 6, 'STARTED',   '2025-03-02 14:40:00'),
-(26, 2, 10, 6, 'COMPLETED', '2025-03-02 14:55:00'),
-(27, 2, 10, 7, 'STARTED',   '2025-03-02 14:55:00'),
-(28, 2, 10, 7, 'COMPLETED', '2025-03-02 15:10:00'),
-(29, 3, 12, 1, 'STARTED',   '2025-03-03 09:30:00'),
-(30, 3, 12, 1, 'COMPLETED', '2025-03-03 09:32:00'),
-(31, 3, 12, 2, 'STARTED',   '2025-03-03 09:32:00'),
-(32, 3, 12, 2, 'COMPLETED', '2025-03-03 09:34:00'),
-(33, 3, 12, 3, 'STARTED',   '2025-03-03 09:34:00'),
-(34, 3, 12, 3, 'COMPLETED', '2025-03-03 09:38:00'),
-(35, 3, 12, 4, 'STARTED',   '2025-03-03 09:38:00'),
-(36, 3, 12, 4, 'COMPLETED', '2025-03-03 09:48:00'),
-(37, 3, 12, 5, 'STARTED',   '2025-03-03 09:50:00'),
-(38, 4, 14, 1, 'STARTED',   '2025-03-04 14:00:00'),
-(39, 4, 14, 1, 'COMPLETED', '2025-03-04 14:02:00'),
-(40, 4, 14, 2, 'STARTED',   '2025-03-04 14:02:00'),
-(41, 4, 14, 2, 'COMPLETED', '2025-03-04 14:05:00'),
-(42, 4, 14, 3, 'STARTED',   '2025-03-04 14:05:00'),
-(43, 4, 14, 3, 'COMPLETED', '2025-03-04 14:08:00'),
-(44, 4, 14, 4, 'STARTED',   '2025-03-04 14:08:00'),
-(45, 4, 14, 4, 'COMPLETED', '2025-03-04 14:18:00'),
-(46, 4, 14, 5, 'STARTED',   '2025-03-04 14:18:00'),
-(47, 4, 14, 5, 'COMPLETED', '2025-03-04 15:20:00'),
-(48, 4, 14, 6, 'STARTED',   '2025-03-04 15:20:00'),
-(49, 4, 14, 6, 'COMPLETED', '2025-03-04 15:35:00'),
-(50, 4, 14, 7, 'STARTED',   '2025-03-04 15:35:00'),
-(51, 4, 14, 7, 'COMPLETED', '2025-03-04 16:00:00'),
-(52, 5, 11, 1, 'STARTED',   '2025-03-05 09:15:00'),
-(53, 5, 11, 1, 'COMPLETED', '2025-03-05 09:17:00'),
-(54, 5, 11, 2, 'STARTED',   '2025-03-05 09:17:00'),
-(55, 5, 11, 2, 'COMPLETED', '2025-03-05 09:22:00'),
-(56, 5, 11, 3, 'STARTED',   '2025-03-05 09:22:00'),
-(57, 5, 11, 3, 'COMPLETED', '2025-03-05 09:28:00'),
-(58, 5, 11, 4, 'STARTED',   '2025-03-05 09:28:00'),
-(59, 5, 11, 4, 'COMPLETED', '2025-03-05 09:45:00'),
-(60, 5, 11, 5, 'STARTED',   '2025-03-05 09:50:00'),
-(61, 6, 13, 1, 'STARTED',   '2025-03-06 10:00:00'),
-(62, 6, 13, 1, 'COMPLETED', '2025-03-06 10:03:00'),
-(63, 6, 13, 2, 'STARTED',   '2025-03-06 10:03:00'),
-(64, 6, 13, 2, 'COMPLETED', '2025-03-06 10:08:00'),
-(65, 6, 13, 3, 'STARTED',   '2025-03-06 10:08:00'),
-(66, 6, 13, 3, 'COMPLETED', '2025-03-06 10:15:00'),
-(67, 6, 13, 4, 'STARTED',   '2025-03-06 10:15:00'),
-(68, 7, 15, 1, 'STARTED',   '2025-03-06 15:30:00');
+-- 单选题2
+('模型评估指标', 'Single Choice', 'RMSE指标越小说明什么？',
+ '{"A": "模型过拟合", "B": "预测精度越高", "C": "数据噪声越大", "D": "计算复杂度越高"}',
+ '["B"]',
+ 2),
 
--- 9.1 实验成绩 (ExperimentGrade)
-INSERT IGNORE INTO `model_results` (`result_id`, `experiment_id`, `model_name`, `model_parameters`, `rmse`, `mae`, `r2`, `mape`, `prediction_output`) VALUES
-(1, 1, 'ARIMA',               '{"p":2,"d":1,"q":1}',        8.52, 6.30, 0.87, 4.10, '{"forecast":[128,133,139,145]}'),
-(2, 1, 'ExponentialSmoothing','{"alpha":0.3}',               10.40, 7.90, 0.79, 5.35, '{"forecast":[126,131,135,140]}'),
-(3, 2, 'LSTM',                '{"epochs":50,"layers":2}',    6.12, 4.85, 0.91, 3.72, '{"forecast":[215,221,229,236]}'),
-(4, 4, 'MovingAverage',       '{"window":3}',                 9.35, 7.21, 0.83, 4.85, '{"forecast":[182,185,189,192]}');
+-- 多选题
+('集成学习', 'Multiple Choice', '以下哪些是常见的集成学习方法？',
+ '{"A": "Bagging", "B": "Boosting", "C": "Stacking", "D": "K-Means"}',
+ '["A", "B", "C"]',
+ 3),
 
-INSERT IGNORE INTO `production_plans` (`plan_id`, `experiment_id`, `plan_details`) VALUES
-(1, 1, '{"horizon_weeks":4,"lines":2,"safety_stock":320,"notes":"结合 ARIMA 预测调整排产节奏"}'),
-(2, 2, '{"horizon_weeks":6,"lines":3,"safety_stock":180,"notes":"LSTM 预测显示节假日前需求激增"}'),
-(3, 4, '{"horizon_weeks":3,"lines":1,"safety_stock":90,"notes":"采用移动平均模型稳定生产"}');
--- 11. 学生答题记录 (StudentResponses)
-INSERT IGNORE INTO `student_responses` (`response_id`, `experiment_id`, `question_id`, `answer`, `is_correct`) VALUES
-(1, 1, 1, 'B',    TRUE),
-(2, 1, 2, '["A","B","D"]', TRUE),
-(3, 2, 1, 'A',    FALSE),
-(4, 2, 3, '正确', TRUE),
-(5, 4, 4, 'C',    TRUE);
+-- 判断题1
+('时间序列分析', 'True/False', '所有时间序列数据都必须经过一阶差分才能用于ARIMA建模。',
+ '{"正确": "一阶差分后序列一定平稳", "错误": "需要根据ADF检验确定差分阶数"}',
+ '["错误"]',
+ 2),
 
--- 12. 实验报告 (ExperimentReports)
-INSERT IGNORE INTO `experiment_reports` (`report_id`, `experiment_id`, `student_id`, `report_content`, `pdf_file_path`, `submitted_at`, `grade`, `feedback`, `graded_by`) VALUES
-(1, 1, 9,  '基于 ARIMA 模型的智能手环需求预测分析。', '/uploads/reports/exp1-report.pdf', '2025-03-01 21:30:00', 92.5, '模型选择合理，报告结构清晰。', 3),
-(2, 2, 10, 'LSTM 模型捕捉到季节特征并提升预测准确率。', '/uploads/reports/exp2-report.pdf', '2025-03-02 22:15:00', 88.0, '建议增加模型可解释性讨论。', 4),
-(3, 4, 14, '移动平均模型用于饮料需求预测的快速实践。', '/uploads/reports/exp4-report.pdf', '2025-03-04 20:05:00', 85.0, '适合入门演示，可尝试更多模型比较。', 5),
-(4, 1, 9,  'ARIMA 模型的多情景预测与库存策略优化。', '/uploads/reports/exp1-report-v2.pdf', '2025-03-06 18:45:00', 96.0, '扩展了情景分析，建议分享给全班同学参考。', 3),
-(5, 5, 11, '协作机器人实验阶段性小结。', '/uploads/reports/exp5-draft.pdf', '2025-03-07 17:20:00', NULL, NULL, NULL),
-(6, 5, 11, '协作机器人实验最终报告。', '/uploads/reports/exp5-final.pdf', '2025-03-10 10:10:00', 78.5, '按照评分标准补充实验数据分析。', 3),
-(7, 3, 12, '冷链配送模型预分析。', '/uploads/reports/exp3-draft.pdf', '2025-03-05 11:05:00', NULL, '等待完整数据后再评分。', NULL),
-(8, 3, 12, '冷链配送模型最终报告。', '/uploads/reports/exp3-final.pdf', '2025-03-09 19:45:00', 90.0, '场景描述全面，值得分享。', 4),
-(9, 6, 13, '储能系统实验初稿。', '/uploads/reports/exp6-draft.pdf', '2025-03-08 15:00:00', NULL, '请补充温控实验数据。', NULL),
-(10, 6, 13, '储能系统实验优化方案。', '/uploads/reports/exp6-iteration.pdf', '2025-03-11 09:30:00', 82.0, '改进了能效对比，继续跟踪。', 4),
-(11, 7, 15, '供应链协同仿真体验记录。', '/uploads/reports/exp7-prep.pdf', '2025-03-07 12:00:00', NULL, NULL, NULL);
+-- 判断题2
+('模型选择', 'True/False', 'R²值为0.9表示模型解释了90%的方差。',
+ '{"正确": "模型效果很好", "错误": "R²值不代表因果关系"}',
+ '["正确"]',
+ 3);
 
--- 13. 实验手册 (ExperimentManuals)
-INSERT IGNORE INTO `experiment_manuals` (`manual_id`, `file_name`, `file_path`, `description`, `is_active`, `uploader_id`) VALUES
-(1, '虚拟仿真实验手册 V2.0.pdf', '/uploads/static/manuals/virtual-lab-v2.pdf', '2025 春季学期使用，包含实验流程与评分标准。', TRUE, 1),
-(2, '教师操作速查表.pdf',       '/uploads/static/manuals/teacher-quickstart.pdf', '教师端重点功能速览。', FALSE, 2);
+-- 插入实验报告数据
+INSERT INTO `experiment_reports` (
+  `experiment_id`, `student_id`, `report_content`,
+  `pdf_file_path`, `submitted_at`, `grade`,
+  `feedback`, `graded_by`
+) VALUES
+-- 学生1的完整报告
+(1, 5,
+ '本实验通过对XYZ科技公司智能手机销售数据的分析，完成了从数据预处理到生产计划制定的全流程。通过对比多种预测模型，最终选择了堆叠集成模型作为最佳方案，该模型在测试集上的RMSE为70.85，R²值为0.956，表现最佳。基于预测结果，制定了详细的生产库存计划。',
+ '/var/uploads/reports/student1_xyz_smartphone_report_20230915.pdf',
+ '2023-09-15 17:00:00',
+ 92.5,
+ '报告结构清晰，模型选择合理，生产计划制定科学。建议在未来工作中进一步考虑不确定性分析。',
+ 2),
 
--- 14. 数据集 (Datasets)
-INSERT IGNORE INTO `datasets` (`dataset_id`, `data_name`, `file_path`, `description`) VALUES
-(1, '电子产品销售月度数据', '/uploads/static/datasets/electronics-monthly.csv', '包含 2022-2024 年月度销量、收入、均价。'),
-(2, '家电行业节假日销量', '/uploads/static/datasets/home-appliance-holidays.csv', '节假日前后 60 天的日销量及促销活动标签。'),
-(3, '冷链物流温控数据', '/uploads/static/datasets/cold-chain-temp.csv', '多线路冷链配送的温度与到货时效监控数据。');
+-- 学生2的报告（待评分）
+(2, 6,
+ '本次实验分析了ABC服饰休闲装的销售数据，完成了前四个步骤的模型训练。目前已完成移动平均和指数平滑模型的训练，RMSE分别为210.75和未完成。后续将完成剩余模型对比和生产计划制定。',
+ '/var/uploads/reports/student2_abc_casualwear_report_20230914.pdf',
+ '2023-09-14 14:20:00',
+ NULL,
+ NULL,
+ NULL);
 
--- --------------------------------------------------------
--- 结束
--- --------------------------------------------------------
+-- 插入评分权重配置
+INSERT INTO `grade_weights` (
+  `teacher_id`,
+  `exp_flow_demand_data_preparation`, `exp_flow_demand_descriptive_stats`,
+  `exp_flow_demand_model_selection`, `exp_flow_demand_generate_results`,
+  `exp_flow_production_inventory_calc`, `exp_flow_production_service_level`,
+  `exp_flow_production_variable_calc`, `exp_flow_production_plan_creation`,
+  `exp_flow_report_submission`,
+  `exp_flow`, `knowledge_test`, `model_quality`, `report_quality`
+) VALUES
+-- 老师1的评分权重配置
+(2,
+ 8, 7,
+ 10, 10,
+ 5, 2,
+ 2, 1,
+ 0,
+ 45,
+ 20,
+ 20,
+ 15),
+
+-- 老师2的评分权重配置
+(3,
+ 10, 8,
+ 12, 10,
+ 4, 3,
+ 2, 1,
+ 0,
+ 50,
+ 15,
+ 25,
+ 10);
+
+-- 插入实验评分数据
+INSERT INTO `experiment_grade` (
+  `experiment_id`, `student_id`, `grader_id`,
+  `exp_flow`,
+  `exp_flow_demand_data_preparation`, `exp_flow_demand_descriptive_stats`,
+  `exp_flow_demand_model_selection`, `exp_flow_demand_generate_results`,
+  `exp_flow_production_inventory_calc`, `exp_flow_production_service_level`,
+  `exp_flow_production_variable_calc`, `exp_flow_production_plan_creation`,
+  `exp_flow_report_submission`,
+  `knowledge_test`, `model_quality`, `report_quality`
+) VALUES
+-- 学生1的详细评分
+(1, 5, 2,
+ 90,
+ 95, 92,
+ 88, 92,
+ 85, 88,
+ 90, 95,
+ 90,
+ 95,
+ 92,
+ 90);
+
+--
+-- 4. 系统管理
+--
+
+-- 插入实验手册数据
+INSERT INTO `experiment_manuals` (
+  `file_name`, `file_path`, `description`,
+  `is_active`, `uploader_id`
+) VALUES
+-- 实验操作手册
+('时间序列预测实验操作手册_v1.0.pdf',
+ '/var/uploads/manuals/time_series_forecasting_manual_v1.0.pdf',
+ '详细介绍时间序列预测实验的完整操作流程，包括数据预处理、模型训练、结果分析和生产计划制定等所有步骤。',
+ TRUE,
+ 2),
+
+('生产计划制定指南_v1.0.pdf',
+ '/var/uploads/manuals/production_planning_guide_v1.0.pdf',
+ '指导学生如何基于预测结果制定科学的生产库存计划，包括安全库存计算、服务水平评估等内容。',
+ TRUE,
+ 3),
+
+('数据分析基础教程.pdf',
+ '/var/uploads/manuals/data_analysis_basics.pdf',
+ '时间序列数据分析基础知识，包括平稳性检验、模型评估指标等内容。',
+ FALSE,
+ 2);
+
+-- 插入数据集数据
+INSERT INTO `datasets` (`data_name`, `file_path`, `description`) VALUES
+('消费电子行业销售数据_2020-2023.csv',
+ '/var/uploads/datasets/consumer_electronics_sales_2020-2023.csv',
+ '包含2020-2023年消费电子行业多家企业的月度销售数据，包含智能手机、平板电脑等产品的销售金额和促销信息。'),
+
+('服装纺织行业销售数据_2019-2023.csv',
+ '/var/uploads/datasets/apparel_textiles_sales_2019-2023.csv',
+ '包含2019-2023年服装纺织行业销售数据，涵盖休闲装、正装等多个品类，包含季节性和促销影响因素。'),
+
+('汽车行业销售数据_2021-2023.csv',
+ '/var/uploads/datasets/automotive_sales_2021-2023.csv',
+ '包含2021-2023年汽车行业销售数据，包括乘用车和商用车销售数据，考虑经济周期影响。');
+
+-- 插入数据集分段数据
+INSERT INTO `dataset_segments` (
+  `dataset_id`, `industry_name`, `company_name`,
+  `product_name`, `start_row`, `end_row`, `file_path`
+) VALUES
+-- XYZ科技公司智能手机数据 (第一数据集)
+(1, '电子消费品', 'XYZ科技公司', '智能手机', 2, 37,
+ '/var/uploads/dataset_segments/electronics_xyz_smartphone_2020-2023.csv'),
+
+-- ABC服饰休闲装数据 (第二数据集)
+(2, '服装纺织', 'ABC服饰有限公司', '休闲装', 2, 58,
+ '/var/uploads/dataset_segments/apparel_abc_casualwear_2019-2023.csv'),
+
+-- DEF汽车SUV数据 (第三数据集)
+(3, '汽车制造', 'DEF汽车集团', 'SUV车型', 2, 37,
+ '/var/uploads/dataset_segments/automotive_def_suv_2021-2023.csv'),
+
+-- GHI科技平板电脑数据 (第一数据集)
+(1, '电子消费品', 'GHI科技公司', '平板电脑', 38, 73,
+ '/var/uploads/dataset_segments/electronics_ghi_tablet_2020-2023.csv'),
+
+-- JKL服饰正装数据 (第二数据集)
+(2, '服装纺织', 'JKL服饰公司', '正装', 59, 94,
+ '/var/uploads/dataset_segments/apparel_jkl_formalwear_2019-2023.csv');
+
+-- 插入一条额外的评分记录用于测试
+INSERT INTO `experiment_grade` (
+  `experiment_id`, `student_id`, `grader_id`,
+  `exp_flow`,
+  `exp_flow_demand_data_preparation`, `exp_flow_demand_descriptive_stats`,
+  `exp_flow_demand_model_selection`, `exp_flow_demand_generate_results`
+) VALUES
+(2, 6, 4,
+ 75,
+ 80, 78,
+ 72, 75);
+
+-- 恢复外键检查
+SET FOREIGN_KEY_CHECKS = 1;
+
+-- 显示插入的数据统计
+SELECT '用户数据' as table_name, COUNT(*) as record_count FROM `users`
+UNION ALL
+SELECT '班级数据', COUNT(*) FROM `classes`
+UNION ALL
+SELECT '选课数据', COUNT(*) FROM `enrollments`
+UNION ALL
+SELECT '助教分配', COUNT(*) FROM `class_assistants`
+UNION ALL
+SELECT '实验状态', COUNT(*) FROM `experiment_status`
+UNION ALL
+SELECT '步骤事件', COUNT(*) FROM `experiment_step_events`
+UNION ALL
+SELECT '题库数据', COUNT(*) FROM `question_bank`
+UNION ALL
+SELECT '实验报告', COUNT(*) FROM `experiment_reports`
+UNION ALL
+SELECT '评分权重', COUNT(*) FROM `grade_weights`
+UNION ALL
+SELECT '实验评分', COUNT(*) FROM `experiment_grade`
+UNION ALL
+SELECT '实验手册', COUNT(*) FROM `experiment_manuals`
+UNION ALL
+SELECT '数据集', COUNT(*) FROM `datasets`
+UNION ALL
+SELECT '数据分段', COUNT(*) FROM `dataset_segments`;
