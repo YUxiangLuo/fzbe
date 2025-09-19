@@ -319,7 +319,7 @@ INSERT INTO `experiment_manuals` (
 ('生产计划制定指南_v1.0.pdf',
  '/var/uploads/manuals/production_planning_guide_v1.0.pdf',
  '指导学生如何基于预测结果制定科学的生产库存计划，包括安全库存计算、服务水平评估等内容。',
- TRUE,
+ FALSE,
  3),
 
 ('数据分析基础教程.pdf',

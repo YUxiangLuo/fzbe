@@ -66,6 +66,10 @@ CREATE TABLE IF NOT EXISTS `experiment_status` (
   `selected_industry` VARCHAR(255),
   `selected_company` VARCHAR(255),
   `selected_product` VARCHAR(255),
+
+  -- {"train_start_index": 0, "train_end_index": 100, "predict_start_index": 101, "predict_end_index": 120}
+  `data_window` JSON DEFAULT NULL,
+
   `moving_average_completed` BOOLEAN DEFAULT NULL,
   `moving_average_window` INT,
   `moving_average_metrics_rmse` FLOAT,

@@ -10,7 +10,8 @@ import userRoutes from "./routes/users";
 import classRoutes from "./routes/classes";
 import manualRoutes from "./routes/manuals";
 import datasetRoutes from "./routes/datasets";
-import forecastApi from "./routes/forecasting";
+import gradeRoutes from "./routes/grade";
+import modelApi from "./routes/model";
 
 // --- Custom Logger Middleware ---
 const timestampedLogger = async (c: Context, next: Next) => {
@@ -70,7 +71,13 @@ app.use(
 app.use(
   "/js/*",
   serveStatic({
-    root: path.resolve(import.meta.dir, "../uploads"),
+    root: path.resolve(import.meta.dir, "../cdn"),
+  }),
+);
+app.use(
+  "/images/*",
+  serveStatic({
+    root: path.resolve(import.meta.dir, "../cdn"),
   }),
 );
 
@@ -81,7 +88,8 @@ api.route("/", userRoutes(pool, JWT_SECRET));
 api.route("/", classRoutes(pool, JWT_SECRET));
 api.route("/", manualRoutes(pool, JWT_SECRET));
 api.route("/", datasetRoutes(pool, JWT_SECRET));
-api.route("/", forecastApi(JWT_SECRET)); // Forecasting routes are already prefixed with /forecast and /tools
+api.route("/", gradeRoutes(pool, JWT_SECRET));
+api.route("/", modelApi(JWT_SECRET)); // Model routes are already prefixed with their own paths
 
 app.route("/api", api);
 
