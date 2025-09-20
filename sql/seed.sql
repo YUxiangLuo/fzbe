@@ -310,20 +310,20 @@ INSERT INTO `experiment_manuals` (
   `is_active`, `uploader_id`
 ) VALUES
 -- 实验操作手册
-('时间序列预测实验操作手册_v1.0.pdf',
- '/var/uploads/manuals/time_series_forecasting_manual_v1.0.pdf',
+('虚拟仿真实验手册.pdf',
+ '/var/uploads/manuals/shiyanshouce.pdf',
  '详细介绍时间序列预测实验的完整操作流程，包括数据预处理、模型训练、结果分析和生产计划制定等所有步骤。',
  TRUE,
  2),
 
 ('生产计划制定指南_v1.0.pdf',
- '/var/uploads/manuals/production_planning_guide_v1.0.pdf',
+ '/var/uploads/manuals/shiyanshouce.pdf',
  '指导学生如何基于预测结果制定科学的生产库存计划，包括安全库存计算、服务水平评估等内容。',
  FALSE,
  3),
 
 ('数据分析基础教程.pdf',
- '/var/uploads/manuals/data_analysis_basics.pdf',
+ '/var/uploads/manuals/shiyanshouce.pdf',
  '时间序列数据分析基础知识，包括平稳性检验、模型评估指标等内容。',
  FALSE,
  2);
@@ -331,15 +331,15 @@ INSERT INTO `experiment_manuals` (
 -- 插入数据集数据
 INSERT INTO `datasets` (`data_name`, `file_path`, `description`) VALUES
 ('消费电子行业销售数据_2020-2023.csv',
- '/var/uploads/datasets/consumer_electronics_sales_2020-2023.csv',
+ '/var/uploads/datasets/ceshishuju.csv',
  '包含2020-2023年消费电子行业多家企业的月度销售数据，包含智能手机、平板电脑等产品的销售金额和促销信息。'),
 
 ('服装纺织行业销售数据_2019-2023.csv',
- '/var/uploads/datasets/apparel_textiles_sales_2019-2023.csv',
+ '/var/uploads/datasets/ceshishuju.csv',
  '包含2019-2023年服装纺织行业销售数据，涵盖休闲装、正装等多个品类，包含季节性和促销影响因素。'),
 
 ('汽车行业销售数据_2021-2023.csv',
- '/var/uploads/datasets/automotive_sales_2021-2023.csv',
+ '/var/uploads/datasets/ceshishuju.csv',
  '包含2021-2023年汽车行业销售数据，包括乘用车和商用车销售数据，考虑经济周期影响。');
 
 -- 插入数据集分段数据

@@ -3,9 +3,11 @@ import { jwt } from "hono/jwt";
 import { z } from "zod";
 import { zValidator } from "@hono/zod-validator";
 import { unlink } from "node:fs/promises";
+import { createReadStream } from "node:fs";
 import path from "path";
 import type { Pool, ResultSetHeader, RowDataPacket } from "mysql2/promise";
 import { parseCsvSegments } from "../utils";
+import csv from "csv-parser";
 
 const industryParamSchema = z.object({
   industry: z.string().min(1),
@@ -14,6 +16,12 @@ const industryParamSchema = z.object({
 const industryAndCompanyParamSchema = z.object({
   industry: z.string().min(1),
   company: z.string().min(1),
+});
+
+const industryCompanyProductParamSchema = z.object({
+  industry: z.string().min(1),
+  company: z.string().min(1),
+  product: z.string().min(1),
 });
 
 // Zod Schemas for Validation
@@ -56,6 +64,13 @@ type CompanyRow = RowDataPacket & {
 
 type ProductRow = RowDataPacket & {
   product_name: string;
+};
+
+type SegmentDetailRow = RowDataPacket & {
+  dataset_id: number;
+  start_row: number;
+  end_row: number;
+  file_path: string;
 };
 
 const isNodeError = (error: unknown): error is NodeJS.ErrnoException => {
@@ -238,6 +253,160 @@ export default (pool: Pool, JWT_SECRET: string) => {
     }
   });
 
+  // 登录用户: 获取行业/公司/产品层级信息 - needs to be registered before /datasets/:datasetId
+  datasetsApi.get("/datasets/industries", jwt({ secret: JWT_SECRET }), async (c) => {
+    try {
+      const [rows] = await pool.query<IndustryRow[]>(
+        "SELECT DISTINCT industry_name FROM dataset_segments ORDER BY industry_name ASC",
+      );
+      return c.json(rows.map((row) => row.industry_name));
+    } catch (error) {
+      console.error("Error fetching industries:", error);
+      throw error;
+    }
+  });
+
+  datasetsApi.get(
+    "/datasets/industries/:industry/companies",
+    jwt({ secret: JWT_SECRET }),
+    zValidator("param", industryParamSchema),
+    async (c) => {
+      try {
+        const { industry } = c.req.valid("param");
+        const [rows] = await pool.query<CompanyRow[]>(
+          "SELECT DISTINCT company_name FROM dataset_segments WHERE industry_name = ? ORDER BY company_name ASC",
+          [industry],
+        );
+        return c.json(rows.map((row) => row.company_name));
+      } catch (error) {
+        console.error("Error fetching companies by industry:", error);
+        throw error;
+      }
+    },
+  );
+
+  datasetsApi.get(
+    "/datasets/industries/:industry/companies/:company/products",
+    jwt({ secret: JWT_SECRET }),
+    zValidator("param", industryAndCompanyParamSchema),
+    async (c) => {
+      try {
+        const { industry, company } = c.req.valid("param");
+        const [rows] = await pool.query<ProductRow[]>(
+          `SELECT DISTINCT product_name
+             FROM dataset_segments
+            WHERE industry_name = ? AND company_name = ?
+            ORDER BY product_name ASC`,
+          [industry, company],
+        );
+        return c.json(rows.map((row) => row.product_name));
+      } catch (error) {
+        console.error("Error fetching products by industry and company:", error);
+        throw error;
+      }
+    },
+  );
+
+  datasetsApi.get(
+    "/datasets/industries/:industry/companies/:company/products/:product/sales",
+    jwt({ secret: JWT_SECRET }),
+    zValidator("param", industryCompanyProductParamSchema),
+    async (c) => {
+      try {
+        const { industry, company, product } = c.req.valid("param");
+
+        const [segments] = await pool.query<SegmentDetailRow[]>(
+          `SELECT dataset_id, start_row, end_row, file_path
+             FROM dataset_segments
+            WHERE industry_name = ? AND company_name = ? AND product_name = ?
+            LIMIT 1`,
+          [industry, company, product],
+        );
+
+        const segment = segments[0];
+        if (!segment) {
+          return c.json({ error: "Product segment not found" }, 404);
+        }
+
+        const { start_row: startRow, end_row: endRow, file_path: filePath } = segment;
+
+        const monthlySales: Array<{ month: string; sales: number }> = [];
+        let unit = "";
+
+        const normalizeYear = (value: unknown) => {
+          const raw = String(value ?? "").trim();
+          const match = raw.match(/\d{4}/);
+          return match ? match[0] : raw;
+        };
+
+        const normalizeMonth = (value: unknown) => {
+          const raw = String(value ?? "").trim();
+          if (!raw) return raw;
+          const match = raw.match(/\d+/);
+          if (!match) return raw.padStart(2, "0");
+          const monthNumber = Number.parseInt(match[0], 10);
+          if (Number.isNaN(monthNumber)) {
+            return raw;
+          }
+          return String(monthNumber).padStart(2, "0");
+        };
+
+        const parseSales = (value: unknown) => {
+          const raw = String(value ?? "").trim();
+          if (!raw) return Number.NaN;
+          const cleaned = raw.replace(/,/g, "");
+          return Number(cleaned);
+        };
+
+        await new Promise<void>((resolve, reject) => {
+          let rowIndex = 0;
+          createReadStream(filePath)
+            .pipe(
+              csv({
+                mapHeaders: ({ header }) => header.replace(/^\uFEFF/, "").trim(),
+              }),
+            )
+            .on("data", (row: Record<string, unknown>) => {
+              rowIndex += 1;
+              if (rowIndex < startRow) return;
+              if (rowIndex > endRow) return;
+
+              const year = normalizeYear(row["年份"]);
+              const month = normalizeMonth(row["月份"]);
+
+              if (!year || !month) return;
+
+              const salesValue = parseSales(row["销售数量"]);
+              if (!Number.isFinite(salesValue)) return;
+
+              if (!unit && row["数量单位"]) {
+                unit = String(row["数量单位"]).trim();
+              }
+
+              monthlySales.push({ month: `${year}-${month}`, sales: salesValue });
+            })
+            .on("end", () => resolve())
+            .on("error", reject);
+        });
+
+        return c.json({
+          meta: {
+            industry,
+            company,
+            product,
+            name: product,
+            description: "",
+            unit,
+          },
+          monthlySales,
+        });
+      } catch (error) {
+        console.error("Error fetching product sales data:", error);
+        throw error;
+      }
+    },
+  );
+
   // 登录用户: 获取单个数据集
   datasetsApi.get(
     "/datasets/:datasetId",
@@ -354,63 +523,6 @@ export default (pool: Pool, JWT_SECRET: string) => {
         return c.json({ message: "Dataset deleted successfully" });
       } catch (error) {
         console.error("Error deleting dataset:", error);
-        throw error;
-      }
-    },
-  );
-
-  datasetsApi.get(
-    "/datasets/industries",
-    jwt({ secret: JWT_SECRET }),
-    async (c) => {
-      try {
-        const [rows] = await pool.query<IndustryRow[]>(
-          "SELECT DISTINCT industry_name FROM dataset_segments ORDER BY industry_name ASC",
-        );
-        return c.json(rows.map((row) => row.industry_name));
-      } catch (error) {
-        console.error("Error fetching industries:", error);
-        throw error;
-      }
-    },
-  );
-
-  datasetsApi.get(
-    "/datasets/industries/:industry/companies",
-    jwt({ secret: JWT_SECRET }),
-    zValidator("param", industryParamSchema),
-    async (c) => {
-      try {
-        const { industry } = c.req.valid("param");
-        const [rows] = await pool.query<CompanyRow[]>(
-          "SELECT DISTINCT company_name FROM dataset_segments WHERE industry_name = ? ORDER BY company_name ASC",
-          [industry],
-        );
-        return c.json(rows.map((row) => row.company_name));
-      } catch (error) {
-        console.error("Error fetching companies by industry:", error);
-        throw error;
-      }
-    },
-  );
-
-  datasetsApi.get(
-    "/datasets/industries/:industry/companies/:company/products",
-    jwt({ secret: JWT_SECRET }),
-    zValidator("param", industryAndCompanyParamSchema),
-    async (c) => {
-      try {
-        const { industry, company } = c.req.valid("param");
-        const [rows] = await pool.query<ProductRow[]>(
-          `SELECT DISTINCT product_name
-             FROM dataset_segments
-            WHERE industry_name = ? AND company_name = ?
-            ORDER BY product_name ASC`,
-          [industry, company],
-        );
-        return c.json(rows.map((row) => row.product_name));
-      } catch (error) {
-        console.error("Error fetching products by industry and company:", error);
         throw error;
       }
     },
