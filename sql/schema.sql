@@ -3,9 +3,11 @@
 -- Compatible with MariaDB / MySQL
 -- --------------------------------------------------------
 
---
+SET NAMES utf8mb4;
+
+-- ========================================================
 -- 1. User and Class Management
---
+-- ========================================================
 
 CREATE TABLE IF NOT EXISTS `users` (
   `user_id` INT AUTO_INCREMENT PRIMARY KEY,
@@ -17,16 +19,18 @@ CREATE TABLE IF NOT EXISTS `users` (
   `phone_number` VARCHAR(50),
   `role` ENUM('Student', 'Teacher', 'Assistant', 'Admin') NOT NULL,
   `created_at` TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-);
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
 CREATE TABLE IF NOT EXISTS `classes` (
   `class_id` INT AUTO_INCREMENT PRIMARY KEY,
   `class_name` VARCHAR(255) NOT NULL,
   `class_code` VARCHAR(255) UNIQUE,
-  `teacher_id` INT NOT NULL,
+  `teacher_id` INT NULL,
   `created_at` TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-  FOREIGN KEY (`teacher_id`) REFERENCES `users`(`user_id`) ON DELETE CASCADE
-);
+  -- 设计选择：避免 users → classes → enrollments/assistants 与 users → enrollments/assistants 的多路径级联
+  -- 因此这里使用 SET NULL（或在你的业务中先改派再删老师）
+  FOREIGN KEY (`teacher_id`) REFERENCES `users`(`user_id`) ON DELETE SET NULL
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
 CREATE TABLE IF NOT EXISTS `enrollments` (
   `enrollment_id` INT AUTO_INCREMENT PRIMARY KEY,
@@ -35,7 +39,7 @@ CREATE TABLE IF NOT EXISTS `enrollments` (
   FOREIGN KEY (`student_id`) REFERENCES `users`(`user_id`) ON DELETE CASCADE,
   FOREIGN KEY (`class_id`) REFERENCES `classes`(`class_id`) ON DELETE CASCADE,
   UNIQUE KEY `student_class_unique` (`student_id`, `class_id`)
-);
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
 CREATE TABLE IF NOT EXISTS `class_assistants` (
   `assignment_id` INT AUTO_INCREMENT PRIMARY KEY,
@@ -44,11 +48,11 @@ CREATE TABLE IF NOT EXISTS `class_assistants` (
   FOREIGN KEY (`assistant_id`) REFERENCES `users`(`user_id`) ON DELETE CASCADE,
   FOREIGN KEY (`class_id`) REFERENCES `classes`(`class_id`) ON DELETE CASCADE,
   UNIQUE KEY `assistant_class_unique` (`assistant_id`, `class_id`)
-);
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
---
+-- ========================================================
 -- 2. Experiment and Production Planning Management
---
+-- ========================================================
 
 CREATE TABLE IF NOT EXISTS `experiment_status` (
   `experiment_id` INT AUTO_INCREMENT PRIMARY KEY,
@@ -75,6 +79,7 @@ CREATE TABLE IF NOT EXISTS `experiment_status` (
   `moving_average_metrics_rmse` FLOAT,
   `moving_average_metrics_mae` FLOAT,
   `moving_average_metrics_r2` FLOAT,
+
   `exponential_smoothing_completed` BOOLEAN DEFAULT NULL,
   `exponential_smoothing_alpha` FLOAT,
   `exponential_smoothing_metrics_rmse` FLOAT,
@@ -89,6 +94,7 @@ CREATE TABLE IF NOT EXISTS `experiment_status` (
   `arima_metrics_rmse` FLOAT,
   `arima_metrics_mae` FLOAT,
   `arima_metrics_r2` FLOAT,
+
   -- ADF stationarity diagnostics JSON array
   -- [
   --   { diff_order: 0, statistic: -1.876, p_value: 0.640, stationary: false,
@@ -134,29 +140,42 @@ CREATE TABLE IF NOT EXISTS `experiment_status` (
   `predict_steps` INT DEFAULT NULL,
   -- [100], [100, 110, 120, 130], [100, 110, 120, 130, 140, 150]
   `predict_values` JSON DEFAULT NULL,
+
+  -- quiz_1_completed → quiz_about_model_completed
+  -- quiz_2_completed → quiz_about_plan_completed
   `quiz_about_model_completed` BOOLEAN DEFAULT NULL,
   `quiz_about_plan_completed` BOOLEAN DEFAULT NULL,
+
   `experiment_report_submitted` BOOLEAN DEFAULT NULL,
 
-  FOREIGN KEY (`student_id`) REFERENCES `users`(`user_id`) ON DELETE CASCADE
-);
+  FOREIGN KEY (`student_id`) REFERENCES `users`(`user_id`) ON DELETE CASCADE,
+
+  -- 为子表复合外键提供可引用的唯一性
+  UNIQUE KEY `uq_experiment_status_exp_stu` (`experiment_id`, `student_id`),
+  INDEX `idx_experiment_status_student` (`student_id`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
 CREATE TABLE IF NOT EXISTS `experiment_step_events` (
   `event_id` INT AUTO_INCREMENT PRIMARY KEY,
   `experiment_id` INT NOT NULL,
   `student_id` INT NOT NULL,
+
   -- Values range from 1-7
   `step_order` INT NOT NULL,
   `event_type` ENUM('STARTED', 'COMPLETED') NOT NULL,
   `event_timestamp` TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-  FOREIGN KEY (`experiment_id`) REFERENCES `experiment_status`(`experiment_id`) ON DELETE CASCADE,
-  FOREIGN KEY (`student_id`) REFERENCES `users`(`user_id`) ON DELETE CASCADE,
-  INDEX `idx_experiment_step_order` (`experiment_id`, `step_order`, `event_timestamp`)
-);
 
---
+  -- 复合外键锚定到 experiment_status，避免 users → 子表 的多路径级联
+  FOREIGN KEY (`experiment_id`, `student_id`)
+    REFERENCES `experiment_status`(`experiment_id`, `student_id`)
+    ON DELETE CASCADE,
+
+  INDEX `idx_experiment_step_order` (`experiment_id`, `step_order`, `event_timestamp`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+-- ========================================================
 -- 3. Assessment and Grading
---
+-- ========================================================
 
 CREATE TABLE IF NOT EXISTS `question_bank` (
   `question_id` INT AUTO_INCREMENT PRIMARY KEY,
@@ -166,28 +185,37 @@ CREATE TABLE IF NOT EXISTS `question_bank` (
 
   -- {"A":"Autoregressive order","B":"Differencing order","C":"Moving average order","D":"Seasonal period"} / ["True","False"]
   `options` JSON,
+
   -- ["A","B","D"] / ["True"]
   `correct_answers` JSON NOT NULL,
+
   `creator_id` INT,
   FOREIGN KEY (`creator_id`) REFERENCES `users`(`user_id`) ON DELETE SET NULL
-);
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
 CREATE TABLE IF NOT EXISTS `experiment_reports` (
   `report_id` INT AUTO_INCREMENT PRIMARY KEY,
   `experiment_id` INT NOT NULL,
   `student_id` INT NOT NULL,
   `report_content` TEXT,
+
   -- Absolute path on Linux that ends with .pdf
   `pdf_file_path` VARCHAR(255),
+
   `submitted_at` TIMESTAMP NULL,
   -- 0-100
   `grade` FLOAT,
   `feedback` TEXT,
   `graded_by` INT,
-  FOREIGN KEY (`experiment_id`) REFERENCES `experiment_status`(`experiment_id`) ON DELETE CASCADE,
-  FOREIGN KEY (`student_id`) REFERENCES `users`(`user_id`) ON DELETE CASCADE,
+
+  -- 复合外键到 experiment_status（级联删除）
+  FOREIGN KEY (`experiment_id`, `student_id`)
+    REFERENCES `experiment_status`(`experiment_id`, `student_id`)
+    ON DELETE CASCADE,
+
+  -- 打分老师删除时置空
   FOREIGN KEY (`graded_by`) REFERENCES `users`(`user_id`) ON DELETE SET NULL
-);
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
 -- Drop table if exists to ensure clean creation
 DROP TABLE IF EXISTS `grade_weights`;
@@ -211,8 +239,9 @@ CREATE TABLE `grade_weights` (
   `knowledge_test` FLOAT DEFAULT 0,
   `model_quality` FLOAT DEFAULT 0,
   `report_quality` FLOAT DEFAULT 0,
+
   FOREIGN KEY (`teacher_id`) REFERENCES `users`(`user_id`) ON DELETE CASCADE
-);
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
 -- Drop table if exists to ensure clean creation
 DROP TABLE IF EXISTS `experiment_grade`;
@@ -239,14 +268,19 @@ CREATE TABLE `experiment_grade` (
   `model_quality` FLOAT DEFAULT 0,
   `report_quality` FLOAT DEFAULT 0,
   `created_at` TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-  FOREIGN KEY (`experiment_id`) REFERENCES `experiment_status`(`experiment_id`) ON DELETE CASCADE,
-  FOREIGN KEY (`student_id`) REFERENCES `users`(`user_id`) ON DELETE CASCADE,
-  FOREIGN KEY (`grader_id`) REFERENCES `users`(`user_id`) ON DELETE SET NULL
-);
 
---
+  -- 复合外键（级联删除）
+  FOREIGN KEY (`experiment_id`, `student_id`)
+    REFERENCES `experiment_status`(`experiment_id`, `student_id`)
+    ON DELETE CASCADE,
+
+  -- 打分老师删除时置空
+  FOREIGN KEY (`grader_id`) REFERENCES `users`(`user_id`) ON DELETE SET NULL
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+-- ========================================================
 -- 4. System Management
---
+-- ========================================================
 
 CREATE TABLE IF NOT EXISTS `experiment_manuals` (
   `manual_id` INT AUTO_INCREMENT PRIMARY KEY,
@@ -254,12 +288,13 @@ CREATE TABLE IF NOT EXISTS `experiment_manuals` (
 
   -- Absolute Linux path that ends with .pdf
   `file_path` VARCHAR(255) NOT NULL,
+
   `description` TEXT,
   `is_active` BOOLEAN DEFAULT false,
   `uploader_id` INT,
   `uploaded_at` TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
   FOREIGN KEY (`uploader_id`) REFERENCES `users`(`user_id`) ON DELETE SET NULL
-);
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
 CREATE TABLE IF NOT EXISTS `datasets` (
   `dataset_id` INT AUTO_INCREMENT PRIMARY KEY,
@@ -267,9 +302,10 @@ CREATE TABLE IF NOT EXISTS `datasets` (
 
   -- Absolute Linux path that ends with .csv
   `file_path` VARCHAR(255) NOT NULL,
+
   `description` TEXT,
   `uploaded_at` TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-);
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
 CREATE TABLE IF NOT EXISTS `dataset_segments` (
   `segment_id` INT AUTO_INCREMENT PRIMARY KEY,
@@ -278,10 +314,12 @@ CREATE TABLE IF NOT EXISTS `dataset_segments` (
   `company_name` VARCHAR(255) NOT NULL,
   `product_name` VARCHAR(255) NOT NULL,
 
-
   -- Absolute Linux path that ends with .csv
   `file_path` VARCHAR(512) NOT NULL,
+
   FOREIGN KEY (`dataset_id`) REFERENCES `datasets`(`dataset_id`) ON DELETE CASCADE,
   INDEX `idx_dataset_segments_dataset_id` (`dataset_id`),
+
+  -- 原版唯一约束：不包含 dataset_id
   UNIQUE KEY `uniq_dataset_segments_product` (`industry_name`, `company_name`, `product_name`)
-);
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
