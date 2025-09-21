@@ -90,7 +90,9 @@ INSERT INTO `experiment_status` (
   `ensemble_boosting_metrics_rmse`, `ensemble_boosting_metrics_mae`, `ensemble_boosting_metrics_r2`,
   `ensemble_stacking_completed`, `ensemble_stacking_base_models`,
   `ensemble_stacking_metrics_rmse`, `ensemble_stacking_metrics_mae`, `ensemble_stacking_metrics_r2`,
-  `best_model`
+  `selected_best_model`,
+  `predict_steps`,
+  `predict_values`
 ) VALUES (
   5,
   '2023-09-01 09:00:00',
@@ -118,7 +120,9 @@ INSERT INTO `experiment_status` (
   82.10, 64.50, 0.928,
   TRUE, '["ma", "exp", "arima", "lstm"]',
   70.85, 55.20, 0.956,
-  'ensemble_stacking'
+  'ensemble_stacking',
+  3,
+  '[100, 101, 102]'
 );
 
 -- 插入学生2的实验状态（进行中）
@@ -345,27 +349,22 @@ INSERT INTO `datasets` (`data_name`, `file_path`, `description`) VALUES
 -- 插入数据集分段数据
 INSERT INTO `dataset_segments` (
   `dataset_id`, `industry_name`, `company_name`,
-  `product_name`, `start_row`, `end_row`, `file_path`
+  `product_name`, `file_path`
 ) VALUES
 -- XYZ科技公司智能手机数据 (第一数据集)
-(1, '电子消费品', 'XYZ科技公司', '智能手机', 2, 37,
- '/var/uploads/dataset_segments/electronics_xyz_smartphone_2020-2023.csv'),
+(1, '电子消费品', 'XYZ科技公司', '智能手机', '/var/uploads/dataset_segments/electronics_xyz_smartphone_2020-2023.csv'),
 
 -- ABC服饰休闲装数据 (第二数据集)
-(2, '服装纺织', 'ABC服饰有限公司', '休闲装', 2, 58,
- '/var/uploads/dataset_segments/apparel_abc_casualwear_2019-2023.csv'),
+(2, '服装纺织', 'ABC服饰有限公司', '休闲装', '/var/uploads/dataset_segments/apparel_abc_casualwear_2019-2023.csv'),
 
 -- DEF汽车SUV数据 (第三数据集)
-(3, '汽车制造', 'DEF汽车集团', 'SUV车型', 2, 37,
- '/var/uploads/dataset_segments/automotive_def_suv_2021-2023.csv'),
+(3, '汽车制造', 'DEF汽车集团', 'SUV车型', '/var/uploads/dataset_segments/automotive_def_suv_2021-2023.csv'),
 
 -- GHI科技平板电脑数据 (第一数据集)
-(1, '电子消费品', 'GHI科技公司', '平板电脑', 38, 73,
- '/var/uploads/dataset_segments/electronics_ghi_tablet_2020-2023.csv'),
+(1, '电子消费品', 'GHI科技公司', '平板电脑', '/var/uploads/dataset_segments/electronics_ghi_tablet_2020-2023.csv'),
 
 -- JKL服饰正装数据 (第二数据集)
-(2, '服装纺织', 'JKL服饰公司', '正装', 59, 94,
- '/var/uploads/dataset_segments/apparel_jkl_formalwear_2019-2023.csv');
+(2, '服装纺织', 'JKL服饰公司', '正装', '/var/uploads/dataset_segments/apparel_jkl_formalwear_2019-2023.csv');
 
 -- 插入一条额外的评分记录用于测试
 INSERT INTO `experiment_grade` (

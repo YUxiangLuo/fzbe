@@ -2,12 +2,25 @@ import { Hono } from "hono";
 import { jwt } from "hono/jwt";
 import { z } from "zod";
 import { zValidator } from "@hono/zod-validator";
-import { unlink } from "node:fs/promises";
+import { unlink, mkdir, rm } from "node:fs/promises";
 import { createReadStream } from "node:fs";
 import path from "path";
 import type { Pool, ResultSetHeader, RowDataPacket } from "mysql2/promise";
 import { parseCsvSegments } from "../utils";
 import csv from "csv-parser";
+
+// Helper to convert an array of objects to a CSV string
+const toCsvString = (data: Record<string, string>[]): string => {
+  if (data.length === 0) {
+    return "";
+  }
+  const headers = Object.keys(data[0] ?? {});
+  const headerRow = headers.join(",");
+  const bodyRows = data.map((row) =>
+    headers.map((header) => `"${row[header]}"`).join(","),
+  );
+  return [headerRow, ...bodyRows].join("\n");
+};
 
 const industryParamSchema = z.object({
   industry: z.string().min(1),
@@ -67,9 +80,6 @@ type ProductRow = RowDataPacket & {
 };
 
 type SegmentDetailRow = RowDataPacket & {
-  dataset_id: number;
-  start_row: number;
-  end_row: number;
   file_path: string;
 };
 
@@ -82,7 +92,9 @@ export default (pool: Pool, JWT_SECRET: string) => {
 
   // 管理员: 上传新的数据集
   datasetsApi.post("/datasets", jwt({ secret: JWT_SECRET }), async (c) => {
-    let uploadPath: string | null = null;
+    let tempUploadPath: string | null = null;
+    let datasetDirectory: string | null = null;
+
     try {
       const payload = c.get("jwtPayload");
       if (payload.role !== "Admin") {
@@ -100,46 +112,31 @@ export default (pool: Pool, JWT_SECRET: string) => {
         return c.json({ error: "data_name is required" }, 400);
       }
 
+      // 1. Save to a temporary location first
+      const tempDir = path.resolve(import.meta.dir, "../../uploads", "temp");
+      await mkdir(tempDir, { recursive: true });
       const uniqueFilename = `${Date.now()}-${file.name}`;
-      uploadPath = path.resolve(
-        import.meta.dir,
-        "../../uploads",
-        "datasets",
-        uniqueFilename,
-      );
+      tempUploadPath = path.join(tempDir, uniqueFilename);
+      await Bun.write(tempUploadPath, file);
 
-      await Bun.write(uploadPath, file);
+      // 2. Parse file in memory to get segments
+      const segmentsMap = await parseCsvSegments(tempUploadPath);
 
       const connection = await pool.getConnection();
       try {
         await connection.beginTransaction();
 
-        const segments = await parseCsvSegments(uploadPath);
-
-        const uniqueKeysMap = new Map<string, (typeof segments)[number]>();
-        for (const segment of segments) {
-          const key = `${segment["行业名称"]}|${segment["公司名称"]}|${segment["产品名称"]}`;
-          if (!uniqueKeysMap.has(key)) {
-            uniqueKeysMap.set(key, segment);
-          }
-        }
-
-        if (uniqueKeysMap.size > 0) {
-          const duplicateConditions = Array.from({ length: uniqueKeysMap.size })
+        // 3. Check for duplicates before proceeding
+        if (segmentsMap.size > 0) {
+          const duplicateConditions = Array.from({ length: segmentsMap.size })
             .map(
               () =>
                 "(industry_name = ? AND company_name = ? AND product_name = ?)",
             )
             .join(" OR ");
-
-          const duplicateValues = Array.from(uniqueKeysMap.values()).flatMap(
-            (segment) => [
-              segment["行业名称"],
-              segment["公司名称"],
-              segment["产品名称"],
-            ],
+          const duplicateValues = Array.from(segmentsMap.values()).flatMap(
+            (seg) => [seg.industryName, seg.companyName, seg.productName],
           );
-
           const [existing] = await connection.query<SegmentIdentityRow[]>(
             `SELECT industry_name, company_name, product_name FROM dataset_segments WHERE ${duplicateConditions}`,
             duplicateValues,
@@ -155,19 +152,6 @@ export default (pool: Pool, JWT_SECRET: string) => {
               .join(", ");
             const suffix = existing.length > 5 ? "..." : "";
             await connection.rollback();
-            if (uploadPath) {
-              try {
-                await unlink(uploadPath);
-              } catch (fsError: unknown) {
-                if (isNodeError(fsError) && fsError.code !== "ENOENT") {
-                  console.warn(
-                    `Failed to clean up uploaded file ${uploadPath}:`,
-                    fsError,
-                  );
-                }
-              }
-              uploadPath = null;
-            }
             return c.json(
               {
                 error: `数据库已经存在相同产品的销售数据: ${preview}${suffix}`,
@@ -177,29 +161,58 @@ export default (pool: Pool, JWT_SECRET: string) => {
           }
         }
 
+        // 4. Insert into datasets table to get an ID
         const [result] = await connection.query<ResultSetHeader>(
           "INSERT INTO datasets (data_name, file_path, description) VALUES (?, ?, ?)",
-          [dataName, uploadPath, description || null],
+          [dataName, "placeholder", description || null], // Use a placeholder path for now
         );
-
         const datasetId: number = result.insertId;
 
-        if (segments.length > 0) {
-          const segmentPlaceholders = segments
-            .map(() => "(?, ?, ?, ?, ?, ?, ?)")
+        // 5. Create dedicated directories for the dataset and its segments
+        datasetDirectory = path.resolve(
+          import.meta.dir,
+          "../../uploads",
+          "datasets",
+          String(datasetId),
+        );
+        const segmentsDir = path.join(datasetDirectory, "segments");
+        await mkdir(segmentsDir, { recursive: true });
+
+        // 6. Move original file to its permanent location and update the DB record
+        const permanentOriginalPath = path.join(
+          datasetDirectory,
+          "original.csv",
+        );
+        await Bun.write(permanentOriginalPath, Bun.file(tempUploadPath));
+        await connection.query(
+          "UPDATE datasets SET file_path = ? WHERE dataset_id = ?",
+          [permanentOriginalPath, datasetId],
+        );
+
+        // 7. Write each segment to its own CSV file and prepare for batch insert
+        if (segmentsMap.size > 0) {
+          const segmentValues = [];
+          for (const segment of segmentsMap.values()) {
+            const segmentFileName = `${segment.productName.replace(/[\/\\?%*:|"<>]/g, "-")}.csv`;
+            const segmentFilePath = path.join(segmentsDir, segmentFileName);
+            const csvContent = toCsvString(segment.rows);
+            await Bun.write(segmentFilePath, csvContent);
+
+            segmentValues.push(
+              datasetId,
+              segment.industryName,
+              segment.companyName,
+              segment.productName,
+              segmentFilePath, // Path to the new segment file
+            );
+          }
+
+          const segmentPlaceholders = Array.from({ length: segmentsMap.size })
+            .map(() => "(?, ?, ?, ?, ?)")
             .join(", ");
-          const segmentValues = segments.flatMap((segment) => [
-            datasetId,
-            segment["行业名称"],
-            segment["公司名称"],
-            segment["产品名称"],
-            segment["起始位置"],
-            segment["结束位置"],
-            segment.filePath,
-          ]);
 
           await connection.query(
-            `INSERT INTO dataset_segments (dataset_id, industry_name, company_name, product_name, start_row, end_row, file_path) VALUES ${segmentPlaceholders}`,
+            `INSERT INTO dataset_segments (dataset_id, industry_name, company_name, product_name, file_path) VALUES ${segmentPlaceholders}`,
             segmentValues,
           );
         }
@@ -210,7 +223,6 @@ export default (pool: Pool, JWT_SECRET: string) => {
           "SELECT * FROM datasets WHERE dataset_id = ?",
           [datasetId],
         );
-
         return c.json(rows[0], 201);
       } catch (dbError) {
         try {
@@ -218,25 +230,26 @@ export default (pool: Pool, JWT_SECRET: string) => {
         } catch (rollbackError) {
           console.error("Rollback failed:", rollbackError);
         }
-        throw dbError;
+        throw dbError; // Rethrow the original error
       } finally {
         connection.release();
       }
     } catch (error) {
       console.error("Error uploading dataset:", error);
-      if (typeof uploadPath === "string") {
-        try {
-          await unlink(uploadPath);
-        } catch (fsError: unknown) {
-          if (isNodeError(fsError) && fsError.code !== "ENOENT") {
-            console.warn(
-              `Failed to clean up uploaded file ${uploadPath}:`,
-              fsError,
-            );
-          }
-        }
+      // Cleanup directory if it was created
+      if (datasetDirectory) {
+        await rm(datasetDirectory, { recursive: true, force: true }).catch(
+          (err) => console.error("Failed to cleanup dataset directory:", err),
+        );
       }
       throw error;
+    } finally {
+      // Always cleanup the temporary file
+      if (tempUploadPath) {
+        await unlink(tempUploadPath).catch((err) =>
+          console.error("Failed to cleanup temp file:", err),
+        );
+      }
     }
   });
 
@@ -316,7 +329,7 @@ export default (pool: Pool, JWT_SECRET: string) => {
         const { industry, company, product } = c.req.valid("param");
 
         const [segments] = await pool.query<SegmentDetailRow[]>(
-          `SELECT dataset_id, start_row, end_row, file_path
+          `SELECT file_path
              FROM dataset_segments
             WHERE industry_name = ? AND company_name = ? AND product_name = ?
             LIMIT 1`,
@@ -328,7 +341,7 @@ export default (pool: Pool, JWT_SECRET: string) => {
           return c.json({ error: "Product segment not found" }, 404);
         }
 
-        const { start_row: startRow, end_row: endRow, file_path: filePath } = segment;
+        const { file_path: filePath } = segment;
 
         const monthlySales: Array<{ month: string; sales: number }> = [];
         let unit = "";
@@ -359,7 +372,6 @@ export default (pool: Pool, JWT_SECRET: string) => {
         };
 
         await new Promise<void>((resolve, reject) => {
-          let rowIndex = 0;
           createReadStream(filePath)
             .pipe(
               csv({
@@ -367,10 +379,6 @@ export default (pool: Pool, JWT_SECRET: string) => {
               }),
             )
             .on("data", (row: Record<string, unknown>) => {
-              rowIndex += 1;
-              if (rowIndex < startRow) return;
-              if (rowIndex > endRow) return;
-
               const year = normalizeYear(row["年份"]);
               const month = normalizeMonth(row["月份"]);
 
@@ -500,16 +508,9 @@ export default (pool: Pool, JWT_SECRET: string) => {
           return c.json({ error: "Dataset not found" }, 404);
         }
 
-        try {
-          await unlink(dataset.file_path);
-        } catch (fsError: unknown) {
-          if (isNodeError(fsError) && fsError.code !== "ENOENT") {
-            throw fsError;
-          }
-          console.warn(
-            `File not found, but proceeding with DB deletion: ${dataset.file_path}`,
-          );
-        }
+        // Delete the entire directory for this dataset
+        const datasetDirectory = path.dirname(dataset.file_path);
+        await rm(datasetDirectory, { recursive: true, force: true });
 
         const [result] = await pool.query<ResultSetHeader>(
           "DELETE FROM datasets WHERE dataset_id = ?",
@@ -517,10 +518,11 @@ export default (pool: Pool, JWT_SECRET: string) => {
         );
 
         if (result.affectedRows === 0) {
-          return c.json({ error: "Dataset not found" }, 404);
+          // This case should ideally not be reached if the directory was found
+          return c.json({ error: "Dataset not found in database" }, 404);
         }
 
-        return c.json({ message: "Dataset deleted successfully" });
+        return c.json({ message: "Dataset and all associated files deleted successfully" });
       } catch (error) {
         console.error("Error deleting dataset:", error);
         throw error;

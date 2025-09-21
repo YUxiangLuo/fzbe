@@ -67,7 +67,7 @@ CREATE TABLE IF NOT EXISTS `experiment_status` (
   `selected_company` VARCHAR(255),
   `selected_product` VARCHAR(255),
 
-  -- {"train_start_index": 0, "train_end_index": 100, "predict_start_index": 101, "predict_end_index": 120}
+  -- {"train_start_index": 0, "train_end_index": 100, "evaluate_start_index": 101, "evaluate_end_index": 120}
   `data_window` JSON DEFAULT NULL,
 
   `moving_average_completed` BOOLEAN DEFAULT NULL,
@@ -129,8 +129,15 @@ CREATE TABLE IF NOT EXISTS `experiment_status` (
   `ensemble_stacking_metrics_mae` FLOAT,
   `ensemble_stacking_metrics_r2` FLOAT,
 
-  --
-  `best_model` ENUM('ma', 'exp', 'arima', 'lstm', 'ensemble_weighted', 'ensemble_boosting', 'ensemble_stacking') DEFAULT NULL,
+  `selected_best_model` ENUM('ma', 'exp', 'arima', 'lstm', 'ensemble_weighted', 'ensemble_boosting', 'ensemble_stacking') DEFAULT NULL,
+  -- 1-6
+  `predict_steps` INT DEFAULT NULL,
+  -- [100], [100, 110, 120, 130], [100, 110, 120, 130, 140, 150]
+  `predict_values` JSON DEFAULT NULL,
+  `quiz_about_model_completed` BOOLEAN DEFAULT NULL,
+  `quiz_about_plan_completed` BOOLEAN DEFAULT NULL,
+  `experiment_report_submitted` BOOLEAN DEFAULT NULL,
+
   FOREIGN KEY (`student_id`) REFERENCES `users`(`user_id`) ON DELETE CASCADE
 );
 
@@ -270,8 +277,7 @@ CREATE TABLE IF NOT EXISTS `dataset_segments` (
   `industry_name` VARCHAR(255) NOT NULL,
   `company_name` VARCHAR(255) NOT NULL,
   `product_name` VARCHAR(255) NOT NULL,
-  `start_row` INT NOT NULL,
-  `end_row` INT NOT NULL,
+
 
   -- Absolute Linux path that ends with .csv
   `file_path` VARCHAR(512) NOT NULL,
