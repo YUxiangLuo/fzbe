@@ -89,7 +89,7 @@ api.route("/", classRoutes(pool, JWT_SECRET));
 api.route("/", manualRoutes(pool, JWT_SECRET));
 api.route("/", datasetRoutes(pool, JWT_SECRET));
 api.route("/", gradeRoutes(pool, JWT_SECRET));
-api.route("/", modelApi(JWT_SECRET)); // Model routes are already prefixed with their own paths
+api.route("/", modelApi(pool, JWT_SECRET)); // Model routes are already prefixed with their own paths
 
 app.route("/api", api);
 
