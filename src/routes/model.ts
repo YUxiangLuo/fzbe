@@ -76,31 +76,33 @@ export default (pool: Pool, JWT_SECRET: string) => {
           .on("error", reject);
       });
 
+     
+
       // Validate window indices and split the data
       if (data_window.trainEndIndex >= allData.length || data_window.evaluateEndIndex >= allData.length) {
         return c.json({ error: "Data window indices are out of bounds for the dataset.", dataset_size: allData.length }, 400);
       }
 
       const trainData = allData.slice(data_window.trainStartIndex, data_window.trainEndIndex + 1);
-      const predictData = allData.slice(data_window.evaluateStartIndex, data_window.evaluateEndIndex + 1);
+      const evaluateData = allData.slice(data_window.evaluateStartIndex, data_window.evaluateEndIndex + 1);
 
-      // Create temporary CSV files for training and prediction
+      // Create temporary CSV files for training and evaluation
       const outputDir = path.resolve(import.meta.dir, `../../model_csv/${studentId}/ma`);
       await fs.promises.mkdir(outputDir, { recursive: true });
 
       const trainCsvPath = path.join(outputDir, "train.csv");
-      const predictCsvPath = path.join(outputDir, "predict.csv");
+      const evaluateCsvPath = path.join(outputDir, "evaluate.csv");
 
       const toCsvString = (data: Record<string, string>[]): string => {
-          if (data.length === 0) return "";
-          const headers = Object.keys(data[0] ?? {});
-          const headerRow = headers.join(",");
-          const bodyRows = data.map((row) => headers.map((header) => `"${row[header]}"`).join(","));
-          return [headerRow, ...bodyRows].join("\n");
+        if (data.length === 0) return "";
+        const headers = Object.keys(data[0] ?? {});
+        const headerRow = headers.join(",");
+        const bodyRows = data.map((row) => headers.map((header) => `"${row[header]}"`).join(","));
+        return [headerRow, ...bodyRows].join("\n");
       };
 
       await Bun.write(trainCsvPath, toCsvString(trainData));
-      await Bun.write(predictCsvPath, toCsvString(predictData));
+      await Bun.write(evaluateCsvPath, toCsvString(evaluateData));
 
       // Return a fake success response with the old structure for frontend compatibility
       return c.json({

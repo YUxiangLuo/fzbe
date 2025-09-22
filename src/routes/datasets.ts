@@ -343,6 +343,13 @@ export default (pool: Pool, JWT_SECRET: string) => {
 
         const { file_path: filePath } = segment;
 
+        // Gracefully handle cases where the file is missing from the filesystem
+        const fileExists = await Bun.file(filePath).exists();
+        if (!fileExists) {
+          console.error(`File not found on disk for product segment: ${filePath}`);
+          return c.json({ error: "Product sales data file is missing" }, 404);
+        }
+
         const monthlySales: Array<{ month: string; sales: number }> = [];
         let unit = "";
 
@@ -372,26 +379,36 @@ export default (pool: Pool, JWT_SECRET: string) => {
         };
 
         await new Promise<void>((resolve, reject) => {
-          createReadStream(filePath)
-            .pipe(
-              csv({
-                mapHeaders: ({ header }) => header.replace(/^\uFEFF/, "").trim(),
-              }),
-            )
+          const stream = createReadStream(filePath).pipe(
+            csv({
+              mapHeaders: ({ header }) => header.replace(/^\uFEFF/, "").trim(),
+            }),
+          );
+
+          stream
             .on("data", (row: Record<string, unknown>) => {
-              const year = normalizeYear(row["年份"]);
-              const month = normalizeMonth(row["月份"]);
+              try {
+                const year = normalizeYear(row["年份"]);
+                const month = normalizeMonth(row["月份"]);
 
-              if (!year || !month) return;
+                if (!year || !month) return;
 
-              const salesValue = parseSales(row["销售数量"]);
-              if (!Number.isFinite(salesValue)) return;
+                const salesValue = parseSales(row["销售数量"]);
+                if (!Number.isFinite(salesValue)) return;
 
-              if (!unit && row["数量单位"]) {
-                unit = String(row["数量单位"]).trim();
+                if (!unit && row["数量单位"]) {
+                  unit = String(row["数量单位"]).trim();
+                }
+
+                monthlySales.push({ month: `${year}-${month}`, sales: salesValue });
+              } catch (processingError) {
+                // Manually destroy the stream on a sync error, which will trigger the 'error' event
+                stream.destroy(
+                  processingError instanceof Error
+                    ? processingError
+                    : new Error(String(processingError)),
+                );
               }
-
-              monthlySales.push({ month: `${year}-${month}`, sales: salesValue });
             })
             .on("end", () => resolve())
             .on("error", reject);

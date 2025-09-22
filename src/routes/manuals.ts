@@ -2,7 +2,7 @@ import { Hono } from "hono";
 import { jwt } from "hono/jwt";
 import { z } from "zod";
 import { zValidator } from "@hono/zod-validator";
-import { unlink } from "node:fs/promises";
+import { rm } from "node:fs/promises";
 import { join } from "node:path";
 import type { Pool } from "mysql2/promise";
 import path from "path";
@@ -214,16 +214,8 @@ export default (pool: Pool, JWT_SECRET: string) => {
           return c.json({ error: "Manual not found" }, 404);
         }
 
-        try {
-          await unlink(manual.file_path);
-        } catch (fsError: any) {
-          if (fsError.code !== "ENOENT") {
-            throw fsError;
-          }
-          console.warn(
-            `File not found, but proceeding with DB deletion: ${manual.file_path}`,
-          );
-        }
+        // Use rm with force: true to avoid crashing if the file is already deleted
+        await rm(manual.file_path, { force: true });
 
         await pool.query("DELETE FROM experiment_manuals WHERE manual_id = ?", [
           manualIdNumber,

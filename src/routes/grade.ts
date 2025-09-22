@@ -164,37 +164,63 @@ export default (pool: Pool, JWT_SECRET: string) => {
     }
   });
 
-  gradeApi.get("/question-bank/random", async (c) => {
-    try {
-      const payload = c.get("jwtPayload");
-      if (payload.role !== "Student") {
-        return c.json({ error: "Forbidden" }, 403);
+const randomQuestionsQuerySchema = z.object({
+  knowledge_point: z.string().trim().min(1).optional(),
+  limit: z
+    .string()
+    .regex(/^\d+$/, { message: "limit must be a positive integer" })
+    .transform(Number)
+    .refine((n) => n > 0, { message: "limit must be greater than 0" })
+    .default(1),
+});
+
+  gradeApi.get(
+    "/question-bank/random",
+    zValidator("query", randomQuestionsQuerySchema),
+    async (c) => {
+      try {
+        const payload = c.get("jwtPayload");
+        if (payload.role !== "Student") {
+          return c.json({ error: "Forbidden" }, 403);
+        }
+
+        const { knowledge_point, limit } = c.req.valid("query");
+
+        let sql = `
+        SELECT qb.question_id,
+               qb.knowledge_point,
+               qb.question_type,
+               qb.question_text,
+               qb.options,
+               qb.creator_id,
+               creator.full_name AS creator_name
+          FROM question_bank qb
+     LEFT JOIN users creator ON creator.user_id = qb.creator_id
+    `;
+        const params: (string | number)[] = [];
+
+        if (knowledge_point) {
+          sql += " WHERE qb.knowledge_point = ?";
+          params.push(knowledge_point);
+        }
+
+        sql += " ORDER BY RAND() LIMIT ?";
+        params.push(limit);
+
+        const [rows]: any[] = await pool.query(sql, params);
+
+        if (rows.length === 0) {
+          return c.json({ error: "No questions available for the given criteria" }, 404);
+        }
+
+        const normalized = rows.map((row: any) => normalizeQuestionRow(row, false));
+        return c.json(normalized);
+      } catch (error) {
+        console.error("Error fetching random questions:", error);
+        throw error;
       }
-
-      const [rows]: any[] = await pool.query(
-        `SELECT qb.question_id,
-                qb.knowledge_point,
-                qb.question_type,
-                qb.question_text,
-                qb.options,
-                qb.creator_id,
-                creator.full_name AS creator_name
-           FROM question_bank qb
-      LEFT JOIN users creator ON creator.user_id = qb.creator_id
-          ORDER BY RAND()
-          LIMIT 1`,
-      );
-
-      if (rows.length === 0) {
-        return c.json({ error: "No questions available" }, 404);
-      }
-
-      return c.json(normalizeQuestionRow(rows[0], false));
-    } catch (error) {
-      console.error("Error fetching random question:", error);
-      throw error;
-    }
-  });
+    },
+  );
 
   gradeApi.post(
     "/question-bank",
@@ -333,6 +359,69 @@ export default (pool: Pool, JWT_SECRET: string) => {
         return c.json(normalizeQuestionRow((rows as any[])[0], true));
       } catch (error) {
         console.error("Error updating question bank item:", error);
+        throw error;
+      }
+    },
+  );
+
+  const submitAnswerSchema = z.object({
+    experiment_id: z.number().int().positive(),
+    question_id: z.number().int().positive(),
+    quiz_type: z.enum(["quiz_about_model", "quiz_about_plan"]),
+    submitted_answer: z.array(z.string().trim().min(1)).min(1),
+  });
+
+  gradeApi.post(
+    "/quiz/answers",
+    zValidator("json", submitAnswerSchema),
+    async (c) => {
+      try {
+        const payload = c.get("jwtPayload");
+        if (payload.role !== "Student") {
+          return c.json({ error: "Forbidden" }, 403);
+        }
+        const studentId = Number.parseInt(payload.sub, 10);
+
+        const { experiment_id, question_id, quiz_type, submitted_answer } =
+          c.req.valid("json");
+
+        const [questionRows]: any = await pool.query(
+          "SELECT correct_answers FROM question_bank WHERE question_id = ?",
+          [question_id],
+        );
+
+        if (questionRows.length === 0) {
+          return c.json({ error: "Question not found" }, 404);
+        }
+
+        const correctAnswers = JSON.parse(questionRows[0].correct_answers);
+
+        // Sort both arrays to ensure order-independent comparison
+        const isCorrect =
+          JSON.stringify([...submitted_answer].sort()) ===
+          JSON.stringify([...correctAnswers].sort());
+
+        await pool.query(
+          `INSERT INTO quiz_answers
+             (experiment_id, student_id, question_id, quiz_type, submitted_answer, is_correct)
+           VALUES (?, ?, ?, ?, ?, ?)`,
+          [
+            experiment_id,
+            studentId,
+            question_id,
+            quiz_type,
+            JSON.stringify(submitted_answer),
+            isCorrect,
+          ],
+        );
+
+        return c.json({
+          is_correct: isCorrect,
+          correct_answers: correctAnswers,
+        }, 201);
+
+      } catch (error) {
+        console.error("Error submitting quiz answer:", error);
         throw error;
       }
     },

@@ -148,15 +148,15 @@ INSERT INTO experiment_step_events (event_id, experiment_id, student_id, step_or
 
 -- 7) question_bank（options/correct_answers 结构遵循注释示例）
 INSERT INTO question_bank (question_id, knowledge_point, question_type, question_text, options, correct_answers, creator_id) VALUES
-(1, 'ARIMA basics', 'Single Choice',
+(1, 'ARIMA基础', 'Single Choice',
  'In ARIMA(p,d,q), what does d stand for?',
  JSON_OBJECT('A','Autoregressive order','B','Differencing order','C','Moving average order','D','Seasonal period'),
  JSON_ARRAY('B'), 1),
-(2, 'Stationarity', 'True/False',
+(2, 'LSTM基础', 'True/False',
  'A stationary series has constant mean and variance over time.',
  JSON_ARRAY('True','False'),
  JSON_ARRAY('True'), 2),
-(3, 'Inventory Planning', 'Multiple Choice',
+(3, '融合模型原理', 'Multiple Choice',
  'Which factors influence safety stock? (Select all that apply)',
  JSON_OBJECT('A','Demand variability','B','Lead time variability','C','Selling price','D','Service level target'),
  JSON_ARRAY('A','B','D'), 1);

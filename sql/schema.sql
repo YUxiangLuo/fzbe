@@ -179,7 +179,7 @@ CREATE TABLE IF NOT EXISTS `experiment_step_events` (
 
 CREATE TABLE IF NOT EXISTS `question_bank` (
   `question_id` INT AUTO_INCREMENT PRIMARY KEY,
-  `knowledge_point` VARCHAR(255),
+  `knowledge_point` ENUM('ARIMA基础', 'LSTM基础', '融合模型原理', '生产变量计算公式', '服务水平计算公式') NOT NULL,
   `question_type` ENUM('Single Choice', 'Multiple Choice', 'True/False') NOT NULL,
   `question_text` TEXT NOT NULL,
 
@@ -191,6 +191,29 @@ CREATE TABLE IF NOT EXISTS `question_bank` (
 
   `creator_id` INT,
   FOREIGN KEY (`creator_id`) REFERENCES `users`(`user_id`) ON DELETE SET NULL
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+CREATE TABLE IF NOT EXISTS `quiz_answers` (
+  `answer_id` INT AUTO_INCREMENT PRIMARY KEY,
+  `experiment_id` INT NOT NULL,
+  `student_id` INT NOT NULL,
+  `question_id` INT NOT NULL,
+  `quiz_type` ENUM('quiz_about_model', 'quiz_about_plan') NOT NULL,
+  -- Submitted answers, stored in the same JSON array format as the question bank's correct_answers
+  `submitted_answer` JSON NOT NULL,
+  `is_correct` BOOLEAN, -- Can be calculated and stored upon submission
+  `answered_at` TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+
+  -- Composite foreign key to a specific student's experiment
+  FOREIGN KEY (`experiment_id`, `student_id`)
+    REFERENCES `experiment_status`(`experiment_id`, `student_id`)
+    ON DELETE CASCADE,
+
+  -- Foreign key to the question
+  FOREIGN KEY (`question_id`) REFERENCES `question_bank`(`question_id`) ON DELETE CASCADE,
+
+  -- Index to efficiently look up the latest answers for a given quiz
+  INDEX `idx_quiz_answers_lookup` (`student_id`, `experiment_id`, `quiz_type`, `answered_at` DESC)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
 CREATE TABLE IF NOT EXISTS `experiment_reports` (
