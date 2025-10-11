@@ -342,10 +342,10 @@ INSERT INTO `experiment_manuals` (`manual_id`, `file_name`, `file_path`, `descri
   true, 1, '2024-01-20 09:00:00'),
 (2, 'Quick_Start_Guide.pdf', '/var/manuals/quick_start_guide.pdf', 
   'Quick start guide for new students', 
-  true, 2, '2024-01-22 10:00:00'),
+  false, 2, '2024-01-22 10:00:00'),
 (3, 'Model_Selection_Guidelines.pdf', '/var/manuals/model_selection_guidelines.pdf', 
   'Detailed guidelines for selecting appropriate forecasting models', 
-  true, 2, '2024-01-25 11:00:00');
+  false, 2, '2024-01-25 11:00:00');
 
 -- ========================================================
 -- Summary Statistics Query

@@ -85,7 +85,7 @@ CREATE TABLE IF NOT EXISTS `experiment_status` (
   `arima_completed` BOOLEAN DEFAULT false,
   -- Tip for frontend: d is user-provided; p and q are auto-selected during training
   `arima_p` TINYINT DEFAULT NULL,
-  `arima_d` TINYINT DEFAULT 0,
+  `arima_d` TINYINT DEFAULT NULL,
   `arima_q` TINYINT DEFAULT NULL,
   `arima_metrics_rmse` FLOAT DEFAULT NULL,
   `arima_metrics_mae` FLOAT DEFAULT NULL,

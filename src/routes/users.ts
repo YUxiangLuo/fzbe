@@ -418,6 +418,24 @@ export default (pool: Pool, JWT_SECRET: string) => {
       if (!user) {
         return c.json({ error: "User not found" }, 404);
       }
+
+      if (user.role === "Student") {
+        const [classRows]: any[] = await pool.query(
+          `SELECT c.class_id,
+                  c.class_name,
+                  c.class_code,
+                  c.teacher_id,
+                  teacher.full_name AS teacher_name
+             FROM enrollments e
+             JOIN classes c ON c.class_id = e.class_id
+        LEFT JOIN users teacher ON teacher.user_id = c.teacher_id
+            WHERE e.student_id = ?
+            LIMIT 1`,
+          [userId],
+        );
+        user.class = classRows[0] ?? null;
+      }
+
       return c.json(user);
     } catch (error) {
       console.error("Error fetching current user:", error);
