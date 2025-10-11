@@ -286,6 +286,9 @@ const updateExperimentSchema = z
 const sanitizeForDb = (data: Record<string, unknown>) => {
   const sanitized: Record<string, unknown> = {};
 
+  const toMySqlDateTime = (date: Date) =>
+    date.toISOString().slice(0, 19).replace("T", " ");
+
   for (const [key, rawValue] of Object.entries(data)) {
     if (rawValue === undefined) {
       continue;
@@ -310,8 +313,31 @@ const sanitizeForDb = (data: Record<string, unknown>) => {
       continue;
     }
 
+    if (datetimeFields.has(key)) {
+      if (rawValue instanceof Date) {
+        sanitized[key] = toMySqlDateTime(rawValue);
+        continue;
+      }
+
+      if (typeof rawValue === "string") {
+        const trimmed = rawValue.trim();
+        if (!trimmed) {
+          sanitized[key] = null;
+          continue;
+        }
+
+        const parsed = new Date(trimmed);
+        if (Number.isNaN(parsed.getTime())) {
+          sanitized[key] = trimmed;
+        } else {
+          sanitized[key] = toMySqlDateTime(parsed);
+        }
+        continue;
+      }
+    }
+
     if (rawValue instanceof Date) {
-      sanitized[key] = rawValue;
+      sanitized[key] = toMySqlDateTime(rawValue);
       continue;
     }
 
@@ -460,21 +486,6 @@ export default (pool: Pool, JWT_SECRET: string) => {
 
       const connection = await pool.getConnection();
       try {
-        const [existing] = await connection.query<RowDataPacket[]>(
-          "SELECT experiment_id FROM experiment_status WHERE student_id = ? LIMIT 1",
-          [studentId],
-        );
-
-        if (existing.length > 0) {
-          return c.json(
-            {
-              error:
-                "Experiment status already exists. Use PUT to update the existing record.",
-            },
-            409,
-          );
-        }
-
         const sanitized = sanitizeForDb({ ...data, student_id: studentId });
 
         if (sanitized["current_step"] === null) {

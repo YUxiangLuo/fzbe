@@ -671,7 +671,7 @@ export default (pool: Pool, JWT_SECRET: string) => {
                   es.selected_industry,
                   es.selected_company,
                   es.selected_product,
-                  es.best_model
+                  es.selected_best_model
              FROM experiment_status es
              JOIN enrollments e
                ON e.student_id = es.student_id
