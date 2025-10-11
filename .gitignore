@@ -1,6 +1,8 @@
 notes.txt
 model_csv
 py
+py_tools
+*demo*
 uploads
 cdn
 # dependencies (bun install)

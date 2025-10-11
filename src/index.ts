@@ -13,6 +13,7 @@ import datasetRoutes from "./routes/datasets";
 import gradeRoutes from "./routes/grade";
 import modelApi from "./routes/model";
 import experimentingRoutes from "./routes/experimenting";
+import toolsRoutes from "./routes/tools";
 
 // --- Custom Logger Middleware ---
 const timestampedLogger = async (c: Context, next: Next) => {
@@ -92,6 +93,7 @@ api.route("/", datasetRoutes(pool, JWT_SECRET));
 api.route("/", gradeRoutes(pool, JWT_SECRET));
 api.route("/", modelApi(pool, JWT_SECRET)); // Model routes are already prefixed with their own paths
 api.route("/", experimentingRoutes(pool, JWT_SECRET));
+api.route("/", toolsRoutes(pool, JWT_SECRET));
 
 app.route("/api", api);
 
