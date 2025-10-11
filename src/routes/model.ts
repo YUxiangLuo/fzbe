@@ -2,30 +2,55 @@ import { Hono } from "hono";
 import { jwt } from "hono/jwt";
 import { z } from "zod";
 import { zValidator } from "@hono/zod-validator";
-import { parse, stringify } from "yaml";
 import path from "path";
 import fs from "fs";
 import type { Pool } from "mysql2/promise";
 import csv from "csv-parser";
 
 // Zod schema for the moving average training request
-const trainMovingAverageSchema = z.object({
-  selected_industry: z.string(),
-  selected_company: z.string(),
-  selected_product: z.string(),
-  movingAverage: z.object({
-    window: z.number().int().min(1, "Window size must be at least 1"),
-  }),
-  data_window: z.object({
-    trainStartIndex: z.number().int(),
-    trainEndIndex: z.number().int(),
-    evaluateStartIndex: z.number().int(),
-    evaluateEndIndex: z.number().int(),
-  }),
-});
-
-// Infer the TypeScript type from the Zod schema
-type TrainMovingAverageBody = z.infer<typeof trainMovingAverageSchema>;
+const trainMovingAverageSchema = z
+  .object({
+    selected_industry: z.string().min(1),
+    selected_company: z.string().min(1),
+    selected_product: z.string().min(1),
+    data_window_train_start_index: z.coerce
+      .number()
+      .int()
+      .min(0, "train start index must be >= 0"),
+    data_window_train_end_index: z.coerce
+      .number()
+      .int()
+      .min(0, "train end index must be >= 0"),
+    data_window_evaluate_start_index: z.coerce
+      .number()
+      .int()
+      .min(0, "evaluate start index must be >= 0"),
+    data_window_evaluate_end_index: z.coerce
+      .number()
+      .int()
+      .min(0, "evaluate end index must be >= 0"),
+    moving_average_window: z.coerce
+      .number()
+      .int()
+      .min(1, "moving average window must be at least 1"),
+  })
+  .refine(
+    (data) =>
+      data.data_window_train_start_index <= data.data_window_train_end_index,
+    {
+      message: "train_start_index must be <= train_end_index",
+      path: ["data_window_train_end_index"],
+    },
+  )
+  .refine(
+    (data) =>
+      data.data_window_evaluate_start_index <=
+      data.data_window_evaluate_end_index,
+    {
+      message: "evaluate_start_index must be <= evaluate_end_index",
+      path: ["data_window_evaluate_end_index"],
+    },
+  );
 
 export default (pool: Pool, JWT_SECRET: string) => {
   const modelApi = new Hono();
@@ -47,13 +72,17 @@ export default (pool: Pool, JWT_SECRET: string) => {
       }
       const studentId = payload.sub;
 
+      const body = c.req.valid("json");
       const {
         selected_industry,
         selected_company,
         selected_product,
-        movingAverage,
-        data_window,
-      } = c.req.valid("json");
+        data_window_train_start_index,
+        data_window_train_end_index,
+        data_window_evaluate_start_index,
+        data_window_evaluate_end_index,
+        moving_average_window,
+      } = body;
 
       // Get the file path for the specific product segment from the request body
       const [segmentRows]: any[] = await pool.query(
@@ -76,15 +105,24 @@ export default (pool: Pool, JWT_SECRET: string) => {
           .on("error", reject);
       });
 
-     
+ 
 
       // Validate window indices and split the data
-      if (data_window.trainEndIndex >= allData.length || data_window.evaluateEndIndex >= allData.length) {
+      if (
+        data_window_train_end_index >= allData.length ||
+        data_window_evaluate_end_index >= allData.length
+      ) {
         return c.json({ error: "Data window indices are out of bounds for the dataset.", dataset_size: allData.length }, 400);
       }
 
-      const trainData = allData.slice(data_window.trainStartIndex, data_window.trainEndIndex + 1);
-      const evaluateData = allData.slice(data_window.evaluateStartIndex, data_window.evaluateEndIndex + 1);
+      const trainData = allData.slice(
+        data_window_train_start_index,
+        data_window_train_end_index + 1,
+      );
+      const evaluateData = allData.slice(
+        data_window_evaluate_start_index,
+        data_window_evaluate_end_index + 1,
+      );
 
       // Create temporary CSV files for training and evaluation
       const outputDir = path.resolve(import.meta.dir, `../../model_csv/${studentId}/ma`);
@@ -113,7 +151,7 @@ export default (pool: Pool, JWT_SECRET: string) => {
             mae: 0.5 + Math.random() * 0.5,  // Fake metric
             r2: 0.1 + Math.random() * 0.5,   // Fake metric
           },
-          window: movingAverage.window,
+          window: moving_average_window,
         },
       });
     },
