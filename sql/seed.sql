@@ -114,7 +114,7 @@ INSERT INTO `experiment_status` (`experiment_id`, `student_id`, `status`, `highe
   `exponential_smoothing_completed`, `exponential_smoothing_alpha`, `exponential_smoothing_metrics_rmse`, `exponential_smoothing_metrics_mae`, `exponential_smoothing_metrics_r2`,
   `arima_completed`, `arima_p`, `arima_d`, `arima_q`, `arima_metrics_rmse`, `arima_metrics_mae`, `arima_metrics_r2`,
   `arima_adf_stationarity`,
-  `lstm_completed`, `lstm_normalization`, `lstm_features`, `lstm_metrics_rmse`, `lstm_metrics_mae`, `lstm_metrics_r2`,
+  `lstm_completed`, `lstm_normalization`, `lstm_features`, `lstm_target_field`, `lstm_metrics_rmse`, `lstm_metrics_mae`, `lstm_metrics_r2`,
   `ensemble_weighted_completed`, `ensemble_weighted_base_models`, `ensemble_weighted_metrics_rmse`, `ensemble_weighted_metrics_mae`, `ensemble_weighted_metrics_r2`,
   `selected_best_model`, `quiz_about_model_completed`, `quiz_about_plan_completed`,
   `start_time`, `last_activity_at`, `completion_time`) 
@@ -126,7 +126,7 @@ VALUES
   true, 0.3, 1180.2, 920.1, 0.94,
   true, 2, 1, 2, 1050.8, 850.4, 0.96,
   '[{"diff_order":0,"statistic":-1.876,"p_value":0.640,"stationary":false,"critical_values":{"1%":-3.500,"5%":-2.890,"10%":-2.580}},{"diff_order":1,"statistic":-3.954,"p_value":0.002,"stationary":true,"critical_values":{"1%":-3.500,"5%":-2.890,"10%":-2.580}}]',
-  true, 'minmax', '["Month", "Sales_Amount", "Is_Promotion", "Holiday_Flag"]', 980.5, 780.2, 0.97,
+  true, 'minmax', '["Month", "Sales_Amount", "Is_Promotion", "Holiday_Flag"]', 'Sales_Amount', 980.5, 780.2, 0.97,
   true, '["arima", "lstm"]', 920.3, 720.5, 0.98,
   'ensemble_weighted', true, true,
   '2024-02-01 09:00:00', '2024-02-15 16:30:00', '2024-02-15 16:30:00');

@@ -98,6 +98,7 @@ CREATE TABLE IF NOT EXISTS `experiment_status` (
   `lstm_normalization` ENUM('minmax', 'zscore') DEFAULT NULL,
   -- CSV file column names array: ['Month', 'Sales Amount', 'Is Promotion']
   `lstm_features` JSON DEFAULT NULL,
+  `lstm_target_field` VARCHAR(255) DEFAULT NULL,
   `lstm_metrics_rmse` FLOAT DEFAULT NULL,
   `lstm_metrics_mae` FLOAT DEFAULT NULL,
   `lstm_metrics_r2` FLOAT DEFAULT NULL,

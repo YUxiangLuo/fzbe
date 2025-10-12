@@ -237,6 +237,7 @@ const optionalFields: Record<string, z.ZodTypeAny> = {
     .nullable()
     .optional(),
   lstm_features: optionalJson,
+  lstm_target_field: optionalString,
   lstm_metrics_rmse: optionalFloat(0),
   lstm_metrics_mae: optionalFloat(0),
   lstm_metrics_r2: optionalFloat(),

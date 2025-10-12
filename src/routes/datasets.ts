@@ -321,6 +321,75 @@ export default (pool: Pool, JWT_SECRET: string) => {
   );
 
   datasetsApi.get(
+    "/datasets/industries/:industry/companies/:company/products/:product/fields",
+    jwt({ secret: JWT_SECRET }),
+    zValidator("param", industryCompanyProductParamSchema),
+    async (c) => {
+      try {
+        const { industry, company, product } = c.req.valid("param");
+
+        const [segments] = await pool.query<SegmentDetailRow[]>(
+          `SELECT file_path
+             FROM dataset_segments
+            WHERE industry_name = ? AND company_name = ? AND product_name = ?
+            LIMIT 1`,
+          [industry, company, product],
+        );
+
+        const segment = segments[0];
+        if (!segment) {
+          return c.json({ error: "Product segment not found" }, 404);
+        }
+
+        const { file_path: filePath } = segment;
+        const fileExists = await Bun.file(filePath).exists();
+        if (!fileExists) {
+          console.error(`File not found on disk for product segment: ${filePath}`);
+          return c.json({ error: "Product segment file is missing" }, 404);
+        }
+
+        const fields = await new Promise<string[]>((resolve, reject) => {
+          let settled = false;
+          const parser = createReadStream(filePath).pipe(
+            csv({
+              mapHeaders: ({ header }) => header.replace(/^\uFEFF/, "").trim(),
+            }),
+          );
+
+          parser
+            .once("headers", (headers: string[]) => {
+              settled = true;
+              // Immediately resolve with trimmed headers; destroy stream to stop further processing
+              resolve(
+                headers
+                  .map((header) => header.trim())
+                  .filter((header) => header.length > 0),
+              );
+              parser.destroy();
+            })
+            .on("end", () => {
+              if (!settled) {
+                settled = true;
+                resolve([]);
+              }
+            })
+            .on("error", (err) => {
+              if (!settled) {
+                settled = true;
+                reject(err);
+              }
+            });
+        });
+
+        return c.json({ fields });
+      } catch (error) {
+        console.error("Error fetching product fields:", error);
+        throw error;
+      }
+    },
+  );
+
+  datasetsApi.get(
     "/datasets/industries/:industry/companies/:company/products/:product/sales",
     jwt({ secret: JWT_SECRET }),
     zValidator("param", industryCompanyProductParamSchema),
