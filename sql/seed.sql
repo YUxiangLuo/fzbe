@@ -45,25 +45,25 @@ INSERT INTO `users` (`user_id`, `username`, `password_hash`, `full_name`, `email
 -- ========================================================
 
 INSERT INTO `classes` (`class_id`, `class_name`, `class_code`, `teacher_id`, `created_at`) VALUES
-(1, 'Production Planning and Control - Spring 2024', 'PPC-2024-S1', 2, '2024-01-20 10:00:00'),
-(2, 'Operations Management - Spring 2024', 'OPM-2024-S1', 3, '2024-01-20 10:30:00'),
-(3, 'Supply Chain Simulation - Spring 2024', 'SCS-2024-S1', 2, '2024-01-20 11:00:00');
+(1, '企业需求预测与生产计划 - 2024春季', 'DFPP-2024-S1', 2, '2024-01-20 10:00:00'),
+(2, '供应链管理与需求分析 - 2024春季', 'SCDA-2024-S1', 3, '2024-01-20 10:30:00'),
+(3, '时间序列预测方法 - 2024春季', 'TSFM-2024-S1', 2, '2024-01-20 11:00:00');
 
 -- ========================================================
 -- 3. Enrollments
 -- ========================================================
 
 INSERT INTO `enrollments` (`student_id`, `class_id`) VALUES
--- Class 1: PPC-2024-S1
+-- Class 1: 企业需求预测与生产计划
 (6, 1),
 (7, 1),
 (8, 1),
 (9, 1),
--- Class 2: OPM-2024-S1
+-- Class 2: 供应链管理与需求分析
 (7, 2),
 (8, 2),
 (10, 2),
--- Class 3: SCS-2024-S1
+-- Class 3: 时间序列预测方法
 (6, 3),
 (9, 3),
 (10, 3);
@@ -73,9 +73,9 @@ INSERT INTO `enrollments` (`student_id`, `class_id`) VALUES
 -- ========================================================
 
 INSERT INTO `class_assistants` (`assistant_id`, `class_id`) VALUES
-(4, 1),  -- Liu Fang assists PPC class
-(5, 2),  -- Chen Ming assists OPM class
-(4, 3);  -- Liu Fang assists SCS class
+(4, 1),  -- Liu Fang assists 企业需求预测与生产计划
+(5, 2),  -- Chen Ming assists 供应链管理与需求分析
+(4, 3);  -- Liu Fang assists 时间序列预测方法
 
 -- ========================================================
 -- 5. Datasets

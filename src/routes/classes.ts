@@ -3,6 +3,10 @@ import { jwt } from "hono/jwt";
 import { z } from "zod";
 import { zValidator } from "@hono/zod-validator";
 import type { Pool } from "mysql2/promise";
+import csv from "csv-parser";
+import { createReadStream } from "node:fs";
+import { unlink, mkdir } from "node:fs/promises";
+import path from "path";
 
 // Zod Schemas for Validation
 const classIdParamSchema = z.object({
@@ -25,6 +29,13 @@ const studentIdParamSchema = z.object({
 const classStudentParamSchema = z.object({
   classId: z.string().regex(/^\d+$/),
   studentId: z.string().regex(/^\d+$/),
+});
+
+const createStudentSchema = z.object({
+  username: z.string().min(1, { message: "学号 is required" }), // 学号作为username
+  full_name: z.string().min(1, { message: "姓名 is required" }),
+  email: z.string().email().optional(), // 可选，如果不提供则自动生成
+  phone_number: z.string().optional(),
 });
 
 const reportIdParamSchema = z.object({
@@ -149,78 +160,169 @@ const normalizeExperimentGradeRow = (row: any) => {
 export default (pool: Pool, JWT_SECRET: string) => {
   const classesApi = new Hono();
 
-  // 受保护的路由: 创建新班级
+  // 受保护的路由: 创建新班级 (支持上传学生名单CSV)
   classesApi.post(
     "/classes",
     jwt({ secret: JWT_SECRET }),
-    zValidator("json", createClassSchema),
     async (c) => {
+      let tempCsvPath: string | null = null;
+
       try {
         const payload = c.get("jwtPayload");
         if (payload.role !== "Teacher" && payload.role !== "Admin") {
           return c.json({ error: "Forbidden" }, 403);
         }
 
-        const { class_name, class_code } = c.req.valid("json");
+        const body = await c.req.parseBody();
+        const class_name = body["class_name"];
+        const class_code = body["class_code"];
+        const studentListFile = body["student_list"]; // CSV file (optional)
+
+        if (!class_name || typeof class_name !== "string") {
+          return c.json({ error: "class_name is required" }, 400);
+        }
+
         const teacher_id = payload.sub;
+        const connection = await pool.getConnection();
 
-        const [result]: any = await pool.query(
-          "INSERT INTO classes (class_name, class_code, teacher_id) VALUES (?, ?, ?)",
-          [class_name, class_code || null, teacher_id],
-        );
+        try {
+          await connection.beginTransaction();
 
-        const [newClassRows]: any[] = await pool.query(
-          "SELECT c.*, u.full_name as teacher_name FROM classes c JOIN users u ON c.teacher_id = u.user_id WHERE c.class_id = ?",
-          [result.insertId],
-        );
+          // 1. Create the class
+          const [result]: any = await connection.query(
+            "INSERT INTO classes (class_name, class_code, teacher_id) VALUES (?, ?, ?)",
+            [class_name, typeof class_code === "string" ? class_code || null : null, teacher_id],
+          );
 
-        return c.json(newClassRows[0], 201);
+          const classId = result.insertId;
+          let createdStudentsCount = 0;
+          const createdStudents: any[] = [];
+          const errors: string[] = [];
+
+          // 2. If a student list CSV file is provided, parse and create students
+          if (studentListFile instanceof File) {
+            // Save CSV to temporary location
+            const tempDir = path.resolve(import.meta.dir, "../../uploads", "temp");
+            await mkdir(tempDir, { recursive: true });
+            const uniqueFilename = `${Date.now()}-${studentListFile.name}`;
+            tempCsvPath = path.join(tempDir, uniqueFilename);
+            await Bun.write(tempCsvPath, studentListFile);
+
+            // Fixed password hash
+            const defaultPasswordHash = "$2b$10$DVZtxD9Efhm/j8.LSWMFx.hfdpk81iHO4Tv0fUaDr1LlW/mFrgXrG";
+
+            // Parse CSV and collect student records
+            const studentRecords: Array<{ studentId: string; fullName: string; email: string }> = [];
+
+            await new Promise<void>((resolve, reject) => {
+              createReadStream(tempCsvPath!)
+                .pipe(csv({
+                  mapHeaders: ({ header }) => header.replace(/^\uFEFF/, "").trim()
+                }))
+                .on("data", (row: Record<string, string>) => {
+                  const studentId = row["学号"]?.trim();
+                  const fullName = row["姓名"]?.trim();
+
+                  if (studentId && fullName) {
+                    // Generate email as studentId@student.edu
+                    const email = `${studentId}@student.edu`;
+                    studentRecords.push({ studentId, fullName, email });
+                  }
+                })
+                .on("end", resolve)
+                .on("error", reject);
+            });
+
+            // 3. Batch insert students and enroll them in the class
+            for (const record of studentRecords) {
+              try {
+                // Check if student already exists
+                const [existingUser]: any[] = await connection.query(
+                  "SELECT user_id FROM users WHERE username = ?",
+                  [record.studentId]
+                );
+
+                let userId: number;
+
+                if (existingUser.length > 0) {
+                  // Student already exists, check if enrolled in any other class
+                  userId = existingUser[0].user_id;
+
+                  const [enrollments]: any[] = await connection.query(
+                    "SELECT class_id FROM enrollments WHERE student_id = ?",
+                    [userId]
+                  );
+
+                  if (enrollments.length > 0) {
+                    // Student is already in another class, reject
+                    throw new Error(`学生 ${record.studentId} (${record.fullName}) 已在其他班级中，无法重复添加`);
+                  }
+                  // Student exists but not enrolled anywhere, can reuse the account
+                } else {
+                  // Create new student user
+                  const [userResult]: any = await connection.query(
+                    "INSERT INTO users (username, password_hash, full_name, email, role) VALUES (?, ?, ?, ?, 'Student')",
+                    [record.studentId, defaultPasswordHash, record.fullName, record.email]
+                  );
+                  userId = userResult.insertId;
+                  createdStudentsCount++;
+                }
+
+                // Enroll student in the class
+                await connection.query(
+                  "INSERT INTO enrollments (student_id, class_id) VALUES (?, ?)",
+                  [userId, classId]
+                );
+                createdStudents.push({
+                  user_id: userId,
+                  username: record.studentId,
+                  full_name: record.fullName,
+                  email: record.email
+                });
+              } catch (studentError: any) {
+                if (studentError.code === "ER_DUP_ENTRY") {
+                  errors.push(`学生 ${record.studentId} 已存在但无法加入班级`);
+                } else {
+                  errors.push(`创建学生 ${record.studentId} 失败: ${studentError.message}`);
+                }
+              }
+            }
+          }
+
+          await connection.commit();
+
+          const [newClassRows]: any[] = await connection.query(
+            "SELECT c.*, u.full_name as teacher_name FROM classes c JOIN users u ON c.teacher_id = u.user_id WHERE c.class_id = ?",
+            [classId],
+          );
+
+          return c.json({
+            class: newClassRows[0],
+            students_created: createdStudentsCount,
+            students_enrolled: createdStudents.length,
+            students: createdStudents,
+            errors: errors.length > 0 ? errors : undefined
+          }, 201);
+
+        } catch (error) {
+          await connection.rollback();
+          throw error;
+        } finally {
+          connection.release();
+        }
       } catch (error: any) {
         if (error.code === "ER_DUP_ENTRY") {
           return c.json({ error: "Class code already exists" }, 409);
         }
         console.error("Error creating class:", error);
         throw error;
-      }
-    },
-  );
-
-  // 受保护的路由: 学生使用班级代码加入班级
-  classesApi.post(
-    "/classes/enroll",
-    jwt({ secret: JWT_SECRET }),
-    zValidator("json", enrollSchema),
-    async (c) => {
-      try {
-        const payload = c.get("jwtPayload");
-        if (payload.role !== "Student") {
-          return c.json({ error: "Only students can enroll in classes" }, 403);
+      } finally {
+        // Cleanup temporary CSV file
+        if (tempCsvPath) {
+          await unlink(tempCsvPath).catch((err) =>
+            console.error("Failed to cleanup temp CSV file:", err)
+          );
         }
-
-        const { class_code } = c.req.valid("json");
-        const [classRows]: any[] = await pool.query(
-          "SELECT class_id FROM classes WHERE class_code = ?",
-          [class_code],
-        );
-        const targetClass = classRows[0];
-
-        if (!targetClass) {
-          return c.json({ error: "Class not found" }, 404);
-        }
-
-        const student_id = payload.sub;
-        await pool.query(
-          "INSERT INTO enrollments (student_id, class_id) VALUES (?, ?)",
-          [student_id, targetClass.class_id],
-        );
-
-        return c.json({ message: "Enrolled successfully" }, 200);
-      } catch (error: any) {
-        if (error.code === "ER_DUP_ENTRY") {
-          return c.json({ error: "Already enrolled in this class" }, 409);
-        }
-        console.error("Error enrolling in class:", error);
-        throw error;
       }
     },
   );
@@ -243,7 +345,7 @@ export default (pool: Pool, JWT_SECRET: string) => {
     }
   });
 
-  // 受保护的路由: 获取单个班级详情 (包括学生列表)
+  // 受保护的路由: 获取单个班级详情 (包括学生列表和助教列表)
   classesApi.get(
     "/classes/:classId",
     jwt({ secret: JWT_SECRET }),
@@ -526,6 +628,108 @@ export default (pool: Pool, JWT_SECRET: string) => {
       } catch (error) {
         console.error("Error fetching assistants for class:", error);
         throw error;
+      }
+    },
+  );
+
+  // 创建学生并加入指定班级
+  classesApi.post(
+    "/classes/:classId/students",
+    jwt({ secret: JWT_SECRET }),
+    zValidator("param", classIdParamSchema),
+    zValidator("json", createStudentSchema),
+    async (c) => {
+      const payload = c.get("jwtPayload");
+      if (payload.role !== "Admin" && payload.role !== "Teacher") {
+        return c.json({ error: "Forbidden" }, 403);
+      }
+
+      const { classId } = c.req.valid("param");
+      const classIdNumber = Number.parseInt(classId, 10);
+      const { username, full_name, email, phone_number } = c.req.valid("json");
+
+      const connection = await pool.getConnection();
+      try {
+        await connection.beginTransaction();
+
+        const [classRows]: any[] = await connection.query(
+          "SELECT teacher_id FROM classes WHERE class_id = ?",
+          [classIdNumber],
+        );
+
+        if (classRows.length === 0) {
+          await connection.rollback();
+          return c.json({ error: "Class not found" }, 404);
+        }
+
+        const classOwner = classRows[0].teacher_id;
+        if (payload.role === "Teacher" && payload.sub !== classOwner) {
+          await connection.rollback();
+          return c.json({ error: "Forbidden" }, 403);
+        }
+
+        const defaultPasswordHash =
+          "$2b$10$DVZtxD9Efhm/j8.LSWMFx.hfdpk81iHO4Tv0fUaDr1LlW/mFrgXrG";
+        const studentEmail = email || `${username}@student.edu`;
+
+        const [userResult]: any = await connection.query(
+          "INSERT INTO users (username, password_hash, full_name, email, role, phone_number) VALUES (?, ?, ?, ?, 'Student', ?)",
+          [
+            username,
+            defaultPasswordHash,
+            full_name,
+            studentEmail,
+            phone_number || null,
+          ],
+        );
+
+        const newStudentId = userResult.insertId;
+
+        await connection.query(
+          "INSERT INTO enrollments (student_id, class_id) VALUES (?, ?)",
+          [newStudentId, classIdNumber],
+        );
+
+        const [studentRows]: any[] = await connection.query(
+          `SELECT u.user_id,
+                  u.username,
+                  u.full_name,
+                  u.email,
+                  u.phone_number,
+                  u.role,
+                  u.created_at
+             FROM users u
+            WHERE u.user_id = ?
+            LIMIT 1`,
+          [newStudentId],
+        );
+
+        if (studentRows.length === 0) {
+          throw new Error("Failed to load created student record");
+        }
+
+        await connection.commit();
+
+        return c.json(studentRows[0], 201);
+      } catch (error: any) {
+        await connection.rollback();
+
+        if (error.code === "ER_DUP_ENTRY") {
+          if (typeof error.message === "string") {
+            if (error.message.includes("users.username")) {
+              return c.json({ error: "学号已存在" }, 409);
+            }
+            if (error.message.includes("users.email")) {
+              return c.json({ error: "邮箱已存在" }, 409);
+            }
+          }
+          return c.json({ error: "学生创建冲突" }, 409);
+        }
+
+        console.error("Error creating student and enrolling in class:", error);
+        throw error;
+      } finally {
+        connection.release();
       }
     },
   );
