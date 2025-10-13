@@ -1,32 +1,27 @@
 #!/usr/bin/env bash
-# Train a boosting ensemble model.
-set -euo pipefail
+# Usage: ./train_boosting.sh <DATA_FULL> <TRAIN_START> <TRAIN_END> <EVAL_START> <EVAL_END> <D> <WINDOW> <ALPHA> <LOOKBACK> <NORM> <FEATURE_TYPES> <MODEL_SAVE_LOC> <MODEL1> <MODEL2> [<MODEL3> ...]
 
-ROOT="$(cd "$(dirname "$0")" && pwd)"
-cd "$ROOT"
+if [ "$#" -lt 14 ]; then
+  echo "Error: Requires at least 14 arguments" >&2
+  echo "Usage: $0 <DATA_FULL> <TRAIN_START> <TRAIN_END> <EVAL_START> <EVAL_END> <D> <WINDOW> <ALPHA> <LOOKBACK> <NORM> <FEATURE_TYPES> <MODEL_SAVE_LOC> <MODEL1> <MODEL2> [...]" >&2
+  exit 1
+fi
 
-echo ">>> Generating dataset..."
-DATA_FULL="$(python -c 'from gen_dataset import generate_dataset; import json; print(json.dumps(generate_dataset(start_year=2021, n_years=3)))')"
+DATA_FULL="$1"
+TRAIN_START="$2"
+TRAIN_END="$3"
+EVAL_START="$4"
+EVAL_END="$5"
+D="$6"
+WINDOW="$7"
+ALPHA="$8"
+LOOKBACK="$9"
+NORM="${10}"
+FEATURE_TYPES="${11}"
+MODEL_SAVE_LOC="${12}"
+shift 12
+BASE_MODELS=("$@")
 
-TRAIN_START=0
-TRAIN_END=29
-EVAL_START=30
-EVAL_END=35
-
-# Base models to use in the boosting sequence.
-# The paths are used as templates/configurations.
-# These do NOT need to be pre-trained.
-BASE_MODELS=(
-  "trained_models/arima.pkl"
-  "trained_models/ma.pkl"
-  "trained_models/es.pkl"
-  "trained_models/lstm.pt"
-)
-
-MODEL_SAVE_LOC="trained_models/boosting_config.pkl"
-
-echo ">>> Training boosting ensemble..."
-# Provide hyperparameters for all base models, as they will be re-trained on residuals.
 python src/main.py \
   --method boosting \
   --data "$DATA_FULL" \
@@ -34,11 +29,10 @@ python src/main.py \
   --train_start "$TRAIN_START" --train_end "$TRAIN_END" \
   --eval_start "$EVAL_START" --eval_end "$EVAL_END" \
   --save_ensemble "$MODEL_SAVE_LOC" \
-  --d 1 \
-  --window 4 \
-  --alpha 0.5 \
-  --lookback 4 \
-  --norm zscore \
+  --d "$D" \
+  --window "$WINDOW" \
+  --alpha "$ALPHA" \
+  --lookback "$LOOKBACK" \
+  --norm "$NORM" \
+  --feature_types "$FEATURE_TYPES" \
   --pretty
-
-echo ">>> Boosting ensemble training complete. Config saved to $MODEL_SAVE_LOC"

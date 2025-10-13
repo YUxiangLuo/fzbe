@@ -1,21 +1,22 @@
 #!/usr/bin/env bash
-DATA_SIMPLE="$(python - <<'PY'
-from gen_dataset import generate_dataset, generate_simple_format
-import json
-data = generate_dataset(start_year=2021, n_years=3)
-print(json.dumps(generate_simple_format(data)))
-PY
-)"
+# Usage: ./train_ma.sh <DATA_SIMPLE> <TRAIN_START> <TRAIN_END> <EVAL_START> <EVAL_END> <WINDOW> <MODEL_SAVE_LOC>
 
-TRAIN_START=0
-TRAIN_END=29
-EVAL_START=30
-EVAL_END=35
-WINDOW=4
-MODEL_SAVE_LOC=./trained_models/ma.pkl
+if [ "$#" -ne 7 ]; then
+  echo "Error: Requires 7 arguments" >&2
+  echo "Usage: $0 <DATA_SIMPLE> <TRAIN_START> <TRAIN_END> <EVAL_START> <EVAL_END> <WINDOW> <MODEL_SAVE_LOC>" >&2
+  exit 1
+fi
+
+DATA_SIMPLE="$1"
+TRAIN_START="$2"
+TRAIN_END="$3"
+EVAL_START="$4"
+EVAL_END="$5"
+WINDOW="$6"
+MODEL_SAVE_LOC="$7"
 
 python src/main.py --method ma \
   --data "$DATA_SIMPLE" \
   --train_start "$TRAIN_START" --train_end "$TRAIN_END" \
   --eval_start "$EVAL_START" --eval_end "$EVAL_END" \
-  --window $WINDOW --save_model "$MODEL_SAVE_LOC" --pretty
+  --window "$WINDOW" --save_model "$MODEL_SAVE_LOC" --pretty

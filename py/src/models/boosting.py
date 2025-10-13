@@ -119,9 +119,9 @@ def run(args) -> None:
 
     for i, model_path in enumerate(model_paths):
         print(f"Boosting Step {i+1}/{len(model_paths)}: Training on residuals with base model {model_path}", file=sys.stderr)
-        
+
         temp_args = deepcopy(args)
-        
+
         model_type = "unknown"
         path_lower = model_path.lower()
         if "arima" in path_lower: model_type = "arima"
@@ -138,7 +138,7 @@ def run(args) -> None:
         # Set up a valid train/eval split for the sub-model training,
         # respecting the specific needs of the LSTM model.
         residual_len = len(current_residuals_train)
-        
+
         if model_type == "lstm":
             lookback = int(getattr(args, "lookback", 4))
             min_eval_len = lookback + 1
@@ -155,28 +155,38 @@ def run(args) -> None:
             temp_args.train_end = residual_len - 2
             temp_args.eval_start = residual_len - 1
             temp_args.eval_end = residual_len - 1
-        
+
         temp_args.train_start = 0
-        
+
         model_filename = f"residual_model_{i+1}_{os.path.basename(model_path)}"
         new_model_path = os.path.join(temp_dir, model_filename)
         temp_args.save_model = new_model_path
-        
-        if model_type == "arima":
-            if not hasattr(args, "d"): raise ValueError("ARIMA model for boosting requires --d")
-            arima.run(temp_args)
-        elif model_type == "lstm":
-            if not hasattr(args, "feature_types"):
-                temp_args.feature_types = json.dumps({"year": "numeric", "month_of_year": "numeric", "day_of_week": "numeric", "is_holiday": "binary"})
-            lstm.run(temp_args)
-        elif model_type == "es":
-            if not hasattr(args, "alpha"): raise ValueError("ES model for boosting requires --alpha")
-            es_model.run(temp_args)
-        elif model_type == "ma":
-            if not hasattr(args, "window"): raise ValueError("MA model for boosting requires --window")
-            ma_model.run(temp_args)
-        else:
-            raise ValueError(f"Cannot determine model type for boosting from path: {model_path}")
+
+        # Suppress stdout from sub-model training to avoid polluting boosting output
+        original_stdout = sys.stdout
+        sys.stdout = sys.stderr
+
+        try:
+            if model_type == "arima":
+                if not hasattr(args, "d"):
+                    raise ValueError("ARIMA model for boosting requires --d")
+                arima.run(temp_args)
+            elif model_type == "lstm":
+                if not hasattr(args, "feature_types"):
+                    raise ValueError("LSTM model for boosting requires --feature_types. Please provide feature types for the CSV data.")
+                lstm.run(temp_args)
+            elif model_type == "es":
+                if not hasattr(args, "alpha"):
+                    raise ValueError("ES model for boosting requires --alpha")
+                es_model.run(temp_args)
+            elif model_type == "ma":
+                if not hasattr(args, "window"):
+                    raise ValueError("MA model for boosting requires --window")
+                ma_model.run(temp_args)
+            else:
+                raise ValueError(f"Cannot determine model type for boosting from path: {model_path}")
+        finally:
+            sys.stdout = original_stdout
 
         trained_residual_models.append(new_model_path)
 

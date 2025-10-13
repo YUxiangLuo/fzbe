@@ -1,5 +1,15 @@
-MODEL_LOC="trained_models/stacking_config.pkl"
-FORECAST_STEPS=6
+#!/usr/bin/env bash
+# Usage: ./predict_stacking.sh <MODEL_LOC> <FORECAST_STEPS>
+
+if [ "$#" -ne 2 ]; then
+  echo "Error: Requires 2 arguments" >&2
+  echo "Usage: $0 <MODEL_LOC> <FORECAST_STEPS>" >&2
+  exit 1
+fi
+
+MODEL_LOC="$1"
+FORECAST_STEPS="$2"
+
 python src/main.py \
   --method stacking \
   --load_ensemble "$MODEL_LOC" \
