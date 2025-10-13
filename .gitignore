@@ -1,7 +1,8 @@
 notes.txt
 model_csv
-py
-py_tools
+__pycache__
+/py/trained_models
+venv
 *demo*
 uploads
 cdn
