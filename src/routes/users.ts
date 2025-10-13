@@ -623,6 +623,74 @@ export default (pool: Pool, JWT_SECRET: string) => {
     },
   );
 
+  // Teacher/Admin: Reset a student's password to default
+  usersApi.post(
+    "/users/:userId/reset-password",
+    jwt({ secret: JWT_SECRET }),
+    zValidator("param", userIdParamSchema),
+    async (c) => {
+      try {
+        const payload = c.get("jwtPayload");
+        const { userId } = c.req.valid("param");
+        const targetUserId = parseInt(userId, 10);
+
+        if (payload.role !== "Admin" && payload.role !== "Teacher") {
+          return c.json({ error: "Forbidden" }, 403);
+        }
+
+        // 1. Fetch target user's role
+        const [userRows]: any[] = await pool.query(
+          "SELECT role FROM users WHERE user_id = ?",
+          [targetUserId],
+        );
+        const targetUser = userRows[0];
+
+        if (!targetUser) {
+          return c.json({ error: "User not found" }, 404);
+        }
+
+        if (targetUser.role !== "Student") {
+          return c.json({ error: "Can only reset passwords for students" }, 400);
+        }
+
+        // 2. Authorization check for teachers
+        if (payload.role === "Teacher") {
+          const teacherId = payload.sub;
+          const [enrollmentRows]: any[] = await pool.query(
+            `SELECT 1
+               FROM enrollments e
+               JOIN classes c ON e.class_id = c.class_id
+              WHERE e.student_id = ? AND c.teacher_id = ?
+              LIMIT 1`,
+            [targetUserId, teacherId],
+          );
+
+          if (enrollmentRows.length === 0) {
+            return c.json({ error: "Forbidden: Student is not in one of your classes" }, 403);
+          }
+        }
+        // Admins are allowed to proceed
+
+        // 3. Update password to the default hash
+        const defaultPasswordHash = "$2b$10$DVZtxD9Efhm/j8.LSWMFx.hfdpk81iHO4Tv0fUaDr1LlW/mFrgXrG";
+        const [result]: any = await pool.query(
+          "UPDATE users SET password_hash = ? WHERE user_id = ?",
+          [defaultPasswordHash, targetUserId],
+        );
+
+        if (result.affectedRows === 0) {
+          // This case should be rare given the check above, but good for safety
+          return c.json({ error: "User not found" }, 404);
+        }
+
+        return c.json({ message: "Password reset to default successfully" });
+      } catch (error) {
+        console.error("Error resetting password:", error);
+        throw error;
+      }
+    },
+  );
+
   // Delete user by ID (Admin only)
   usersApi.delete(
     "/users/:userId",

@@ -52,6 +52,7 @@ async function setupDatabase() {
       user: DB_USER,
       password: DB_PASSWORD,
       multipleStatements: true, // 允许执行多个语句
+      charset: 'utf8mb4'
     });
     console.log('✅ Connection successful.');
 

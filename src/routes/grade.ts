@@ -153,7 +153,7 @@ export default (pool: Pool, JWT_SECRET: string) => {
                 creator.full_name AS creator_name
            FROM question_bank qb
       LEFT JOIN users creator ON creator.user_id = qb.creator_id
-          ORDER BY qb.question_id ASC`,
+          ORDER BY qb.question_id DESC`,
       );
 
       const normalized = (questions as any[]).map((row) => normalizeQuestionRow(row, true));
@@ -359,6 +359,36 @@ const randomQuestionsQuerySchema = z.object({
         return c.json(normalizeQuestionRow((rows as any[])[0], true));
       } catch (error) {
         console.error("Error updating question bank item:", error);
+        throw error;
+      }
+    },
+  );
+
+  gradeApi.delete(
+    "/question-bank/:questionId",
+    zValidator("param", questionIdParamSchema),
+    async (c) => {
+      try {
+        const payload = c.get("jwtPayload");
+        if (payload.role !== "Admin" && payload.role !== "Teacher") {
+          return c.json({ error: "Forbidden" }, 403);
+        }
+
+        const { questionId } = c.req.valid("param");
+        const questionIdNumber = Number.parseInt(questionId, 10);
+
+        const [result]: any = await pool.query(
+          "DELETE FROM question_bank WHERE question_id = ?",
+          [questionIdNumber],
+        );
+
+        if (result.affectedRows === 0) {
+          return c.json({ error: "Question not found" }, 404);
+        }
+
+        return c.json({ message: "Question deleted successfully" });
+      } catch (error) {
+        console.error("Error deleting question bank item:", error);
         throw error;
       }
     },

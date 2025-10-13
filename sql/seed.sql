@@ -224,53 +224,53 @@ INSERT INTO `experiment_step_events` (`experiment_id`, `student_id`, `step_order
 
 INSERT INTO `question_bank` (`question_id`, `knowledge_point`, `question_type`, `question_text`, `options`, `correct_answers`, `creator_id`) VALUES
 -- ARIMA Basics
-(1, 'arima_basics', 'Single Choice', 'In ARIMA(p,d,q) model, what does the parameter "p" represent?', 
+(1, 'ARIMA模型', 'Single Choice', 'In ARIMA(p,d,q) model, what does the parameter "p" represent?', 
   '{"A":"Autoregressive order","B":"Differencing order","C":"Moving average order","D":"Seasonal period"}', 
   '["A"]', 2),
-(2, 'arima_basics', 'Single Choice', 'What is the purpose of the differencing parameter "d" in ARIMA?', 
+(2, 'ARIMA模型', 'Single Choice', 'What is the purpose of the differencing parameter "d" in ARIMA?', 
   '{"A":"To remove trend","B":"To make series stationary","C":"To remove seasonality","D":"Both A and B"}', 
   '["D"]', 2),
-(3, 'arima_basics', 'True/False', 'The ADF test is used to check if a time series is stationary.', 
-  '["True","False"]', 
-  '["True"]', 2),
+(3, 'ARIMA模型', 'True/False', 'The ADF test is used to check if a time series is stationary.', 
+  '["正确","错误"]', 
+  '["正确"]', 2),
 
 -- LSTM Basics
-(4, 'lstm_basics', 'Single Choice', 'What type of neural network is LSTM?', 
+(4, 'LSTM模型', 'Single Choice', 'What type of neural network is LSTM?', 
   '{"A":"Feedforward Neural Network","B":"Convolutional Neural Network","C":"Recurrent Neural Network","D":"Generative Adversarial Network"}', 
   '["C"]', 2),
-(5, 'lstm_basics', 'Multiple Choice', 'Which of the following are components of an LSTM cell?', 
+(5, 'LSTM模型', 'Multiple Choice', 'Which of the following are components of an LSTM cell?', 
   '{"A":"Forget gate","B":"Input gate","C":"Output gate","D":"Attention mechanism"}', 
   '["A","B","C"]', 2),
-(6, 'lstm_basics', 'Single Choice', 'What is the main advantage of LSTM over traditional RNN?', 
+(6, 'LSTM模型', 'Single Choice', 'What is the main advantage of LSTM over traditional RNN?', 
   '{"A":"Faster training","B":"Solves vanishing gradient problem","C":"Requires less data","D":"Simpler architecture"}', 
   '["B"]', 3),
 
 -- Ensemble Principles
-(7, 'ensemble_principles', 'Multiple Choice', 'Which of the following are ensemble learning methods?', 
+(7, '融合模型', 'Multiple Choice', 'Which of the following are ensemble learning methods?', 
   '{"A":"Bagging","B":"Boosting","C":"Stacking","D":"Dropout"}', 
   '["A","B","C"]', 2),
-(8, 'ensemble_principles', 'Single Choice', 'In weighted ensemble, how are individual model predictions combined?', 
+(8, '融合模型', 'Single Choice', 'In weighted ensemble, how are individual model predictions combined?', 
   '{"A":"Simple average","B":"Weighted average","C":"Maximum value","D":"Minimum value"}', 
   '["B"]', 2),
-(9, 'ensemble_principles', 'True/False', 'Ensemble methods always perform better than individual models.', 
-  '["True","False"]', 
-  '["False"]', 3),
+(9, '融合模型', 'True/False', 'Ensemble methods always perform better than individual models.', 
+  '["正确","错误"]', 
+  '["错误"]', 3),
 
 -- Production Calculation
-(10, 'production_calculation', 'Single Choice', 'If forecasted demand is 1000 units and safety stock is 200 units, what is the total production requirement?', 
+(10, '生产计划', 'Single Choice', 'If forecasted demand is 1000 units and safety stock is 200 units, what is the total production requirement?', 
   '{"A":"800 units","B":"1000 units","C":"1200 units","D":"Depends on current inventory"}', 
   '["D"]', 2),
-(11, 'production_calculation', 'Single Choice', 'Safety stock is primarily used to:', 
+(11, '生产计划', 'Single Choice', 'Safety stock is primarily used to:', 
   '{"A":"Reduce costs","B":"Buffer against demand uncertainty","C":"Increase production efficiency","D":"Minimize waste"}', 
   '["B"]', 3),
 
 -- Service Level Calculation
-(12, 'service_level_calculation', 'Single Choice', 'A 95% service level means:', 
+(12, '生产计划', 'Single Choice', 'A 95% service level means:', 
   '{"A":"95% of products are high quality","B":"95% of customer demands are met from stock","C":"95% production efficiency","D":"95% cost reduction"}', 
   '["B"]', 2),
-(13, 'service_level_calculation', 'True/False', 'Higher service levels always require higher safety stock.', 
-  '["True","False"]', 
-  '["True"]', 2);
+(13, '生产计划', 'True/False', 'Higher service levels always require higher safety stock.', 
+  '["正确","错误"]', 
+  '["正确"]', 2);
 
 -- ========================================================
 -- 10. Quiz Answers (for completed student)

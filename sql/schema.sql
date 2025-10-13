@@ -174,7 +174,7 @@ CREATE TABLE IF NOT EXISTS `experiment_step_events` (
 CREATE TABLE IF NOT EXISTS `question_bank` (
   `question_id` INT AUTO_INCREMENT PRIMARY KEY,
   -- Fixed: Use English codes instead of Chinese characters
-  `knowledge_point` ENUM('arima_basics', 'lstm_basics', 'ensemble_principles', 'production_calculation', 'service_level_calculation') NOT NULL,
+  `knowledge_point` ENUM('ARIMA模型', 'LSTM模型', '移动平均法', '指数平滑法', '融合模型', '生产计划') NOT NULL,
   `question_type` ENUM('Single Choice', 'Multiple Choice', 'True/False') NOT NULL,
   `question_text` TEXT NOT NULL,
 
