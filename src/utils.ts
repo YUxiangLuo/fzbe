@@ -64,6 +64,37 @@ export function parseCsvSegments(
   });
 }
 
+/**
+ * Efficiently reads only the headers from a CSV file.
+ * @param filePath The absolute path to the CSV file.
+ * @returns A Promise that resolves to an array of header strings.
+ */
+export function getCsvHeaders(filePath: string): Promise<string[]> {
+  return new Promise((resolve, reject) => {
+    const stream = fs.createReadStream(filePath)
+      .pipe(csv({ mapHeaders: ({ header }) => header.replace(/^\uFEFF/, "").trim() }));
+
+    let headersEmitted = false;
+
+    stream.on('headers', (headers: string[]) => {
+      headersEmitted = true;
+      stream.destroy(); // Stop reading the rest of the file
+      resolve(headers);
+    });
+
+    stream.on('error', (error) => {
+      reject(error);
+    });
+
+    // In case the file is empty and 'headers' event is not emitted
+    stream.on('end', () => {
+      if (!headersEmitted) {
+        resolve([]);
+      }
+    });
+  });
+}
+
 // 输入：时间序列的单个元素
 export interface AdfInputPoint {
   /** 月份（或时间标签），字符串格式如 "2021-02" */

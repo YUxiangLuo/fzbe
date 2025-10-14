@@ -6,7 +6,7 @@ import { unlink, mkdir, rm } from "node:fs/promises";
 import { createReadStream } from "node:fs";
 import path from "path";
 import type { Pool, ResultSetHeader, RowDataPacket } from "mysql2/promise";
-import { parseCsvSegments } from "../utils";
+import { parseCsvSegments, getCsvHeaders } from "../utils";
 import csv from "csv-parser";
 
 // Helper to convert an array of objects to a CSV string
@@ -118,6 +118,19 @@ export default (pool: Pool, JWT_SECRET: string) => {
       const uniqueFilename = `${Date.now()}-${file.name}`;
       tempUploadPath = path.join(tempDir, uniqueFilename);
       await Bun.write(tempUploadPath, file);
+
+      // 1.5 Validate CSV headers
+      const requiredHeaders = ["年份", "月份", "销售数量"];
+      const headers = await getCsvHeaders(tempUploadPath);
+      const missingHeaders = requiredHeaders.filter(h => !headers.includes(h));
+
+      if (missingHeaders.length > 0) {
+        return c.json({
+          error: "文件格式错误",
+          details: `上传的 CSV 文件缺少必要的列: ${missingHeaders.join(", ")}`,
+          missing_headers: missingHeaders,
+        }, 400);
+      }
 
       // 2. Parse file in memory to get segments
       const segmentsMap = await parseCsvSegments(tempUploadPath);

@@ -316,7 +316,7 @@ const sanitizeForDb = (data: Record<string, unknown>) => {
 
     if (datetimeFields.has(key)) {
       if (rawValue instanceof Date) {
-        sanitized[key] = toMySqlDateTime(rawValue);
+        sanitized[key] = rawValue; // Pass Date object directly
         continue;
       }
 
@@ -328,17 +328,14 @@ const sanitizeForDb = (data: Record<string, unknown>) => {
         }
 
         const parsed = new Date(trimmed);
-        if (Number.isNaN(parsed.getTime())) {
-          sanitized[key] = trimmed;
-        } else {
-          sanitized[key] = toMySqlDateTime(parsed);
-        }
+        // Pass Date object directly if valid, otherwise pass original string
+        sanitized[key] = Number.isNaN(parsed.getTime()) ? trimmed : parsed;
         continue;
       }
     }
 
     if (rawValue instanceof Date) {
-      sanitized[key] = toMySqlDateTime(rawValue);
+      sanitized[key] = rawValue; // Pass Date object directly
       continue;
     }
 
@@ -482,11 +479,25 @@ export default (pool: Pool, JWT_SECRET: string) => {
       if (payload.role !== "Student") {
         return c.json({ error: "Forbidden" }, 403);
       }
-      const studentId = payload.sub;
+      const studentId = Number.parseInt(payload.sub, 10);
       const data = c.req.valid("json");
 
       const connection = await pool.getConnection();
       try {
+        // Check for an existing, unfinished experiment for the student
+        const [existingRows] = await connection.query<RowDataPacket[]>(
+          `SELECT * FROM experiment_status WHERE student_id = ? AND status != 'Completed' ORDER BY experiment_id DESC LIMIT 1`,
+          [studentId]
+        );
+
+        const unfinishedExperiment = existingRows[0];
+        // If an unfinished experiment is found, return it instead of creating a new one
+        if (unfinishedExperiment) {
+          connection.release();
+          return c.json(normalizeExperimentRow(unfinishedExperiment));
+        }
+
+        // If no unfinished experiment exists, proceed to create a new one
         const sanitized = sanitizeForDb({ ...data, student_id: studentId });
 
         if (sanitized["current_step"] === null) {
@@ -579,6 +590,57 @@ export default (pool: Pool, JWT_SECRET: string) => {
         throw error;
       }
     },
+  );
+
+  const experimentEventSchema = z.object({
+    experiment_id: z.number().int().positive(),
+    step_order: z.number().int().min(1).max(7),
+    event_type: z.enum(["STARTED", "COMPLETED"]),
+  });
+
+  // 为实验步骤创建开始/结束事件
+  experimentingApi.post(
+    "/experiments/events",
+    zValidator("json", experimentEventSchema),
+    async (c) => {
+      const payload = c.get("jwtPayload");
+      if (payload.role !== "Student") {
+        return c.json({ error: "Forbidden" }, 403);
+      }
+      const studentId = Number.parseInt(payload.sub, 10);
+      const { experiment_id, step_order, event_type } = c.req.valid("json");
+
+      try {
+        // 验证该实验是否属于当前学生
+        const [experimentRows] = await pool.query<RowDataPacket[]>(
+          "SELECT student_id FROM experiment_status WHERE experiment_id = ? LIMIT 1",
+          [experiment_id]
+        );
+
+        if (experimentRows.length === 0) {
+          return c.json({ error: "Experiment not found" }, 404);
+        }
+        if ((experimentRows[0] as { student_id: number }).student_id !== studentId) {
+          return c.json({ error: "Forbidden: You do not own this experiment" }, 403);
+        }
+
+        // 插入事件记录
+        const [result] = await pool.query<ResultSetHeader>(
+          `INSERT INTO experiment_step_events (experiment_id, student_id, step_order, event_type)
+           VALUES (?, ?, ?, ?)`,
+          [experiment_id, studentId, step_order, event_type]
+        );
+
+        return c.json({
+          message: "Event created successfully",
+          event_id: result.insertId,
+        }, 201);
+
+      } catch (error) {
+        console.error("Error creating experiment step event:", error);
+        throw error;
+      }
+    }
   );
 
   return experimentingApi;

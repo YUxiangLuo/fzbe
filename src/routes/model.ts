@@ -184,64 +184,42 @@ function prepareSimpleData(data: Record<string, any>[]): string {
 function prepareFullData(
   data: Record<string, any>[],
   lstmFeatures?: string[]
-): { dataFull: string; featureTypes: Record<string, "numeric" | "binary"> } {
-  // Full format for LSTM: {"ts": "2021-01", "y": 37200, "x": {...}}
-
+): {
+  dataFull: string;
+  featureTypes: Record<string, "numeric" | "binary">;
+  invalidFeatures: string[];
+} {
   const excludeFields = ['年份', '月份', '销售数量', '销售总额', 'year', 'month', 'sales', 'y',
                          '行业名称', '公司代码', '公司名称', '产品编码', '产品名称'];
 
-  // Determine which features to use
   let featuresToUse: string[];
   if (lstmFeatures && lstmFeatures.length > 0) {
     featuresToUse = lstmFeatures;
   } else {
-    // Use all CSV columns except excluded fields
     const allColumns = Object.keys(data[0] || {});
     featuresToUse = allColumns.filter(col => !excludeFields.includes(col));
   }
 
-  // Infer feature types
   const featureTypes: Record<string, "numeric" | "binary"> = {};
+  const invalidFeatures: string[] = [];
+
   for (const feature of featuresToUse) {
-    // Collect all non-null values for this feature
     const values = data
       .map(row => row[feature])
       .filter(val => val !== null && val !== undefined && val !== "");
 
     if (values.length === 0) {
-      featureTypes[feature] = "numeric";
+      featureTypes[feature] = "numeric"; // Assume numeric if no data
       continue;
     }
 
-    // Count unique values
     const uniqueValues = new Set(values.map(v => String(v).trim().toLowerCase()));
 
-    // Check if binary (only 2 unique values)
     if (uniqueValues.size <= 2) {
-      const binaryPatterns = [
-        new Set(["0", "1"]),
-        new Set(["true", "false"]),
-        new Set(["yes", "no"]),
-        new Set(["y", "n"]),
-        new Set(["t", "f"]),
-        new Set(["是", "否"]),
-        new Set(["有", "无"]),
-        new Set(["男", "女"]),
-        new Set(["真", "假"]),
-      ];
-
-      const isBinary = binaryPatterns.some(pattern => {
-        const intersection = new Set([...uniqueValues].filter(v => pattern.has(v)));
-        return intersection.size === uniqueValues.size;
-      });
-
-      if (isBinary) {
-        featureTypes[feature] = "binary";
-        continue;
-      }
+      featureTypes[feature] = "binary";
+      continue;
     }
 
-    // Check if numeric
     let numericCount = 0;
     for (const val of values) {
       const num = parseFloat(String(val));
@@ -250,19 +228,20 @@ function prepareFullData(
       }
     }
 
-    // If >80% of values are numeric, treat as numeric
-    featureTypes[feature] = (numericCount / values.length > 0.8) ? "numeric" : "numeric";
+    if (numericCount / values.length > 0.8) {
+      featureTypes[feature] = "numeric";
+    } else {
+      // This is an unsupported categorical feature
+      invalidFeatures.push(feature);
+    }
   }
 
-  // Build data array
   const dataArray = data.map(row => {
     const year = row['年份'] || row.year || "0";
     const month = row['月份'] || row.month || "1";
     const sales = parseFloat(row['销售数量'] || row['销售总额'] || row.sales || row.y || "0");
-
     const ts = `${year}-${String(month).padStart(2, '0')}`;
 
-    // Only include specified features in x
     const features: Record<string, any> = {};
     for (const feature of featuresToUse) {
       if (row[feature] !== undefined) {
@@ -271,16 +250,13 @@ function prepareFullData(
       }
     }
 
-    return {
-      ts: ts,
-      y: sales,
-      x: features
-    };
+    return { ts: ts, y: sales, x: features };
   });
 
   return {
     dataFull: JSON.stringify(dataArray),
-    featureTypes: featureTypes
+    featureTypes: featureTypes,
+    invalidFeatures: invalidFeatures,
   };
 }
 
@@ -450,7 +426,16 @@ export default (pool: Pool, JWT_SECRET: string) => {
         return c.json({ error: "Data window indices out of bounds", dataset_size: allData.length }, 400);
       }
 
-      const { dataFull, featureTypes } = prepareFullData(allData, body.lstm_features);
+      const { dataFull, featureTypes, invalidFeatures } = prepareFullData(allData, body.lstm_features);
+
+      // Validate that all selected features are usable
+      if (invalidFeatures.length > 0) {
+        return c.json({
+          error: "Invalid feature(s) provided for LSTM training.",
+          details: `The following features could not be classified as numeric or binary: ${invalidFeatures.join(", ")}`,
+          invalid_features: invalidFeatures,
+        }, 400);
+      }
 
       const modelSaveLoc = path.resolve(import.meta.dir, `../../py/trained_models/${studentId}_lstm.pt`);
 
