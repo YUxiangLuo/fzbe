@@ -3,6 +3,10 @@ import { jwt } from "hono/jwt";
 import { z } from "zod";
 import { zValidator } from "@hono/zod-validator";
 import type { Pool } from "mysql2/promise";
+import puppeteer from "puppeteer";
+import path from "path";
+import { mkdir } from "node:fs/promises";
+
 
 const optionsSchema = z.union([
   z.record(z.string(), z.string()),
@@ -453,6 +457,105 @@ const randomQuestionsQuerySchema = z.object({
       } catch (error) {
         console.error("Error submitting quiz answer:", error);
         throw error;
+      }
+    },
+  );
+
+  const submitReportSchema = z.object({
+    experiment_id: z.number().int().positive(),
+    report_content: z.string().trim().min(1).refine((val) => {
+      try {
+        // Attempt to decode to see if it's valid Base64
+        Buffer.from(val, 'base64');
+        return true;
+      } catch (e) {
+        return false;
+      }
+    }, { message: "report_content must be a valid Base64 encoded string" }),
+  });
+
+  gradeApi.post(
+    "/reports",
+    zValidator("json", submitReportSchema),
+    async (c) => {
+      let browser;
+      try {
+        const payload = c.get("jwtPayload");
+        if (payload.role !== "Student") {
+          return c.json({ error: "Forbidden" }, 403);
+        }
+        const studentId = Number.parseInt(payload.sub, 10);
+
+        const { experiment_id, report_content: base64Content } = c.req.valid("json");
+
+        const report_content = Buffer.from(base64Content, "base64").toString("utf-8");
+
+        // --- PDF Generation Logic ---
+        const reportsDir = path.resolve(import.meta.dir, "../../uploads", "reports");
+        await mkdir(reportsDir, { recursive: true });
+
+        const uniqueFilename = `report-exp${experiment_id}-student${studentId}-${Date.now()}.pdf`;
+        const pdfPath = path.join(reportsDir, uniqueFilename);
+
+        browser = await puppeteer.launch({
+          args: ["--no-sandbox", "--disable-setuid-sandbox"],
+        });
+        const page = await browser.newPage();
+        await page.setContent(report_content, { waitUntil: "networkidle0" });
+        await page.pdf({ path: pdfPath, format: "A4" });
+        // --- End of PDF Generation ---
+
+        // --- Database Logic ---
+        const sql = `
+          INSERT INTO experiment_reports (experiment_id, student_id, report_content, pdf_file_path, submitted_at)
+          VALUES (?, ?, ?, ?, NOW())
+          ON DUPLICATE KEY UPDATE
+            report_content = VALUES(report_content),
+            pdf_file_path = VALUES(pdf_file_path),
+            submitted_at = NOW()
+        `;
+
+        const [result]: any = await pool.query(sql, [
+          experiment_id,
+          studentId,
+          report_content,
+          pdfPath,
+        ]);
+
+        const reportId = result.insertId;
+
+        if (reportId === 0 && result.affectedRows > 0) {
+          const [rows]: any = await pool.query(
+            "SELECT report_id FROM experiment_reports WHERE experiment_id = ? AND student_id = ?",
+            [experiment_id, studentId],
+          );
+          if (rows.length > 0) {
+            return c.json({
+              message: "Report updated successfully",
+              report_id: rows[0].report_id,
+              pdf_path: pdfPath,
+            });
+          }
+        }
+
+        return c.json(
+          {
+            message: "Report submitted successfully",
+            report_id: reportId,
+            pdf_path: pdfPath,
+          },
+          201,
+        );
+      } catch (error) {
+        console.error("Error submitting experiment report:", error);
+        return c.json(
+          { error: "An internal server error occurred while processing the report." },
+          500,
+        );
+      } finally {
+        if (browser) {
+          await browser.close();
+        }
       }
     },
   );

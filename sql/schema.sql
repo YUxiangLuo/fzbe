@@ -247,7 +247,10 @@ CREATE TABLE IF NOT EXISTS `experiment_reports` (
     ON DELETE SET NULL,
   
   -- Add constraint to ensure grade is in valid range
-  CONSTRAINT `chk_report_grade` CHECK (`grade` IS NULL OR (`grade` >= 0 AND `grade` <= 100))
+  CONSTRAINT `chk_report_grade` CHECK (`grade` IS NULL OR (`grade` >= 0 AND `grade` <= 100)),
+  
+  -- Ensure that each student can only submit one report per experiment
+  UNIQUE KEY `student_experiment_unique` (`student_id`, `experiment_id`)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
 -- Drop table if exists to ensure clean creation
