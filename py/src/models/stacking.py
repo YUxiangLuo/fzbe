@@ -97,12 +97,15 @@ def run(args) -> None:
         # Combine them using the meta-model
         final_predictions = _stacking_predict(base_predictions, meta_model)
 
+        std_dev = config.get("std_dev_residuals", 0.0)
+        predictions_with_std = [{"prediction": p, "std_dev": std_dev} for p in final_predictions]
+
         out = {
             "mode": "stacking_loaded_predict",
             "n_base_models": len(model_paths),
             "meta_model": meta_model,
             "forecast_steps": steps,
-            "predictions": final_predictions,
+            "predictions": predictions_with_std,
         }
 
         print(json.dumps(out, ensure_ascii=False, indent=2 if pretty else None))
@@ -141,6 +144,9 @@ def run(args) -> None:
     # 3. (Optional) Evaluate the trained stacking model on the same eval set
     final_predictions_on_eval = _stacking_predict(base_predictions_on_eval, meta_model)
 
+    residuals = np.array(y_true_on_eval) - np.array(final_predictions_on_eval)
+    std_dev_residuals = float(np.std(residuals))
+
     out = {
         "mode": "stacking_train_eval",
         "n_base_models": len(model_paths),
@@ -160,6 +166,7 @@ def run(args) -> None:
             "base_model_paths": model_paths,
             "meta_model": meta_model,
             "strategy": "stacking",
+            "std_dev_residuals": std_dev_residuals,
         }
         dump_joblib(config, save_ensemble_path)
         out["saved_ensemble"] = save_ensemble_path

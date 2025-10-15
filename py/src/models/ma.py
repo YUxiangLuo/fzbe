@@ -3,7 +3,7 @@
 import json
 import math
 from typing import List, Dict, Any, Tuple, Optional
-
+import numpy as np
 from joblib_compat import load_joblib, dump_joblib
 
 MODEL_TYPE = "ma"
@@ -121,15 +121,17 @@ def predict(
     steps: int,
     data: Optional[str] = None,
     state: Optional[Dict[str, Any]] = None,
-) -> List[float]:
+) -> Tuple[List[float], float]:
     """
     Forecast future values using a saved MA model.
     If data (JSON) is provided and contains actual future values, they will be
     consumed to update the moving window. Otherwise forecasts rely on past history.
+    Returns a tuple of (predictions, std_dev_residuals).
     """
     state = state or _load_state(model_path)
     window = int(state["window"])
     history = list(state["history"])
+    std_dev_residuals = float(state.get("std_dev_residuals", 0.0))
     train_end = int(state["train_end_index"])
     if window < 1:
         raise ValueError("Saved MA model window must be >= 1.")
@@ -149,7 +151,38 @@ def predict(
         except Exception:
             future_values = None
 
-    return _forecast_future(history, window, steps, future_values)
+    predictions = _forecast_future(history, window, steps, future_values)
+    return predictions, std_dev_residuals
+
+
+def train_and_evaluate(
+    sales: List[float], months: List[str], train_range: range, eval_range: range, window: int
+) -> Tuple[Dict[str, Any], float]:
+    """
+    Trains the model (conceptually) and evaluates it, returning metrics and residual std dev.
+    """
+    idxs, preds = moving_average_forecast(sales, eval_range, window)
+    if not idxs:
+        raise ValueError(
+            "no evaluation points: choose a smaller --window or move eval_start to >= window"
+        )
+    y_true = [sales[i] for i in idxs]
+    y_pred = preds
+
+    residuals = np.array(y_true) - np.array(y_pred)
+    std_dev_residuals = np.std(residuals)
+
+    metrics: Dict[str, Any] = {
+        "window": window,
+        "evaluated_points": len(y_true),
+        "rmse": rmse(y_true, y_pred),
+        "mae": mae(y_true, y_pred),
+        "mape": mape(y_true, y_pred),
+        "r2": r2_score(y_true, y_pred),
+        "evaluate_indices": idxs,
+        "evaluate_months": [months[i] for i in idxs],
+    }
+    return metrics, float(std_dev_residuals)
 
 
 # ---------- public entry ----------
@@ -185,13 +218,17 @@ def run(args) -> None:
             if steps <= 0:
                 raise ValueError("--forecast_steps must be > 0.")
 
-        preds = predict(load_path, steps, getattr(args, "data", None), state=state)
+        preds, std_dev = predict(load_path, steps, getattr(args, "data", None), state=state)
+        
+        # Create prediction objects with std_dev
+        predictions_with_std = [{"prediction": p, "std_dev": std_dev} for p in preds]
+
         out: Dict[str, Any] = {
             "mode": "ma_loaded_predict",
             "window": int(state["window"]),
             "train_end_index": int(state["train_end_index"]),
             "forecast_steps": steps,
-            "predictions": preds,
+            "predictions": predictions_with_std,
         }
 
         if getattr(args, "data", None) and es is not None and ee is not None:
@@ -256,26 +293,8 @@ def run(args) -> None:
             f"--window ({w}) cannot exceed available history (train_end_index+1={te+1})."
         )
 
-    # -------- 预测（闭区间：range(es, ee+1)） --------
-    eval_range = range(es, ee + 1)
-    idxs, preds = moving_average_forecast(sales, eval_range, w)
-    if not idxs:
-        raise ValueError(
-            "no evaluation points: choose a smaller --window or move eval_start to >= window"
-        )
-    y_true = [sales[i] for i in idxs]
-    y_pred = preds
-
-    metrics: Dict[str, Any] = {
-        "window": w,
-        "evaluated_points": len(y_true),
-        "rmse": rmse(y_true, y_pred),
-        "mae": mae(y_true, y_pred),
-        "mape": mape(y_true, y_pred),
-        "r2": r2_score(y_true, y_pred),
-        "evaluate_indices": idxs,
-        "evaluate_months": [months[i] for i in idxs],
-    }
+    # -------- 训练与评估 --------
+    metrics, std_dev_residuals = train_and_evaluate(sales, months, range(ts, te + 1), range(es, ee + 1), w)
 
     out: Dict[str, Any] = {
         "mode": "fixed_window_only",
@@ -299,6 +318,7 @@ def run(args) -> None:
             "train_end_index": te,
             "history": history,
             "value_key": value_key,
+            "std_dev_residuals": std_dev_residuals,
         }
         dump_joblib(state, save_path)
         out["saved_model"] = save_path

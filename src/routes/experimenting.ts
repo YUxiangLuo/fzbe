@@ -36,6 +36,7 @@ const JSON_FIELDS = new Set<string>([
   "ensemble_boosting_base_models",
   "ensemble_stacking_base_models",
   "production_mps_table",
+  "production_forecast_results",
 ]);
 
 const INTEGER_FIELDS = new Set<string>([
@@ -274,6 +275,7 @@ const optionalFields: Record<string, z.ZodTypeAny> = {
   production_target_service_level: optionalFloat(0),
   production_safety_stock_z_score: optionalFloat(),
   production_mps_table: optionalJson,
+  production_forecast_results: optionalJson,
   start_time: optionalString,
   last_activity_at: optionalString,
   completion_time: optionalString,
@@ -641,13 +643,14 @@ export default (pool: Pool, JWT_SECRET: string) => {
         if (event_type === "COMPLETED") {
           await connection.beginTransaction();
 
-          // 1. 获取当前实验最新的事件
+          // 1. 获取当前实验最新的事件，并锁定该行以待更新
           const [latestEventRows] = await connection.query<RowDataPacket[]>(
             `SELECT step_order
                FROM experiment_step_events
               WHERE experiment_id = ?
               ORDER BY event_timestamp DESC
-              LIMIT 1`,
+              LIMIT 1
+              FOR UPDATE`,
             [experiment_id]
           );
 

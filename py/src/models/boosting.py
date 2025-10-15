@@ -59,12 +59,15 @@ def run(args) -> None:
         predictions = get_model_predictions(model_paths, steps, data)
         ensemble_pred = _ensemble_predict_boosting(predictions)
         
+        std_dev = config.get("std_dev_residuals", 0.0)
+        predictions_with_std = [{"prediction": p, "std_dev": std_dev} for p in ensemble_pred]
+
         out = {
             "mode": "boosting_loaded_predict",
             "strategy": strategy,
             "n_models": len(model_paths),
             "forecast_steps": steps,
-            "predictions": ensemble_pred,
+            "predictions": predictions_with_std,
         }
         
         if hasattr(args, "data") and hasattr(args, "eval_start") and hasattr(args, "eval_end"):
@@ -200,6 +203,10 @@ def run(args) -> None:
         final_eval_predictions += np.array(eval_preds)
 
     ensemble_pred = final_eval_predictions.tolist()
+
+    residuals = np.array(y_eval_true) - np.array(ensemble_pred)
+    std_dev_residuals = float(np.std(residuals))
+
     out = {
         "mode": "boosting_train_eval",
         "strategy": "boosting",
@@ -215,7 +222,12 @@ def run(args) -> None:
     }
     
     if save_ensemble_path:
-        config = {"model_paths": trained_residual_models, "weights": None, "strategy": "boosting"}
+        config = {
+            "model_paths": trained_residual_models, 
+            "weights": None, 
+            "strategy": "boosting",
+            "std_dev_residuals": std_dev_residuals,
+        }
         dump_joblib(config, save_ensemble_path)
         out["saved_ensemble"] = save_ensemble_path
     

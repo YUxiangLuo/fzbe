@@ -105,13 +105,16 @@ def run(args) -> None:
         predictions = get_model_predictions(model_paths, steps, data)
         ensemble_pred = _ensemble_predict(predictions, weights)
         
+        std_dev = config.get("std_dev_residuals", 0.0)
+        predictions_with_std = [{"prediction": p, "std_dev": std_dev} for p in ensemble_pred]
+
         out = {
             "mode": "ensemble_loaded_predict",
             "strategy": strategy,
             "n_models": len(model_paths),
             "weights": weights,
             "forecast_steps": steps,
-            "predictions": ensemble_pred,
+            "predictions": predictions_with_std,
         }
         
         if hasattr(args, "data") and hasattr(args, "eval_start") and hasattr(args, "eval_end"):
@@ -173,6 +176,9 @@ def run(args) -> None:
     
     ensemble_pred = _ensemble_predict(eval_predictions, weights)
     
+    residuals = np.array(y_true) - np.array(ensemble_pred)
+    std_dev_residuals = float(np.std(residuals))
+
     out = {
         "mode": "ensemble_train_eval",
         "strategy": strategy,
@@ -189,7 +195,12 @@ def run(args) -> None:
     }
     
     if save_ensemble_path:
-        config = {"model_paths": model_paths, "weights": weights, "strategy": strategy}
+        config = {
+            "model_paths": model_paths, 
+            "weights": weights, 
+            "strategy": strategy,
+            "std_dev_residuals": std_dev_residuals,
+        }
         dump_joblib(config, save_ensemble_path)
         out["saved_ensemble"] = save_ensemble_path
     

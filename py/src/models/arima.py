@@ -111,7 +111,7 @@ def _search_pq(
 
 
 # ---------- predict (for ensemble) ----------
-def predict(model_path: str, steps: int) -> List[float]:
+def predict(model_path: str, steps: int) -> List[Dict[str, float]]:
     """
     纯预测函数，用于 ensemble 调用。
     加载已训练的 ARIMA 模型并预测 steps 步。
@@ -121,11 +121,17 @@ def predict(model_path: str, steps: int) -> List[float]:
         steps: 预测步数
     
     Returns:
-        预测值列表
+        A list of prediction dictionaries, each containing 'prediction' and 'std_dev'.
     """
     res = load_joblib(model_path)
     fcst = res.get_forecast(steps=steps)
-    return fcst.predicted_mean.tolist()
+    
+    predictions = fcst.predicted_mean.tolist()
+    std_errors = fcst.se_mean.tolist()
+    
+    return [
+        {"prediction": p, "std_dev": s} for p, s in zip(predictions, std_errors)
+    ]
 
 
 # ---------- run ----------
@@ -150,9 +156,11 @@ def run(args) -> None:
         # 1) 若提供 eval 范围，steps = eval_end - eval_start + 1
         # 2) 否则用 --forecast_steps
         steps = None
-        if hasattr(args, "eval_start") and hasattr(args, "eval_end"):
+        es = getattr(args, "eval_start", None)
+        ee = getattr(args, "eval_end", None)
+        if es is not None and ee is not None:
             try:
-                es, ee = int(args.eval_start), int(args.eval_end)
+                es, ee = int(es), int(ee)
                 if ee >= es:
                     steps = ee - es + 1
             except Exception:
@@ -168,21 +176,21 @@ def run(args) -> None:
                 raise ValueError("--forecast_steps must be > 0.")
 
         # 预测
-        fcst = res.get_forecast(steps=steps)
-        y_pred = fcst.predicted_mean.tolist()
+        predictions_with_std = predict(load_path, steps)
+        y_pred = [p["prediction"] for p in predictions_with_std]
 
         out: Dict[str, Any] = {
             "mode": "arima_loaded_predict",
             "order": {"p": p_d_q[0], "d": p_d_q[1], "q": p_d_q[2]},
             "forecast_steps": steps,
-            "predictions": y_pred,
+            "predictions": predictions_with_std,
         }
 
         # 若用户给了 data + eval，可以顺带算指标（有真值才算）
         if (
             hasattr(args, "data")
-            and hasattr(args, "eval_start")
-            and hasattr(args, "eval_end")
+            and es is not None
+            and ee is not None
         ):
             try:
                 arr = json.loads(args.data)

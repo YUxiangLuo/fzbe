@@ -3,7 +3,7 @@
 import json
 import math
 from typing import List, Dict, Any, Optional, Tuple
-
+import numpy as np
 from joblib_compat import load_joblib, dump_joblib
 
 MODEL_TYPE = "es"
@@ -75,16 +75,18 @@ def predict(
     steps: int,
     data: Optional[str] = None,
     state: Optional[Dict[str, Any]] = None,
-) -> List[float]:
+) -> Tuple[List[float], float]:
     """
     Forecast using a saved SES model. If actual future data is provided, the
     level will be updated sequentially to mimic online smoothing.
+    Returns a tuple of (predictions, std_dev_residuals).
     """
     if steps <= 0:
         raise ValueError("steps must be > 0 for forecasting.")
     state = state or _load_state(model_path)
     alpha = float(state["alpha"])
     level = float(state["level"])
+    std_dev_residuals = float(state.get("std_dev_residuals", 0.0))
     train_end = int(state["train_end_index"])
 
     future_values: Optional[List[float]] = None
@@ -104,7 +106,54 @@ def predict(
         if future_values and idx < len(future_values):
             actual = future_values[idx]
             level = alpha * actual + (1.0 - alpha) * level
-    return preds
+    return preds, std_dev_residuals
+
+
+def train_and_evaluate(
+    sales: List[float], months: List[str], train_range: range, eval_range: range, alpha: float
+) -> Tuple[Dict[str, Any], float, float]:
+    """
+    Trains, evaluates, and returns metrics, residual std dev, and the final smoothed level.
+    """
+    n = len(sales)
+    ts = train_range.start
+    
+    # 计算全序列的平滑值 s_t
+    s = [None] * n
+    s[ts] = sales[ts]  # 初始化
+    for t in range(ts + 1, n):
+        s[t] = alpha * sales[t] + (1.0 - alpha) * s[t - 1]
+
+    # 一步预测：ŷ_t = s_{t-1}
+    idxs = []
+    preds = []
+    for t in eval_range:
+        if s[t - 1] is None:
+            continue
+        idxs.append(t)
+        preds.append(s[t - 1])
+
+    if not idxs:
+        raise ValueError(
+            "no evaluation points: adjust --eval_start or provide more training history"
+        )
+
+    y_true = [sales[i] for i in idxs]
+    y_pred = preds
+
+    residuals = np.array(y_true) - np.array(y_pred)
+    std_dev_residuals = np.std(residuals)
+
+    metrics = {
+        "rmse": rmse(y_true, y_pred),
+        "mae": mae(y_true, y_pred),
+        "mape": mape(y_true, y_pred),
+        "r2": r2_score(y_true, y_pred),
+    }
+    
+    final_level = s[train_range.stop - 1]
+
+    return metrics, float(std_dev_residuals), float(final_level)
 
 
 # ----- core -----
@@ -141,13 +190,16 @@ def run(args) -> None:
             if steps <= 0:
                 raise ValueError("--forecast_steps must be > 0.")
 
-        preds = predict(load_path, steps, getattr(args, "data", None), state=state)
+        preds, std_dev = predict(load_path, steps, getattr(args, "data", None), state=state)
+        
+        predictions_with_std = [{"prediction": p, "std_dev": std_dev} for p in preds]
+        
         out: Dict[str, Any] = {
             "mode": "es_loaded_predict",
             "alpha": float(state["alpha"]),
             "train_end_index": int(state["train_end_index"]),
             "forecast_steps": steps,
-            "predictions": preds,
+            "predictions": predictions_with_std,
         }
         if getattr(args, "data", None) and es is not None and ee is not None:
             try:
@@ -207,30 +259,9 @@ def run(args) -> None:
     if es < ts + 1:
         raise ValueError("no evaluation points: set eval_start >= train_start + 1")
 
-    # 计算全序列的平滑值 s_t（仅使用过去真实值，不泄漏未来）
-    s = [None] * n
-    s[ts] = sales[ts]  # 初始化
-    # 用真实值递推到末尾
-    for t in range(ts + 1, n):
-        s[t] = alpha * sales[t] + (1.0 - alpha) * s[t - 1]
-
-    # 一步预测：ŷ_t = s_{t-1}（闭区间：range(es, ee+1)）
-    idxs = []
-    preds = []
-    for t in range(es, ee + 1):
-        if s[t - 1] is None:
-            # 理论上 t>=es>=ts+1 已确保有 s[t-1]
-            continue
-        idxs.append(t)
-        preds.append(s[t - 1])
-
-    if not idxs:
-        raise ValueError(
-            "no evaluation points: adjust --eval_start or provide more training history"
-        )
-
-    y_true = [sales[i] for i in idxs]
-    y_pred = preds
+    metrics, std_dev_residuals, final_level = train_and_evaluate(
+        sales, months, range(ts, te + 1), range(es, ee + 1), alpha
+    )
 
     out: Dict[str, Any] = {
         "mode": "ses_fixed_alpha",
@@ -246,15 +277,7 @@ def run(args) -> None:
             "end_index": ee,
             "months": months[es : ee + 1],
         },
-        "evaluated_points": len(idxs),
-        "evaluate_indices": idxs,
-        "evaluate_months": [months[i] for i in idxs],
-        "metrics": {
-            "rmse": rmse(y_true, y_pred),
-            "mae": mae(y_true, y_pred),
-            "mape": mape(y_true, y_pred),
-            "r2": r2_score(y_true, y_pred),
-        },
+        "metrics": metrics,
         "notes": [
             "SES: forecast at t uses s_{t-1}.",
             "s_t = alpha*y_t + (1-alpha)*s_{t-1}; s_{train_start} = y_{train_start}.",
@@ -267,8 +290,9 @@ def run(args) -> None:
             "model_type": MODEL_TYPE,
             "alpha": alpha,
             "train_end_index": te,
-            "level": float(s[te]),
+            "level": final_level,
             "value_key": value_key,
+            "std_dev_residuals": std_dev_residuals,
         }
         dump_joblib(state, save_path)
         out["saved_model"] = save_path

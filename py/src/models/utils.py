@@ -47,72 +47,60 @@ def r2_score(y_true: List[float], y_pred: List[float]) -> float:
 def get_model_predictions(model_paths: List[str], steps: int, data: Optional[str] = None) -> List[List[float]]:
     """
     Gets predictions from all models by dynamically calling their predict() functions.
+    This function normalizes the output from different predict() signatures.
     """
     # Lazy import to avoid circular dependencies
     from models import arima, lstm, ma as ma_model, es as es_model
 
-    predictions = []
+    all_predictions = []
     for path in model_paths:
+        raw_preds = None
         try:
             path_lower = path.lower()
 
+            # Determine model type and call the appropriate predict function
             if path_lower.endswith((".pt", ".pth")) or "lstm" in path_lower:
-                preds = lstm.predict(path, steps, data)
-                predictions.append(preds)
-                continue
+                raw_preds = lstm.predict(path, steps, data)
+            else:
+                # For joblib models, inspect the content to decide
+                state = load_joblib(path)
+                if isinstance(state, dict):
+                    model_type = state.get("model_type")
+                    if model_type == "ma":
+                        raw_preds = ma_model.predict(path, steps, data, state=state)
+                    elif model_type == "es":
+                        raw_preds = es_model.predict(path, steps, data, state=state)
+                
+                # ARIMA models are identified by their object type
+                if raw_preds is None and hasattr(state, "get_forecast"):
+                    raw_preds = arima.predict(path, steps)
 
-            state = None
-            if path_lower.endswith((".pkl", ".joblib")):
-                try:
-                    state = load_joblib(path)
-                except Exception:
-                    state = None
+            if raw_preds is None:
+                 raise ValueError(f"Could not determine model type for path: {path}")
 
-            if isinstance(state, dict):
-                model_type = state.get("model_type")
-                if model_type == "ma":
-                    preds = ma_model.predict(path, steps, data, state=state)
-                    predictions.append(preds)
-                    continue
-                if model_type == "es":
-                    preds = es_model.predict(path, steps, data, state=state)
-                    predictions.append(preds)
-                    continue
+            # --- Normalize the prediction output ---
+            normalized_preds = []
+            if isinstance(raw_preds, tuple):
+                # Handles MA, ES which return (predictions, std_dev)
+                normalized_preds = raw_preds[0]
+            elif isinstance(raw_preds, list) and raw_preds and isinstance(raw_preds[0], dict):
+                # Handles ARIMA which returns [{'prediction': p, 'std_dev': s}, ...]
+                normalized_preds = [p.get("prediction") for p in raw_preds]
+            elif isinstance(raw_preds, list):
+                # Handles old format or LSTM which might still return a simple list
+                normalized_preds = raw_preds
+            else:
+                raise TypeError(f"Unsupported prediction format from model {path}: {type(raw_preds)}")
 
-            if state is not None and hasattr(state, "get_forecast"): # ARIMA model
-                fcst = state.get_forecast(steps)
-                preds = fcst.predicted_mean.tolist()
-                predictions.append(preds)
-                continue
-
-            # Fallback order for models without clear type hints in the saved file
-            try:
-                preds = arima.predict(path, steps)
-                predictions.append(preds)
-                continue
-            except Exception:
-                pass
-            try:
-                preds = ma_model.predict(path, steps, data)
-                predictions.append(preds)
-                continue
-            except Exception:
-                pass
-            try:
-                preds = es_model.predict(path, steps, data)
-                predictions.append(preds)
-                continue
-            except Exception:
-                pass
-            
-            # Final fallback to LSTM if others fail
-            preds = lstm.predict(path, steps, data)
-            predictions.append(preds)
+            all_predictions.append(normalized_preds)
 
         except Exception as e:
-            raise ValueError(f"Failed to predict with model {path}: {e}")
+            raise ValueError(f"Failed to get or normalize predictions from model {path}: {e}")
     
-    if len(set(len(p) for p in predictions)) > 1:
+    if not all_predictions:
+        return []
+
+    if len(set(len(p) for p in all_predictions)) > 1:
         raise ValueError("All models must produce predictions of the same length")
     
-    return predictions
+    return all_predictions

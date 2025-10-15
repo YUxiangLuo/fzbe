@@ -299,7 +299,7 @@ def _reconstruct_window_from_data(records: List[Dict[str, Any]], meta: Dict[str,
 
 
 # ---------- predict (for ensemble) ----------
-def predict(model_path: str, steps: int, data: Optional[str] = None) -> List[float]:
+def predict(model_path: str, steps: int, data: Optional[str] = None) -> Tuple[List[float], float]:
     """
     纯预测函数，用于 ensemble 调用。
     加载已训练的 LSTM 模型并预测 steps 步。
@@ -310,7 +310,7 @@ def predict(model_path: str, steps: int, data: Optional[str] = None) -> List[flo
         data: 可选的 JSON 数据字符串（如果模型没有嵌入 last_window）
     
     Returns:
-        预测值列表
+        A tuple containing (predictions, std_dev_residuals).
     """
     state = torch.load(model_path, map_location="cpu")
     meta = state["meta"]
@@ -321,7 +321,7 @@ def predict(model_path: str, steps: int, data: Optional[str] = None) -> List[flo
     model.eval()
 
     model_lookback = int(meta["lookback"])
-    input_dim = int(meta["input_dim"])
+    std_dev_residuals = float(meta.get("std_dev_residuals", 0.0))
 
     # 获取窗口（优先使用嵌入的 last_window）
     window = None
@@ -332,51 +332,7 @@ def predict(model_path: str, steps: int, data: Optional[str] = None) -> List[flo
         try:
             arr = json.loads(data)
             records = arr if isinstance(arr, list) else []
-            if not records or len(records) < model_lookback:
-                raise ValueError("not enough records to form lookback window")
-
-            num_keys = meta["numeric_keys"]
-            cat_keys = meta["categorical_keys"]
-            n = len(records)
-            
-            X_num = (
-                np.stack(
-                    [[float(records[i]["x"][k]) for k in num_keys] for i in range(n)],
-                    axis=0,
-                )
-                if num_keys
-                else np.zeros((n, 0), dtype=float)
-            )
-            
-            # 数值缩放
-            X_num_tf = np.empty_like(X_num, dtype=float)
-            for j, (kind, a, b) in enumerate(meta["num_params"]):
-                if kind == "z":
-                    X_num_tf[:, j] = (X_num[:, j] - a) / b
-                elif kind == "m":
-                    X_num_tf[:, j] = (X_num[:, j] - a) / (b - a)
-                else:
-                    X_num_tf[:, j] = X_num[:, j]
-            
-            # 分类 one-hot
-            if cat_keys:
-                oh_cols = []
-                for k, vocab in meta["cat_maps"].items():
-                    idx = [vocab.get(records[i]["x"][k], 0) for i in range(n)]
-                    vocab_size = (max(vocab.values()) if vocab else 0) + 1
-                    oh = np.zeros((n, vocab_size), dtype=float)
-                    oh[np.arange(n), idx] = 1.0
-                    oh_cols.append(oh)
-                X_cat_oh = np.concatenate(oh_cols, axis=1)
-            else:
-                X_cat_oh = np.zeros((n, 0), dtype=float)
-            
-            X_all = (
-                np.concatenate([X_num_tf, X_cat_oh], axis=1)
-                if X_cat_oh.shape[1] > 0
-                else X_num_tf
-            )
-            window = X_all[-model_lookback:, :].copy()
+            window = _reconstruct_window_from_data(records, meta)
         except Exception as e:
             raise ValueError(f"Failed to construct window from data: {e}")
     else:
@@ -389,10 +345,12 @@ def predict(model_path: str, steps: int, data: Optional[str] = None) -> List[flo
         with torch.no_grad():
             y_hat = model(x).cpu().numpy().ravel()[0]
         preds_scaled.append(float(y_hat))
+        # 滚动窗口：移除最旧的，添加最新的（这里用最后一行占位，因为我们没有新特征）
         window = np.vstack([window[1:], window[-1]])
 
     # 反缩放
-    return _inverse_y(preds_scaled, meta["y_params"])
+    predictions = _inverse_y(preds_scaled, meta["y_params"])
+    return predictions, std_dev_residuals
 
 
 # ---------- public entry ----------
@@ -479,7 +437,10 @@ def run(args) -> None:
             preds = [v * (mx - mn) + mn for v in preds_scaled]
         else:
             preds = preds_scaled
-        out["predictions"] = preds
+        
+        std_dev = meta.get("std_dev_residuals", 0.0)
+        predictions_with_std = [{"prediction": p, "std_dev": std_dev} for p in preds]
+        out["predictions"] = predictions_with_std
 
         # 若有 data 且 eval_start/end，则顺带评估（闭区间）
         if (
@@ -692,6 +653,9 @@ def run(args) -> None:
     preds = _inverse_y(preds_scaled, prep["y_params"])
     y_true = [float(records[i]["y"]) for i in range(es, ee + 1)]  # 闭区间
 
+    residuals = np.array(y_true) - np.array(preds)
+    std_dev_residuals = float(np.std(residuals))
+
     out = {
         "mode": "lstm_train_eval",
         "norm": norm,
@@ -727,6 +691,7 @@ def run(args) -> None:
             "num_params": prep["num_params"],
             "y_params": prep["y_params"],
             "last_window": last_window.tolist(),  # 关键：保存最后窗口
+            "std_dev_residuals": std_dev_residuals,
         }
         torch.save({"model": model.state_dict(), "meta": meta}, save_path)
         out["saved_model"] = save_path

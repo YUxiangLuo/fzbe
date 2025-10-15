@@ -135,6 +135,7 @@ CREATE TABLE IF NOT EXISTS `experiment_status` (
   `production_target_service_level` FLOAT DEFAULT NULL,
   `production_safety_stock_z_score` FLOAT DEFAULT NULL,
   `production_mps_table` JSON DEFAULT NULL,
+  `production_forecast_results` JSON DEFAULT NULL,
 
   `start_time` TIMESTAMP DEFAULT NULL,
   `last_activity_at` TIMESTAMP DEFAULT NULL,
@@ -168,7 +169,15 @@ CREATE TABLE IF NOT EXISTS `experiment_step_events` (
     REFERENCES `users`(`user_id`)
     ON DELETE CASCADE,
 
+  -- Existing index, useful for some lookups
   INDEX `idx_experiment_step_order` (`experiment_id`, `step_order`, `event_timestamp`),
+  
+  -- === NEW INDEXES FOR PERFORMANCE ===
+  -- Optimizes fetching all events for a student, ordered by time (for class progress view)
+  INDEX `idx_student_timestamp` (`student_id`, `event_timestamp`),
+  
+  -- Optimizes fetching the latest event for a specific experiment (for FOR UPDATE lock)
+  INDEX `idx_experiment_timestamp` (`experiment_id`, `event_timestamp`),
   
   -- Add constraint to ensure step_order is valid
   CONSTRAINT `chk_step_order` CHECK (`step_order` BETWEEN 1 AND 7)
