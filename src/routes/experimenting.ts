@@ -26,6 +26,7 @@ const BOOLEAN_FIELDS = new Set<string>([
   "ensemble_stacking_completed",
   "quiz_about_model_completed",
   "quiz_about_plan_completed",
+  "production_plan_completed",
 ]);
 
 const JSON_FIELDS = new Set<string>([
@@ -34,6 +35,7 @@ const JSON_FIELDS = new Set<string>([
   "ensemble_weighted_base_models",
   "ensemble_boosting_base_models",
   "ensemble_stacking_base_models",
+  "production_mps_table",
 ]);
 
 const INTEGER_FIELDS = new Set<string>([
@@ -49,6 +51,7 @@ const INTEGER_FIELDS = new Set<string>([
   "arima_p",
   "arima_d",
   "arima_q",
+  "production_forecast_periods",
 ]);
 
 const FLOAT_FIELDS = new Set<string>([
@@ -74,6 +77,9 @@ const FLOAT_FIELDS = new Set<string>([
   "ensemble_stacking_metrics_rmse",
   "ensemble_stacking_metrics_mae",
   "ensemble_stacking_metrics_r2",
+  "production_initial_inventory",
+  "production_target_service_level",
+  "production_safety_stock_z_score",
 ]);
 
 const datetimeFields = new Set<string>([
@@ -262,6 +268,12 @@ const optionalFields: Record<string, z.ZodTypeAny> = {
     .optional(),
   quiz_about_model_completed: optionalBoolean,
   quiz_about_plan_completed: optionalBoolean,
+  production_plan_completed: optionalBoolean,
+  production_forecast_periods: optionalInt(1),
+  production_initial_inventory: optionalFloat(0),
+  production_target_service_level: optionalFloat(0),
+  production_safety_stock_z_score: optionalFloat(),
+  production_mps_table: optionalJson,
   start_time: optionalString,
   last_activity_at: optionalString,
   completion_time: optionalString,

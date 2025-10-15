@@ -129,6 +129,13 @@ CREATE TABLE IF NOT EXISTS `experiment_status` (
   `quiz_about_model_completed` BOOLEAN DEFAULT false,
   `quiz_about_plan_completed` BOOLEAN DEFAULT false,
 
+  `production_plan_completed` BOOLEAN DEFAULT false,
+  `production_forecast_periods` INT DEFAULT NULL,
+  `production_initial_inventory` FLOAT DEFAULT NULL,
+  `production_target_service_level` FLOAT DEFAULT NULL,
+  `production_safety_stock_z_score` FLOAT DEFAULT NULL,
+  `production_mps_table` JSON DEFAULT NULL,
+
   `start_time` TIMESTAMP DEFAULT NULL,
   `last_activity_at` TIMESTAMP DEFAULT NULL,
   `completion_time` TIMESTAMP DEFAULT NULL,
