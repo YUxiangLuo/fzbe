@@ -168,64 +168,6 @@ export default (pool: Pool, JWT_SECRET: string) => {
     }
   });
 
-const randomQuestionsQuerySchema = z.object({
-  knowledge_point: z.string().trim().min(1).optional(),
-  limit: z
-    .string()
-    .regex(/^\d+$/, { message: "limit must be a positive integer" })
-    .transform(Number)
-    .refine((n) => n > 0, { message: "limit must be greater than 0" })
-    .default(1),
-});
-
-  gradeApi.get(
-    "/question-bank/random",
-    zValidator("query", randomQuestionsQuerySchema),
-    async (c) => {
-      try {
-        const payload = c.get("jwtPayload");
-        if (payload.role !== "Student") {
-          return c.json({ error: "Forbidden" }, 403);
-        }
-
-        const { knowledge_point, limit } = c.req.valid("query");
-
-        let sql = `
-        SELECT qb.question_id,
-               qb.knowledge_point,
-               qb.question_type,
-               qb.question_text,
-               qb.options,
-               qb.creator_id,
-               creator.full_name AS creator_name
-          FROM question_bank qb
-     LEFT JOIN users creator ON creator.user_id = qb.creator_id
-    `;
-        const params: (string | number)[] = [];
-
-        if (knowledge_point) {
-          sql += " WHERE qb.knowledge_point = ?";
-          params.push(knowledge_point);
-        }
-
-        sql += " ORDER BY RAND() LIMIT ?";
-        params.push(limit);
-
-        const [rows]: any[] = await pool.query(sql, params);
-
-        if (rows.length === 0) {
-          return c.json({ error: "No questions available for the given criteria" }, 404);
-        }
-
-        const normalized = rows.map((row: any) => normalizeQuestionRow(row, false));
-        return c.json(normalized);
-      } catch (error) {
-        console.error("Error fetching random questions:", error);
-        throw error;
-      }
-    },
-  );
-
   gradeApi.post(
     "/question-bank",
     zValidator("json", createQuestionSchema),

@@ -1264,25 +1264,104 @@ export default (pool: Pool, JWT_SECRET: string) => {
           return c.json({ error: "Forbidden" }, 403);
         }
 
-        const [events] = await pool.query(
-          `SELECT ese.event_id,
-                  ese.experiment_id,
-                  ese.student_id,
-                  e.class_id,
-                  ese.step_order,
-                  ese.event_type,
-                  ese.event_timestamp,
-                  u.username,
-                  u.full_name
-             FROM experiment_step_events ese
-             JOIN enrollments e ON e.student_id = ese.student_id
-             JOIN users u ON u.user_id = ese.student_id
-            WHERE e.class_id = ?
-            ORDER BY ese.student_id ASC, ese.experiment_id ASC, ese.event_timestamp ASC`,
-          [classIdNumber],
-        );
+        const sql = `
+WITH ClassStudents AS (
+  -- 1. Get all students in the class
+  SELECT u.user_id AS student_id, u.username, u.full_name
+  FROM users u JOIN enrollments e ON u.user_id = e.student_id
+  WHERE e.class_id = ? AND u.role = 'Student'
+),
+LatestStudentExperiment AS (
+  -- 2. Find the latest experiment for each student
+  SELECT es.experiment_id, es.student_id,
+         ROW_NUMBER() OVER(PARTITION BY es.student_id ORDER BY es.start_time DESC) as rn
+  FROM experiment_status es
+  WHERE es.student_id IN (SELECT student_id FROM ClassStudents)
+),
+NumberedEvents AS (
+  -- 3. Get all events for the latest experiments, ordered chronologically
+  SELECT
+    lse.student_id,
+    ese.experiment_id,
+    ese.step_order,
+    ese.event_type,
+    ese.event_timestamp,
+    -- Use COALESCE on a 2-argument LAG for better MariaDB compatibility
+    COALESCE(LAG(ese.step_order, 1) OVER(PARTITION BY lse.student_id ORDER BY ese.event_timestamp), 0) as prev_step_order
+  FROM experiment_step_events ese
+  JOIN LatestStudentExperiment lse ON ese.experiment_id = lse.experiment_id AND lse.rn = 1
+),
+JumpBacks AS (
+  -- 4. Identify all "jump back" events
+  SELECT student_id, event_timestamp, step_order
+  FROM NumberedEvents
+  WHERE event_type = 'STARTED' AND step_order < prev_step_order
+),
+LatestResetPoint AS (
+  -- 5. Find the most recent "jump back", which is our reset point
+  SELECT student_id, event_timestamp as reset_timestamp, step_order as reset_step_order
+  FROM (
+    SELECT student_id, event_timestamp, step_order,
+           ROW_NUMBER() OVER(PARTITION BY student_id ORDER BY event_timestamp DESC) as rn
+    FROM JumpBacks
+  ) ranked_jumps
+  WHERE rn = 1
+),
+ValidEvents AS (
+  -- 6. Filter events to get only the "valid" ones for the final sequence
+  SELECT ne.student_id, ne.experiment_id, ne.step_order, ne.event_type, ne.event_timestamp
+  FROM NumberedEvents ne
+  LEFT JOIN LatestResetPoint lrp ON ne.student_id = lrp.student_id
+  WHERE
+    -- Condition A: The student never jumped back, so all events are valid.
+    lrp.student_id IS NULL OR
+    -- Condition B: The event is for a step BEFORE the reset point. These are preserved.
+    ne.step_order < lrp.reset_step_order OR
+    -- Condition C: The event happened AT or AFTER the reset. This is the new sequence.
+    ne.event_timestamp >= lrp.reset_timestamp
+),
+PivotedSteps AS (
+  -- 7. Pivot the valid events into started/completed columns
+  SELECT
+    student_id,
+    experiment_id,
+    step_order,
+    MAX(CASE WHEN event_type = 'STARTED' THEN event_timestamp END) AS started_at,
+    MAX(CASE WHEN event_type = 'COMPLETED' THEN event_timestamp END) AS completed_at
+  FROM ValidEvents
+  GROUP BY student_id, experiment_id, step_order
+)
+-- 8. Aggregate everything into the final JSON structure
+SELECT
+  cs.student_id,
+  cs.username,
+  cs.full_name,
+  lse.experiment_id,
+  -- Rely on the mysql2 driver to auto-parse the JSON string
+  CASE
+    WHEN COUNT(ps.step_order) > 0 THEN
+      CONCAT('[',
+        GROUP_CONCAT(
+          JSON_OBJECT(
+            'step_order', ps.step_order,
+            'started_at', ps.started_at,
+            'completed_at', ps.completed_at
+          ) ORDER BY ps.step_order SEPARATOR ','
+        ),
+      ']')
+    ELSE NULL
+  END AS steps
+FROM ClassStudents cs
+LEFT JOIN LatestStudentExperiment lse ON cs.student_id = lse.student_id AND lse.rn = 1
+LEFT JOIN PivotedSteps ps ON cs.student_id = ps.student_id
+GROUP BY cs.student_id, cs.username, cs.full_name, lse.experiment_id
+ORDER BY cs.full_name;
+        `;
 
-        return c.json(events);
+        const [results] = await pool.query(sql, [classIdNumber]);
+
+        // mysql2/promise driver automatically parses JSON strings from the database
+        return c.json(results);
       } catch (error) {
         console.error("Error fetching class step events:", error);
         throw error;

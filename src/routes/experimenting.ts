@@ -622,9 +622,10 @@ export default (pool: Pool, JWT_SECRET: string) => {
       const studentId = Number.parseInt(payload.sub, 10);
       const { experiment_id, step_order, event_type } = c.req.valid("json");
 
+      const connection = await pool.getConnection();
       try {
         // 验证该实验是否属于当前学生
-        const [experimentRows] = await pool.query<RowDataPacket[]>(
+        const [experimentRows] = await connection.query<RowDataPacket[]>(
           "SELECT student_id FROM experiment_status WHERE experiment_id = ? LIMIT 1",
           [experiment_id]
         );
@@ -636,12 +637,46 @@ export default (pool: Pool, JWT_SECRET: string) => {
           return c.json({ error: "Forbidden: You do not own this experiment" }, 403);
         }
 
-        // 插入事件记录
-        const [result] = await pool.query<ResultSetHeader>(
+        // --- 新的优化逻辑开始 ---
+        if (event_type === "COMPLETED") {
+          await connection.beginTransaction();
+
+          // 1. 获取当前实验最新的事件
+          const [latestEventRows] = await connection.query<RowDataPacket[]>(
+            `SELECT step_order
+               FROM experiment_step_events
+              WHERE experiment_id = ?
+              ORDER BY event_timestamp DESC
+              LIMIT 1`,
+            [experiment_id]
+          );
+
+          const latestStepOrder = latestEventRows.length > 0 ? latestEventRows[0].step_order : 0;
+
+          // 2. 如果最新步骤比当前要完成的步骤还要靠后，说明发生了“跳回”完成
+          if (latestStepOrder > step_order) {
+            // 3. 自动插入一个10秒前的 "STARTED" 事件
+            const syntheticStartedTimestamp = new Date(Date.now() - 10000);
+            await connection.query<ResultSetHeader>(
+              `INSERT INTO experiment_step_events (experiment_id, student_id, step_order, event_type, event_timestamp)
+               VALUES (?, ?, ?, ?, ?)`,
+              [experiment_id, studentId, step_order, "STARTED", syntheticStartedTimestamp]
+            );
+          }
+        }
+        // --- 新的优化逻辑结束 ---
+
+        // 插入用户请求的原始事件
+        const [result] = await connection.query<ResultSetHeader>(
           `INSERT INTO experiment_step_events (experiment_id, student_id, step_order, event_type)
            VALUES (?, ?, ?, ?)`,
           [experiment_id, studentId, step_order, event_type]
         );
+
+        // 如果在事务中，则提交
+        if (event_type === "COMPLETED") {
+          await connection.commit();
+        }
 
         return c.json({
           message: "Event created successfully",
@@ -649,8 +684,14 @@ export default (pool: Pool, JWT_SECRET: string) => {
         }, 201);
 
       } catch (error) {
+        // 如果在事务中且发生错误，则回滚
+        if (connection.connection._fatalError === null && event_type === "COMPLETED") {
+          await connection.rollback();
+        }
         console.error("Error creating experiment step event:", error);
         throw error;
+      } finally {
+        connection.release();
       }
     }
   );

@@ -264,6 +264,7 @@ function prepareFullData(
 async function runShellScript(
   scriptName: string,
   args: string[],
+  timeoutMs?: number,
 ): Promise<any> {
   const pyDir = path.resolve(import.meta.dir, "../../py");
   const scriptPath = path.join(pyDir, scriptName);
@@ -275,24 +276,49 @@ async function runShellScript(
     env: { ...process.env, PATH: `${pyDir}/venv/bin:${process.env.PATH}` },
   });
 
-  const [stdout, stderr] = await Promise.all([
-    new Response(proc.stdout).text(),
-    new Response(proc.stderr).text(),
-  ]);
+  let timeoutId: Timer | undefined;
 
-  await proc.exited;
+  const executionPromise = new Promise<any>(async (resolve, reject) => {
+    try {
+      const [stdout, stderr] = await Promise.all([
+        new Response(proc.stdout).text(),
+        new Response(proc.stderr).text(),
+      ]);
 
-  if (proc.exitCode !== 0) {
-    console.error("Script error:", stderr);
-    throw new Error(`Script execution failed: ${stderr}`);
+      await proc.exited;
+
+      if (proc.exitCode !== 0) {
+        console.error("Script error:", stderr);
+        reject(new Error(`Script execution failed: ${stderr}`));
+      } else {
+        try {
+          resolve(JSON.parse(stdout));
+        } catch (e) {
+          console.error("Failed to parse script output:", stdout);
+          reject(new Error("Invalid output from script"));
+        }
+      }
+    } catch (err) {
+      reject(err);
+    } finally {
+      if (timeoutId) {
+        clearTimeout(timeoutId);
+      }
+    }
+  });
+
+  if (!timeoutMs) {
+    return executionPromise;
   }
 
-  try {
-    return JSON.parse(stdout);
-  } catch (e) {
-    console.error("Failed to parse script output:", stdout);
-    throw new Error("Invalid output from script");
-  }
+  const timeoutPromise = new Promise<any>((_, reject) => {
+    timeoutId = setTimeout(() => {
+      proc.kill(); // Terminate the process
+      reject(new Error(`Script execution timed out after ${timeoutMs}ms`));
+    }, timeoutMs);
+  });
+
+  return Promise.race([executionPromise, timeoutPromise]);
 }
 
 export default (pool: Pool, JWT_SECRET: string) => {
@@ -329,10 +355,13 @@ export default (pool: Pool, JWT_SECRET: string) => {
         String(body.data_window_evaluate_end_index),
         String(body.moving_average_window),
         modelSaveLoc,
-      ]);
+      ], 10000); // 10-second timeout
 
       return c.json({ status: "success", results: result });
     } catch (error: any) {
+      if (error.message.includes("timed out")) {
+        return c.json({ error: "Training timed out after 10 seconds" }, 504);
+      }
       console.error("MA training error:", error);
       return c.json({ error: error.message }, 500);
     }
@@ -365,10 +394,13 @@ export default (pool: Pool, JWT_SECRET: string) => {
         String(body.data_window_evaluate_end_index),
         String(body.exponential_smoothing_alpha),
         modelSaveLoc,
-      ]);
+      ], 10000); // 10-second timeout
 
       return c.json({ status: "success", results: result });
     } catch (error: any) {
+      if (error.message.includes("timed out")) {
+        return c.json({ error: "Training timed out after 10 seconds" }, 504);
+      }
       console.error("ES training error:", error);
       return c.json({ error: error.message }, 500);
     }
@@ -401,10 +433,12 @@ export default (pool: Pool, JWT_SECRET: string) => {
         String(body.data_window_evaluate_end_index),
         String(body.arima_d),
         modelSaveLoc,
-      ]);
+      ], 10000); // 10-second timeout
 
       return c.json({ status: "success", results: result });
-    } catch (error: any) {
+    } catch (error: any)      if (error.message.includes("timed out")) {
+        return c.json({ error: "Training timed out after 10 seconds" }, 504);
+      }
       console.error("ARIMA training error:", error);
       return c.json({ error: error.message }, 500);
     }
@@ -448,7 +482,7 @@ export default (pool: Pool, JWT_SECRET: string) => {
         String(body.data_window_evaluate_end_index),
         body.lstm_normalization,
         modelSaveLoc,
-      ]);
+      ], 10000); // 10-second timeout
 
       return c.json({
         status: "success",
@@ -456,6 +490,9 @@ export default (pool: Pool, JWT_SECRET: string) => {
         inferred_feature_types: featureTypes,
       });
     } catch (error: any) {
+      if (error.message.includes("timed out")) {
+        return c.json({ error: "Training timed out after 10 seconds" }, 504);
+      }
       console.error("LSTM training error:", error);
       return c.json({ error: error.message }, 500);
     }
@@ -492,10 +529,13 @@ export default (pool: Pool, JWT_SECRET: string) => {
         body.weight_strategy,
         ensembleSaveLoc,
         ...modelPaths,
-      ]);
+      ], 10000); // 10-second timeout
 
       return c.json({ status: "success", results: result });
     } catch (error: any) {
+      if (error.message.includes("timed out")) {
+        return c.json({ error: "Training timed out after 10 seconds" }, 504);
+      }
       console.error("Weighted Average training error:", error);
       return c.json({ error: error.message }, 500);
     }
@@ -580,7 +620,7 @@ export default (pool: Pool, JWT_SECRET: string) => {
         JSON.stringify(featureTypes),
         ensembleSaveLoc,
         ...modelPaths,
-      ]);
+      ], 10000); // 10-second timeout
 
       return c.json({
         status: "success",
@@ -588,6 +628,9 @@ export default (pool: Pool, JWT_SECRET: string) => {
         ...(Object.keys(featureTypes).length > 0 && { inferred_feature_types: featureTypes })
       });
     } catch (error: any) {
+      if (error.message.includes("timed out")) {
+        return c.json({ error: "Training timed out after 10 seconds" }, 504);
+      }
       console.error("Boosting training error:", error);
       return c.json({ error: error.message }, 500);
     }
@@ -621,10 +664,13 @@ export default (pool: Pool, JWT_SECRET: string) => {
         String(body.data_window_evaluate_end_index),
         ensembleSaveLoc,
         ...modelPaths,
-      ]);
+      ], 10000); // 10-second timeout
 
       return c.json({ status: "success", results: result });
     } catch (error: any) {
+      if (error.message.includes("timed out")) {
+        return c.json({ error: "Training timed out after 10 seconds" }, 504);
+      }
       console.error("Stacking training error:", error);
       return c.json({ error: error.message }, 500);
     }
