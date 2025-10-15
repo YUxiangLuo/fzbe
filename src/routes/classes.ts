@@ -7,6 +7,7 @@ import csv from "csv-parser";
 import { createReadStream } from "node:fs";
 import { unlink, mkdir } from "node:fs/promises";
 import path from "path";
+import { createUploadValidator } from "../utils";
 
 // Zod Schemas for Validation
 const classIdParamSchema = z.object({
@@ -157,6 +158,11 @@ const normalizeExperimentGradeRow = (row: any) => {
   return normalized;
 };
 
+const csvUploadValidator = createUploadValidator({
+  allowedMimeTypes: ["text/csv"],
+  maxSizeMb: 50,
+});
+
 export default (pool: Pool, JWT_SECRET: string) => {
   const classesApi = new Hono();
 
@@ -164,6 +170,7 @@ export default (pool: Pool, JWT_SECRET: string) => {
   classesApi.post(
     "/classes",
     jwt({ secret: JWT_SECRET }),
+    csvUploadValidator,
     async (c) => {
       let tempCsvPath: string | null = null;
 
@@ -173,10 +180,10 @@ export default (pool: Pool, JWT_SECRET: string) => {
           return c.json({ error: "Forbidden" }, 403);
         }
 
-        const body = await c.req.parseBody();
+        const body = c.get("parsedBody");
         const class_name = body["class_name"];
         const class_code = body["class_code"];
-        const studentListFile = body["student_list"]; // CSV file (optional)
+        const studentListFile = body["file"]; // file from middleware
 
         if (!class_name || typeof class_name !== "string") {
           return c.json({ error: "class_name is required" }, 400);

@@ -6,7 +6,7 @@ import { unlink, mkdir, rm } from "node:fs/promises";
 import { createReadStream } from "node:fs";
 import path from "path";
 import type { Pool, ResultSetHeader, RowDataPacket } from "mysql2/promise";
-import { parseCsvSegments, getCsvHeaders } from "../utils";
+import { parseCsvSegments, getCsvHeaders, createUploadValidator } from "../utils";
 import csv from "csv-parser";
 
 // Helper to convert an array of objects to a CSV string
@@ -87,11 +87,16 @@ const isNodeError = (error: unknown): error is NodeJS.ErrnoException => {
   return typeof error === "object" && error !== null && "code" in error;
 };
 
+const csvUploadValidator = createUploadValidator({
+  allowedMimeTypes: ["text/csv"],
+  maxSizeMb: 50,
+});
+
 export default (pool: Pool, JWT_SECRET: string) => {
   const datasetsApi = new Hono();
 
   // 管理员: 上传新的数据集
-  datasetsApi.post("/datasets", jwt({ secret: JWT_SECRET }), async (c) => {
+  datasetsApi.post("/datasets", jwt({ secret: JWT_SECRET }), csvUploadValidator, async (c) => {
     let tempUploadPath: string | null = null;
     let datasetDirectory: string | null = null;
 
@@ -101,13 +106,11 @@ export default (pool: Pool, JWT_SECRET: string) => {
         return c.json({ error: "Forbidden" }, 403);
       }
 
-      const body = await c.req.parseBody();
+      const body = c.get("parsedBody");
       const file = body["file"];
       const dataName = body["data_name"];
       const description = body["description"];
-      if (!(file instanceof File)) {
-        return c.json({ error: "File is required" }, 400);
-      }
+      
       if (!dataName || typeof dataName !== "string") {
         return c.json({ error: "data_name is required" }, 400);
       }
@@ -120,7 +123,7 @@ export default (pool: Pool, JWT_SECRET: string) => {
       await Bun.write(tempUploadPath, file);
 
       // 1.5 Validate CSV headers
-      const requiredHeaders = ["年份", "月份", "销售数量"];
+      const requiredHeaders = ["年份", "月份", "销售数量", "行业名称", "公司名称", "产品名称"];
       const headers = await getCsvHeaders(tempUploadPath);
       const missingHeaders = requiredHeaders.filter(h => !headers.includes(h));
 

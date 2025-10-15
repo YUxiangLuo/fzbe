@@ -6,6 +6,7 @@ import { rm } from "node:fs/promises";
 import { join } from "node:path";
 import type { Pool } from "mysql2/promise";
 import path from "path";
+import { createUploadValidator } from "../utils";
 
 // Zod Schemas for Validation
 const manualIdParamSchema = z.object({
@@ -18,26 +19,28 @@ const updateManualSchema = z.object({
   is_active: z.boolean().optional(),
 });
 
+const pdfUploadValidator = createUploadValidator({
+  allowedMimeTypes: ["application/pdf"],
+  maxSizeMb: 50,
+});
+
 export default (pool: Pool, JWT_SECRET: string) => {
   const manualsApi = new Hono();
 
   // 管理员: 上传新的实验手册
-  manualsApi.post("/manuals", jwt({ secret: JWT_SECRET }), async (c) => {
+  manualsApi.post("/manuals", jwt({ secret: JWT_SECRET }), pdfUploadValidator, async (c) => {
     try {
       const payload = c.get("jwtPayload");
       if (payload.role !== "Admin") {
         return c.json({ error: "Forbidden" }, 403);
       }
 
-      const body = await c.req.parseBody();
+      const body = c.get("parsedBody");
       const file = body["file"];
       const fileName = body["file_name"];
       const description = body["description"];
       const uploaderId = payload.sub;
 
-      if (!(file instanceof File)) {
-        return c.json({ error: "File is required" }, 400);
-      }
       if (!fileName || typeof fileName !== "string") {
         return c.json({ error: "file_name is required" }, 400);
       }

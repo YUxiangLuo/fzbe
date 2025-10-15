@@ -260,7 +260,6 @@ function prepareFullData(
   };
 }
 
-
 async function runShellScript(
   scriptName: string,
   args: string[],
@@ -436,7 +435,8 @@ export default (pool: Pool, JWT_SECRET: string) => {
       ], 10000); // 10-second timeout
 
       return c.json({ status: "success", results: result });
-    } catch (error: any)      if (error.message.includes("timed out")) {
+    } catch (error: any) {
+      if (error.message.includes("timed out")) {
         return c.json({ error: "Training timed out after 10 seconds" }, 504);
       }
       console.error("ARIMA training error:", error);
