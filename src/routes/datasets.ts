@@ -123,7 +123,7 @@ export default (pool: Pool, JWT_SECRET: string) => {
       await Bun.write(tempUploadPath, file);
 
       // 1.5 Validate CSV headers
-      const requiredHeaders = ["年份", "月份", "销售数量", "行业名称", "公司名称", "产品名称"];
+      const requiredHeaders = ["年份", "月份", "销售数量", "行业名称", "公司名称", "产品名称", "数量单位"];
       const headers = await getCsvHeaders(tempUploadPath);
       const missingHeaders = requiredHeaders.filter(h => !headers.includes(h));
 
