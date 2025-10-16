@@ -553,6 +553,7 @@ export default (pool: Pool, JWT_SECRET: string) => {
         const pdfPath = path.join(reportsDir, uniqueFilename);
 
         browser = await puppeteer.launch({
+          headless: true,
           args: ["--no-sandbox", "--disable-setuid-sandbox"],
         });
         const page = await browser.newPage();
