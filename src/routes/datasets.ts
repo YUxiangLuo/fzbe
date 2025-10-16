@@ -185,20 +185,22 @@ export default (pool: Pool, JWT_SECRET: string) => {
         const datasetId: number = result.insertId;
 
         // 5. Create dedicated directories for the dataset and its segments
-        datasetDirectory = path.resolve(
+        const permanentStorageDir = path.resolve(
           import.meta.dir,
           "../../uploads",
           "datasets",
-          String(datasetId),
         );
+        const uniquePermanentFilename = `${datasetId}-${file.name.replace(/[\/\\?%*:|"<>]/g, "-")}`;
+        const permanentOriginalPath = path.join(
+          permanentStorageDir,
+          uniquePermanentFilename,
+        );
+
+        datasetDirectory = path.join(permanentStorageDir, String(datasetId));
         const segmentsDir = path.join(datasetDirectory, "segments");
         await mkdir(segmentsDir, { recursive: true });
 
         // 6. Move original file to its permanent location and update the DB record
-        const permanentOriginalPath = path.join(
-          datasetDirectory,
-          "original.csv",
-        );
         await Bun.write(permanentOriginalPath, Bun.file(tempUploadPath));
         await connection.query(
           "UPDATE datasets SET file_path = ? WHERE dataset_id = ?",
@@ -610,9 +612,21 @@ export default (pool: Pool, JWT_SECRET: string) => {
           return c.json({ error: "Dataset not found" }, 404);
         }
 
-        // Delete the entire directory for this dataset
-        const datasetDirectory = path.dirname(dataset.file_path);
-        await rm(datasetDirectory, { recursive: true, force: true });
+        // Delete the original file itself
+        await rm(dataset.file_path, { force: true, recursive: false }).catch(err => 
+          console.error(`Could not delete dataset file: ${dataset.file_path}`, err)
+        );
+
+        // Delete the associated directory which contains segment files
+        const datasetSegmentsDirectory = path.resolve(
+          import.meta.dir,
+          "../../uploads",
+          "datasets",
+          datasetId,
+        );
+        await rm(datasetSegmentsDirectory, { recursive: true, force: true }).catch(err => 
+          console.error(`Could not delete segments directory: ${datasetSegmentsDirectory}`, err)
+        );
 
         const [result] = await pool.query<ResultSetHeader>(
           "DELETE FROM datasets WHERE dataset_id = ?",
