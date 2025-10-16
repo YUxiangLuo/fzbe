@@ -641,20 +641,48 @@ export default (pool: Pool, JWT_SECRET: string) => {
     },
   );
 
-  // Get all assistants for a class
+  // Get all assistants for a class (restricted access)
   classesApi.get(
     "/classes/:classId/assistants",
     jwt({ secret: JWT_SECRET }),
     zValidator("param", classIdParamSchema),
     async (c) => {
       try {
+        const payload = c.get("jwtPayload");
         const { classId } = c.req.valid("param");
         const classIdNumber = Number.parseInt(classId, 10);
 
+        // Authorization: Admin or class owner (teacher) or assigned assistant
+        const [classRows]: any[] = await pool.query(
+          "SELECT teacher_id FROM classes WHERE class_id = ?",
+          [classIdNumber],
+        );
+        if (classRows.length === 0) {
+          return c.json({ error: "Class not found" }, 404);
+        }
+
+        const classOwner = classRows[0].teacher_id;
+        let isAllowed = false;
+        if (payload.role === "Admin" || payload.sub === classOwner) {
+          isAllowed = true;
+        } else if (payload.role === "Assistant") {
+          const [[assignment]]: any[] = await pool.query(
+            "SELECT 1 FROM class_assistants WHERE class_id = ? AND assistant_id = ?",
+            [classIdNumber, payload.sub],
+          );
+          if (assignment) {
+            isAllowed = true;
+          }
+        }
+
+        if (!isAllowed) {
+          return c.json({ error: "Forbidden" }, 403);
+        }
+
         const [rows] = await pool.query(
-          `SELECT u.user_id, u.username, u.full_name, u.email 
-           FROM users u 
-           JOIN class_assistants ca ON u.user_id = ca.assistant_id 
+          `SELECT u.user_id, u.username, u.full_name, u.email
+           FROM users u
+           JOIN class_assistants ca ON u.user_id = ca.assistant_id
            WHERE ca.class_id = ?`,
           [classIdNumber],
         );

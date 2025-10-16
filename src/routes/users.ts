@@ -372,7 +372,7 @@ export default (pool: Pool, JWT_SECRET: string) => {
     zValidator("json", registerSchema),
     async (c) => {
       try {
-        const { username, password, full_name, email, role, phone_number } =
+        const { username, password, full_name, email, phone_number } =
           c.req.valid("json");
         const password_hash = await Bun.password.hash(password, {
           algorithm: "bcrypt",
@@ -380,13 +380,12 @@ export default (pool: Pool, JWT_SECRET: string) => {
         });
 
         const [result]: any = await pool.query(
-          "INSERT INTO users (username, password_hash, full_name, email, role, phone_number) VALUES (?, ?, ?, ?, ?, ?)",
+          "INSERT INTO users (username, password_hash, full_name, email, role, phone_number) VALUES (?, ?, ?, ?, 'Student', ?)",
           [
             username,
             password_hash,
             full_name,
             email,
-            role,
             phone_number || null,
           ],
         );
@@ -396,7 +395,7 @@ export default (pool: Pool, JWT_SECRET: string) => {
           username,
           full_name,
           email,
-          role,
+          role: "Student",
           phone_number: phone_number || null,
         };
         return c.json(newUser, 201);
