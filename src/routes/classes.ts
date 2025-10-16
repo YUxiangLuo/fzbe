@@ -1655,6 +1655,11 @@ ORDER BY cs.full_name;
           "SELECT COUNT(*) as count FROM enrollments WHERE class_id = ?",
           [classIdNumber],
         );
+        // Count grade_weights rows for this class prior to deletion (will be removed via ON DELETE CASCADE)
+        const [[gradeWeightsCountRow]]: any[] = await connection.query(
+          "SELECT COUNT(*) as count FROM grade_weights WHERE class_id = ?",
+          [classIdNumber],
+        );
         const [deleteResult]: any = await connection.query(
           "DELETE FROM classes WHERE class_id = ?",
           [classIdNumber],
@@ -1672,7 +1677,7 @@ ORDER BY cs.full_name;
           cleanup: {
             removedAssistants: assistantCountRow.count,
             removedEnrollments: enrollmentCountRow.count,
-            removedGradeWeights: 0,
+            removedGradeWeights: gradeWeightsCountRow.count,
           },
         });
       } catch (error) {

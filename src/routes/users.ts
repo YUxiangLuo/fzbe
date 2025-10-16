@@ -74,52 +74,9 @@ const createAssistantSchema = registerSchema
   })
   .omit({ role: true }); // Role is fixed to 'Assistant', so we don't need it from the input.
 
-const gradeWeightKeys = [
-  "exp_flow",
-  "exp_flow_demand_data_preparation",
-  "exp_flow_demand_descriptive_stats",
-  "exp_flow_demand_model_selection",
-  "exp_flow_demand_generate_results",
-  "exp_flow_production_inventory_calc",
-  "exp_flow_production_service_level",
-  "exp_flow_production_variable_calc",
-  "exp_flow_production_plan_creation",
-  "exp_flow_report_submission",
-  "knowledge_test",
-  "model_quality",
-  "report_quality",
-];
-
-const DEFAULT_GRADE_WEIGHTS: Record<string, number> = {
-  exp_flow: 40,
-  exp_flow_demand_data_preparation: 12,
-  exp_flow_demand_descriptive_stats: 10,
-  exp_flow_demand_model_selection: 8,
-  exp_flow_demand_generate_results: 10,
-  exp_flow_production_inventory_calc: 10,
-  exp_flow_production_service_level: 10,
-  exp_flow_production_variable_calc: 10,
-  exp_flow_production_plan_creation: 15,
-  exp_flow_report_submission: 15,
-  knowledge_test: 20,
-  model_quality: 20,
-  report_quality: 20,
-};
-
-const ensureDefaultGradeWeights = async (teacherId: number, pool: Pool) => {
-  const [rows]: any[] = await pool.query(
-    "SELECT weight_id FROM grade_weights WHERE teacher_id = ?",
-    [teacherId],
-  );
-
-  if (rows.length > 0) {
-    return;
-  }
-
-  const sql = `INSERT INTO grade_weights (teacher_id, ${gradeWeightKeys.join(", ")}) VALUES (${["?", ...gradeWeightKeys.map(() => "?")].join(", ")})`;
-  const values = [teacherId, ...gradeWeightKeys.map((key) => DEFAULT_GRADE_WEIGHTS[key])];
-  await pool.query(sql, values);
-};
+// Teacher-centric grade weights have been removed. All grade weights are now class-centric
+// via the `grade_weights` table keyed by `class_id`. Any legacy teacher-based initialization
+// logic has been deleted.
 
 export default (pool: Pool, JWT_SECRET: string) => {
   const usersApi = new Hono();
@@ -287,9 +244,6 @@ export default (pool: Pool, JWT_SECRET: string) => {
 
         const newTeacherId = result.insertId;
 
-        // Note: The ensureDefaultGradeWeights function is teacher-centric and is deprecated
-        // by the new class-centric grade weight system. No need to call it here.
-
         const newUser = {
           user_id: newTeacherId,
           username,
@@ -436,10 +390,6 @@ export default (pool: Pool, JWT_SECRET: string) => {
             phone_number || null,
           ],
         );
-
-        if (role === "Teacher") {
-          await ensureDefaultGradeWeights(result.insertId, pool);
-        }
 
         const newUser = {
           user_id: result.insertId,
@@ -796,10 +746,6 @@ export default (pool: Pool, JWT_SECRET: string) => {
                 ]);
                 cleanupSummary.deletedClasses = classRows.length;
               }
-              await connection.query(
-                "DELETE FROM grade_weights WHERE teacher_id = ?",
-                [targetUserId],
-              );
               break;
             }
             case "Assistant": {
