@@ -561,46 +561,87 @@ export default (pool: Pool, JWT_SECRET: string) => {
         // --- End of PDF Generation ---
 
         // --- Database Logic ---
-        const sql = `
-          INSERT INTO experiment_reports (experiment_id, student_id, report_content, pdf_file_path, submitted_at)
-          VALUES (?, ?, ?, ?, NOW())
-          ON DUPLICATE KEY UPDATE
-            report_content = VALUES(report_content),
-            pdf_file_path = VALUES(pdf_file_path),
-            submitted_at = NOW()
-        `;
+        const connection = await pool.getConnection();
+        try {
+          await connection.beginTransaction();
 
-        const [result]: any = await pool.query(sql, [
-          experiment_id,
-          studentId,
-          report_content,
-          pdfPath,
-        ]);
+          const reportSql = `
+            INSERT INTO experiment_reports (experiment_id, student_id, report_content, pdf_file_path, submitted_at)
+            VALUES (?, ?, ?, ?, NOW())
+            ON DUPLICATE KEY UPDATE
+              report_content = VALUES(report_content),
+              pdf_file_path = VALUES(pdf_file_path),
+              submitted_at = NOW()
+          `;
 
-        const reportId = result.insertId;
+          const [reportResult]: any = await connection.query(reportSql, [
+            experiment_id,
+            studentId,
+            report_content,
+            pdfPath,
+          ]);
 
-        if (reportId === 0 && result.affectedRows > 0) {
-          const [rows]: any = await pool.query(
-            "SELECT report_id FROM experiment_reports WHERE experiment_id = ? AND student_id = ?",
-            [experiment_id, studentId],
-          );
-          if (rows.length > 0) {
-            return c.json({
-              message: "Report updated successfully",
-              report_id: rows[0].report_id,
-              pdf_path: pdfPath,
-            });
+          // Now, create the initial grade entry
+          const gradeSql = `
+            INSERT INTO experiment_grade (
+              experiment_id, student_id,
+              exp_flow,
+              exp_flow_demand_data_preparation, exp_flow_demand_descriptive_stats,
+              exp_flow_demand_model_selection, exp_flow_demand_generate_results,
+              exp_flow_production_inventory_calc, exp_flow_production_service_level,
+              exp_flow_production_variable_calc, exp_flow_production_plan_creation,
+              exp_flow_report_submission,
+              model_quality
+            )
+            VALUES (?, ?, 100, 100, 100, 100, 100, 100, 100, 100, 100, 100, 100)
+            ON DUPLICATE KEY UPDATE
+              exp_flow = 100,
+              exp_flow_demand_data_preparation = 100, exp_flow_demand_descriptive_stats = 100,
+              exp_flow_demand_model_selection = 100, exp_flow_demand_generate_results = 100,
+              exp_flow_production_inventory_calc = 100, exp_flow_production_service_level = 100,
+              exp_flow_production_variable_calc = 100, exp_flow_production_plan_creation = 100,
+              exp_flow_report_submission = 100,
+              model_quality = 100,
+              -- Reset other fields in case of re-submission
+              knowledge_test = 0,
+              report_quality = 0,
+              grader_id = NULL
+          `;
+
+          await connection.query(gradeSql, [experiment_id, studentId]);
+
+          await connection.commit();
+
+          let reportId = reportResult.insertId;
+          if (reportId === 0 && reportResult.affectedRows > 0) {
+            const [rows]: any = await connection.query(
+              "SELECT report_id FROM experiment_reports WHERE experiment_id = ? AND student_id = ?",
+              [experiment_id, studentId],
+            );
+            if (rows.length > 0) {
+              reportId = rows[0].report_id;
+              return c.json({
+                message: "Report updated successfully",
+                report_id: reportId,
+                pdf_path: pdfPath,
+              });
+            }
           }
-        }
 
-        return c.json(
-          {
-            message: "Report submitted successfully",
-            report_id: reportId,
-            pdf_path: pdfPath,
-          },
-          201,
-        );
+          return c.json(
+            {
+              message: "Report submitted successfully",
+              report_id: reportId,
+              pdf_path: pdfPath,
+            },
+            201,
+          );
+        } catch (dbError) {
+          await connection.rollback();
+          throw dbError; // Re-throw to be caught by the outer try-catch
+        } finally {
+          connection.release();
+        }
       } catch (error) {
         console.error("Error submitting experiment report:", error);
         return c.json(

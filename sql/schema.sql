@@ -146,7 +146,8 @@ CREATE TABLE IF NOT EXISTS `experiment_status` (
   
   -- Add constraint to ensure step values are valid
   CONSTRAINT `chk_current_step` CHECK (`current_step` BETWEEN 1 AND 7),
-  CONSTRAINT `chk_highest_step` CHECK (`highest_completed_step` <= 7)
+  CONSTRAINT `chk_highest_step` CHECK (`highest_completed_step` <= 7),
+  INDEX `idx_student_status_completion` (`student_id`, `status`, `completion_time` DESC)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
 CREATE TABLE IF NOT EXISTS `experiment_step_events` (
@@ -273,7 +274,7 @@ CREATE TABLE IF NOT EXISTS `experiment_reports` (
 DROP TABLE IF EXISTS `grade_weights`;
 CREATE TABLE `grade_weights` (
   `weight_id` INT AUTO_INCREMENT PRIMARY KEY,
-  `teacher_id` INT NOT NULL UNIQUE,
+  `class_id` INT NOT NULL UNIQUE,
 
   -- Fields starting with exp_flow_ and must sum to 100
   `exp_flow_demand_data_preparation` FLOAT DEFAULT 0,
@@ -292,7 +293,7 @@ CREATE TABLE `grade_weights` (
   `model_quality` FLOAT DEFAULT 0,
   `report_quality` FLOAT DEFAULT 0,
 
-  FOREIGN KEY (`teacher_id`) REFERENCES `users`(`user_id`) ON DELETE CASCADE,
+  FOREIGN KEY (`class_id`) REFERENCES `classes`(`class_id`) ON DELETE CASCADE,
   
   -- Add constraints to ensure weights are in valid range
   CONSTRAINT `chk_weights_range` CHECK (
@@ -318,7 +319,7 @@ CREATE TABLE `experiment_grade` (
   `grade_id` INT AUTO_INCREMENT PRIMARY KEY,
   `experiment_id` INT NOT NULL,
   `student_id` INT NOT NULL,
-  `grader_id` INT,
+  `grader_id` INT DEFAULT NULL,
 
   -- 0-100
   `exp_flow` FLOAT DEFAULT 0,
@@ -366,7 +367,8 @@ CREATE TABLE `experiment_grade` (
     `knowledge_test` >= 0 AND `knowledge_test` <= 100 AND
     `model_quality` >= 0 AND `model_quality` <= 100 AND
     `report_quality` >= 0 AND `report_quality` <= 100
-  )
+  ),
+  INDEX `idx_experiment_grade_experiment_id` (`experiment_id`)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
 -- ========================================================

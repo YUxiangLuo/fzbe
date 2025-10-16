@@ -21,6 +21,12 @@ const registerSchema = z.object({
   phone_number: z.string().optional(),
 });
 
+const createTeacherSchema = z.object({
+  username: z.string().min(3),
+  full_name: z.string().min(1),
+  email: z.string().email(),
+});
+
 const updateUserSchema = z
   .object({
     full_name: z.string().min(1).optional(),
@@ -252,6 +258,57 @@ export default (pool: Pool, JWT_SECRET: string) => {
         throw error;
       } finally {
         connection.release();
+      }
+    },
+  );
+
+  // Admin: Create a new teacher user
+  usersApi.post(
+    "/users/teachers",
+    jwt({ secret: JWT_SECRET }),
+    zValidator("json", createTeacherSchema),
+    async (c) => {
+      try {
+        const payload = c.get("jwtPayload");
+        if (payload.role !== "Admin") {
+          return c.json({ error: "Forbidden" }, 403);
+        }
+
+        const { username, full_name, email } = c.req.valid("json");
+
+        // Use a default password for admin-created teachers
+        const defaultPasswordHash =
+          "$2b$10$DVZtxD9Efhm/j8.LSWMFx.hfdpk81iHO4Tv0fUaDr1LlW/mFrgXrG";
+
+        const [result]: any = await pool.query(
+          "INSERT INTO users (username, password_hash, full_name, email, role) VALUES (?, ?, ?, ?, 'Teacher')",
+          [username, defaultPasswordHash, full_name, email],
+        );
+
+        const newTeacherId = result.insertId;
+
+        // Note: The ensureDefaultGradeWeights function is teacher-centric and is deprecated
+        // by the new class-centric grade weight system. No need to call it here.
+
+        const newUser = {
+          user_id: newTeacherId,
+          username,
+          full_name,
+          email,
+          role: "Teacher",
+        };
+        return c.json(newUser, 201);
+      } catch (error: any) {
+        if (error.code === "ER_DUP_ENTRY") {
+          if (error.message.includes("users.username")) {
+            return c.json({ error: "Username already exists" }, 409);
+          }
+          if (error.message.includes("users.email")) {
+            return c.json({ error: "Email already exists" }, 409);
+          }
+        }
+        console.error("Error creating teacher:", error);
+        throw error;
       }
     },
   );
