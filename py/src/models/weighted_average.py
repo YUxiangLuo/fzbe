@@ -17,6 +17,26 @@ def _weight_equal(n_models: int) -> List[float]:
     return [1.0 / n_models] * n_models
 
 
+def _weight_inverse_variance(predictions: List[List[float]], y_true: List[float]) -> List[float]:
+    variances = []
+    for pred in predictions:
+        residuals = np.array(y_true) - np.array(pred)
+        var = float(np.var(residuals))
+        variances.append(var)
+
+    if any(v == 0.0 for v in variances):
+        weights = [1.0 if v == 0.0 else 0.0 for v in variances]
+        if sum(weights) == 0.0:
+            return _weight_equal(len(predictions))
+        return weights
+
+    inv_vars = [1.0 / v if v > 0 else 0.0 for v in variances]
+    total = sum(inv_vars)
+    if total <= 0.0:
+        return _weight_equal(len(predictions))
+    return [w / total for w in inv_vars]
+
+
 def _weight_inverse_rmse(predictions: List[List[float]], y_true: List[float]) -> List[float]:
     errors = [rmse(y_true, pred) for pred in predictions]
     if any(e == 0 for e in errors):
@@ -156,9 +176,9 @@ def run(args) -> None:
     if not (0 <= es <= ee < n):
         raise ValueError(f"Invalid eval range: [{es},{ee}] within [0,{n-1}]")
     
-    strategy = getattr(args, "weight_strategy", "equal").lower()
-    if strategy not in ("equal", "inverse_rmse", "grid_search", "linear_regression"):
-        raise ValueError("--weight_strategy must be one of: equal, inverse_rmse, grid_search, linear_regression")
+    strategy = getattr(args, "weight_strategy", "inverse_variance").lower()
+    if strategy not in ("equal", "inverse_variance", "inverse_rmse", "grid_search", "linear_regression"):
+        raise ValueError("--weight_strategy must be one of: equal, inverse_variance, inverse_rmse, grid_search, linear_regression")
     
     eval_steps = ee - es + 1
     eval_predictions = get_model_predictions(model_paths, eval_steps, args.data)
@@ -167,6 +187,8 @@ def run(args) -> None:
     weights = []
     if strategy == "equal":
         weights = _weight_equal(len(model_paths))
+    elif strategy == "inverse_variance":
+        weights = _weight_inverse_variance(eval_predictions, y_true)
     elif strategy == "inverse_rmse":
         weights = _weight_inverse_rmse(eval_predictions, y_true)
     elif strategy == "grid_search":

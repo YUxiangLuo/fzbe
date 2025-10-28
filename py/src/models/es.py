@@ -113,32 +113,38 @@ def train_and_evaluate(
     sales: List[float], months: List[str], train_range: range, eval_range: range, alpha: float
 ) -> Tuple[Dict[str, Any], float, float]:
     """
-    Trains, evaluates, and returns metrics, residual std dev, and the final smoothed level.
+    Trains the SES model strictly on the declared training segment, then
+    evaluates sequentially over eval_range. Returns metrics, residual std dev,
+    and the smoothed level at train_end (before consuming evaluation targets).
     """
-    n = len(sales)
     ts = train_range.start
-    
-    # 计算全序列的平滑值 s_t
-    s = [None] * n
-    s[ts] = sales[ts]  # 初始化
-    for t in range(ts + 1, n):
-        s[t] = alpha * sales[t] + (1.0 - alpha) * s[t - 1]
+    te = train_range.stop - 1  # inclusive
 
-    # 一步预测：ŷ_t = s_{t-1}
-    idxs = []
-    preds = []
+    # --- Phase 1: fit level on training slice only ---
+    level = float(sales[ts])
+    for t in range(ts + 1, te + 1):
+        level = alpha * float(sales[t]) + (1.0 - alpha) * level
+
+    train_level = float(level)  # snapshot before evaluation
+
+    # --- Phase 2: sequential evaluation (1-step ahead) ---
+    idxs: List[int] = []
+    preds: List[float] = []
+    current_level = float(level)
     for t in eval_range:
-        if s[t - 1] is None:
+        if t <= ts:
+            # Defensive: evaluation must have at least one prior observation
             continue
+        preds.append(current_level)
         idxs.append(t)
-        preds.append(s[t - 1])
+        current_level = alpha * float(sales[t]) + (1.0 - alpha) * current_level
 
     if not idxs:
         raise ValueError(
-            "no evaluation points: adjust --eval_start or provide more training history"
+            "no evaluation points: set eval_start >= train_start + 1 to ensure at least one forecast."
         )
 
-    y_true = [sales[i] for i in idxs]
+    y_true = [float(sales[i]) for i in idxs]
     y_pred = preds
 
     residuals = np.array(y_true) - np.array(y_pred)
@@ -150,10 +156,8 @@ def train_and_evaluate(
         "mape": mape(y_true, y_pred),
         "r2": r2_score(y_true, y_pred),
     }
-    
-    final_level = s[train_range.stop - 1]
 
-    return metrics, float(std_dev_residuals), float(final_level)
+    return metrics, float(std_dev_residuals), train_level
 
 
 # ----- core -----

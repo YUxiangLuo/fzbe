@@ -29,7 +29,11 @@ from models.utils import rmse, mae, mape, r2_score, get_model_predictions
 
 
 # ---------- Meta-Model Training ----------
-def _train_meta_model(predictions: List[List[float]], y_true: List[float]) -> Dict[str, Any]:
+def _train_meta_model(
+    predictions: List[List[float]],
+    y_true: List[float],
+    l2_strength: float,
+) -> Dict[str, Any]:
     """
     Trains a linear regression meta-model.
     Returns a dictionary containing the learned coefficients and intercept.
@@ -42,17 +46,20 @@ def _train_meta_model(predictions: List[List[float]], y_true: List[float]) -> Di
     # Add a column of ones to X to account for the intercept
     X_b = np.c_[np.ones((X.shape[0], 1)), X]
 
-    # Solve for the coefficients (theta) using the Normal Equation: theta = (X^T * X)^-1 * X^T * y
-    # np.linalg.lstsq is a robust way to do this.
+    lam = max(float(l2_strength), 0.0)
+    XtX = X_b.T @ X_b
+    reg = np.eye(XtX.shape[0], dtype=float)
+    reg[0, 0] = 0.0  # do not regularise intercept
+
     try:
-        theta = np.linalg.lstsq(X_b, y, rcond=None)[0]
+        theta = np.linalg.solve(XtX + lam * reg, X_b.T @ y)
     except np.linalg.LinAlgError:
-        raise RuntimeError("Failed to solve for meta-model coefficients. The prediction matrix may be singular.")
+        theta = np.linalg.lstsq(X_b, y, rcond=None)[0]
 
-    intercept = theta[0]
-    coefficients = theta[1:].tolist()
+    intercept = float(theta[0])
+    coefficients = [float(c) for c in theta[1:]]
 
-    return {"intercept": intercept, "coefficients": coefficients}
+    return {"intercept": intercept, "coefficients": coefficients, "l2": lam}
 
 
 # ---------- Stacking Prediction ----------
@@ -62,7 +69,7 @@ def _stacking_predict(predictions: List[List[float]], meta_model: Dict[str, Any]
     """
     X = np.array(predictions).T
     intercept = meta_model["intercept"]
-    coefficients = np.array(meta_model["coefficients"])
+    coefficients = np.array(meta_model["coefficients"], dtype=float)
 
     if X.shape[1] != len(coefficients):
         raise ValueError(f"Number of base model predictions ({X.shape[1]}) does not match number of meta-model coefficients ({len(coefficients)}).")
@@ -77,12 +84,17 @@ def run(args) -> None:
     pretty = bool(getattr(args, "pretty", False))
     load_ensemble_path = getattr(args, "load_ensemble", None)
     save_ensemble_path = getattr(args, "save_ensemble", None)
+    l2_strength = float(getattr(args, "meta_l2", 0.1))
+    if l2_strength < 0:
+        raise ValueError("--meta_l2 must be >= 0")
 
     # ========== Loading/Prediction Mode ==========
     if load_ensemble_path:
         config = load_joblib(load_ensemble_path)
         model_paths = config["base_model_paths"]
         meta_model = config["meta_model"]
+        if "meta_l2" in config and "l2" not in meta_model:
+            meta_model = {**meta_model, "l2": config["meta_l2"]}
 
         fs = getattr(args, "forecast_steps", None)
         if fs is None:
@@ -108,6 +120,24 @@ def run(args) -> None:
             "predictions": predictions_with_std,
         }
 
+        es = getattr(args, "eval_start", None)
+        ee = getattr(args, "eval_end", None)
+        if getattr(args, "data", None) and es is not None and ee is not None:
+            try:
+                es_i, ee_i = int(es), int(ee)
+                arr = json.loads(args.data)
+                sales = [float(it.get("sales", it.get("y"))) for it in arr]
+                y_true = sales[es_i : ee_i + 1]
+                if len(y_true) == len(final_predictions):
+                    out["metrics"] = {
+                        "rmse": rmse(y_true, final_predictions),
+                        "mae": mae(y_true, final_predictions),
+                        "mape": mape(y_true, final_predictions),
+                        "r2": r2_score(y_true, final_predictions),
+                    }
+            except Exception:
+                pass
+
         print(json.dumps(out, ensure_ascii=False, indent=2 if pretty else None))
         return
 
@@ -116,8 +146,8 @@ def run(args) -> None:
         raise ValueError("Must provide --models <path1> <path2> ... for stacking training.")
     
     model_paths = args.models if isinstance(args.models, list) else [args.models]
-    if len(model_paths) < 1:
-        raise ValueError("Stacking requires at least 1 base model.")
+    if len(model_paths) < 2:
+        raise ValueError("Stacking requires at least 2 base models.")
 
     try:
         arr = json.loads(args.data)
@@ -138,8 +168,11 @@ def run(args) -> None:
     base_predictions_on_eval = get_model_predictions(model_paths, eval_steps, args.data)
     y_true_on_eval = sales[es : ee + 1]
 
+    if not base_predictions_on_eval:
+        raise ValueError("Base models produced no predictions; check model paths and data.")
+
     # 2. Train the meta-model
-    meta_model = _train_meta_model(base_predictions_on_eval, y_true_on_eval)
+    meta_model = _train_meta_model(base_predictions_on_eval, y_true_on_eval, l2_strength)
 
     # 3. (Optional) Evaluate the trained stacking model on the same eval set
     final_predictions_on_eval = _stacking_predict(base_predictions_on_eval, meta_model)
@@ -158,7 +191,10 @@ def run(args) -> None:
             "mape": mape(y_true_on_eval, final_predictions_on_eval),
             "r2": r2_score(y_true_on_eval, final_predictions_on_eval),
         },
-        "notes": ["Meta-model (Linear Regression) was trained on the predictions of base models over the evaluation set."],
+        "notes": [
+            "Meta-model (Linear Regression) was trained on the predictions of base models over the evaluation set.",
+            f"L2 regularisation strength meta_l2={l2_strength}",
+        ],
     }
 
     if save_ensemble_path:
@@ -167,6 +203,7 @@ def run(args) -> None:
             "meta_model": meta_model,
             "strategy": "stacking",
             "std_dev_residuals": std_dev_residuals,
+            "meta_l2": l2_strength,
         }
         dump_joblib(config, save_ensemble_path)
         out["saved_ensemble"] = save_ensemble_path

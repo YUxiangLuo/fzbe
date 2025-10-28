@@ -16,14 +16,15 @@ from models.utils import rmse, mae, mape, r2_score, get_model_predictions
 
 
 # ---------- Ensemble Prediction ----------
-def _ensemble_predict_boosting(predictions: List[List[float]]) -> List[float]:
+def _ensemble_predict_boosting(predictions: List[List[float]], learning_rate: float = 1.0) -> List[float]:
     """Boosting ensemble (summation)"""
     if not predictions:
         return []
-    ensemble_pred = list(predictions[0])
-    for i in range(1, len(predictions)):
-        for j in range(len(ensemble_pred)):
-            ensemble_pred[j] += predictions[i][j]
+    lr = float(learning_rate)
+    ensemble_pred = [0.0] * len(predictions[0])
+    for stage in predictions:
+        for j, val in enumerate(stage):
+            ensemble_pred[j] += lr * float(val)
     return ensemble_pred
 
 
@@ -32,12 +33,16 @@ def run(args) -> None:
     pretty = bool(getattr(args, "pretty", False))
     load_ensemble_path = getattr(args, "load_ensemble", None)
     save_ensemble_path = getattr(args, "save_ensemble", None)
+    learning_rate = float(getattr(args, "learning_rate", 1.0))
+    if learning_rate <= 0.0:
+        raise ValueError("--learning_rate must be > 0")
     
     # ========== Loading Mode ==========
     if load_ensemble_path:
         config = load_joblib(load_ensemble_path)
         model_paths = config["model_paths"]
         strategy = config.get("strategy", "boosting")
+        learning_rate_cfg = float(config.get("learning_rate", learning_rate))
 
         steps = None
         if hasattr(args, "eval_start") and hasattr(args, "eval_end"):
@@ -57,7 +62,7 @@ def run(args) -> None:
         
         data = getattr(args, "data", None)
         predictions = get_model_predictions(model_paths, steps, data)
-        ensemble_pred = _ensemble_predict_boosting(predictions)
+        ensemble_pred = _ensemble_predict_boosting(predictions, learning_rate_cfg)
         
         std_dev = config.get("std_dev_residuals", 0.0)
         predictions_with_std = [{"prediction": p, "std_dev": std_dev} for p in ensemble_pred]
@@ -68,6 +73,7 @@ def run(args) -> None:
             "n_models": len(model_paths),
             "forecast_steps": steps,
             "predictions": predictions_with_std,
+            "learning_rate": learning_rate_cfg,
         }
         
         if hasattr(args, "data") and hasattr(args, "eval_start") and hasattr(args, "eval_end"):
@@ -199,8 +205,10 @@ def run(args) -> None:
         # ensuring consistency between training evaluation and final prediction.
         eval_preds = get_model_predictions([new_model_path], len(y_eval_true), data=None)[0]
 
-        current_residuals_train = [true - pred for true, pred in zip(current_residuals_train, train_preds)]
-        final_eval_predictions += np.array(eval_preds)
+        current_residuals_train = [
+            true - learning_rate * pred for true, pred in zip(current_residuals_train, train_preds)
+        ]
+        final_eval_predictions += learning_rate * np.array(eval_preds, dtype=float)
 
     ensemble_pred = final_eval_predictions.tolist()
 
@@ -212,13 +220,17 @@ def run(args) -> None:
         "strategy": "boosting",
         "n_models": len(trained_residual_models),
         "eval_range": {"start": es, "end": ee},
+        "learning_rate": learning_rate,
         "metrics": {
             "rmse": rmse(y_eval_true, ensemble_pred),
             "mae": mae(y_eval_true, ensemble_pred),
             "mape": mape(y_eval_true, ensemble_pred),
             "r2": r2_score(y_eval_true, ensemble_pred),
         },
-        "notes": [f"Boosting ensemble trained. Residual models stored in {temp_dir}"],
+        "notes": [
+            f"Boosting ensemble trained. Residual models stored in {temp_dir}",
+            f"Learning rate (shrinkage) applied at each stage: {learning_rate}",
+        ],
     }
     
     if save_ensemble_path:
@@ -227,6 +239,7 @@ def run(args) -> None:
             "weights": None, 
             "strategy": "boosting",
             "std_dev_residuals": std_dev_residuals,
+            "learning_rate": learning_rate,
         }
         dump_joblib(config, save_ensemble_path)
         out["saved_ensemble"] = save_ensemble_path

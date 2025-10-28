@@ -81,8 +81,9 @@ def _validate_ranges(n: int, ts: int, te: int, es: int, ee: int) -> None:
     if not (0 <= es <= ee < n):
         raise ValueError(f"eval range invalid: es={es}, ee={ee}, n={n}")
     if es <= te:
-        # Keep behavior (do not hard error), only warn because some users purposely overlap
-        warnings.warn("Eval range overlaps train; may not be true OOS.", RuntimeWarning)
+        raise ValueError(
+            "eval_start must be > train_end for ARIMA to ensure genuine out-of-sample evaluation."
+        )
     if (ee - es + 1) <= 0:
         raise ValueError("empty eval range")
 

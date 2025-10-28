@@ -92,7 +92,7 @@ const trainWeightedAverageSchema = baseDataSchema
   .merge(evalRangeSchema)
   .extend({
     ensemble_weighted_base_models: z.array(z.enum(["ma", "es", "arima", "lstm"])).min(2),
-    weight_strategy: z.enum(["equal", "inverse_rmse", "grid_search", "linear_regression"]).default("inverse_rmse"),
+    weight_strategy: z.enum(["equal", "inverse_variance", "inverse_rmse", "grid_search", "linear_regression"]).default("inverse_variance"),
   })
   .refine((data) => data.data_window_evaluate_start_index <= data.data_window_evaluate_end_index, {
     message: "evaluate_start_index must be <= evaluate_end_index",
@@ -110,6 +110,7 @@ const trainBoostingSchema = baseDataSchema
     lstm_features: z.array(z.string()).optional(),
     lstm_target_field: z.string().optional(),
     lstm_normalization: z.enum(["zscore", "minmax"]).optional(),
+    learning_rate: z.coerce.number().positive().optional(),
   })
   .refine((data) => data.data_window_train_start_index <= data.data_window_train_end_index, {
     message: "train_start_index must be <= train_end_index",
@@ -124,6 +125,7 @@ const trainStackingSchema = baseDataSchema
   .merge(evalRangeSchema)
   .extend({
     ensemble_stacking_base_models: z.array(z.enum(["ma", "es", "arima", "lstm"])).min(2),
+    meta_l2: z.coerce.number().min(0).optional(),
   })
   .refine((data) => data.data_window_evaluate_start_index <= data.data_window_evaluate_end_index, {
     message: "evaluate_start_index must be <= evaluate_end_index",
@@ -260,22 +262,20 @@ function prepareFullData(
   };
 }
 
-async function runShellScript(
-  scriptName: string,
-  args: string[],
-  timeoutMs?: number,
-): Promise<any> {
+async function runPythonMain(args: string[], timeoutMs?: number): Promise<any> {
   const pyDir = path.resolve(import.meta.dir, "../../py");
-  const scriptPath = path.join(pyDir, scriptName);
+  const pythonExec = process.platform === "win32"
+    ? path.join(pyDir, "venv", "Scripts", "python.exe")
+    : path.join(pyDir, "venv", "bin", "python");
 
-  const proc = Bun.spawn(["bash", scriptPath, ...args], {
+  const proc = Bun.spawn([pythonExec, "src/main.py", ...args], {
     cwd: pyDir,
     stdout: "pipe",
     stderr: "pipe",
     env: { ...process.env, PATH: `${pyDir}/venv/bin:${process.env.PATH}` },
   });
 
-  let timeoutId: Timer | undefined;
+  let timeoutId: ReturnType<typeof setTimeout> | undefined;
 
   const executionPromise = new Promise<any>(async (resolve, reject) => {
     try {
@@ -287,14 +287,14 @@ async function runShellScript(
       await proc.exited;
 
       if (proc.exitCode !== 0) {
-        console.error("Script error:", stderr);
-        reject(new Error(`Script execution failed: ${stderr}`));
+        console.error("Python error:", stderr);
+        reject(new Error(`Python execution failed: ${stderr}`));
       } else {
         try {
           resolve(JSON.parse(stdout));
         } catch (e) {
-          console.error("Failed to parse script output:", stdout);
-          reject(new Error("Invalid output from script"));
+          console.error("Failed to parse python output:", stdout);
+          reject(new Error("Invalid output from python"));
         }
       }
     } catch (err) {
@@ -312,8 +312,8 @@ async function runShellScript(
 
   const timeoutPromise = new Promise<any>((_, reject) => {
     timeoutId = setTimeout(() => {
-      proc.kill(); // Terminate the process
-      reject(new Error(`Script execution timed out after ${timeoutMs}ms`));
+      proc.kill();
+      reject(new Error(`Python execution timed out after ${timeoutMs}ms`));
     }, timeoutMs);
   });
 
@@ -346,15 +346,17 @@ export default (pool: Pool, JWT_SECRET: string) => {
       const dataSimple = prepareSimpleData(allData);
       const modelSaveLoc = path.resolve(import.meta.dir, `../../py/trained_models/${studentId}_ma.pkl`);
 
-      const result = await runShellScript("train_ma.sh", [
-        dataSimple,
-        String(body.data_window_train_start_index),
-        String(body.data_window_train_end_index),
-        String(body.data_window_evaluate_start_index),
-        String(body.data_window_evaluate_end_index),
-        String(body.moving_average_window),
-        modelSaveLoc,
-      ], 10000); // 10-second timeout
+      const result = await runPythonMain([
+        "--method", "ma",
+        "--data", dataSimple,
+        "--train_start", String(body.data_window_train_start_index),
+        "--train_end", String(body.data_window_train_end_index),
+        "--eval_start", String(body.data_window_evaluate_start_index),
+        "--eval_end", String(body.data_window_evaluate_end_index),
+        "--window", String(body.moving_average_window),
+        "--save_model", modelSaveLoc,
+        "--pretty",
+      ], 30000); // 30-second timeout
 
       return c.json({ status: "success", results: result });
     } catch (error: any) {
@@ -385,15 +387,17 @@ export default (pool: Pool, JWT_SECRET: string) => {
       const dataSimple = prepareSimpleData(allData);
       const modelSaveLoc = path.resolve(import.meta.dir, `../../py/trained_models/${studentId}_es.pkl`);
 
-      const result = await runShellScript("train_es.sh", [
-        dataSimple,
-        String(body.data_window_train_start_index),
-        String(body.data_window_train_end_index),
-        String(body.data_window_evaluate_start_index),
-        String(body.data_window_evaluate_end_index),
-        String(body.exponential_smoothing_alpha),
-        modelSaveLoc,
-      ], 10000); // 10-second timeout
+      const result = await runPythonMain([
+        "--method", "es",
+        "--data", dataSimple,
+        "--train_start", String(body.data_window_train_start_index),
+        "--train_end", String(body.data_window_train_end_index),
+        "--eval_start", String(body.data_window_evaluate_start_index),
+        "--eval_end", String(body.data_window_evaluate_end_index),
+        "--alpha", String(body.exponential_smoothing_alpha),
+        "--save_model", modelSaveLoc,
+        "--pretty",
+      ], 30000); // 30-second timeout
 
       return c.json({ status: "success", results: result });
     } catch (error: any) {
@@ -424,15 +428,17 @@ export default (pool: Pool, JWT_SECRET: string) => {
       const dataSimple = prepareSimpleData(allData);
       const modelSaveLoc = path.resolve(import.meta.dir, `../../py/trained_models/${studentId}_arima.pkl`);
 
-      const result = await runShellScript("train_arima.sh", [
-        dataSimple,
-        String(body.data_window_train_start_index),
-        String(body.data_window_train_end_index),
-        String(body.data_window_evaluate_start_index),
-        String(body.data_window_evaluate_end_index),
-        String(body.arima_d),
-        modelSaveLoc,
-      ], 10000); // 10-second timeout
+      const result = await runPythonMain([
+        "--method", "arima",
+        "--data", dataSimple,
+        "--train_start", String(body.data_window_train_start_index),
+        "--train_end", String(body.data_window_train_end_index),
+        "--eval_start", String(body.data_window_evaluate_start_index),
+        "--eval_end", String(body.data_window_evaluate_end_index),
+        "--d", String(body.arima_d),
+        "--save_model", modelSaveLoc,
+        "--pretty",
+      ], 30000); // 30-second timeout
 
       return c.json({ status: "success", results: result });
     } catch (error: any) {
@@ -473,16 +479,18 @@ export default (pool: Pool, JWT_SECRET: string) => {
 
       const modelSaveLoc = path.resolve(import.meta.dir, `../../py/trained_models/${studentId}_lstm.pt`);
 
-      const result = await runShellScript("train_lstm.sh", [
-        dataFull,
-        JSON.stringify(featureTypes),
-        String(body.data_window_train_start_index),
-        String(body.data_window_train_end_index),
-        String(body.data_window_evaluate_start_index),
-        String(body.data_window_evaluate_end_index),
-        body.lstm_normalization,
-        modelSaveLoc,
-      ], 10000); // 10-second timeout
+      const result = await runPythonMain([
+        "--method", "lstm",
+        "--data", dataFull,
+        "--feature_types", JSON.stringify(featureTypes),
+        "--train_start", String(body.data_window_train_start_index),
+        "--train_end", String(body.data_window_train_end_index),
+        "--eval_start", String(body.data_window_evaluate_start_index),
+        "--eval_end", String(body.data_window_evaluate_end_index),
+        "--norm", body.lstm_normalization,
+        "--save_model", modelSaveLoc,
+        "--pretty",
+      ], 30000); // 30-second timeout
 
       return c.json({
         status: "success",
@@ -522,14 +530,17 @@ export default (pool: Pool, JWT_SECRET: string) => {
       );
       const ensembleSaveLoc = path.resolve(import.meta.dir, `../../py/trained_models/${studentId}_weighted_average_config.pkl`);
 
-      const result = await runShellScript("train_weighted_average.sh", [
-        dataFull,
-        String(body.data_window_evaluate_start_index),
-        String(body.data_window_evaluate_end_index),
-        body.weight_strategy,
-        ensembleSaveLoc,
+      const result = await runPythonMain([
+        "--method", "weighted_average",
+        "--data", dataFull,
+        "--eval_start", String(body.data_window_evaluate_start_index),
+        "--eval_end", String(body.data_window_evaluate_end_index),
+        "--weight_strategy", body.weight_strategy,
+        "--save_ensemble", ensembleSaveLoc,
+        "--models",
         ...modelPaths,
-      ], 10000); // 10-second timeout
+        "--pretty",
+      ], 30000); // 30-second timeout
 
       return c.json({ status: "success", results: result });
     } catch (error: any) {
@@ -606,20 +617,24 @@ export default (pool: Pool, JWT_SECRET: string) => {
       );
       const ensembleSaveLoc = path.resolve(import.meta.dir, `../../py/trained_models/${studentId}_boosting_config.pkl`);
 
-      const result = await runShellScript("train_boosting.sh", [
-        dataFull,
-        String(body.data_window_train_start_index),
-        String(body.data_window_train_end_index),
-        String(body.data_window_evaluate_start_index),
-        String(body.data_window_evaluate_end_index),
-        String(body.arima_d ?? 0),
-        String(body.moving_average_window ?? 1),
-        String(body.exponential_smoothing_alpha ?? 0.5),
-        "4", // lstm_lookback is fixed at 4
-        body.lstm_normalization ?? 'zscore',
-        JSON.stringify(featureTypes),
-        ensembleSaveLoc,
+      const result = await runPythonMain([
+        "--method", "boosting",
+        "--data", dataFull,
+        "--train_start", String(body.data_window_train_start_index),
+        "--train_end", String(body.data_window_train_end_index),
+        "--eval_start", String(body.data_window_evaluate_start_index),
+        "--eval_end", String(body.data_window_evaluate_end_index),
+        "--d", String(body.arima_d ?? 0),
+        "--window", String(body.moving_average_window ?? 1),
+        "--alpha", String(body.exponential_smoothing_alpha ?? 0.5),
+        "--lookback", "4",
+        "--norm", body.lstm_normalization ?? "zscore",
+        "--feature_types", JSON.stringify(featureTypes),
+        "--learning_rate", String(body.learning_rate ?? 1),
+        "--save_ensemble", ensembleSaveLoc,
+        "--models",
         ...modelPaths,
+        "--pretty",
       ], 10000); // 10-second timeout
 
       return c.json({
@@ -658,12 +673,16 @@ export default (pool: Pool, JWT_SECRET: string) => {
       );
       const ensembleSaveLoc = path.resolve(import.meta.dir, `../../py/trained_models/${studentId}_stacking_config.pkl`);
 
-      const result = await runShellScript("train_stacking.sh", [
-        dataFull,
-        String(body.data_window_evaluate_start_index),
-        String(body.data_window_evaluate_end_index),
-        ensembleSaveLoc,
+      const result = await runPythonMain([
+        "--method", "stacking",
+        "--data", dataFull,
+        "--eval_start", String(body.data_window_evaluate_start_index),
+        "--eval_end", String(body.data_window_evaluate_end_index),
+        "--meta_l2", String(body.meta_l2 ?? 0.1),
+        "--save_ensemble", ensembleSaveLoc,
+        "--models",
         ...modelPaths,
+        "--pretty",
       ], 10000); // 10-second timeout
 
       return c.json({ status: "success", results: result });
@@ -704,11 +723,15 @@ export default (pool: Pool, JWT_SECRET: string) => {
         return c.json({ error: `Model not found. Please train the ${modelType} model first.` }, 404);
       }
 
-      const scriptName = `predict_${modelType}.sh`;
-      const result = await runShellScript(scriptName, [
-        modelPath,
-        String(body.forecast_steps),
-      ]);
+      const pythonArgs = ["--method", modelType];
+      if (isEnsemble) {
+        pythonArgs.push("--load_ensemble", modelPath);
+      } else {
+        pythonArgs.push("--load_model", modelPath);
+      }
+      pythonArgs.push("--forecast_steps", String(body.forecast_steps), "--pretty");
+
+      const result = await runPythonMain(pythonArgs);
 
       return c.json({ status: "success", results: result });
     } catch (error: any) {

@@ -46,17 +46,17 @@ def r2_score(y_true: List[float], y_pred: List[float]) -> float:
 
 # ---------- core ----------
 def moving_average_forecast(
-    series: List[float], eval_range: range, window: int
+    series: List[float], eval_range: range, window: int, min_index: int = 0
 ) -> Tuple[List[int], List[float]]:
     """
     对 eval_range 中的每个 t，使用 series[t-window:t] 的真实值做一步预测。
-    t < window 的点跳过。
-    返回：有效的索引列表、对应的预测值列表
+    当预测窗口会访问 min_index 之前的数据时，该时间点会被跳过。
+    返回：有效的索引列表、对应的预测值列表。
     """
     idxs: List[int] = []
     preds: List[float] = []
     for t in eval_range:
-        if t - window < 0:
+        if t - window < min_index:
             continue
         preds.append(sum(series[t - window : t]) / window)
         idxs.append(t)
@@ -161,10 +161,10 @@ def train_and_evaluate(
     """
     Trains the model (conceptually) and evaluates it, returning metrics and residual std dev.
     """
-    idxs, preds = moving_average_forecast(sales, eval_range, window)
+    idxs, preds = moving_average_forecast(sales, eval_range, window, min_index=train_range.start)
     if not idxs:
         raise ValueError(
-            "no evaluation points: choose a smaller --window or move eval_start to >= window"
+            "no evaluation points: choose a smaller --window or increase eval_start to ensure at least `window` points within the training span."
         )
     y_true = [sales[i] for i in idxs]
     y_pred = preds
@@ -287,6 +287,11 @@ def run(args) -> None:
         raise ValueError("eval_end must be >= eval_start")
     if w < 1:
         raise ValueError("--window must be >= 1")
+    train_len = te - ts + 1
+    if w > train_len:
+        raise ValueError(
+            f"--window ({w}) cannot exceed training span length ({train_len})."
+        )
     # 为确保对验证区间的首个点 es 至少在某些 t 上有足够历史，这里以 te+1 作为上限（保守做法）
     if w > te + 1:
         raise ValueError(
@@ -311,7 +316,7 @@ def run(args) -> None:
     }
 
     if save_path:
-        history = sales[max(0, te - w + 1) : te + 1]
+        history = sales[max(ts, te - w + 1) : te + 1]
         state = {
             "model_type": MODEL_TYPE,
             "window": w,

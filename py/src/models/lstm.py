@@ -74,7 +74,7 @@ def _fit_numeric_scaler(values: np.ndarray, method: str):
     # returns (params, transform_fn, inverse_fn)
     method = method.lower()
     if method == "none":
-        return (None, lambda a: a, lambda a: a)
+        return (("n", 0.0, 1.0), lambda a: a, lambda a: a)
     if method == "zscore":
         mu = float(values.mean()) if values.size > 0 else 0.0
         sd = float(values.std(ddof=0)) if values.size > 0 else 1.0
@@ -269,10 +269,17 @@ def _reconstruct_window_from_data(records: List[Dict[str, Any]], meta: Dict[str,
 
     # Apply saved scaling parameters
     X_num_tf = np.empty_like(X_num, dtype=float)
-    for j, (kind, a, b) in enumerate(meta["num_params"]):
-        if kind == "z": X_num_tf[:, j] = (X_num[:, j] - a) / b
-        elif kind == "m": X_num_tf[:, j] = (X_num[:, j] - a) / (b - a)
-        else: X_num_tf[:, j] = X_num[:, j]
+    for j, params in enumerate(meta["num_params"]):
+        if not params:
+            X_num_tf[:, j] = X_num[:, j]
+            continue
+        kind, a, b = params
+        if kind == "z":
+            X_num_tf[:, j] = (X_num[:, j] - a) / b
+        elif kind == "m":
+            X_num_tf[:, j] = (X_num[:, j] - a) / (b - a)
+        else:  # 'n' or any unknown kind fall back to identity
+            X_num_tf[:, j] = X_num[:, j]
 
     # Apply saved one-hot encoding
     if cat_keys:

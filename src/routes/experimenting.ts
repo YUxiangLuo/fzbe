@@ -447,7 +447,7 @@ const fetchExperimentById = async (pool: Pool, experimentId: number) => {
   return rows[0];
 };
 
-const fetchLatestExperimentForStudent = async (pool: Pool, studentId: number) => {
+const fetchLatestNotCompletedExperimentForStudent = async (pool: Pool, studentId: number) => {
   const [rows] = await pool.query<RowDataPacket[]>(
     `SELECT *
        FROM experiment_status
@@ -456,7 +456,9 @@ const fetchLatestExperimentForStudent = async (pool: Pool, studentId: number) =>
       LIMIT 1`,
     [studentId],
   );
-  return rows[0];
+  const row0 = rows[0] as any;
+  if(row0 && row0.status!=="Completed") return rows[0];
+  else return undefined;
 };
 
 export default (pool: Pool, JWT_SECRET: string) => {
@@ -473,7 +475,7 @@ export default (pool: Pool, JWT_SECRET: string) => {
     const studentId = payload.sub;
 
     try {
-      const row = await fetchLatestExperimentForStudent(pool, studentId);
+      const row = await fetchLatestNotCompletedExperimentForStudent(pool, studentId);
       if (!row) {
         return c.json({ error: "Experiment status not found" }, 404);
       }
@@ -498,36 +500,8 @@ export default (pool: Pool, JWT_SECRET: string) => {
 
       const connection = await pool.getConnection();
       try {
-        // Check for an existing, unfinished experiment for the student
-        const [existingRows] = await connection.query<RowDataPacket[]>(
-          `SELECT * FROM experiment_status WHERE student_id = ? AND status != 'Completed' ORDER BY experiment_id DESC LIMIT 1`,
-          [studentId]
-        );
-
-        const unfinishedExperiment = existingRows[0];
-        // If an unfinished experiment is found, return it instead of creating a new one
-        if (unfinishedExperiment) {
-          connection.release();
-          return c.json(normalizeExperimentRow(unfinishedExperiment));
-        }
-
-        // If no unfinished experiment exists, proceed to create a new one
         const sanitized = sanitizeForDb({ ...data, student_id: studentId });
-
-        if (sanitized["current_step"] === null) {
-          delete sanitized["current_step"];
-        }
-        if (sanitized["highest_completed_step"] === null) {
-          delete sanitized["highest_completed_step"];
-        }
-
         const columns = Object.keys(sanitized);
-        if (columns.length === 0) {
-          return c.json(
-            { error: "No fields provided to create experiment status" },
-            400,
-          );
-        }
 
         const placeholders = columns.map(() => "?").join(", ");
         const values = columns.map((key) => sanitized[key]);

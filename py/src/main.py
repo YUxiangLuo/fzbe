@@ -47,12 +47,29 @@ def main():
     
     # Weighted Average Ensemble specific
     parser.add_argument(
-        "--weight_strategy", 
-        type=str, 
-        required=False, 
-        default="equal",
-        choices=["equal", "inverse_rmse", "grid_search", "linear_regression"],
+        "--weight_strategy",
+        type=str,
+        required=False,
+        default="inverse_variance",
+        choices=["equal", "inverse_variance", "inverse_rmse", "grid_search", "linear_regression"],
         help="Weight strategy for weighted average ensemble."
+    )
+
+    parser.add_argument(
+        "--learning_rate",
+        type=float,
+        required=False,
+        default=1.0,
+        help="Boosting shrinkage factor applied at each stage (>0)."
+    )
+
+    # Stacking specific
+    parser.add_argument(
+        "--meta_l2",
+        type=float,
+        required=False,
+        default=0.1,
+        help="L2 regularisation strength for stacking meta-model (>=0)."
     )
 
     args = parser.parse_args()
