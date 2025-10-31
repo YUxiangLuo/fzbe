@@ -2,6 +2,14 @@ import fs from "fs";
 import csv from "csv-parser";
 import path from "path";
 
+export const getDefaultPasswordHash = (): string => {
+  const hash = Bun.env.DEFAULT_PASSWORD_HASH;
+  if (!hash) {
+    throw new Error("DEFAULT_PASSWORD_HASH environment variable not set");
+  }
+  return hash;
+};
+
 // Represents a segment of data for a specific product, including its metadata and all its data rows.
 export interface SegmentData {
   industryName: string;
@@ -93,63 +101,6 @@ export function getCsvHeaders(filePath: string): Promise<string[]> {
     });
   });
 }
-
-/**
- * Factory function to create a Hono middleware for validating file uploads.
- *
- * @param options - Configuration for the validator.
- * @param options.allowedMimeTypes - An array of allowed MIME types (e.g., ["text/csv", "application/pdf"]).
- * @param options.maxSizeMb - The maximum allowed file size in megabytes.
- * @returns A Hono middleware function.
- */
-export const createUploadValidator = (options: {
-  allowedMimeTypes: string[];
-  maxSizeMb: number;
-}) => {
-  const { allowedMimeTypes, maxSizeMb } = options;
-  const maxSizeBytes = maxSizeMb * 1024 * 1024;
-
-  return async (c: any, next: any) => {
-    try {
-      const body = await c.req.parseBody();
-      const file = body["file"];
-
-      if (!(file instanceof File)) {
-        return c.json({ error: "File is required" }, 400);
-      }
-
-      // 1. Validate file type
-      if (!allowedMimeTypes.includes(file.type)) {
-        return c.json(
-          {
-            error: "Invalid file type",
-            details: `File must be one of type: ${allowedMimeTypes.join(", ")}. Got ${file.type}`,
-          },
-          400,
-        );
-      }
-
-      // 2. Validate file size
-      if (file.size > maxSizeBytes) {
-        return c.json(
-          {
-            error: "File size exceeds the limit",
-            details: `File size must be less than ${maxSizeMb}MB.`,
-          },
-          413, // Payload Too Large
-        );
-      }
-
-      // Store the parsed body in the context to avoid re-parsing
-      c.set("parsedBody", body);
-
-      await next();
-    } catch (error) {
-      console.error("Error in upload validation middleware:", error);
-      return c.json({ error: "Failed to process file upload" }, 500);
-    }
-  };
-};
 
 
 // 输入：时间序列的单个元素

@@ -3,6 +3,11 @@ import { jwt } from "hono/jwt";
 import { z } from "zod";
 import { zValidator } from "@hono/zod-validator";
 import type { Pool } from "mysql2/promise";
+import { getDefaultPasswordHash } from "../utils";
+import csv from "csv-parser";
+import path from "path";
+import { mkdir, unlink } from "node:fs/promises";
+import { createReadStream } from "node:fs";
 
 // Zod Schemas for Validation
 const registerSchema = z.object({
@@ -21,6 +26,12 @@ const createTeacherSchema = z.object({
   full_name: z.string().min(1),
   email: z.string().email(),
 });
+
+const PHONE_REGEX = /^\d{6,15}$/;
+const MIN_TEACHER_NAME_LENGTH = 2;
+const TEACHER_EMAIL_DOMAIN = "teacher.edu";
+
+const DEFAULT_PASSWORD_HASH = getDefaultPasswordHash();
 
 const updateUserSchema = z
   .object({
@@ -187,13 +198,9 @@ export default (pool: Pool, JWT_SECRET: string) => {
 
         const { username, full_name, email } = c.req.valid("json");
 
-        // Use a default password for admin-created teachers
-        const defaultPasswordHash =
-          "$2b$10$DVZtxD9Efhm/j8.LSWMFx.hfdpk81iHO4Tv0fUaDr1LlW/mFrgXrG";
-
         const [result]: any = await pool.query(
           "INSERT INTO users (username, password_hash, full_name, email, role) VALUES (?, ?, ?, ?, 'Teacher')",
-          [username, defaultPasswordHash, full_name, email],
+          [username, DEFAULT_PASSWORD_HASH, full_name, email],
         );
 
         const newTeacherId = result.insertId;
@@ -217,6 +224,226 @@ export default (pool: Pool, JWT_SECRET: string) => {
         }
         console.error("Error creating teacher:", error);
         throw error;
+      }
+    },
+  );
+
+  // Admin: Batch create teachers via CSV
+  usersApi.post(
+    "/api/users/teachers/batch",
+    jwt({ secret: JWT_SECRET }),
+    async (c) => {
+      let tempCsvPath: string | null = null;
+      try {
+        const payload = c.get("jwtPayload");
+        if (payload.role !== "Admin") {
+          return c.json({ error: "Forbidden" }, 403);
+        }
+
+        const body = await c.req.parseBody();
+        const file = body["file"];
+
+        if (!(file instanceof File)) {
+          return c.json({ error: "CSV 文件缺失或类型错误" }, 400);
+        }
+
+        if (
+          file.type &&
+          file.type !== "text/csv" &&
+          !file.type.includes("csv")
+        ) {
+          return c.json({ error: "仅支持上传 CSV 文件" }, 400);
+        }
+
+        const maxSizeBytes = 5 * 1024 * 1024;
+        if (file.size > maxSizeBytes) {
+          return c.json({ error: "CSV 文件大小不能超过 5MB" }, 413);
+        }
+
+        const tempDir = path.resolve(import.meta.dir, "../../uploads", "temp");
+        await mkdir(tempDir, { recursive: true });
+        tempCsvPath = path.join(
+          tempDir,
+          `teachers-${Date.now()}-${file.name.replace(/[\/\\?%*:|"<>]/g, "-")}`,
+        );
+        await Bun.write(tempCsvPath, file);
+
+        const teacherRows: Array<{
+          row: number;
+          fullName: string;
+          phone: string;
+          username: string;
+          email: string;
+        }> = [];
+        const invalidRows: Array<{ row: number; reason: string }> = [];
+        const seenPhones = new Set<string>();
+        let rowNumber = 0;
+
+        await new Promise<void>((resolve, reject) => {
+          createReadStream(tempCsvPath!)
+            .pipe(
+              csv({
+                mapHeaders: ({ header }) => header.replace(/^\uFEFF/, "").trim(),
+              }),
+            )
+            .on("data", (row: Record<string, string>) => {
+              rowNumber += 1;
+              const fullName = row["姓名"]?.trim() ?? "";
+              const phone = row["手机号"]?.trim() ?? "";
+
+              if (!fullName || !phone) {
+                invalidRows.push({ row: rowNumber, reason: "姓名或手机号缺失" });
+                return;
+              }
+
+              if (fullName.length < MIN_TEACHER_NAME_LENGTH) {
+                invalidRows.push({
+                  row: rowNumber,
+                  reason: `姓名长度需至少 ${MIN_TEACHER_NAME_LENGTH} 个字符`,
+                });
+                return;
+              }
+
+              if (!PHONE_REGEX.test(phone)) {
+                invalidRows.push({
+                  row: rowNumber,
+                  reason: `手机号 ${phone} 格式不正确，应为 6-15 位数字`,
+                });
+                return;
+              }
+
+              if (seenPhones.has(phone)) {
+                invalidRows.push({
+                  row: rowNumber,
+                  reason: `CSV 内存在重复手机号 ${phone}`,
+                });
+                return;
+              }
+
+              seenPhones.add(phone);
+              const username = `prof_${phone}`;
+              const email = `prof_${phone}@${TEACHER_EMAIL_DOMAIN}`;
+
+              teacherRows.push({ row: rowNumber, fullName, phone, username, email });
+            })
+            .on("end", resolve)
+            .on("error", reject);
+        });
+
+        if (invalidRows.length > 0) {
+          return c.json(
+            {
+              error: "CSV 文件包含无效记录",
+              invalid_rows: invalidRows.slice(0, 10),
+            },
+            400,
+          );
+        }
+
+        if (teacherRows.length === 0) {
+          return c.json({ error: "CSV 文件未包含有效的教师记录" }, 400);
+        }
+
+        const connection = await pool.getConnection();
+        try {
+          await connection.beginTransaction();
+
+          const usernames = Array.from(
+            new Set(teacherRows.map((row) => row.username)),
+          );
+          const emails = Array.from(
+            new Set(teacherRows.map((row) => row.email)),
+          );
+          const phones = Array.from(
+            new Set(teacherRows.map((row) => row.phone)),
+          );
+
+          const placeholdersSegments: string[] = [];
+          const values: any[] = [];
+
+          const pushSegment = (label: string, items: string[]) => {
+            if (items.length > 0) {
+              placeholdersSegments.push(
+                `${label} IN (${items.map(() => "?").join(", ")})`,
+              );
+              values.push(...items);
+            }
+          };
+
+          pushSegment("username", usernames);
+          pushSegment("phone_number", phones);
+          pushSegment("email", emails);
+
+          if (placeholdersSegments.length > 0) {
+            const [existing]: any[] = await connection.query(
+              `SELECT username, phone_number, email FROM users WHERE ${placeholdersSegments.join(" OR ")}`,
+              values,
+            );
+
+            if (existing.length > 0) {
+              await connection.rollback();
+              return c.json(
+                {
+                  error: "部分教师信息已存在，批量创建已取消",
+                  conflicts: existing.slice(0, 10),
+                },
+                409,
+              );
+            }
+          }
+
+          const createdTeachers: Array<{
+            user_id: number;
+            username: string;
+            full_name: string;
+            phone_number: string;
+            email: string;
+          }> = [];
+
+          for (const row of teacherRows) {
+            const [result]: any = await connection.query(
+              "INSERT INTO users (username, password_hash, full_name, email, role, phone_number) VALUES (?, ?, ?, ?, 'Teacher', ?)",
+              [
+                row.username,
+                DEFAULT_PASSWORD_HASH,
+                row.fullName,
+                row.email,
+                row.phone,
+              ],
+            );
+            createdTeachers.push({
+              user_id: result.insertId,
+              username: row.username,
+              full_name: row.fullName,
+              phone_number: row.phone,
+              email: row.email,
+            });
+          }
+
+          await connection.commit();
+
+          return c.json(
+            {
+              created: createdTeachers.length,
+              teachers: createdTeachers,
+            },
+            201,
+          );
+        } catch (error) {
+          await connection.rollback();
+          throw error;
+        } finally {
+          connection.release();
+        }
+      } catch (error) {
+        console.error("Error batch creating teachers:", error);
+        throw error;
+      } finally {
+        if (tempCsvPath) {
+          await unlink(tempCsvPath).catch((err) =>
+            console.error("Failed to cleanup temp teacher CSV:", err),
+          );
+        }
       }
     },
   );
@@ -632,10 +859,9 @@ export default (pool: Pool, JWT_SECRET: string) => {
         // Admins are allowed to proceed
 
         // 3. Update password to the default hash
-        const defaultPasswordHash = "$2b$10$DVZtxD9Efhm/j8.LSWMFx.hfdpk81iHO4Tv0fUaDr1LlW/mFrgXrG";
         const [result]: any = await pool.query(
           "UPDATE users SET password_hash = ? WHERE user_id = ?",
-          [defaultPasswordHash, targetUserId],
+          [DEFAULT_PASSWORD_HASH, targetUserId],
         );
 
         if (result.affectedRows === 0) {

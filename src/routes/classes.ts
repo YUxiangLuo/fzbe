@@ -7,6 +7,7 @@ import csv from "csv-parser";
 import { createReadStream } from "node:fs";
 import { unlink, mkdir } from "node:fs/promises";
 import path from "path";
+import { getDefaultPasswordHash } from "../utils";
 
 // Zod Schemas for Validation
 const classIdParamSchema = z.object({
@@ -34,6 +35,14 @@ const updateClassSchema = z
   .refine((data) => data.class_name !== undefined || data.class_code !== undefined, {
     message: "At least one field (class_name or class_code) must be provided",
   });
+
+const STUDENT_ID_REGEX = /^[A-Za-z0-9_-]{3,32}$/;
+const MIN_FULL_NAME_LENGTH = 2;
+const MAX_FULL_NAME_LENGTH = 64;
+
+const isValidStudentId = (value: string) => STUDENT_ID_REGEX.test(value);
+const isValidFullName = (value: string) =>
+  value.length >= MIN_FULL_NAME_LENGTH && value.length <= MAX_FULL_NAME_LENGTH;
 
 export default (pool: Pool, JWT_SECRET: string) => {
   const classesApi = new Hono();
@@ -101,21 +110,71 @@ export default (pool: Pool, JWT_SECRET: string) => {
             tempCsvPath = path.join(tempDir, uniqueFilename);
             await Bun.write(tempCsvPath, studentListFile);
 
-            const studentRecords: Array<{ studentId: string; fullName: string; email: string }> = [];
+            const studentRecords: Array<{
+              row: number;
+              studentId: string;
+              fullName: string;
+              email: string;
+            }> = [];
+            const invalidRecords: Array<{ row: number; reason: string }> = [];
+            const seenStudentIds = new Set<string>();
+            let rowNumber = 0;
+
             await new Promise<void>((resolve, reject) => {
               createReadStream(tempCsvPath!)
                 .pipe(csv({ mapHeaders: ({ header }) => header.replace(/^\uFEFF/, "").trim() }))
                 .on("data", (row: Record<string, string>) => {
-                  const studentId = row["学号"]?.trim();
-                  const fullName = row["姓名"]?.trim();
-                  if (studentId && fullName) {
-                    const email = `${studentId}@student.edu`;
-                    studentRecords.push({ studentId, fullName, email });
+                  rowNumber += 1;
+                  const studentId = row["学号"]?.trim() ?? "";
+                  const fullName = row["姓名"]?.trim() ?? "";
+
+                  if (!studentId || !fullName) {
+                    invalidRecords.push({ row: rowNumber, reason: "学号或姓名缺失" });
+                    return;
                   }
+
+                  if (!isValidStudentId(studentId)) {
+                    invalidRecords.push({
+                      row: rowNumber,
+                      reason: `学号 ${studentId} 不符合格式要求`,
+                    });
+                    return;
+                  }
+
+                  if (!isValidFullName(fullName)) {
+                    invalidRecords.push({
+                      row: rowNumber,
+                      reason: `姓名长度需在 ${MIN_FULL_NAME_LENGTH}-${MAX_FULL_NAME_LENGTH} 个字符之间`,
+                    });
+                    return;
+                  }
+
+                  if (seenStudentIds.has(studentId)) {
+                    invalidRecords.push({
+                      row: rowNumber,
+                      reason: `CSV 内存在重复学号 ${studentId}`,
+                    });
+                    return;
+                  }
+
+                  seenStudentIds.add(studentId);
+                  const email = `${studentId}@student.edu`;
+                  studentRecords.push({ row: rowNumber, studentId, fullName, email });
                 })
                 .on("end", resolve)
                 .on("error", reject);
             });
+
+            if (invalidRecords.length > 0) {
+              await connection.rollback();
+              return c.json(
+                {
+                  error: "学生名单存在无效记录",
+                  invalid_rows: invalidRecords.slice(0, 10),
+                },
+                400,
+              );
+            }
 
             if (studentRecords.length > 0) {
               const studentIds = studentRecords.map(record => record.studentId);
@@ -127,14 +186,13 @@ export default (pool: Pool, JWT_SECRET: string) => {
               if (existingUsers.length > 0) {
                 const existingUsernames = existingUsers.map((u: any) => u.username);
                 await connection.rollback();
-                connection.release();
                 return c.json({
                   error: "Transaction failed. The following students already exist in the database.",
                   existing_students: existingUsernames
                 }, 409);
               }
 
-              const defaultPasswordHash = "$2b$10$DVZtxD9Efhm/j8.LSWMFx.hfdpk81iHO4Tv0fUaDr1LlW/mFrgXrG";
+              const defaultPasswordHash = getDefaultPasswordHash();
 
               for (const record of studentRecords) {
                 const [userResult]: any = await connection.query(

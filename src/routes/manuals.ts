@@ -3,10 +3,8 @@ import { jwt } from "hono/jwt";
 import { z } from "zod";
 import { zValidator } from "@hono/zod-validator";
 import { rm } from "node:fs/promises";
-import { join } from "node:path";
 import type { Pool } from "mysql2/promise";
 import path from "path";
-import { createUploadValidator } from "../utils";
 
 // Zod Schemas for Validation
 const manualIdParamSchema = z.object({
@@ -19,27 +17,39 @@ const updateManualSchema = z.object({
   is_active: z.boolean().optional(),
 });
 
-const pdfUploadValidator = createUploadValidator({
-  allowedMimeTypes: ["application/pdf"],
-  maxSizeMb: 50,
-});
-
 export default (pool: Pool, JWT_SECRET: string) => {
   const manualsApi = new Hono();
 
   // 管理员: 上传新的实验手册
-  manualsApi.post("/api/manuals", jwt({ secret: JWT_SECRET }), pdfUploadValidator, async (c) => {
+  manualsApi.post("/api/manuals", jwt({ secret: JWT_SECRET }), async (c) => {
     try {
       const payload = c.get("jwtPayload");
       if (payload.role !== "Admin") {
         return c.json({ error: "Forbidden" }, 403);
       }
 
-      const body = c.get("parsedBody");
+      const body = await c.req.parseBody();
       const file = body["file"];
       const fileName = body["file_name"];
       const description = body["description"];
       const uploaderId = payload.sub;
+
+      if (!(file instanceof File)) {
+        return c.json({ error: "file is required" }, 400);
+      }
+
+      if (
+        file.type &&
+        file.type !== "application/pdf" &&
+        !file.type.includes("pdf")
+      ) {
+        return c.json({ error: "Invalid file type, only PDF is allowed" }, 400);
+      }
+
+      const maxSizeBytes = 50 * 1024 * 1024;
+      if (file.size > maxSizeBytes) {
+        return c.json({ error: "PDF file size cannot exceed 50MB" }, 413);
+      }
 
       if (!fileName || typeof fileName !== "string") {
         return c.json({ error: "file_name is required" }, 400);

@@ -3,6 +3,7 @@ import { jwt } from "hono/jwt";
 import { z } from "zod";
 import { zValidator } from "@hono/zod-validator";
 import type { Pool, PoolConnection } from "mysql2/promise";
+import { getDefaultPasswordHash } from "../utils";
 
 // Zod Schemas for Validation
 const classIdParamSchema = z.object({
@@ -100,8 +101,7 @@ export default (pool: Pool, JWT_SECRET: string) => {
           return c.json({ error: "Forbidden" }, 403);
         }
 
-        const defaultPasswordHash =
-          "$2b$10$DVZtxD9Efhm/j8.LSWMFx.hfdpk81iHO4Tv0fUaDr1LlW/mFrgXrG";
+        const defaultPasswordHash = getDefaultPasswordHash();
         const studentEmail = email || `${username}@student.edu`;
 
         const [userResult]: any = await connection.query(
