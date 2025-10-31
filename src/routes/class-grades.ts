@@ -305,14 +305,14 @@ export default (pool: Pool, JWT_SECRET: string) => {
              u.username,
              u.full_name,
              e.enrollment_id,
-             COUNT(DISTINCT exp.experiment_id) as total_experiments,
-             SUM(CASE WHEN exp.status = 'Completed' THEN 1 ELSE 0 END) as completed_experiments,
-             SUM(CASE WHEN er.report_id IS NOT NULL THEN 1 ELSE 0 END) as submitted_reports,
-             MAX(exp.created_at) as last_experiment_date
+             COUNT(DISTINCT es.experiment_id) AS total_experiments,
+             SUM(CASE WHEN es.status = 'Completed' THEN 1 ELSE 0 END) AS completed_experiments,
+             SUM(CASE WHEN er.report_id IS NOT NULL THEN 1 ELSE 0 END) AS submitted_reports,
+             MAX(COALESCE(es.last_activity_at, es.start_time)) AS last_experiment_date
            FROM enrollments e
            JOIN users u ON e.student_id = u.user_id
-           LEFT JOIN experiments exp ON u.user_id = exp.student_id
-           LEFT JOIN experiment_reports er ON exp.experiment_id = er.experiment_id
+           LEFT JOIN experiment_status es ON u.user_id = es.student_id
+           LEFT JOIN experiment_reports er ON es.experiment_id = er.experiment_id
            WHERE e.class_id = ?
            GROUP BY u.user_id, e.enrollment_id
            ORDER BY u.username ASC`,
@@ -594,23 +594,25 @@ export default (pool: Pool, JWT_SECRET: string) => {
              eg.knowledge_test,
              eg.report_quality,
              eg.feedback,
-             eg.graded_at,
+             eg.created_at AS graded_at,
              ROUND(
                COALESCE(eg.exp_flow, 0) * COALESCE(gw.exp_flow_weight, 0) / 100 +
                COALESCE(eg.model_quality, 0) * COALESCE(gw.model_quality_weight, 0) / 100 +
                COALESCE(eg.knowledge_test, 0) * COALESCE(gw.knowledge_test_weight, 0) / 100 +
                COALESCE(eg.report_quality, 0) * COALESCE(gw.report_quality_weight, 0) / 100,
                2
-             ) as final_score
+             ) AS final_score
            FROM enrollments e
            JOIN users u ON e.student_id = u.user_id
            LEFT JOIN (
-             SELECT experiment_id, student_id, MAX(graded_at) as max_graded_at
+             SELECT student_id, MAX(created_at) AS max_graded_at
              FROM experiment_grade
-             WHERE graded_at IS NOT NULL
+             WHERE created_at IS NOT NULL
              GROUP BY student_id
            ) latest ON u.user_id = latest.student_id
-           LEFT JOIN experiment_grade eg ON latest.student_id = eg.student_id AND latest.max_graded_at = eg.graded_at
+           LEFT JOIN experiment_grade eg
+             ON latest.student_id = eg.student_id
+             AND latest.max_graded_at = eg.created_at
            LEFT JOIN grade_weights gw ON e.class_id = gw.class_id
            WHERE e.class_id = ?
            ORDER BY u.username ASC`,
@@ -671,17 +673,15 @@ export default (pool: Pool, JWT_SECRET: string) => {
              se.student_id,
              u.username,
              u.full_name,
-             se.step_name,
+             se.step_order,
              se.event_type,
-             se.event_data,
-             se.created_at,
-             se.updated_at
-           FROM step_events se
-           JOIN experiments exp ON se.experiment_id = exp.experiment_id
+             se.event_timestamp
+           FROM experiment_step_events se
+           JOIN experiment_status es ON se.experiment_id = es.experiment_id
            JOIN users u ON se.student_id = u.user_id
            JOIN enrollments e ON u.user_id = e.student_id
            WHERE e.class_id = ?
-           ORDER BY se.created_at DESC`,
+           ORDER BY se.event_timestamp DESC`,
           [classIdNumber],
         );
 

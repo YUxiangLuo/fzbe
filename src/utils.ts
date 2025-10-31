@@ -1,6 +1,5 @@
 import fs from "fs";
 import csv from "csv-parser";
-import { $ } from "bun";
 import path from "path";
 
 // Represents a segment of data for a specific product, including its metadata and all its data rows.
@@ -194,22 +193,34 @@ export async function runAdf(data: AdfInputPoint[]): Promise<AdfResult> {
   // 序列化成 JSON，确保 key 带双引号
   const jsonArg = JSON.stringify(data);
 
-  const root_dir = path.resolve(import.meta.dir, "..");
-  console.log(root_dir)
+  const toolRoot = path.resolve(import.meta.dir, "..", "py_tools", "adf");
+  const pythonExec =
+    process.platform === "win32"
+      ? path.join(toolRoot, "venv", "Scripts", "python.exe")
+      : path.join(toolRoot, "venv", "bin", "python");
 
-  // 执行 Python 命令（在 venv 中运行）
-  // const proc = await $`cd ${root_dir}/py_tools/adf && ./venv/bin/python -m adf_tool '${jsonArg}' --pretty`.quiet();
-  const proc = await $`cd ${root_dir}/py_tools/adf && ./venv/bin/python -m adf_tool '${jsonArg}' --pretty`;
+  const proc = Bun.spawn([pythonExec, "-m", "adf_tool", jsonArg, "--pretty"], {
+    cwd: toolRoot,
+    stdout: "pipe",
+    stderr: "pipe",
+  });
 
+  const [stdout, stderr] = await Promise.all([
+    new Response(proc.stdout).text(),
+    new Response(proc.stderr).text(),
+  ]);
 
-  const td = new TextDecoder();
-  const text = td.decode(proc.stdout);
+  const exitCode = await proc.exited;
+
+  if (exitCode !== 0) {
+    const message = stderr.trim() || `Process exited with code ${exitCode}`;
+    throw new Error(`Failed to execute ADF tool: ${message}`);
+  }
 
   try {
-    const parsed = JSON.parse(text);
+    const parsed = JSON.parse(stdout);
     return parsed as AdfResult;
   } catch {
-    // 如果返回非 JSON（例如 Python 报错）
-    throw new Error(`Failed to parse ADF result: ${text}`);
+    throw new Error(`Failed to parse ADF result: ${stdout}`);
   }
 }
