@@ -7,7 +7,6 @@
 -- ========================================================
 -- 1. User and Class Management
 -- ========================================================
-
 CREATE TABLE IF NOT EXISTS `users` (
   `user_id` INT AUTO_INCREMENT PRIMARY KEY,
   `username` VARCHAR(255) NOT NULL UNIQUE,
@@ -274,8 +273,6 @@ CREATE TABLE IF NOT EXISTS `experiment_reports` (
   UNIQUE KEY `student_experiment_unique` (`student_id`, `experiment_id`)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
--- Drop table if exists to ensure clean creation
-DROP TABLE IF EXISTS `grade_weights`;
 CREATE TABLE `grade_weights` (
   `weight_id` INT AUTO_INCREMENT PRIMARY KEY,
   `class_id` INT NOT NULL UNIQUE,
@@ -317,8 +314,6 @@ CREATE TABLE `grade_weights` (
   )
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
--- Drop table if exists to ensure clean creation
-DROP TABLE IF EXISTS `experiment_grade`;
 CREATE TABLE `experiment_grade` (
   `grade_id` INT AUTO_INCREMENT PRIMARY KEY,
   `experiment_id` INT NOT NULL,
