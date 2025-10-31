@@ -213,6 +213,8 @@ def run(args) -> None:
             "mape": mape(y_true, ensemble_pred),
             "r2": r2_score(y_true, ensemble_pred),
         },
+        "eval_y_true": [float(v) for v in y_true],
+        "eval_predictions": [float(v) for v in ensemble_pred],
         "notes": [f"Weights determined on eval set [{es},{ee}] using strategy: {strategy}"],
     }
     

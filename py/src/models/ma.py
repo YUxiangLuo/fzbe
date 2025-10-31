@@ -157,7 +157,7 @@ def predict(
 
 def train_and_evaluate(
     sales: List[float], months: List[str], train_range: range, eval_range: range, window: int
-) -> Tuple[Dict[str, Any], float]:
+) -> Tuple[Dict[str, Any], float, List[float], List[float]]:
     """
     Trains the model (conceptually) and evaluates it, returning metrics and residual std dev.
     """
@@ -182,7 +182,7 @@ def train_and_evaluate(
         "evaluate_indices": idxs,
         "evaluate_months": [months[i] for i in idxs],
     }
-    return metrics, float(std_dev_residuals)
+    return metrics, float(std_dev_residuals), y_true, y_pred
 
 
 # ---------- public entry ----------
@@ -299,7 +299,9 @@ def run(args) -> None:
         )
 
     # -------- 训练与评估 --------
-    metrics, std_dev_residuals = train_and_evaluate(sales, months, range(ts, te + 1), range(es, ee + 1), w)
+    metrics, std_dev_residuals, y_true, y_pred = train_and_evaluate(
+        sales, months, range(ts, te + 1), range(es, ee + 1), w
+    )
 
     out: Dict[str, Any] = {
         "mode": "fixed_window_only",
@@ -307,6 +309,8 @@ def run(args) -> None:
         "train_range": {"start_index": ts, "end_index": te, "months": months[ts:te+1]},
         "evaluate_range": {"start_index": es, "end_index": ee, "months": months[es:ee+1]},
         "metrics": metrics,
+        "eval_y_true": [float(v) for v in y_true],
+        "eval_predictions": [float(v) for v in y_pred],
         "notes": [
             "Fixed window mode only: must provide --window.",
             "Indices use closed interval semantics: [start, end].",

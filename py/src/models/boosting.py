@@ -227,6 +227,8 @@ def run(args) -> None:
             "mape": mape(y_eval_true, ensemble_pred),
             "r2": r2_score(y_eval_true, ensemble_pred),
         },
+        "eval_y_true": [float(v) for v in y_eval_true],
+        "eval_predictions": [float(v) for v in ensemble_pred],
         "notes": [
             f"Boosting ensemble trained. Residual models stored in {temp_dir}",
             f"Learning rate (shrinkage) applied at each stage: {learning_rate}",

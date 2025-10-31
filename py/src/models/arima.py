@@ -262,6 +262,15 @@ def run(args) -> None:
         dump_joblib(best_res, args.save_model)
 
     # Assemble output (keep existing keys; only add new sections)
+    best_predictions = best.get("y_pred")
+    eval_y_true_list = [float(v) for v in y_eval_true.tolist()]
+    eval_pred_list: List[float]
+    if hasattr(best_predictions, "tolist"):
+        eval_pred_list = [float(v) for v in best_predictions.tolist()]
+    elif best_predictions is not None:
+        eval_pred_list = [float(v) for v in best_predictions]
+    else:
+        eval_pred_list = []
     out: Dict[str, Any] = {
         "mode": "arima_search_pq_fixed_d",  # FIXED: Add for consistency
         "best_order": {  # FIXED: Use original "best_order" structure for compatibility
@@ -277,6 +286,8 @@ def run(args) -> None:
             "aic": best["aic"],
             "converged": best.get("converged", True),
         },
+        "eval_y_true": eval_y_true_list,
+        "eval_predictions": eval_pred_list,
         # New fields below are additive and safe for old front-ends to ignore:
         "search_summary": search_summary,
         "meta": {

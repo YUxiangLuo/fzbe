@@ -191,6 +191,8 @@ def run(args) -> None:
             "mape": mape(y_true_on_eval, final_predictions_on_eval),
             "r2": r2_score(y_true_on_eval, final_predictions_on_eval),
         },
+        "eval_y_true": [float(v) for v in y_true_on_eval],
+        "eval_predictions": [float(v) for v in final_predictions_on_eval],
         "notes": [
             "Meta-model (Linear Regression) was trained on the predictions of base models over the evaluation set.",
             f"L2 regularisation strength meta_l2={l2_strength}",

@@ -675,6 +675,8 @@ def run(args) -> None:
             "mape": mape(y_true, preds),
             "r2": r2_score(y_true, preds),
         },
+        "eval_y_true": [float(v) for v in y_true],
+        "eval_predictions": [float(v) for v in preds],
         "notes": ["All indices use closed interval semantics: [start, end]."],
     }
 

@@ -111,7 +111,7 @@ def predict(
 
 def train_and_evaluate(
     sales: List[float], months: List[str], train_range: range, eval_range: range, alpha: float
-) -> Tuple[Dict[str, Any], float, float]:
+) -> Tuple[Dict[str, Any], float, float, List[float], List[float]]:
     """
     Trains the SES model strictly on the declared training segment, then
     evaluates sequentially over eval_range. Returns metrics, residual std dev,
@@ -157,7 +157,7 @@ def train_and_evaluate(
         "r2": r2_score(y_true, y_pred),
     }
 
-    return metrics, float(std_dev_residuals), train_level
+    return metrics, float(std_dev_residuals), train_level, y_true, y_pred
 
 
 # ----- core -----
@@ -263,7 +263,7 @@ def run(args) -> None:
     if es < ts + 1:
         raise ValueError("no evaluation points: set eval_start >= train_start + 1")
 
-    metrics, std_dev_residuals, final_level = train_and_evaluate(
+    metrics, std_dev_residuals, final_level, y_true, y_pred = train_and_evaluate(
         sales, months, range(ts, te + 1), range(es, ee + 1), alpha
     )
 
@@ -282,6 +282,8 @@ def run(args) -> None:
             "months": months[es : ee + 1],
         },
         "metrics": metrics,
+        "eval_y_true": [float(v) for v in y_true],
+        "eval_predictions": [float(v) for v in y_pred],
         "notes": [
             "SES: forecast at t uses s_{t-1}.",
             "s_t = alpha*y_t + (1-alpha)*s_{t-1}; s_{train_start} = y_{train_start}.",
