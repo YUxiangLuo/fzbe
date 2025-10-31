@@ -2,7 +2,7 @@ import { Hono } from "hono";
 import { jwt } from "hono/jwt";
 import { z } from "zod";
 import { zValidator } from "@hono/zod-validator";
-import type { Pool } from "mysql2/promise";
+import type { Pool, PoolConnection } from "mysql2/promise";
 
 // Zod Schemas for Validation
 const classIdParamSchema = z.object({
@@ -61,6 +61,51 @@ const gradeReportSchema = z.object({
 
 export default (pool: Pool, JWT_SECRET: string) => {
   const classGradesApi = new Hono();
+  type Queryable = Pool | PoolConnection;
+
+  const isAssistantAssignedToClass = async (
+    db: Queryable,
+    classId: number,
+    assistantId: number,
+  ): Promise<boolean> => {
+    const [[assignment]]: any[] = await db.query(
+      "SELECT 1 FROM class_assistants WHERE class_id = ? AND assistant_id = ? LIMIT 1",
+      [classId, assistantId],
+    );
+    return Boolean(assignment);
+  };
+
+  const isAssistantAssignedToStudent = async (
+    db: Queryable,
+    studentId: number,
+    assistantId: number,
+  ): Promise<boolean> => {
+    const [[assignment]]: any[] = await db.query(
+      `SELECT 1
+         FROM enrollments e
+         JOIN class_assistants ca ON e.class_id = ca.class_id
+        WHERE e.student_id = ? AND ca.assistant_id = ?
+        LIMIT 1`,
+      [studentId, assistantId],
+    );
+    return Boolean(assignment);
+  };
+
+  const isTeacherOfStudent = async (
+    db: Queryable,
+    studentId: number,
+    teacherId: number,
+  ): Promise<boolean> => {
+    const [[row]]: any[] = await db.query(
+      `SELECT 1
+         FROM enrollments e
+         JOIN classes c ON e.class_id = c.class_id
+        WHERE e.student_id = ? AND c.teacher_id = ?
+        LIMIT 1`,
+      [studentId, teacherId],
+    );
+    return Boolean(row);
+  };
 
   // GET /api/classes/:classId/reports - 获取班级报告
   classGradesApi.get(
@@ -86,6 +131,15 @@ export default (pool: Pool, JWT_SECRET: string) => {
         let isAllowed = false;
         if (payload.role === "Admin" || payload.sub === classRows[0].teacher_id) {
           isAllowed = true;
+        } else if (payload.role === "Assistant") {
+          const assigned = await isAssistantAssignedToClass(
+            pool,
+            classIdNumber,
+            payload.sub,
+          );
+          if (assigned) {
+            isAllowed = true;
+          }
         }
 
         if (!isAllowed) {
@@ -133,7 +187,11 @@ export default (pool: Pool, JWT_SECRET: string) => {
     async (c) => {
       try {
         const payload = c.get("jwtPayload");
-        if (payload.role !== "Teacher" && payload.role !== "Admin") {
+        if (
+          payload.role !== "Teacher" &&
+          payload.role !== "Admin" &&
+          payload.role !== "Assistant"
+        ) {
           return c.json({ error: "Forbidden" }, 403);
         }
 
@@ -157,6 +215,34 @@ export default (pool: Pool, JWT_SECRET: string) => {
           }
 
           const { experiment_id, student_id } = reportRows[0];
+
+          let authorized = false;
+          if (payload.role === "Admin") {
+            authorized = true;
+          } else if (payload.role === "Teacher") {
+            const ownsStudent = await isTeacherOfStudent(
+              connection,
+              student_id,
+              payload.sub,
+            );
+            if (ownsStudent) {
+              authorized = true;
+            }
+          } else if (payload.role === "Assistant") {
+            const assigned = await isAssistantAssignedToStudent(
+              connection,
+              student_id,
+              payload.sub,
+            );
+            if (assigned) {
+              authorized = true;
+            }
+          }
+
+          if (!authorized) {
+            await connection.rollback();
+            return c.json({ error: "Forbidden" }, 403);
+          }
 
           // Build update query for experiment_grade
           const fields: string[] = [];
@@ -284,6 +370,15 @@ export default (pool: Pool, JWT_SECRET: string) => {
         let isAllowed = false;
         if (payload.role === "Admin" || payload.sub === classRows[0].teacher_id) {
           isAllowed = true;
+        } else if (payload.role === "Assistant") {
+          const assigned = await isAssistantAssignedToClass(
+            pool,
+            classIdNumber,
+            payload.sub,
+          );
+          if (assigned) {
+            isAllowed = true;
+          }
         } else if (payload.role === "Student") {
           const [enrollmentRows]: any[] = await pool.query(
             "SELECT enrollment_id FROM enrollments WHERE student_id = ? AND class_id = ?",
@@ -351,6 +446,15 @@ export default (pool: Pool, JWT_SECRET: string) => {
         let isAllowed = false;
         if (payload.role === "Admin" || payload.sub === classRows[0].teacher_id) {
           isAllowed = true;
+        } else if (payload.role === "Assistant") {
+          const assigned = await isAssistantAssignedToClass(
+            pool,
+            classIdNumber,
+            payload.sub,
+          );
+          if (assigned) {
+            isAllowed = true;
+          }
         }
 
         if (!isAllowed) {
@@ -383,7 +487,11 @@ export default (pool: Pool, JWT_SECRET: string) => {
     async (c) => {
       try {
         const payload = c.get("jwtPayload");
-        if (payload.role !== "Teacher" && payload.role !== "Admin") {
+        if (
+          payload.role !== "Teacher" &&
+          payload.role !== "Admin" &&
+          payload.role !== "Assistant"
+        ) {
           return c.json({ error: "Forbidden" }, 403);
         }
 
@@ -401,7 +509,21 @@ export default (pool: Pool, JWT_SECRET: string) => {
           return c.json({ error: "Class not found" }, 404);
         }
 
-        if (payload.role !== "Admin" && payload.sub !== classRows[0].teacher_id) {
+        let isAllowed = false;
+        if (payload.role === "Admin" || payload.sub === classRows[0].teacher_id) {
+          isAllowed = true;
+        } else if (payload.role === "Assistant") {
+          const assigned = await isAssistantAssignedToClass(
+            pool,
+            classIdNumber,
+            payload.sub,
+          );
+          if (assigned) {
+            isAllowed = true;
+          }
+        }
+
+        if (!isAllowed) {
           return c.json({ error: "Forbidden" }, 403);
         }
 
@@ -469,7 +591,11 @@ export default (pool: Pool, JWT_SECRET: string) => {
     async (c) => {
       try {
         const payload = c.get("jwtPayload");
-        if (payload.role !== "Teacher" && payload.role !== "Admin") {
+        if (
+          payload.role !== "Teacher" &&
+          payload.role !== "Admin" &&
+          payload.role !== "Assistant"
+        ) {
           return c.json({ error: "Forbidden" }, 403);
         }
 
@@ -487,7 +613,21 @@ export default (pool: Pool, JWT_SECRET: string) => {
           return c.json({ error: "Class not found" }, 404);
         }
 
-        if (payload.role !== "Admin" && payload.sub !== classRows[0].teacher_id) {
+        let isAllowed = false;
+        if (payload.role === "Admin" || payload.sub === classRows[0].teacher_id) {
+          isAllowed = true;
+        } else if (payload.role === "Assistant") {
+          const assigned = await isAssistantAssignedToClass(
+            pool,
+            classIdNumber,
+            payload.sub,
+          );
+          if (assigned) {
+            isAllowed = true;
+          }
+        }
+
+        if (!isAllowed) {
           return c.json({ error: "Forbidden" }, 403);
         }
 
@@ -568,6 +708,15 @@ export default (pool: Pool, JWT_SECRET: string) => {
         let isAllowed = false;
         if (payload.role === "Admin" || payload.sub === classRows[0].teacher_id) {
           isAllowed = true;
+        } else if (payload.role === "Assistant") {
+          const assigned = await isAssistantAssignedToClass(
+            pool,
+            classIdNumber,
+            payload.sub,
+          );
+          if (assigned) {
+            isAllowed = true;
+          }
         } else if (payload.role === "Student") {
           const [enrollmentRows]: any[] = await pool.query(
             "SELECT enrollment_id FROM enrollments WHERE student_id = ? AND class_id = ?",
@@ -651,6 +800,15 @@ export default (pool: Pool, JWT_SECRET: string) => {
         let isAllowed = false;
         if (payload.role === "Admin" || payload.sub === classRows[0].teacher_id) {
           isAllowed = true;
+        } else if (payload.role === "Assistant") {
+          const assigned = await isAssistantAssignedToClass(
+            pool,
+            classIdNumber,
+            payload.sub,
+          );
+          if (assigned) {
+            isAllowed = true;
+          }
         } else if (payload.role === "Student") {
           const [enrollmentRows]: any[] = await pool.query(
             "SELECT enrollment_id FROM enrollments WHERE student_id = ? AND class_id = ?",

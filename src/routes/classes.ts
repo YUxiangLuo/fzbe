@@ -37,6 +37,16 @@ const updateClassSchema = z
 
 export default (pool: Pool, JWT_SECRET: string) => {
   const classesApi = new Hono();
+  const isAssistantAssignedToClass = async (
+    classId: number,
+    assistantId: number,
+  ): Promise<boolean> => {
+    const [[assignment]]: any[] = await pool.query(
+      "SELECT 1 FROM class_assistants WHERE class_id = ? AND assistant_id = ? LIMIT 1",
+      [classId, assistantId],
+    );
+    return Boolean(assignment);
+  };
 
   // POST /api/classes - 创建班级 (支持上传学生名单CSV)
   classesApi.post(
@@ -227,6 +237,14 @@ export default (pool: Pool, JWT_SECRET: string) => {
         let isAllowed = false;
         if (payload.role === "Admin" || payload.sub === classInfo.teacher_id) {
           isAllowed = true;
+        } else if (payload.role === "Assistant") {
+          const assigned = await isAssistantAssignedToClass(
+            classIdNumber,
+            payload.sub,
+          );
+          if (assigned) {
+            isAllowed = true;
+          }
         } else if (payload.role === "Student") {
           const [enrollmentRows]: any[] = await pool.query(
             "SELECT enrollment_id FROM enrollments WHERE student_id = ? AND class_id = ?",
@@ -285,7 +303,20 @@ export default (pool: Pool, JWT_SECRET: string) => {
         }
 
         const classOwner = classRows[0].teacher_id;
-        if (payload.role !== "Admin" && payload.sub !== classOwner) {
+        let isAllowed = false;
+        if (payload.role === "Admin" || payload.sub === classOwner) {
+          isAllowed = true;
+        } else if (payload.role === "Assistant") {
+          const assigned = await isAssistantAssignedToClass(
+            classIdNumber,
+            payload.sub,
+          );
+          if (assigned) {
+            isAllowed = true;
+          }
+        }
+
+        if (!isAllowed) {
           return c.json({ error: "Forbidden" }, 403);
         }
 

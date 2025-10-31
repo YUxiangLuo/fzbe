@@ -2,7 +2,7 @@ import { Hono } from "hono";
 import { jwt } from "hono/jwt";
 import { z } from "zod";
 import { zValidator } from "@hono/zod-validator";
-import type { Pool } from "mysql2/promise";
+import type { Pool, PoolConnection } from "mysql2/promise";
 
 // Zod Schemas for Validation
 const classIdParamSchema = z.object({
@@ -32,6 +32,19 @@ const addAssistantSchema = z.object({
 
 export default (pool: Pool, JWT_SECRET: string) => {
   const classMembersApi = new Hono();
+  type Queryable = Pool | PoolConnection;
+
+  const isAssistantAssignedToClass = async (
+    db: Queryable,
+    classId: number,
+    assistantId: number,
+  ): Promise<boolean> => {
+    const [[assignment]]: any[] = await db.query(
+      "SELECT 1 FROM class_assistants WHERE class_id = ? AND assistant_id = ? LIMIT 1",
+      [classId, assistantId],
+    );
+    return Boolean(assignment);
+  };
 
   // POST /api/classes/:classId/students - 创建学生并加入班级
   classMembersApi.post(
@@ -41,13 +54,17 @@ export default (pool: Pool, JWT_SECRET: string) => {
     zValidator("json", createStudentSchema),
     async (c) => {
       const payload = c.get("jwtPayload");
-      if (payload.role !== "Admin" && payload.role !== "Teacher") {
-        return c.json({ error: "Forbidden" }, 403);
-      }
-
       const { classId } = c.req.valid("param");
       const classIdNumber = Number.parseInt(classId, 10);
       const { username, full_name, email, phone_number } = c.req.valid("json");
+
+      if (
+        payload.role !== "Admin" &&
+        payload.role !== "Teacher" &&
+        payload.role !== "Assistant"
+      ) {
+        return c.json({ error: "Forbidden" }, 403);
+      }
 
       const connection = await pool.getConnection();
       try {
@@ -64,7 +81,21 @@ export default (pool: Pool, JWT_SECRET: string) => {
         }
 
         const classOwner = classRows[0].teacher_id;
-        if (payload.role === "Teacher" && payload.sub !== classOwner) {
+        let isAllowed = false;
+        if (payload.role === "Admin" || payload.sub === classOwner) {
+          isAllowed = true;
+        } else if (payload.role === "Assistant") {
+          const assigned = await isAssistantAssignedToClass(
+            connection,
+            classIdNumber,
+            payload.sub,
+          );
+          if (assigned) {
+            isAllowed = true;
+          }
+        }
+
+        if (!isAllowed) {
           await connection.rollback();
           return c.json({ error: "Forbidden" }, 403);
         }
@@ -212,7 +243,21 @@ export default (pool: Pool, JWT_SECRET: string) => {
         }
 
         const classOwner = classRows[0].teacher_id;
-        if (payload.role !== "Admin" && payload.sub !== classOwner) {
+        let isAllowed = false;
+        if (payload.role === "Admin" || payload.sub === classOwner) {
+          isAllowed = true;
+        } else if (payload.role === "Assistant") {
+          const assigned = await isAssistantAssignedToClass(
+            pool,
+            classIdNumber,
+            payload.sub,
+          );
+          if (assigned) {
+            isAllowed = true;
+          }
+        }
+
+        if (!isAllowed) {
           return c.json({ error: "Forbidden" }, 403);
         }
 
