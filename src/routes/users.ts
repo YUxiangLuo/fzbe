@@ -21,17 +21,17 @@ const registerSchema = z.object({
   phone_number: z.string().optional(),
 });
 
-const createTeacherSchema = z.object({
-  username: z.string().min(3),
-  full_name: z.string().min(1),
-  email: z.string().email(),
-});
-
 const PHONE_REGEX = /^\d{6,15}$/;
 const MIN_TEACHER_NAME_LENGTH = 2;
 const TEACHER_EMAIL_DOMAIN = "teacher.edu";
 
 const DEFAULT_PASSWORD_HASH = getDefaultPasswordHash();
+
+const createTeacherSchema = z.object({
+  username: z.string().min(3),
+  full_name: z.string().min(1),
+  email: z.string().email().optional(),
+});
 
 const updateUserSchema = z
   .object({
@@ -197,10 +197,11 @@ export default (pool: Pool, JWT_SECRET: string) => {
         }
 
         const { username, full_name, email } = c.req.valid("json");
+        const teacherEmail = email ?? `${username}@${TEACHER_EMAIL_DOMAIN}`;
 
         const [result]: any = await pool.query(
           "INSERT INTO users (username, password_hash, full_name, email, role) VALUES (?, ?, ?, ?, 'Teacher')",
-          [username, DEFAULT_PASSWORD_HASH, full_name, email],
+          [username, DEFAULT_PASSWORD_HASH, full_name, teacherEmail],
         );
 
         const newTeacherId = result.insertId;
@@ -209,7 +210,7 @@ export default (pool: Pool, JWT_SECRET: string) => {
           user_id: newTeacherId,
           username,
           full_name,
-          email,
+          email: teacherEmail,
           role: "Teacher",
         };
         return c.json(newUser, 201);
@@ -546,49 +547,6 @@ export default (pool: Pool, JWT_SECRET: string) => {
       throw error;
     }
   });
-
-  // Register a new user
-  usersApi.post(
-    "/api/users",
-    zValidator("json", registerSchema),
-    async (c) => {
-      try {
-        const { username, password, full_name, email, phone_number } =
-          c.req.valid("json");
-        const password_hash = await Bun.password.hash(password, {
-          algorithm: "bcrypt",
-          cost: 10,
-        });
-
-        const [result]: any = await pool.query(
-          "INSERT INTO users (username, password_hash, full_name, email, role, phone_number) VALUES (?, ?, ?, ?, 'Student', ?)",
-          [
-            username,
-            password_hash,
-            full_name,
-            email,
-            phone_number || null,
-          ],
-        );
-
-        const newUser = {
-          user_id: result.insertId,
-          username,
-          full_name,
-          email,
-          role: "Student",
-          phone_number: phone_number || null,
-        };
-        return c.json(newUser, 201);
-      } catch (error: any) {
-        if (error.code === "ER_DUP_ENTRY") {
-          return c.json({ error: "Username or email already exists" }, 409);
-        }
-        console.error("Registration error:", error);
-        return c.json({ error: "Internal Server Error" }, 500);
-      }
-    },
-  );
 
   // Get current user's info
   usersApi.get("/api/users/me", jwt({ secret: JWT_SECRET }), async (c) => {
