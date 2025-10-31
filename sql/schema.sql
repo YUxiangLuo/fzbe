@@ -277,40 +277,39 @@ CREATE TABLE `grade_weights` (
   `weight_id` INT AUTO_INCREMENT PRIMARY KEY,
   `class_id` INT NOT NULL UNIQUE,
 
-  -- Fields starting with exp_flow_ and must sum to 100
-  `exp_flow_demand_data_preparation` FLOAT DEFAULT 0,
-  `exp_flow_demand_descriptive_stats` FLOAT DEFAULT 0,
-  `exp_flow_demand_model_selection` FLOAT DEFAULT 0,
-  `exp_flow_demand_generate_results` FLOAT DEFAULT 0,
-  `exp_flow_production_inventory_calc` FLOAT DEFAULT 0,
-  `exp_flow_production_service_level` FLOAT DEFAULT 0,
-  `exp_flow_production_variable_calc` FLOAT DEFAULT 0,
-  `exp_flow_production_plan_creation` FLOAT DEFAULT 0,
-  `exp_flow_report_submission` FLOAT DEFAULT 0,
+  -- Fields starting with exp_flow_ must sum to 100
+  `exp_flow_demand_data_preparation` FLOAT DEFAULT 5,
+  `exp_flow_demand_descriptive_stats` FLOAT DEFAULT 5,
+  `exp_flow_demand_model_selection` FLOAT DEFAULT 10,
+  `exp_flow_demand_generate_results` FLOAT DEFAULT 10,
+  `exp_flow_production_inventory_calc` FLOAT DEFAULT 10,
+  `exp_flow_production_service_level` FLOAT DEFAULT 5,
+  `exp_flow_production_variable_calc` FLOAT DEFAULT 5,
+  `exp_flow_production_plan_creation` FLOAT DEFAULT 15,
+  `exp_flow_report_submission` FLOAT DEFAULT 35,
 
-  -- Sum of exp_flow + knowledge_test + model_quality + report_quality must be 100
-  `exp_flow` FLOAT DEFAULT 0,
-  `knowledge_test` FLOAT DEFAULT 0,
-  `model_quality` FLOAT DEFAULT 0,
-  `report_quality` FLOAT DEFAULT 0,
+  -- Sum of exp_flow_weight + knowledge_test_weight + model_quality_weight + report_quality_weight must be 100
+  `exp_flow_weight` FLOAT DEFAULT 40,
+  `knowledge_test_weight` FLOAT DEFAULT 20,
+  `model_quality_weight` FLOAT DEFAULT 20,
+  `report_quality_weight` FLOAT DEFAULT 20,
 
   FOREIGN KEY (`class_id`) REFERENCES `classes`(`class_id`) ON DELETE CASCADE,
-  
-  -- Add constraints to ensure weights are in valid range
+
   CONSTRAINT `chk_weights_range` CHECK (
-    `exp_flow_demand_data_preparation` >= 0 AND `exp_flow_demand_data_preparation` <= 100 AND
-    `exp_flow_demand_descriptive_stats` >= 0 AND `exp_flow_demand_descriptive_stats` <= 100 AND
-    `exp_flow_demand_model_selection` >= 0 AND `exp_flow_demand_model_selection` <= 100 AND
-    `exp_flow_demand_generate_results` >= 0 AND `exp_flow_demand_generate_results` <= 100 AND
-    `exp_flow_production_inventory_calc` >= 0 AND `exp_flow_production_inventory_calc` <= 100 AND
-    `exp_flow_production_service_level` >= 0 AND `exp_flow_production_service_level` <= 100 AND
-    `exp_flow_production_variable_calc` >= 0 AND `exp_flow_production_variable_calc` <= 100 AND
-    `exp_flow_production_plan_creation` >= 0 AND `exp_flow_production_plan_creation` <= 100 AND
-    `exp_flow_report_submission` >= 0 AND `exp_flow_report_submission` <= 100 AND
-    `exp_flow` >= 0 AND `exp_flow` <= 100 AND
-    `knowledge_test` >= 0 AND `knowledge_test` <= 100 AND
-    `model_quality` >= 0 AND `model_quality` <= 100 AND
-    `report_quality` >= 0 AND `report_quality` <= 100
+    `exp_flow_demand_data_preparation` BETWEEN 0 AND 100 AND
+    `exp_flow_demand_descriptive_stats` BETWEEN 0 AND 100 AND
+    `exp_flow_demand_model_selection` BETWEEN 0 AND 100 AND
+    `exp_flow_demand_generate_results` BETWEEN 0 AND 100 AND
+    `exp_flow_production_inventory_calc` BETWEEN 0 AND 100 AND
+    `exp_flow_production_service_level` BETWEEN 0 AND 100 AND
+    `exp_flow_production_variable_calc` BETWEEN 0 AND 100 AND
+    `exp_flow_production_plan_creation` BETWEEN 0 AND 100 AND
+    `exp_flow_report_submission` BETWEEN 0 AND 100 AND
+    `exp_flow_weight` BETWEEN 0 AND 100 AND
+    `knowledge_test_weight` BETWEEN 0 AND 100 AND
+    `model_quality_weight` BETWEEN 0 AND 100 AND
+    `report_quality_weight` BETWEEN 0 AND 100
   )
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
@@ -319,9 +318,6 @@ CREATE TABLE `experiment_grade` (
   `experiment_id` INT NOT NULL,
   `student_id` INT NOT NULL,
   `grader_id` INT DEFAULT NULL,
-
-  -- 0-100
-  `exp_flow` FLOAT DEFAULT 0,
 
   -- All following fields have values from 0-100
   `exp_flow_demand_data_preparation` FLOAT DEFAULT 0,

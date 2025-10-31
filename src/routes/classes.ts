@@ -99,6 +99,10 @@ export default (pool: Pool, JWT_SECRET: string) => {
           );
 
           const classId = result.insertId;
+          await connection.query(
+            "INSERT INTO grade_weights (class_id) VALUES (?)",
+            [classId],
+          );
           let createdStudentsCount = 0;
           const createdStudents: any[] = [];
 

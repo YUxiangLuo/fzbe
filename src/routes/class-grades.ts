@@ -13,18 +13,6 @@ const reportIdParamSchema = z.object({
   reportId: z.string().regex(/^\d+$/, { message: "reportId must be a number" }),
 });
 
-const gradeWeightsSchema = z.object({
-  exp_flow_weight: z.number().min(0).max(100).optional(),
-  model_quality_weight: z.number().min(0).max(100).optional(),
-  knowledge_test_weight: z.number().min(0).max(100).optional(),
-  report_quality_weight: z.number().min(0).max(100).optional(),
-}).refine((data) => {
-  // At least one field must be provided
-  return Object.values(data).some(v => v !== undefined);
-}, {
-  message: "At least one weight field must be provided",
-});
-
 const updateGradeWeightsSchema = z.object({
   exp_flow_weight: z.number().min(0).max(100).optional(),
   model_quality_weight: z.number().min(0).max(100).optional(),
@@ -419,110 +407,6 @@ export default (pool: Pool, JWT_SECRET: string) => {
     },
   );
 
-  // POST /api/classes/:classId/grade-weights - 创建成绩权重
-  classGradesApi.post(
-    "/api/classes/:classId/grade-weights",
-    jwt({ secret: JWT_SECRET }),
-    zValidator("param", classIdParamSchema),
-    zValidator("json", gradeWeightsSchema),
-    async (c) => {
-      try {
-        const payload = c.get("jwtPayload");
-        if (
-          payload.role !== "Teacher" &&
-          payload.role !== "Admin" &&
-          payload.role !== "Assistant"
-        ) {
-          return c.json({ error: "Forbidden" }, 403);
-        }
-
-        const { classId } = c.req.valid("param");
-        const classIdNumber = Number.parseInt(classId, 10);
-        const weightData = c.req.valid("json");
-
-        // Check if user is teacher/admin of this class
-        const [classRows]: any[] = await pool.query(
-          "SELECT teacher_id FROM classes WHERE class_id = ?",
-          [classIdNumber],
-        );
-
-        if (classRows.length === 0) {
-          return c.json({ error: "Class not found" }, 404);
-        }
-
-        let isAllowed = false;
-        if (payload.role === "Admin" || payload.sub === classRows[0].teacher_id) {
-          isAllowed = true;
-        } else if (payload.role === "Assistant") {
-          const assigned = await isAssistantAssignedToClass(
-            pool,
-            classIdNumber,
-            payload.sub,
-          );
-          if (assigned) {
-            isAllowed = true;
-          }
-        }
-
-        if (!isAllowed) {
-          return c.json({ error: "Forbidden" }, 403);
-        }
-
-        // Check if weights already exist
-        const [existing]: any[] = await pool.query(
-          "SELECT weight_id FROM grade_weights WHERE class_id = ?",
-          [classIdNumber],
-        );
-
-        if (existing.length > 0) {
-          return c.json({ error: "Grade weights already exist for this class" }, 409);
-        }
-
-        const fields: string[] = ["class_id"];
-        const values: any[] = [classIdNumber];
-        const placeholders: string[] = ["?"];
-
-        if (weightData.exp_flow_weight !== undefined) {
-          fields.push("exp_flow_weight");
-          values.push(weightData.exp_flow_weight);
-          placeholders.push("?");
-        }
-        if (weightData.model_quality_weight !== undefined) {
-          fields.push("model_quality_weight");
-          values.push(weightData.model_quality_weight);
-          placeholders.push("?");
-        }
-        if (weightData.knowledge_test_weight !== undefined) {
-          fields.push("knowledge_test_weight");
-          values.push(weightData.knowledge_test_weight);
-          placeholders.push("?");
-        }
-        if (weightData.report_quality_weight !== undefined) {
-          fields.push("report_quality_weight");
-          values.push(weightData.report_quality_weight);
-          placeholders.push("?");
-        }
-
-        const sql = `
-          INSERT INTO grade_weights (${fields.join(", ")})
-          VALUES (${placeholders.join(", ")})
-        `;
-
-        const [result]: any = await pool.query(sql, values);
-
-        const [newWeights]: any[] = await pool.query(
-          "SELECT * FROM grade_weights WHERE weight_id = ?",
-          [result.insertId],
-        );
-
-        return c.json(newWeights[0], 201);
-      } catch (error) {
-        console.error("Error creating grade weights:", error);
-        throw error;
-      }
-    },
-  );
-
   // PUT /api/classes/:classId/grade-weights - 更新成绩权重
   classGradesApi.put(
     "/api/classes/:classId/grade-weights",
@@ -675,37 +559,67 @@ export default (pool: Pool, JWT_SECRET: string) => {
         // Get latest grades for all students in class
         const [latestGrades]: any[] = await pool.query(
           `SELECT
-             u.user_id,
-             u.username,
-             u.full_name,
-             eg.experiment_id,
-             eg.exp_flow,
-             eg.model_quality,
-             eg.knowledge_test,
-             eg.report_quality,
-             eg.feedback,
-             eg.created_at AS graded_at,
+             base.user_id,
+             base.username,
+             base.full_name,
+             base.experiment_id,
+             base.exp_flow_score,
+             base.model_quality,
+             base.knowledge_test,
+             base.report_quality,
+             base.feedback,
+             base.graded_at,
              ROUND(
-               COALESCE(eg.exp_flow, 0) * COALESCE(gw.exp_flow_weight, 0) / 100 +
-               COALESCE(eg.model_quality, 0) * COALESCE(gw.model_quality_weight, 0) / 100 +
-               COALESCE(eg.knowledge_test, 0) * COALESCE(gw.knowledge_test_weight, 0) / 100 +
-               COALESCE(eg.report_quality, 0) * COALESCE(gw.report_quality_weight, 0) / 100,
+               COALESCE(base.exp_flow_score, 0) * COALESCE(base.exp_flow_weight, 0) / 100 +
+               COALESCE(base.knowledge_test, 0) * COALESCE(base.knowledge_test_weight, 0) / 100 +
+               COALESCE(base.model_quality, 0) * COALESCE(base.model_quality_weight, 0) / 100 +
+               COALESCE(base.report_quality, 0) * COALESCE(base.report_quality_weight, 0) / 100,
                2
              ) AS final_score
-           FROM enrollments e
-           JOIN users u ON e.student_id = u.user_id
-           LEFT JOIN (
-             SELECT student_id, MAX(created_at) AS max_graded_at
-             FROM experiment_grade
-             WHERE created_at IS NOT NULL
-             GROUP BY student_id
-           ) latest ON u.user_id = latest.student_id
-           LEFT JOIN experiment_grade eg
-             ON latest.student_id = eg.student_id
-             AND latest.max_graded_at = eg.created_at
-           LEFT JOIN grade_weights gw ON e.class_id = gw.class_id
-           WHERE e.class_id = ?
-           ORDER BY u.username ASC`,
+           FROM (
+             SELECT
+               u.user_id,
+               u.username,
+               u.full_name,
+               eg.experiment_id,
+               gw.exp_flow_weight AS exp_flow_weight,
+               gw.knowledge_test_weight AS knowledge_test_weight,
+               gw.model_quality_weight AS model_quality_weight,
+               gw.report_quality_weight AS report_quality_weight,
+               ROUND(
+                 (
+                   COALESCE(eg.exp_flow_demand_data_preparation, 0) * COALESCE(gw.exp_flow_demand_data_preparation, 0) +
+                   COALESCE(eg.exp_flow_demand_descriptive_stats, 0) * COALESCE(gw.exp_flow_demand_descriptive_stats, 0) +
+                   COALESCE(eg.exp_flow_demand_model_selection, 0) * COALESCE(gw.exp_flow_demand_model_selection, 0) +
+                   COALESCE(eg.exp_flow_demand_generate_results, 0) * COALESCE(gw.exp_flow_demand_generate_results, 0) +
+                   COALESCE(eg.exp_flow_production_inventory_calc, 0) * COALESCE(gw.exp_flow_production_inventory_calc, 0) +
+                   COALESCE(eg.exp_flow_production_service_level, 0) * COALESCE(gw.exp_flow_production_service_level, 0) +
+                   COALESCE(eg.exp_flow_production_variable_calc, 0) * COALESCE(gw.exp_flow_production_variable_calc, 0) +
+                   COALESCE(eg.exp_flow_production_plan_creation, 0) * COALESCE(gw.exp_flow_production_plan_creation, 0) +
+                   COALESCE(eg.exp_flow_report_submission, 0) * COALESCE(gw.exp_flow_report_submission, 0)
+                 ) / 100,
+                 2
+               ) AS exp_flow_score,
+               eg.model_quality,
+               eg.knowledge_test,
+               eg.report_quality,
+               eg.feedback,
+               eg.created_at AS graded_at
+             FROM enrollments e
+             JOIN users u ON e.student_id = u.user_id
+             LEFT JOIN (
+               SELECT student_id, MAX(created_at) AS max_graded_at
+               FROM experiment_grade
+               WHERE created_at IS NOT NULL
+               GROUP BY student_id
+             ) latest ON u.user_id = latest.student_id
+             LEFT JOIN experiment_grade eg
+               ON latest.student_id = eg.student_id
+               AND latest.max_graded_at = eg.created_at
+             LEFT JOIN grade_weights gw ON e.class_id = gw.class_id
+             WHERE e.class_id = ?
+           ) AS base
+           ORDER BY base.username ASC`,
           [classIdNumber],
         );
 

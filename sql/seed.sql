@@ -313,7 +313,7 @@ INSERT INTO `grade_weights` (`class_id`,
   `exp_flow_demand_data_preparation`, `exp_flow_demand_descriptive_stats`, `exp_flow_demand_model_selection`, `exp_flow_demand_generate_results`,
   `exp_flow_production_inventory_calc`, `exp_flow_production_service_level`, `exp_flow_production_variable_calc`, `exp_flow_production_plan_creation`,
   `exp_flow_report_submission`,
-  `exp_flow`, `knowledge_test`, `model_quality`, `report_quality`) 
+  `exp_flow_weight`, `knowledge_test_weight`, `model_quality_weight`, `report_quality_weight`) 
 VALUES
 (1, 5, 5, 10, 10, 10, 5, 5, 15, 35, 40, 20, 20, 20),
 (2, 8, 7, 10, 10, 8, 7, 10, 15, 25, 45, 15, 20, 20);
