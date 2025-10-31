@@ -28,7 +28,7 @@ export default (pool: Pool, JWT_SECRET: string) => {
   const manualsApi = new Hono();
 
   // 管理员: 上传新的实验手册
-  manualsApi.post("/manuals", jwt({ secret: JWT_SECRET }), pdfUploadValidator, async (c) => {
+  manualsApi.post("/api/manuals", jwt({ secret: JWT_SECRET }), pdfUploadValidator, async (c) => {
     try {
       const payload = c.get("jwtPayload");
       if (payload.role !== "Admin") {
@@ -76,7 +76,7 @@ export default (pool: Pool, JWT_SECRET: string) => {
   });
 
   // 管理员: 获取所有实验手册列表
-  manualsApi.get("/manuals", jwt({ secret: JWT_SECRET }), async (c) => {
+  manualsApi.get("/api/manuals", jwt({ secret: JWT_SECRET }), async (c) => {
     try {
       const payload = c.get("jwtPayload");
       if (payload.role !== "Admin") {
@@ -96,7 +96,7 @@ export default (pool: Pool, JWT_SECRET: string) => {
   });
 
   // 任何人: 获取当前激活的实验手册
-  manualsApi.get("/manuals/active", async (c) => {
+  manualsApi.get("/api/manuals/active", async (c) => {
     try {
       const [rows]: any[] = await pool.query(`
           SELECT m.*, u.full_name as uploader_name
@@ -118,7 +118,7 @@ export default (pool: Pool, JWT_SECRET: string) => {
 
   // 管理员: 更新实验手册信息 (名称, 描述, 激活状态)
   manualsApi.put(
-    "/manuals/:manualId",
+    "/api/manuals/:manualId",
     jwt({ secret: JWT_SECRET }),
     zValidator("param", manualIdParamSchema),
     zValidator("json", updateManualSchema),
@@ -194,7 +194,7 @@ export default (pool: Pool, JWT_SECRET: string) => {
 
   // 管理员: 删除实验手册
   manualsApi.delete(
-    "/manuals/:manualId",
+    "/api/manuals/:manualId",
     jwt({ secret: JWT_SECRET }),
     zValidator("param", manualIdParamSchema),
     async (c) => {

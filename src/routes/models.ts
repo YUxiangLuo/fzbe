@@ -321,14 +321,14 @@ async function runPythonMain(args: string[], timeoutMs?: number): Promise<any> {
 }
 
 export default (pool: Pool, JWT_SECRET: string) => {
-  const modelApi = new Hono();
+  const modelsApi = new Hono();
 
-  modelApi.use("*", jwt({ secret: JWT_SECRET }));
+  modelsApi.use("*", jwt({ secret: JWT_SECRET }));
 
   // ========== Base Model Training Routes ==========
 
   // MA Training
-  modelApi.post("/model/ma/train", zValidator("json", trainMovingAverageSchema), async (c) => {
+  modelsApi.post("/api/model/ma/train", zValidator("json", trainMovingAverageSchema), async (c) => {
     const payload = c.get("jwtPayload");
     if (payload.role !== "Student") {
       return c.json({ error: "Only students can train models" }, 403);
@@ -369,7 +369,7 @@ export default (pool: Pool, JWT_SECRET: string) => {
   });
 
   // ES Training
-  modelApi.post("/model/es/train", zValidator("json", trainExponentialSmoothingSchema), async (c) => {
+  modelsApi.post("/api/model/es/train", zValidator("json", trainExponentialSmoothingSchema), async (c) => {
     const payload = c.get("jwtPayload");
     if (payload.role !== "Student") {
       return c.json({ error: "Only students can train models" }, 403);
@@ -410,7 +410,7 @@ export default (pool: Pool, JWT_SECRET: string) => {
   });
 
   // ARIMA Training
-  modelApi.post("/model/arima/train", zValidator("json", trainArimaSchema), async (c) => {
+  modelsApi.post("/api/model/arima/train", zValidator("json", trainArimaSchema), async (c) => {
     const payload = c.get("jwtPayload");
     if (payload.role !== "Student") {
       return c.json({ error: "Only students can train models" }, 403);
@@ -451,7 +451,7 @@ export default (pool: Pool, JWT_SECRET: string) => {
   });
 
   // LSTM Training
-  modelApi.post("/model/lstm/train", zValidator("json", trainLstmSchema), async (c) => {
+  modelsApi.post("/api/model/lstm/train", zValidator("json", trainLstmSchema), async (c) => {
     const payload = c.get("jwtPayload");
     if (payload.role !== "Student") {
       return c.json({ error: "Only students can train models" }, 403);
@@ -509,7 +509,7 @@ export default (pool: Pool, JWT_SECRET: string) => {
   // ========== Ensemble Model Training Routes ==========
 
   // Weighted Average Training
-  modelApi.post("/model/weighted-average/train", zValidator("json", trainWeightedAverageSchema), async (c) => {
+  modelsApi.post("/api/model/weighted-average/train", zValidator("json", trainWeightedAverageSchema), async (c) => {
     const payload = c.get("jwtPayload");
     if (payload.role !== "Student") {
       return c.json({ error: "Only students can train models" }, 403);
@@ -553,7 +553,7 @@ export default (pool: Pool, JWT_SECRET: string) => {
   });
 
   // Boosting Training
-  modelApi.post("/model/boosting/train", zValidator("json", trainBoostingSchema), async (c) => {
+  modelsApi.post("/api/model/boosting/train", zValidator("json", trainBoostingSchema), async (c) => {
     const payload = c.get("jwtPayload");
     if (payload.role !== "Student") {
       return c.json({ error: "Only students can train models" }, 403);
@@ -652,7 +652,7 @@ export default (pool: Pool, JWT_SECRET: string) => {
   });
 
   // Stacking Training
-  modelApi.post("/model/stacking/train", zValidator("json", trainStackingSchema), async (c) => {
+  modelsApi.post("/api/model/stacking/train", zValidator("json", trainStackingSchema), async (c) => {
     const payload = c.get("jwtPayload");
     if (payload.role !== "Student") {
       return c.json({ error: "Only students can train models" }, 403);
@@ -698,7 +698,7 @@ export default (pool: Pool, JWT_SECRET: string) => {
   // ========== Prediction Routes ==========
 
   // Universal Prediction Endpoint
-  modelApi.post("/model/predict", zValidator("json", predictSchema), async (c) => {
+  modelsApi.post("/api/model/predict", zValidator("json", predictSchema), async (c) => {
     const payload = c.get("jwtPayload");
     if (payload.role !== "Student") {
       return c.json({ error: "Only students can predict" }, 403);
@@ -740,5 +740,5 @@ export default (pool: Pool, JWT_SECRET: string) => {
     }
   });
 
-  return modelApi;
+  return modelsApi;
 };

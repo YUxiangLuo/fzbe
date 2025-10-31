@@ -1,15 +1,10 @@
 import { Hono } from "hono";
-import { jwt, sign } from "hono/jwt";
+import { jwt } from "hono/jwt";
 import { z } from "zod";
 import { zValidator } from "@hono/zod-validator";
 import type { Pool } from "mysql2/promise";
 
 // Zod Schemas for Validation
-const loginSchema = z.object({
-  username: z.string().min(1, { message: "Username is required" }),
-  password: z.string().min(1, { message: "Password is required" }),
-});
-
 const registerSchema = z.object({
   username: z.string().min(3),
   password: z
@@ -81,50 +76,9 @@ const createAssistantSchema = registerSchema
 export default (pool: Pool, JWT_SECRET: string) => {
   const usersApi = new Hono();
 
-  // --- Auth Routes ---
-  usersApi.post("/auth/login", zValidator("json", loginSchema), async (c) => {
-    try {
-      const { username, password } = c.req.valid("json");
-
-      const [rows]: any[] = await pool.query(
-        "SELECT * FROM users WHERE username = ?",
-        [username],
-      );
-      const user = rows[0];
-
-      if (!user) {
-        return c.json({ error: "Invalid credentials" }, 401);
-      }
-
-      const passwordMatch = await Bun.password.verify(
-        password,
-        user.password_hash,
-      );
-
-      if (!passwordMatch) {
-        return c.json({ error: "Invalid credentials" }, 401);
-      }
-
-      const payload = {
-        sub: user.user_id,
-        username: user.username,
-        role: user.role,
-        exp: Math.floor(Date.now() / 1000) + 60 * 60 * 24, // 24 hours
-      };
-
-      const token = await sign(payload, JWT_SECRET);
-      return c.json({ token });
-    } catch (error) {
-      console.error("Login error:", error);
-      throw error;
-    }
-  });
-
-  // --- User Management Routes ---
-
   // Create an assistant and assign them to classes
   usersApi.post(
-    "/assistants",
+    "/api/assistants",
     jwt({ secret: JWT_SECRET }),
     zValidator("json", createAssistantSchema),
     async (c) => {
@@ -221,7 +175,7 @@ export default (pool: Pool, JWT_SECRET: string) => {
 
   // Admin: Create a new teacher user
   usersApi.post(
-    "/users/teachers",
+    "/api/users/teachers",
     jwt({ secret: JWT_SECRET }),
     zValidator("json", createTeacherSchema),
     async (c) => {
@@ -269,7 +223,7 @@ export default (pool: Pool, JWT_SECRET: string) => {
 
   // Get all assistants associated with a specific teacher through their classes
   usersApi.get(
-    "/teachers/:teacherId/assistants",
+    "/api/teachers/:teacherId/assistants",
     jwt({ secret: JWT_SECRET }),
     zValidator("param", teacherIdParamSchema),
     async (c) => {
@@ -308,7 +262,7 @@ export default (pool: Pool, JWT_SECRET: string) => {
 
   // Get all users (Admin only)
   usersApi.get(
-    "/users",
+    "/api/users",
     jwt({ secret: JWT_SECRET }),
     zValidator("query", paginationQuerySchema),
     async (c) => {
@@ -350,7 +304,7 @@ export default (pool: Pool, JWT_SECRET: string) => {
   );
 
   // Get all assistants (Admin and Teacher only)
-  usersApi.get("/assistants", jwt({ secret: JWT_SECRET }), async (c) => {
+  usersApi.get("/api/assistants", jwt({ secret: JWT_SECRET }), async (c) => {
     try {
       const payload = c.get("jwtPayload");
       if (payload.role !== "Admin" && payload.role !== "Teacher") {
@@ -368,7 +322,7 @@ export default (pool: Pool, JWT_SECRET: string) => {
 
   // Register a new user
   usersApi.post(
-    "/users",
+    "/api/users",
     zValidator("json", registerSchema),
     async (c) => {
       try {
@@ -410,7 +364,7 @@ export default (pool: Pool, JWT_SECRET: string) => {
   );
 
   // Get current user's info
-  usersApi.get("/users/me", jwt({ secret: JWT_SECRET }), async (c) => {
+  usersApi.get("/api/users/me", jwt({ secret: JWT_SECRET }), async (c) => {
     try {
       const payload = c.get("jwtPayload");
       const userId = payload.sub;
@@ -451,7 +405,7 @@ export default (pool: Pool, JWT_SECRET: string) => {
 
   // Update current user's info
   usersApi.put(
-    "/users/me",
+    "/api/users/me",
     jwt({ secret: JWT_SECRET }),
     zValidator("json", updateUserSchema),
     async (c) => {
@@ -496,7 +450,7 @@ export default (pool: Pool, JWT_SECRET: string) => {
 
   // Change current user's password
   usersApi.put(
-    "/users/me/password",
+    "/api/users/me/password",
     jwt({ secret: JWT_SECRET }),
     zValidator("json", changePasswordSchema),
     async (c) => {
@@ -547,7 +501,7 @@ export default (pool: Pool, JWT_SECRET: string) => {
 
   // Get user by ID
   usersApi.get(
-    "/users/:userId",
+    "/api/users/:userId",
     jwt({ secret: JWT_SECRET }),
     zValidator("param", userIdParamSchema),
     async (c) => {
@@ -582,7 +536,7 @@ export default (pool: Pool, JWT_SECRET: string) => {
 
   // Admin: Force change user's password
   usersApi.put(
-    "/users/:userId/password",
+    "/api/users/:userId/password",
     jwt({ secret: JWT_SECRET }),
     zValidator("param", userIdParamSchema),
     zValidator("json", adminChangePasswordSchema),
@@ -631,7 +585,7 @@ export default (pool: Pool, JWT_SECRET: string) => {
 
   // Teacher/Admin: Reset a student's password to default
   usersApi.post(
-    "/users/:userId/reset-password",
+    "/api/users/:userId/reset-password",
     jwt({ secret: JWT_SECRET }),
     zValidator("param", userIdParamSchema),
     async (c) => {
@@ -699,7 +653,7 @@ export default (pool: Pool, JWT_SECRET: string) => {
 
   // Delete user by ID (Admin only)
   usersApi.delete(
-    "/users/:userId",
+    "/api/users/:userId",
     jwt({ secret: JWT_SECRET }),
     zValidator("param", userIdParamSchema),
     async (c) => {

@@ -7,7 +7,6 @@ import csv from "csv-parser";
 import { createReadStream } from "node:fs";
 import { unlink, mkdir } from "node:fs/promises";
 import path from "path";
-import { createUploadValidator } from "../utils";
 
 // Zod Schemas for Validation
 const classIdParamSchema = z.object({
@@ -20,31 +19,6 @@ const teacherIdParamSchema = z.object({
 
 const assistantIdParamSchema = z.object({
   assistantId: z.string().regex(/^\d+$/, { message: "assistantId must be a number" }),
-});
-
-const classAssistantParamSchema = z.object({
-  classId: z.string().regex(/^\d+$/),
-  assistantId: z.string().regex(/^\d+$/),
-});
-
-const studentIdParamSchema = z.object({
-  studentId: z.string().regex(/^\d+$/, { message: "studentId must be a number" }),
-});
-
-const classStudentParamSchema = z.object({
-  classId: z.string().regex(/^\d+$/),
-  studentId: z.string().regex(/^\d+$/),
-});
-
-const createStudentSchema = z.object({
-  username: z.string().min(1, { message: "学号 is required" }), // 学号作为username
-  full_name: z.string().min(1, { message: "姓名 is required" }),
-  email: z.string().email().optional(), // 可选，如果不提供则自动生成
-  phone_number: z.string().optional(),
-});
-
-const reportIdParamSchema = z.object({
-  reportId: z.string().regex(/^\d+$/),
 });
 
 const createClassSchema = z.object({
@@ -61,110 +35,12 @@ const updateClassSchema = z
     message: "At least one field (class_name or class_code) must be provided",
   });
 
-const enrollSchema = z.object({
-  class_code: z.string().min(1, { message: "Class code is required" }),
-});
-
-const addAssistantSchema = z.object({
-  assistant_id: z.number().int().min(1),
-});
-
-const updateReportSchema = z
-  .object({
-    grade: z.number().min(0).max(100).optional(),
-    feedback: z.string().trim().max(2000).optional(),
-  })
-  .refine((data) => data.grade !== undefined || data.feedback !== undefined, {
-    message: "At least one of grade or feedback must be provided",
-  });
-
-const gradeWeightNumeric = z.coerce.number().min(0);
-
-const expFlowKeys = [
-  "exp_flow_demand_data_preparation",
-  "exp_flow_demand_descriptive_stats",
-  "exp_flow_demand_model_selection",
-  "exp_flow_demand_generate_results",
-  "exp_flow_production_inventory_calc",
-  "exp_flow_production_service_level",
-  "exp_flow_production_variable_calc",
-  "exp_flow_production_plan_creation",
-  "exp_flow_report_submission",
-];
-
-const gradeWeightFieldNames = [
-  "exp_flow",
-  ...expFlowKeys,
-  "knowledge_test",
-  "model_quality",
-  "report_quality",
-];
-
-const gradeWeightsBaseSchema = z
-  .object(
-    gradeWeightFieldNames.reduce((acc, key) => {
-      acc[key] = gradeWeightNumeric;
-      return acc;
-    }, {} as Record<string, z.ZodTypeAny>),
-  )
-  .refine((data) => {
-    const expFlowSum = expFlowKeys.reduce((sum, key) => sum + Number(data[key as keyof typeof data] ?? 0), 0);
-    return Math.abs(expFlowSum - 100) < 0.0001;
-  }, {
-    message: "所有实验流程子权重之和必须等于 100",
-    path: ["exp_flow"],
-  })
-  .refine((data) => {
-    const flowSum = Number(data.exp_flow ?? 0);
-    const otherSum = Number(data.knowledge_test ?? 0) + Number(data.model_quality ?? 0) + Number(data.report_quality ?? 0);
-    return Math.abs(flowSum + otherSum - 100) < 0.0001;
-  }, {
-    message: "实验流程 + 知识点测试 + 模型质量 + 实验报告质量之和必须等于 100",
-    path: ["exp_flow"],
-  });
-
-const gradeWeightsCreateSchema = gradeWeightsBaseSchema;
-
-const gradeWeightsUpdateSchema = gradeWeightsBaseSchema;
-
-const normalizeGradeWeightRow = (row: any) => {
-  const result: Record<string, number | null> = { class_id: Number(row.class_id) };
-  for (const field of gradeWeightFieldNames) {
-    result[field] = row[field] !== null && row[field] !== undefined ? Number(row[field]) : null;
-  }
-  return result;
-};
-
-const normalizeExperimentGradeRow = (row: any) => {
-  const normalized: Record<string, any> = {
-    grade_id: Number(row.grade_id),
-    experiment_id: Number(row.experiment_id),
-    student_id: Number(row.student_id),
-    student_username: row.student_username,
-    student_full_name: row.student_full_name,
-    grader_id: row.grader_id !== null && row.grader_id !== undefined ? Number(row.grader_id) : null,
-    grader_name: row.grader_name ?? null,
-    created_at: row.created_at,
-  };
-
-  for (const field of gradeWeightFieldNames) {
-    normalized[field] = row[field] !== null && row[field] !== undefined ? Number(row[field]) : null;
-  }
-
-  return normalized;
-};
-
-const csvUploadValidator = createUploadValidator({
-  allowedMimeTypes: ["text/csv"],
-  maxSizeMb: 50,
-});
-
 export default (pool: Pool, JWT_SECRET: string) => {
   const classesApi = new Hono();
 
-  // 受保护的路由: 创建新班级 (支持上传学生名单CSV)
+  // POST /api/classes - 创建班级 (支持上传学生名单CSV)
   classesApi.post(
-    "/classes",
+    "/api/classes",
     jwt({ secret: JWT_SECRET }),
     async (c) => {
       let tempCsvPath: string | null = null;
@@ -178,7 +54,7 @@ export default (pool: Pool, JWT_SECRET: string) => {
         const body = await c.req.parseBody();
         const class_name = body["class_name"];
         const class_code = body["class_code"];
-        const studentListFile = body["student_list"]; // file from middleware
+        const studentListFile = body["student_list"];
 
         if (studentListFile instanceof File) {
           const maxSize = 5 * 1024 * 1024; // 5MB
@@ -209,14 +85,12 @@ export default (pool: Pool, JWT_SECRET: string) => {
 
           // 2. If a student list CSV file is provided, parse and create students
           if (studentListFile instanceof File) {
-            // Save CSV to temporary location
             const tempDir = path.resolve(import.meta.dir, "../../uploads", "temp");
             await mkdir(tempDir, { recursive: true });
             const uniqueFilename = `${Date.now()}-${studentListFile.name}`;
             tempCsvPath = path.join(tempDir, uniqueFilename);
             await Bun.write(tempCsvPath, studentListFile);
 
-            // Parse CSV and collect student records
             const studentRecords: Array<{ studentId: string; fullName: string; email: string }> = [];
             await new Promise<void>((resolve, reject) => {
               createReadStream(tempCsvPath!)
@@ -234,7 +108,6 @@ export default (pool: Pool, JWT_SECRET: string) => {
             });
 
             if (studentRecords.length > 0) {
-              // --- START MODIFICATION: Pre-check for existing students ---
               const studentIds = studentRecords.map(record => record.studentId);
               const [existingUsers]: any[] = await connection.query(
                 "SELECT username FROM users WHERE username IN (?)",
@@ -243,7 +116,6 @@ export default (pool: Pool, JWT_SECRET: string) => {
 
               if (existingUsers.length > 0) {
                 const existingUsernames = existingUsers.map((u: any) => u.username);
-                // Abort transaction if any student already exists
                 await connection.rollback();
                 connection.release();
                 return c.json({
@@ -251,14 +123,10 @@ export default (pool: Pool, JWT_SECRET: string) => {
                   existing_students: existingUsernames
                 }, 409);
               }
-              // --- END MODIFICATION ---
 
-              // Fixed password hash
               const defaultPasswordHash = "$2b$10$DVZtxD9Efhm/j8.LSWMFx.hfdpk81iHO4Tv0fUaDr1LlW/mFrgXrG";
 
-              // 3. Batch insert students and enroll them in the class
               for (const record of studentRecords) {
-                // Create new student user, since we've pre-checked they don't exist
                 const [userResult]: any = await connection.query(
                   "INSERT INTO users (username, password_hash, full_name, email, role) VALUES (?, ?, ?, ?, 'Student')",
                   [record.studentId, defaultPasswordHash, record.fullName, record.email]
@@ -266,7 +134,6 @@ export default (pool: Pool, JWT_SECRET: string) => {
                 const userId = userResult.insertId;
                 createdStudentsCount++;
 
-                // Enroll student in the class
                 await connection.query(
                   "INSERT INTO enrollments (student_id, class_id) VALUES (?, ?)",
                   [userId, classId]
@@ -309,7 +176,6 @@ export default (pool: Pool, JWT_SECRET: string) => {
         console.error("Error creating class:", error);
         throw error;
       } finally {
-        // Cleanup temporary CSV file
         if (tempCsvPath) {
           await unlink(tempCsvPath).catch((err) =>
             console.error("Failed to cleanup temp CSV file:", err)
@@ -319,8 +185,8 @@ export default (pool: Pool, JWT_SECRET: string) => {
     },
   );
 
-  // 受保护的路由: 获取班级列表
-  classesApi.get("/classes", jwt({ secret: JWT_SECRET }), async (c) => {
+  // GET /api/classes - 获取所有班级
+  classesApi.get("/api/classes", jwt({ secret: JWT_SECRET }), async (c) => {
     try {
       const payload = c.get("jwtPayload");
       if (payload.role !== "Admin") {
@@ -337,9 +203,9 @@ export default (pool: Pool, JWT_SECRET: string) => {
     }
   });
 
-  // 受保护的路由: 获取单个班级详情 (包括学生列表和助教列表)
+  // GET /api/classes/:classId - 获取班级详情
   classesApi.get(
-    "/classes/:classId",
+    "/api/classes/:classId",
     jwt({ secret: JWT_SECRET }),
     zValidator("param", classIdParamSchema),
     async (c) => {
@@ -397,8 +263,9 @@ export default (pool: Pool, JWT_SECRET: string) => {
     },
   );
 
+  // PUT /api/classes/:classId - 更新班级
   classesApi.put(
-    "/classes/:classId",
+    "/api/classes/:classId",
     jwt({ secret: JWT_SECRET }),
     zValidator("param", classIdParamSchema),
     zValidator("json", updateClassSchema),
@@ -462,1192 +329,9 @@ export default (pool: Pool, JWT_SECRET: string) => {
     },
   );
 
-  // 获取指定教师创建的所有班级
-  classesApi.get(
-    "/teachers/:teacherId/classes",
-    jwt({ secret: JWT_SECRET }),
-    zValidator("param", teacherIdParamSchema),
-    async (c) => {
-      try {
-        const payload = c.get("jwtPayload");
-        const { teacherId } = c.req.valid("param");
-        const teacherIdNumber = Number.parseInt(teacherId, 10);
-
-        // Authorization check
-        if (payload.role !== "Admin" && payload.sub !== teacherIdNumber) {
-          return c.json({ error: "Forbidden" }, 403);
-        }
-
-        // Check if the user is actually a teacher
-        const [teacherRows]: any[] = await pool.query(
-          "SELECT role FROM users WHERE user_id = ? AND role = 'Teacher'",
-          [teacherIdNumber],
-        );
-
-        if (teacherRows.length === 0 && payload.role !== "Admin") {
-          // Allow admin to query even if the ID is not a teacher,
-          // but a teacher must be a teacher.
-          return c.json({ error: "Target user is not a teacher" }, 404);
-        }
-
-        const [classRows] = await pool.query(
-          "SELECT c.*, u.full_name as teacher_name FROM classes c JOIN users u ON c.teacher_id = u.user_id WHERE c.teacher_id = ?",
-          [teacherIdNumber],
-        );
-
-        return c.json(classRows);
-      } catch (error) {
-        console.error("Error fetching classes for teacher:", error);
-        throw error;
-      }
-    },
-  );
-
-  // 获取指定助教参与的所有班级
-  classesApi.get(
-    "/assistants/:assistantId/classes",
-    jwt({ secret: JWT_SECRET }),
-    zValidator("param", assistantIdParamSchema),
-    async (c) => {
-      try {
-        const payload = c.get("jwtPayload");
-        const { assistantId } = c.req.valid("param");
-        const assistantIdNumber = Number.parseInt(assistantId, 10);
-
-        // Authorization check: Admin or the assistant themselves
-        if (payload.role !== "Admin" && payload.sub !== assistantIdNumber) {
-          return c.json({ error: "Forbidden" }, 403);
-        }
-
-        // Optional: Check if the user is actually an assistant
-        const [assistantRows]: any[] = await pool.query(
-          "SELECT role FROM users WHERE user_id = ? AND role = 'Assistant'",
-          [assistantIdNumber],
-        );
-
-        if (assistantRows.length === 0 && payload.role !== "Admin") {
-          return c.json({ error: "Target user is not an assistant" }, 404);
-        }
-
-        const [classRows] = await pool.query(
-          `SELECT c.*, u.full_name as teacher_name
-             FROM classes c
-             JOIN class_assistants ca ON c.class_id = ca.class_id
-             JOIN users u ON c.teacher_id = u.user_id
-            WHERE ca.assistant_id = ?`,
-          [assistantIdNumber],
-        );
-
-        return c.json(classRows);
-      } catch (error) {
-        console.error("Error fetching classes for assistant:", error);
-        throw error;
-      }
-    },
-  );
-
-  // --- Assistant Management for a Class ---
-
-  // Add an assistant to a class
-  classesApi.post(
-    "/classes/:classId/assistants",
-    jwt({ secret: JWT_SECRET }),
-    zValidator("param", classIdParamSchema),
-    zValidator("json", addAssistantSchema),
-    async (c) => {
-      try {
-        const payload = c.get("jwtPayload");
-        const { classId } = c.req.valid("param");
-        const classIdNumber = Number.parseInt(classId, 10);
-        const { assistant_id } = c.req.valid("json");
-
-        // 1. Verify class exists and user is the teacher or admin
-        const [classRows]: any[] = await pool.query(
-          "SELECT teacher_id FROM classes WHERE class_id = ?",
-          [classIdNumber],
-        );
-        if (classRows.length === 0) {
-          return c.json({ error: "Class not found" }, 404);
-        }
-        if (payload.role !== "Admin" && payload.sub !== classRows[0].teacher_id) {
-          return c.json({ error: "Forbidden" }, 403);
-        }
-
-        // 2. Verify the user to be added is an assistant
-        const [userRows]: any[] = await pool.query(
-          "SELECT role FROM users WHERE user_id = ?",
-          [assistant_id],
-        );
-        if (userRows.length === 0 || userRows[0].role !== "Assistant") {
-          return c.json({ error: "User is not an assistant" }, 400);
-        }
-
-        // 3. Insert the assignment
-        await pool.query(
-          "INSERT INTO class_assistants (class_id, assistant_id) VALUES (?, ?)",
-          [classIdNumber, assistant_id],
-        );
-
-        return c.json({ message: "Assistant added successfully" }, 201);
-      } catch (error: any) {
-        if (error.code === "ER_DUP_ENTRY") {
-          return c.json({ error: "Assistant already assigned to this class" }, 409);
-        }
-        console.error("Error adding assistant to class:", error);
-        throw error;
-      }
-    },
-  );
-
-  // Remove an assistant from a class
+  // DELETE /api/classes/:classId - 删除班级
   classesApi.delete(
-    "/classes/:classId/assistants/:assistantId",
-    jwt({ secret: JWT_SECRET }),
-    zValidator("param", classAssistantParamSchema),
-    async (c) => {
-      try {
-        const payload = c.get("jwtPayload");
-        const { classId, assistantId } = c.req.valid("param");
-        const classIdNumber = Number.parseInt(classId, 10);
-        const assistantIdNumber = Number.parseInt(assistantId, 10);
-
-        // 1. Verify class exists and user is the teacher or admin
-        const [classRows]: any[] = await pool.query(
-          "SELECT teacher_id FROM classes WHERE class_id = ?",
-          [classIdNumber],
-        );
-        if (classRows.length === 0) {
-          return c.json({ error: "Class not found" }, 404);
-        }
-        if (payload.role !== "Admin" && payload.sub !== classRows[0].teacher_id) {
-          return c.json({ error: "Forbidden" }, 403);
-        }
-
-        // 2. Delete the assignment
-        const [result]: any = await pool.query(
-          "DELETE FROM class_assistants WHERE class_id = ? AND assistant_id = ?",
-          [classIdNumber, assistantIdNumber],
-        );
-
-        if (result.affectedRows === 0) {
-          return c.json({ error: "Assignment not found" }, 404);
-        }
-
-        return c.json({ message: "Assistant removed successfully" });
-      } catch (error) {
-        console.error("Error removing assistant from class:", error);
-        throw error;
-      }
-    },
-  );
-
-  // Get all assistants for a class (restricted access)
-  classesApi.get(
-    "/classes/:classId/assistants",
-    jwt({ secret: JWT_SECRET }),
-    zValidator("param", classIdParamSchema),
-    async (c) => {
-      try {
-        const payload = c.get("jwtPayload");
-        const { classId } = c.req.valid("param");
-        const classIdNumber = Number.parseInt(classId, 10);
-
-        // Authorization: Admin or class owner (teacher) or assigned assistant
-        const [classRows]: any[] = await pool.query(
-          "SELECT teacher_id FROM classes WHERE class_id = ?",
-          [classIdNumber],
-        );
-        if (classRows.length === 0) {
-          return c.json({ error: "Class not found" }, 404);
-        }
-
-        const classOwner = classRows[0].teacher_id;
-        let isAllowed = false;
-        if (payload.role === "Admin" || payload.sub === classOwner) {
-          isAllowed = true;
-        } else if (payload.role === "Assistant") {
-          const [[assignment]]: any[] = await pool.query(
-            "SELECT 1 FROM class_assistants WHERE class_id = ? AND assistant_id = ?",
-            [classIdNumber, payload.sub],
-          );
-          if (assignment) {
-            isAllowed = true;
-          }
-        }
-
-        if (!isAllowed) {
-          return c.json({ error: "Forbidden" }, 403);
-        }
-
-        const [rows] = await pool.query(
-          `SELECT u.user_id, u.username, u.full_name, u.email
-           FROM users u
-           JOIN class_assistants ca ON u.user_id = ca.assistant_id
-           WHERE ca.class_id = ?`,
-          [classIdNumber],
-        );
-
-        return c.json(rows);
-      } catch (error) {
-        console.error("Error fetching assistants for class:", error);
-        throw error;
-      }
-    },
-  );
-
-  // 创建学生并加入指定班级
-  classesApi.post(
-    "/classes/:classId/students",
-    jwt({ secret: JWT_SECRET }),
-    zValidator("param", classIdParamSchema),
-    zValidator("json", createStudentSchema),
-    async (c) => {
-      const payload = c.get("jwtPayload");
-      if (payload.role !== "Admin" && payload.role !== "Teacher") {
-        return c.json({ error: "Forbidden" }, 403);
-      }
-
-      const { classId } = c.req.valid("param");
-      const classIdNumber = Number.parseInt(classId, 10);
-      const { username, full_name, email, phone_number } = c.req.valid("json");
-
-      const connection = await pool.getConnection();
-      try {
-        await connection.beginTransaction();
-
-        const [classRows]: any[] = await connection.query(
-          "SELECT teacher_id FROM classes WHERE class_id = ?",
-          [classIdNumber],
-        );
-
-        if (classRows.length === 0) {
-          await connection.rollback();
-          return c.json({ error: "Class not found" }, 404);
-        }
-
-        const classOwner = classRows[0].teacher_id;
-        if (payload.role === "Teacher" && payload.sub !== classOwner) {
-          await connection.rollback();
-          return c.json({ error: "Forbidden" }, 403);
-        }
-
-        const defaultPasswordHash =
-          "$2b$10$DVZtxD9Efhm/j8.LSWMFx.hfdpk81iHO4Tv0fUaDr1LlW/mFrgXrG";
-        const studentEmail = email || `${username}@student.edu`;
-
-        const [userResult]: any = await connection.query(
-          "INSERT INTO users (username, password_hash, full_name, email, role, phone_number) VALUES (?, ?, ?, ?, 'Student', ?)",
-          [
-            username,
-            defaultPasswordHash,
-            full_name,
-            studentEmail,
-            phone_number || null,
-          ],
-        );
-
-        const newStudentId = userResult.insertId;
-
-        await connection.query(
-          "INSERT INTO enrollments (student_id, class_id) VALUES (?, ?)",
-          [newStudentId, classIdNumber],
-        );
-
-        const [studentRows]: any[] = await connection.query(
-          `SELECT u.user_id,
-                  u.username,
-                  u.full_name,
-                  u.email,
-                  u.phone_number,
-                  u.role,
-                  u.created_at
-             FROM users u
-            WHERE u.user_id = ?
-            LIMIT 1`,
-          [newStudentId],
-        );
-
-        if (studentRows.length === 0) {
-          throw new Error("Failed to load created student record");
-        }
-
-        await connection.commit();
-
-        return c.json(studentRows[0], 201);
-      } catch (error: any) {
-        await connection.rollback();
-
-        if (error.code === "ER_DUP_ENTRY") {
-          if (typeof error.message === "string") {
-            if (error.message.includes("users.username")) {
-              return c.json({ error: "学号已存在" }, 409);
-            }
-            if (error.message.includes("users.email")) {
-              return c.json({ error: "邮箱已存在" }, 409);
-            }
-          }
-          return c.json({ error: "学生创建冲突" }, 409);
-        }
-
-        console.error("Error creating student and enrolling in class:", error);
-        throw error;
-      } finally {
-        connection.release();
-      }
-    },
-  );
-
-  classesApi.get(
-    "/classes/:classId/students",
-    jwt({ secret: JWT_SECRET }),
-    zValidator("param", classIdParamSchema),
-    async (c) => {
-      try {
-        const payload = c.get("jwtPayload");
-        const { classId } = c.req.valid("param");
-        const classIdNumber = Number.parseInt(classId, 10);
-
-        const [classRows]: any[] = await pool.query(
-          "SELECT teacher_id FROM classes WHERE class_id = ?",
-          [classIdNumber],
-        );
-
-        if (classRows.length === 0) {
-          return c.json({ error: "Class not found" }, 404);
-        }
-
-        const classOwner = classRows[0].teacher_id;
-        let isAllowed = false;
-        if (payload.role === "Admin" || payload.sub === classOwner) {
-          isAllowed = true;
-        } else if (payload.role === "Assistant") {
-          const [[assignment]]: any[] = await pool.query(
-            "SELECT 1 FROM class_assistants WHERE class_id = ? AND assistant_id = ?",
-            [classIdNumber, payload.sub],
-          );
-          if (assignment) {
-            isAllowed = true;
-          }
-        }
-
-        if (!isAllowed) {
-          return c.json({ error: "Forbidden" }, 403);
-        }
-
-        const [students] = await pool.query(
-          `SELECT u.user_id, u.username, u.full_name, u.email, u.phone_number, u.role, u.created_at
-             FROM users u
-             JOIN enrollments e ON u.user_id = e.student_id
-            WHERE e.class_id = ?
-            ORDER BY u.full_name ASC`,
-          [classIdNumber],
-        );
-
-        return c.json(students);
-      } catch (error) {
-        console.error("Error fetching students for class:", error);
-        throw error;
-      }
-    },
-  );
-
-  classesApi.get(
-    "/classes/:classId/reports",
-    jwt({ secret: JWT_SECRET }),
-    zValidator("param", classIdParamSchema),
-    async (c) => {
-      try {
-        const payload = c.get("jwtPayload");
-        const { classId } = c.req.valid("param");
-        const classIdNumber = Number.parseInt(classId, 10);
-
-        const [classRows]: any[] = await pool.query(
-          "SELECT teacher_id FROM classes WHERE class_id = ?",
-          [classIdNumber],
-        );
-
-        if (classRows.length === 0) {
-          return c.json({ error: "Class not found" }, 404);
-        }
-
-        const classOwner = classRows[0].teacher_id;
-        let isAllowed = false;
-        if (payload.role === "Admin" || payload.sub === classOwner) {
-          isAllowed = true;
-        } else if (payload.role === "Assistant") {
-          const [[assignment]]: any[] = await pool.query(
-            "SELECT 1 FROM class_assistants WHERE class_id = ? AND assistant_id = ?",
-            [classIdNumber, payload.sub],
-          );
-          if (assignment) {
-            isAllowed = true;
-          }
-        }
-
-        if (!isAllowed) {
-          return c.json({ error: "Forbidden" }, 403);
-        }
-
-        const sql = `
-WITH ClassStudents AS (
-  -- 1. Get all students in the specified class
-  SELECT
-    u.user_id AS student_id,
-    u.username AS student_username,
-    u.full_name AS student_full_name
-  FROM users u
-  JOIN enrollments e ON u.user_id = e.student_id
-  WHERE e.class_id = ?
-),
-RankedReports AS (
-  -- 2. Rank all reports for students in this class by submission date
-  SELECT
-    er.report_id,
-    er.experiment_id,
-    er.student_id,
-    er.report_content,
-    er.pdf_file_path,
-    er.submitted_at,
-    er.grade,
-    er.feedback,
-    er.graded_by,
-    ROW_NUMBER() OVER(PARTITION BY er.student_id ORDER BY er.submitted_at DESC) as rn
-  FROM experiment_reports er
-  WHERE er.student_id IN (SELECT student_id FROM ClassStudents)
-)
--- 3. Left join students with their single latest report (rn=1)
-SELECT
-  cs.student_id,
-  cs.student_username,
-  cs.student_full_name,
-  lr.report_id,
-  lr.experiment_id,
-  lr.report_content,
-  lr.pdf_file_path,
-  lr.submitted_at,
-  lr.grade,
-  lr.feedback,
-  lr.graded_by
-FROM ClassStudents cs
-LEFT JOIN RankedReports lr ON cs.student_id = lr.student_id AND lr.rn = 1
-ORDER BY cs.student_full_name ASC;
-        `;
-
-        const [reports] = await pool.query(sql, [classIdNumber]);
-        return c.json(reports);
-      } catch (error) {
-        console.error("Error fetching class reports:", error);
-        throw error;
-      }
-    },
-  );
-
-  classesApi.get(
-    "/classes/:classId/experiment-status",
-    jwt({ secret: JWT_SECRET }),
-    zValidator("param", classIdParamSchema),
-    async (c) => {
-      try {
-        const payload = c.get("jwtPayload");
-        const { classId } = c.req.valid("param");
-        const classIdNumber = Number.parseInt(classId, 10);
-
-        const [classRows]: any[] = await pool.query(
-          "SELECT teacher_id FROM classes WHERE class_id = ?",
-          [classIdNumber],
-        );
-
-        if (classRows.length === 0) {
-          return c.json({ error: "Class not found" }, 404);
-        }
-
-        const classOwner = classRows[0].teacher_id;
-        let isAllowed = false;
-        if (payload.role === "Admin" || payload.sub === classOwner) {
-          isAllowed = true;
-        } else if (payload.role === "Assistant") {
-          const [[assignment]]: any[] = await pool.query(
-            "SELECT 1 FROM class_assistants WHERE class_id = ? AND assistant_id = ?",
-            [classIdNumber, payload.sub],
-          );
-          if (assignment) {
-            isAllowed = true;
-          }
-        }
-
-        if (!isAllowed) {
-          return c.json({ error: "Forbidden" }, 403);
-        }
-
-        const [statuses] = await pool.query(
-          `SELECT es.experiment_id,
-                  es.student_id,
-                  student.username AS student_username,
-                  student.full_name AS student_full_name,
-                  es.start_time,
-                  es.completion_time,
-                  es.last_activity_at,
-                  es.status,
-                  es.selected_industry,
-                  es.selected_company,
-                  es.selected_product,
-                  es.selected_best_model
-             FROM experiment_status es
-             JOIN enrollments e
-               ON e.student_id = es.student_id
-             JOIN users student
-               ON student.user_id = es.student_id
-            WHERE e.class_id = ?
-            ORDER BY es.student_id ASC, es.start_time DESC`,
-          [classIdNumber],
-        );
-
-        return c.json(statuses);
-      } catch (error) {
-        console.error("Error fetching class experiment status:", error);
-        throw error;
-      }
-    },
-  );
-
-  classesApi.get(
-    "/classes/:classId/grade-weights",
-    jwt({ secret: JWT_SECRET }),
-    zValidator("param", classIdParamSchema),
-    async (c) => {
-      try {
-        const payload = c.get("jwtPayload");
-        const { classId } = c.req.valid("param");
-        const classIdNumber = Number.parseInt(classId, 10);
-
-        // --- Authorization ---
-        const [classRows]: any[] = await pool.query(
-          "SELECT teacher_id FROM classes WHERE class_id = ?",
-          [classIdNumber],
-        );
-
-        if (classRows.length === 0) {
-          return c.json({ error: "Class not found" }, 404);
-        }
-
-        let isAllowed = false;
-        if (payload.role === "Admin") {
-          isAllowed = true;
-        } else if (payload.role === "Teacher" && payload.sub === classRows[0].teacher_id) {
-          isAllowed = true;
-        } else if (payload.role === "Assistant") {
-          const [[assignment]]: any[] = await pool.query(
-            "SELECT 1 FROM class_assistants WHERE class_id = ? AND assistant_id = ?",
-            [classIdNumber, payload.sub],
-          );
-          if (assignment) {
-            isAllowed = true;
-          }
-        }
-
-        if (!isAllowed) {
-          return c.json({ error: "Forbidden" }, 403);
-        }
-        // --- End Authorization ---
-
-        const [rows] = await pool.query(
-          `SELECT class_id, ${gradeWeightFieldNames.join(", ")}
-             FROM grade_weights
-            WHERE class_id = ?
-            LIMIT 1`,
-          [classIdNumber],
-        );
-
-        const record = (rows as any[])[0];
-        if (!record) {
-          return c.json({ error: "Grade weights not found for this class" }, 404);
-        }
-
-        return c.json(normalizeGradeWeightRow(record));
-      } catch (error) {
-        console.error("Error fetching grade weights:", error);
-        throw error;
-      }
-    },
-  );
-
-  classesApi.post(
-    "/classes/:classId/grade-weights",
-    jwt({ secret: JWT_SECRET }),
-    zValidator("param", classIdParamSchema),
-    zValidator("json", gradeWeightsCreateSchema),
-    async (c) => {
-      try {
-        const payload = c.get("jwtPayload");
-        const { classId } = c.req.valid("param");
-        const classIdNumber = Number.parseInt(classId, 10);
-        const body = c.req.valid("json");
-
-        // --- Authorization ---
-        const [classRows]: any[] = await pool.query(
-          "SELECT teacher_id FROM classes WHERE class_id = ?",
-          [classIdNumber],
-        );
-
-        if (classRows.length === 0) {
-          return c.json({ error: "Class not found" }, 404);
-        }
-
-        let isAllowed = false;
-        if (payload.role === "Admin") {
-          isAllowed = true;
-        } else if (payload.role === "Teacher" && payload.sub === classRows[0].teacher_id) {
-          isAllowed = true;
-        } else if (payload.role === "Assistant") {
-          const [[assignment]]: any[] = await pool.query(
-            "SELECT 1 FROM class_assistants WHERE class_id = ? AND assistant_id = ?",
-            [classIdNumber, payload.sub],
-          );
-          if (assignment) {
-            isAllowed = true;
-          }
-        }
-
-        if (!isAllowed) {
-          return c.json({ error: "Forbidden" }, 403);
-        }
-        // --- End Authorization ---
-
-        const [[existingRow]]: any[] = await pool.query(
-          "SELECT class_id FROM grade_weights WHERE class_id = ?",
-          [classIdNumber],
-        );
-        if (existingRow) {
-          return c.json({ error: "Grade weights already exist for this class" }, 409);
-        }
-
-        const insertSql = `INSERT INTO grade_weights (class_id, ${gradeWeightFieldNames.join(", ")}) VALUES (${["?", ...gradeWeightFieldNames.map(() => "?")].join(", ")})`;
-
-        const values = [classIdNumber, ...gradeWeightFieldNames.map((field) => Number(body[field as keyof typeof body]))];
-
-        await pool.query(insertSql, values);
-
-        const [rows] = await pool.query(
-          `SELECT class_id, ${gradeWeightFieldNames.join(", ")}
-             FROM grade_weights
-            WHERE class_id = ?
-            LIMIT 1`,
-          [classIdNumber],
-        );
-
-        return c.json(normalizeGradeWeightRow((rows as any[])[0]), 201);
-      } catch (error) {
-        console.error("Error creating grade weights:", error);
-        throw error;
-      }
-    },
-  );
-
-  classesApi.put(
-    "/classes/:classId/grade-weights",
-    jwt({ secret: JWT_SECRET }),
-    zValidator("param", classIdParamSchema),
-    zValidator("json", gradeWeightsUpdateSchema),
-    async (c) => {
-      try {
-        const payload = c.get("jwtPayload");
-        const { classId } = c.req.valid("param");
-        const classIdNumber = Number.parseInt(classId, 10);
-        const body = c.req.valid("json");
-
-        // --- Authorization ---
-        const [classRows]: any[] = await pool.query(
-          "SELECT teacher_id FROM classes WHERE class_id = ?",
-          [classIdNumber],
-        );
-
-        if (classRows.length === 0) {
-          return c.json({ error: "Class not found" }, 404);
-        }
-
-        let isAllowed = false;
-        if (payload.role === "Admin") {
-          isAllowed = true;
-        } else if (payload.role === "Teacher" && payload.sub === classRows[0].teacher_id) {
-          isAllowed = true;
-        } else if (payload.role === "Assistant") {
-          const [[assignment]]: any[] = await pool.query(
-            "SELECT 1 FROM class_assistants WHERE class_id = ? AND assistant_id = ?",
-            [classIdNumber, payload.sub],
-          );
-          if (assignment) {
-            isAllowed = true;
-          }
-        }
-
-        if (!isAllowed) {
-          return c.json({ error: "Forbidden" }, 403);
-        }
-        // --- End Authorization ---
-
-        const [[existingRow]]: any[] = await pool.query(
-          "SELECT class_id FROM grade_weights WHERE class_id = ?",
-          [classIdNumber],
-        );
-
-        if (!existingRow) {
-          return c.json({ error: "Grade weights not found for this class" }, 404);
-        }
-
-        const updateSql = `UPDATE grade_weights SET ${gradeWeightFieldNames.map((field) => `${field} = ?`).join(", ")} WHERE class_id = ?`;
-        const values = [...gradeWeightFieldNames.map((field) => Number(body[field as keyof typeof body])), classIdNumber];
-
-        await pool.query(updateSql, values);
-
-        const [rows] = await pool.query(
-          `SELECT class_id, ${gradeWeightFieldNames.join(", ")}
-             FROM grade_weights
-            WHERE class_id = ?
-            LIMIT 1`,
-          [classIdNumber],
-        );
-
-        return c.json(normalizeGradeWeightRow((rows as any[])[0]));
-      } catch (error) {
-        console.error("Error updating grade weights:", error);
-        throw error;
-      }
-    },
-  );
-
-  classesApi.get(
-    "/classes/:classId/latest-grades",
-    jwt({ secret: JWT_SECRET }),
-    zValidator("param", classIdParamSchema),
-    async (c) => {
-      try {
-        const payload = c.get("jwtPayload");
-        const { classId } = c.req.valid("param");
-        const classIdNumber = Number.parseInt(classId, 10);
-
-        const [classRows]: any[] = await pool.query(
-          "SELECT teacher_id FROM classes WHERE class_id = ?",
-          [classIdNumber],
-        );
-
-        if (classRows.length === 0) {
-          return c.json({ error: "Class not found" }, 404);
-        }
-
-        const classOwner = classRows[0].teacher_id;
-        let isAllowed = false;
-        if (payload.role === "Admin" || payload.sub === classOwner) {
-          isAllowed = true;
-        } else if (payload.role === "Assistant") {
-          const [[assignment]]: any[] = await pool.query(
-            "SELECT 1 FROM class_assistants WHERE class_id = ? AND assistant_id = ?",
-            [classIdNumber, payload.sub],
-          );
-          if (assignment) {
-            isAllowed = true;
-          }
-        }
-
-        if (!isAllowed) {
-          return c.json({ error: "Forbidden" }, 403);
-        }
-
-        // Fetch all grade weights for this class, including sub-weights
-        const [[gradeWeightsData]]: any[] = await pool.query(
-          "SELECT * FROM grade_weights WHERE class_id = ?",
-          [classIdNumber]
-        );
-
-        if (!gradeWeightsData) {
-          return c.json({ error: "Grade weights for this class have not been set up." }, 404);
-        }
-
-        const sql = `
-WITH ClassStudents AS (
-  -- 1. Get all students for the class
-  SELECT u.user_id, u.username, u.full_name
-  FROM users u JOIN enrollments e ON u.user_id = e.student_id
-  WHERE e.class_id = ?
-),
-LatestCompletedExperiment AS (
-  -- 2. Find the latest COMPLETED experiment for each student
-  SELECT experiment_id, student_id
-  FROM (
-    SELECT
-      es.experiment_id, es.student_id,
-      ROW_NUMBER() OVER(PARTITION BY es.student_id ORDER BY es.completion_time DESC) as rn
-    FROM experiment_status es
-    WHERE es.student_id IN (SELECT user_id FROM ClassStudents) AND es.status = 'Completed'
-  ) ranked_experiments
-  WHERE rn = 1
-),
-ExperimentGrades AS (
-  -- 3. Get all individual exp_flow_* grades and model_quality for the latest experiment
-  SELECT
-    lce.student_id,
-    eg.model_quality,
-    ${expFlowKeys.join(", ")}
-  FROM experiment_grade eg
-  JOIN LatestCompletedExperiment lce ON eg.experiment_id = lce.experiment_id
-),
-QuizScores AS (
-  -- 4. Calculate knowledge_test grade, ONLY if exactly 8 questions were answered.
-  SELECT
-    student_id,
-    CASE
-      -- Only calculate the score if the count of answered questions is exactly 8
-      WHEN COUNT(*) = 8 THEN (SUM(is_correct) * 100.0 / 8.0)
-      -- Otherwise, the score is 0
-      ELSE 0
-    END AS quiz_grade
-  FROM (
-    -- Subquery to rank the latest 8 answers for each student's completed experiment
-    SELECT
-      lce.student_id,
-      qa.is_correct,
-      ROW_NUMBER() OVER(PARTITION BY lce.student_id ORDER BY qa.answered_at DESC) as rn
-    FROM quiz_answers qa
-    JOIN LatestCompletedExperiment lce ON qa.experiment_id = lce.experiment_id
-  ) ranked_answers
-  WHERE rn <= 8
-  GROUP BY student_id
-),
-ReportScores AS (
-  -- 5. Get the report_quality grade for the latest experiment
-  SELECT
-    lce.student_id,
-    er.grade
-  FROM experiment_reports er
-  JOIN LatestCompletedExperiment lce ON er.experiment_id = lce.experiment_id
-)
--- 6. Final Aggregation
-SELECT
-  cs.user_id AS student_id,
-  cs.username AS student_username,
-  cs.full_name AS student_full_name,
-  eg.model_quality AS model_quality_grade,
-  rs.grade AS report_quality_grade,
-  qs.quiz_grade AS knowledge_test_grade,
-  ${expFlowKeys.map(key => `eg.${key}`).join(", ")}
-FROM ClassStudents cs
-LEFT JOIN LatestCompletedExperiment lce ON cs.user_id = lce.student_id
-LEFT JOIN ExperimentGrades eg ON cs.user_id = eg.student_id
-LEFT JOIN QuizScores qs ON cs.user_id = qs.student_id
-LEFT JOIN ReportScores rs ON cs.user_id = rs.student_id
-ORDER BY cs.full_name;
-        `;
-
-        const [studentGradesRaw] = await pool.query(sql, [classIdNumber]);
-
-        // Calculate final weighted grade for each student
-        const finalGrades = (studentGradesRaw as any[]).map(student => {
-          // 1. Calculate weighted exp_flow_grade from sub-items
-          let exp_flow_grade: number | null = null;
-          if (student.exp_flow_demand_data_preparation !== null) {
-            let weightedSum = 0;
-            for (const key of expFlowKeys) {
-              const grade = Number(student[key] ?? 0);
-              const weight = Number(gradeWeightsData[key] ?? 0);
-              weightedSum += (grade * weight) / 100;
-            }
-            exp_flow_grade = weightedSum;
-          }
-
-          // 2. Get other component grades, keeping nulls for the response
-          const model_quality_grade = student.model_quality_grade ?? null;
-          const report_quality_grade = student.report_quality_grade ?? null;
-          const knowledge_test_grade = student.knowledge_test_grade ?? null;
-
-          // 3. Get main weights
-          const mainWeights = {
-            exp_flow: Number(gradeWeightsData.exp_flow ?? 0),
-            model_quality: Number(gradeWeightsData.model_quality ?? 0),
-            knowledge_test: Number(gradeWeightsData.knowledge_test ?? 0),
-            report_quality: Number(gradeWeightsData.report_quality ?? 0),
-          };
-
-          // 4. Calculate final grade, treating nulls as 0 for calculation
-          const final_grade =
-            ((exp_flow_grade ?? 0) * mainWeights.exp_flow) / 100 +
-            ((model_quality_grade ?? 0) * mainWeights.model_quality) / 100 +
-            ((knowledge_test_grade ?? 0) * mainWeights.knowledge_test) / 100 +
-            ((report_quality_grade ?? 0) * mainWeights.report_quality) / 100;
-
-          return {
-            student_id: student.student_id,
-            student_username: student.student_username,
-            student_full_name: student.student_full_name,
-            exp_flow_grade: Math.round(exp_flow_grade ?? 0),
-            model_quality_grade: Math.round(model_quality_grade ?? 0),
-            report_quality_grade: Math.round(report_quality_grade ?? 0),
-            knowledge_test_grade: Math.round(knowledge_test_grade ?? 0),
-            final_grade: Math.round(final_grade),
-          };
-        });
-
-        return c.json(finalGrades);
-      } catch (error) {
-        console.error("Error fetching latest experiment grades:", error);
-        throw error;
-      }
-    },
-  );
-
-  classesApi.put(
-    "/reports/:reportId",
-    jwt({ secret: JWT_SECRET }),
-    zValidator("param", reportIdParamSchema),
-    zValidator("json", updateReportSchema),
-    async (c) => {
-      try {
-        const payload = c.get("jwtPayload");
-        if (payload.role !== "Admin" && payload.role !== "Teacher") {
-          return c.json({ error: "Forbidden" }, 403);
-        }
-
-        const { reportId } = c.req.valid("param");
-        const reportIdNumber = Number.parseInt(reportId, 10);
-
-        const [reportRows]: any[] = await pool.query(
-          "SELECT report_id, experiment_id, student_id FROM experiment_reports WHERE report_id = ?",
-          [reportIdNumber],
-        );
-
-        if (reportRows.length === 0) {
-          return c.json({ error: "Report not found" }, 404);
-        }
-
-        const reportStudentId = reportRows[0].student_id;
-
-        if (payload.role === "Teacher") {
-          const [authRows]: any[] = await pool.query(
-            `SELECT 1
-               FROM classes c
-               JOIN enrollments e ON e.class_id = c.class_id
-              WHERE c.teacher_id = ?
-                AND e.student_id = ?
-              LIMIT 1`,
-            [payload.sub, reportStudentId],
-          );
-
-          if (authRows.length === 0) {
-            return c.json({ error: "Forbidden" }, 403);
-          }
-        }
-
-        const { grade, feedback } = c.req.valid("json");
-        const updateFields: string[] = [];
-        const updateValues: (number | string | null)[] = [];
-
-        if (grade !== undefined) {
-          updateFields.push("grade = ?");
-          updateValues.push(grade);
-        }
-        if (feedback !== undefined) {
-          updateFields.push("feedback = ?");
-          updateValues.push(feedback);
-        }
-
-        updateFields.push("graded_by = ?");
-        updateValues.push(payload.sub);
-
-        updateValues.push(reportIdNumber);
-
-        const updateSql = `
-          UPDATE experiment_reports
-             SET ${updateFields.join(", ")}
-           WHERE report_id = ?
-        `;
-
-        const [updateResult]: any = await pool.query(updateSql, updateValues);
-
-        if (updateResult.affectedRows === 0) {
-          return c.json({ error: "Report not found or not updated" }, 404);
-        }
-
-        const [updatedRows] = await pool.query(
-          `SELECT er.report_id,
-                  er.experiment_id,
-                  er.student_id,
-                  student.username AS student_username,
-                  student.full_name AS student_full_name,
-                  er.report_content,
-                  er.pdf_file_path,
-                  er.submitted_at,
-                  er.grade,
-                  er.feedback,
-                  er.graded_by,
-                  grader.full_name AS graded_by_full_name,
-                  es.status AS experiment_status,
-                  es.selected_industry,
-                  es.selected_company,
-                  es.selected_product
-             FROM experiment_reports er
-             JOIN experiment_status es
-               ON er.experiment_id = es.experiment_id
-              AND er.student_id = es.student_id
-             JOIN users student
-               ON student.user_id = er.student_id
-             LEFT JOIN users grader
-               ON grader.user_id = er.graded_by
-            WHERE er.report_id = ?
-            LIMIT 1`,
-          [reportIdNumber],
-        );
-
-        const updatedReport = (updatedRows as any[])[0];
-        return c.json(updatedReport);
-      } catch (error) {
-        console.error("Error updating class report grading:", error);
-        throw error;
-      }
-    },
-  );
-
-  classesApi.get(
-    "/classes/:classId/step-events",
-    jwt({ secret: JWT_SECRET }),
-    zValidator("param", classIdParamSchema),
-    async (c) => {
-      try {
-        const payload = c.get("jwtPayload");
-        const { classId } = c.req.valid("param");
-        const classIdNumber = Number.parseInt(classId, 10);
-
-        const [classRows]: any[] = await pool.query(
-          "SELECT teacher_id FROM classes WHERE class_id = ?",
-          [classIdNumber],
-        );
-
-        if (classRows.length === 0) {
-          return c.json({ error: "Class not found" }, 404);
-        }
-
-        const classOwner = classRows[0].teacher_id;
-        let isAllowed = false;
-        if (payload.role === "Admin" || payload.sub === classOwner) {
-          isAllowed = true;
-        } else if (payload.role === "Assistant") {
-          const [[assignment]]: any[] = await pool.query(
-            "SELECT 1 FROM class_assistants WHERE class_id = ? AND assistant_id = ?",
-            [classIdNumber, payload.sub],
-          );
-          if (assignment) {
-            isAllowed = true;
-          }
-        }
-
-        if (!isAllowed) {
-          return c.json({ error: "Forbidden" }, 403);
-        }
-
-        const sql = `
-WITH ClassStudents AS (
-  -- 1. Get all students in the class
-  SELECT u.user_id AS student_id, u.username, u.full_name
-  FROM users u JOIN enrollments e ON u.user_id = e.student_id
-  WHERE e.class_id = ? AND u.role = 'Student'
-),
-LatestStudentExperiment AS (
-  -- 2. Find the latest experiment for each student
-  SELECT es.experiment_id, es.student_id,
-         ROW_NUMBER() OVER(PARTITION BY es.student_id ORDER BY es.start_time DESC) as rn
-  FROM experiment_status es
-  WHERE es.student_id IN (SELECT student_id FROM ClassStudents)
-),
-NumberedEvents AS (
-  -- 3. Get all events for the latest experiments, ordered chronologically
-  SELECT
-    lse.student_id,
-    ese.experiment_id,
-    ese.step_order,
-    ese.event_type,
-    ese.event_timestamp,
-    -- Use COALESCE on a 2-argument LAG for better MariaDB compatibility
-    COALESCE(LAG(ese.step_order, 1) OVER(PARTITION BY lse.student_id ORDER BY ese.event_timestamp), 0) as prev_step_order
-  FROM experiment_step_events ese
-  JOIN LatestStudentExperiment lse ON ese.experiment_id = lse.experiment_id AND lse.rn = 1
-),
-JumpBacks AS (
-  -- 4. Identify all "jump back" events
-  SELECT student_id, event_timestamp, step_order
-  FROM NumberedEvents
-  WHERE event_type = 'STARTED' AND step_order < prev_step_order
-),
-LatestResetPoint AS (
-  -- 5. Find the most recent "jump back", which is our reset point
-  SELECT student_id, event_timestamp as reset_timestamp, step_order as reset_step_order
-  FROM (
-    SELECT student_id, event_timestamp, step_order,
-           ROW_NUMBER() OVER(PARTITION BY student_id ORDER BY event_timestamp DESC) as rn
-    FROM JumpBacks
-  ) ranked_jumps
-  WHERE rn = 1
-),
-ValidEvents AS (
-  -- 6. Filter events to get only the "valid" ones for the final sequence
-  SELECT ne.student_id, ne.experiment_id, ne.step_order, ne.event_type, ne.event_timestamp
-  FROM NumberedEvents ne
-  LEFT JOIN LatestResetPoint lrp ON ne.student_id = lrp.student_id
-  WHERE
-    -- Condition A: The student never jumped back, so all events are valid.
-    lrp.student_id IS NULL OR
-    -- Condition B: The event is for a step BEFORE the reset point. These are preserved.
-    ne.step_order < lrp.reset_step_order OR
-    -- Condition C: The event happened AT or AFTER the reset. This is the new sequence.
-    ne.event_timestamp >= lrp.reset_timestamp
-),
-PivotedSteps AS (
-  -- 7. Pivot the valid events into started/completed columns
-  SELECT
-    student_id,
-    experiment_id,
-    step_order,
-    MAX(CASE WHEN event_type = 'STARTED' THEN event_timestamp END) AS started_at,
-    MAX(CASE WHEN event_type = 'COMPLETED' THEN event_timestamp END) AS completed_at
-  FROM ValidEvents
-  GROUP BY student_id, experiment_id, step_order
-)
--- 8. Aggregate everything into the final JSON structure
-SELECT
-  cs.student_id,
-  cs.username,
-  cs.full_name,
-  lse.experiment_id,
-  -- Rely on the mysql2 driver to auto-parse the JSON string
-  CASE
-    WHEN COUNT(ps.step_order) > 0 THEN
-      CONCAT('[',
-        GROUP_CONCAT(
-          JSON_OBJECT(
-            'step_order', ps.step_order,
-            'started_at', ps.started_at,
-            'completed_at', ps.completed_at
-          ) ORDER BY ps.step_order SEPARATOR ','
-        ),
-      ']')
-    ELSE NULL
-  END AS steps
-FROM ClassStudents cs
-LEFT JOIN LatestStudentExperiment lse ON cs.student_id = lse.student_id AND lse.rn = 1
-LEFT JOIN PivotedSteps ps ON cs.student_id = ps.student_id
-GROUP BY cs.student_id, cs.username, cs.full_name, lse.experiment_id
-ORDER BY cs.full_name;
-        `;
-
-        const [results] = await pool.query(sql, [classIdNumber]);
-
-        // mysql2/promise driver automatically parses JSON strings from the database
-        return c.json(results);
-      } catch (error) {
-        console.error("Error fetching class step events:", error);
-        throw error;
-      }
-    },
-  );
-
-  classesApi.delete(
-    "/classes/:classId",
+    "/api/classes/:classId",
     jwt({ secret: JWT_SECRET }),
     zValidator("param", classIdParamSchema),
     async (c) => {
@@ -1683,7 +367,6 @@ ORDER BY cs.full_name;
           "SELECT COUNT(*) as count FROM enrollments WHERE class_id = ?",
           [classIdNumber],
         );
-        // Count grade_weights rows for this class prior to deletion (will be removed via ON DELETE CASCADE)
         const [[gradeWeightsCountRow]]: any[] = await connection.query(
           "SELECT COUNT(*) as count FROM grade_weights WHERE class_id = ?",
           [classIdNumber],
@@ -1718,43 +401,79 @@ ORDER BY cs.full_name;
     },
   );
 
-  classesApi.delete(
-    "/classes/:classId/students/:studentId",
+  // GET /api/teachers/:teacherId/classes - 获取教师的班级
+  classesApi.get(
+    "/api/teachers/:teacherId/classes",
     jwt({ secret: JWT_SECRET }),
-    zValidator("param", classStudentParamSchema),
+    zValidator("param", teacherIdParamSchema),
     async (c) => {
       try {
         const payload = c.get("jwtPayload");
-        const { classId, studentId } = c.req.valid("param");
-        const classIdNumber = Number.parseInt(classId, 10);
-        const studentIdNumber = Number.parseInt(studentId, 10);
+        const { teacherId } = c.req.valid("param");
+        const teacherIdNumber = Number.parseInt(teacherId, 10);
 
-        const [classRows]: any[] = await pool.query(
-          "SELECT teacher_id FROM classes WHERE class_id = ?",
-          [classIdNumber],
-        );
-
-        if (classRows.length === 0) {
-          return c.json({ error: "Class not found" }, 404);
-        }
-
-        const classOwner = classRows[0].teacher_id;
-        if (payload.role !== "Admin" && payload.sub !== classOwner) {
+        if (payload.role !== "Admin" && payload.sub !== teacherIdNumber) {
           return c.json({ error: "Forbidden" }, 403);
         }
 
-        const [result]: any = await pool.query(
-          "DELETE FROM enrollments WHERE class_id = ? AND student_id = ?",
-          [classIdNumber, studentIdNumber],
+        const [teacherRows]: any[] = await pool.query(
+          "SELECT role FROM users WHERE user_id = ? AND role = 'Teacher'",
+          [teacherIdNumber],
         );
 
-        if (result.affectedRows === 0) {
-          return c.json({ error: "Enrollment not found" }, 404);
+        if (teacherRows.length === 0 && payload.role !== "Admin") {
+          return c.json({ error: "Target user is not a teacher" }, 404);
         }
 
-        return c.json({ message: "Student removed from class" });
+        const [classRows] = await pool.query(
+          "SELECT c.*, u.full_name as teacher_name FROM classes c JOIN users u ON c.teacher_id = u.user_id WHERE c.teacher_id = ?",
+          [teacherIdNumber],
+        );
+
+        return c.json(classRows);
       } catch (error) {
-        console.error("Error removing student from class:", error);
+        console.error("Error fetching classes for teacher:", error);
+        throw error;
+      }
+    },
+  );
+
+  // GET /api/assistants/:assistantId/classes - 获取助教的班级
+  classesApi.get(
+    "/api/assistants/:assistantId/classes",
+    jwt({ secret: JWT_SECRET }),
+    zValidator("param", assistantIdParamSchema),
+    async (c) => {
+      try {
+        const payload = c.get("jwtPayload");
+        const { assistantId } = c.req.valid("param");
+        const assistantIdNumber = Number.parseInt(assistantId, 10);
+
+        if (payload.role !== "Admin" && payload.sub !== assistantIdNumber) {
+          return c.json({ error: "Forbidden" }, 403);
+        }
+
+        const [assistantRows]: any[] = await pool.query(
+          "SELECT role FROM users WHERE user_id = ? AND role = 'Assistant'",
+          [assistantIdNumber],
+        );
+
+        if (assistantRows.length === 0 && payload.role !== "Admin") {
+          return c.json({ error: "Target user is not an assistant" }, 404);
+        }
+
+        const [classRows] = await pool.query(
+          `SELECT c.*, u.full_name as teacher_name
+             FROM classes c
+             JOIN class_assistants ca ON c.class_id = ca.class_id
+             JOIN users u ON c.teacher_id = u.user_id
+            WHERE ca.assistant_id = ?`,
+          [assistantIdNumber],
+        );
+
+        return c.json(classRows);
+      } catch (error) {
+        console.error("Error fetching classes for assistant:", error);
         throw error;
       }
     },

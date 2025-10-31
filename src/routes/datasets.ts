@@ -96,7 +96,7 @@ export default (pool: Pool, JWT_SECRET: string) => {
   const datasetsApi = new Hono();
 
   // 管理员: 上传新的数据集
-  datasetsApi.post("/datasets", jwt({ secret: JWT_SECRET }), csvUploadValidator, async (c) => {
+  datasetsApi.post("/api/datasets", jwt({ secret: JWT_SECRET }), csvUploadValidator, async (c) => {
     let tempUploadPath: string | null = null;
     let datasetDirectory: string | null = null;
 
@@ -272,7 +272,7 @@ export default (pool: Pool, JWT_SECRET: string) => {
   });
 
   // 登录用户: 获取所有数据集列表
-  datasetsApi.get("/datasets", jwt({ secret: JWT_SECRET }), async (c) => {
+  datasetsApi.get("/api/datasets", jwt({ secret: JWT_SECRET }), async (c) => {
     try {
       const [rows] = await pool.query<DatasetRow[]>(
         "SELECT * FROM datasets ORDER BY uploaded_at DESC",
@@ -285,7 +285,7 @@ export default (pool: Pool, JWT_SECRET: string) => {
   });
 
   // 登录用户: 获取行业/公司/产品层级信息 - needs to be registered before /datasets/:datasetId
-  datasetsApi.get("/datasets/industries", jwt({ secret: JWT_SECRET }), async (c) => {
+  datasetsApi.get("/api/datasets/industries", jwt({ secret: JWT_SECRET }), async (c) => {
     try {
       const [rows] = await pool.query<IndustryRow[]>(
         "SELECT DISTINCT industry_name FROM dataset_segments ORDER BY industry_name ASC",
@@ -298,7 +298,7 @@ export default (pool: Pool, JWT_SECRET: string) => {
   });
 
   datasetsApi.get(
-    "/datasets/industries/:industry/companies",
+    "/api/datasets/industries/:industry/companies",
     jwt({ secret: JWT_SECRET }),
     zValidator("param", industryParamSchema),
     async (c) => {
@@ -317,7 +317,7 @@ export default (pool: Pool, JWT_SECRET: string) => {
   );
 
   datasetsApi.get(
-    "/datasets/industries/:industry/companies/:company/products",
+    "/api/datasets/industries/:industry/companies/:company/products",
     jwt({ secret: JWT_SECRET }),
     zValidator("param", industryAndCompanyParamSchema),
     async (c) => {
@@ -339,7 +339,7 @@ export default (pool: Pool, JWT_SECRET: string) => {
   );
 
   datasetsApi.get(
-    "/datasets/industries/:industry/companies/:company/products/:product/fields",
+    "/api/datasets/industries/:industry/companies/:company/products/:product/fields",
     jwt({ secret: JWT_SECRET }),
     zValidator("param", industryCompanyProductParamSchema),
     async (c) => {
@@ -408,7 +408,7 @@ export default (pool: Pool, JWT_SECRET: string) => {
   );
 
   datasetsApi.get(
-    "/datasets/industries/:industry/companies/:company/products/:product/sales",
+    "/api/datasets/industries/:industry/companies/:company/products/:product/sales",
     jwt({ secret: JWT_SECRET }),
     zValidator("param", industryCompanyProductParamSchema),
     async (c) => {
@@ -521,7 +521,7 @@ export default (pool: Pool, JWT_SECRET: string) => {
 
   // 登录用户: 获取单个数据集
   datasetsApi.get(
-    "/datasets/:datasetId",
+    "/api/datasets/:datasetId",
     jwt({ secret: JWT_SECRET }),
     zValidator("param", datasetIdParamSchema),
     async (c) => {
@@ -544,7 +544,7 @@ export default (pool: Pool, JWT_SECRET: string) => {
 
   // 管理员: 更新数据集信息
   datasetsApi.put(
-    "/datasets/:datasetId",
+    "/api/datasets/:datasetId",
     jwt({ secret: JWT_SECRET }),
     zValidator("param", datasetIdParamSchema),
     zValidator("json", updateDatasetSchema),
@@ -590,7 +590,7 @@ export default (pool: Pool, JWT_SECRET: string) => {
 
   // 管理员: 删除数据集
   datasetsApi.delete(
-    "/datasets/:datasetId",
+    "/api/datasets/:datasetId",
     jwt({ secret: JWT_SECRET }),
     zValidator("param", datasetIdParamSchema),
     async (c) => {

@@ -6,13 +6,18 @@ import mysql from "mysql2/promise";
 import { serveStatic } from "hono/bun";
 import path from "path";
 // Import route modules
+import authRoutes from "./routes/auth";
 import userRoutes from "./routes/users";
 import classRoutes from "./routes/classes";
+import classMembersRoutes from "./routes/class-members";
+import classGradesRoutes from "./routes/class-grades";
 import manualRoutes from "./routes/manuals";
 import datasetRoutes from "./routes/datasets";
-import gradeRoutes from "./routes/grade";
-import modelApi from "./routes/model";
-import experimentingRoutes from "./routes/experimenting";
+import questionBankRoutes from "./routes/question-bank";
+import quizzesRoutes from "./routes/quizzes";
+import reportsRoutes from "./routes/reports";
+import modelsApi from "./routes/models";
+import experimentsRoutes from "./routes/experiments";
 import toolsRoutes from "./routes/tools";
 
 // --- Custom Logger Middleware ---
@@ -85,18 +90,20 @@ app.use(
 );
 
 // --- Mount Routes ---
-const api = new Hono();
-
-api.route("/", userRoutes(pool, JWT_SECRET));
-api.route("/", classRoutes(pool, JWT_SECRET));
-api.route("/", manualRoutes(pool, JWT_SECRET));
-api.route("/", datasetRoutes(pool, JWT_SECRET));
-api.route("/", gradeRoutes(pool, JWT_SECRET));
-api.route("/", modelApi(pool, JWT_SECRET)); // Model routes are already prefixed with their own paths
-api.route("/", experimentingRoutes(pool, JWT_SECRET));
-api.route("/", toolsRoutes(pool, JWT_SECRET));
-
-app.route("/api", api);
+// All routes now use /api/ prefix directly, so we don't need a nested structure
+app.route("/", authRoutes(pool, JWT_SECRET));
+app.route("/", userRoutes(pool, JWT_SECRET));
+app.route("/", classRoutes(pool, JWT_SECRET));
+app.route("/", classMembersRoutes(pool, JWT_SECRET));
+app.route("/", classGradesRoutes(pool, JWT_SECRET));
+app.route("/", manualRoutes(pool, JWT_SECRET));
+app.route("/", datasetRoutes(pool, JWT_SECRET));
+app.route("/", questionBankRoutes(pool, JWT_SECRET));
+app.route("/", quizzesRoutes(pool, JWT_SECRET));
+app.route("/", reportsRoutes(pool, JWT_SECRET));
+app.route("/", modelsApi(pool, JWT_SECRET));
+app.route("/", experimentsRoutes(pool, JWT_SECRET));
+app.route("/", toolsRoutes(pool, JWT_SECRET));
 
 // --- 404 & Error Handling ---
 app.notFound((c) => c.json({ message: "Not Found" }, 404));
