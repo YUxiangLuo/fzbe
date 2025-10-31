@@ -38,18 +38,6 @@ const updateGradeWeightsSchema = z.object({
 });
 
 const gradeReportSchema = z.object({
-  exp_flow: z.number().min(0).max(100).optional(),
-  exp_flow_demand_data_preparation: z.number().min(0).max(100).optional(),
-  exp_flow_demand_descriptive_stats: z.number().min(0).max(100).optional(),
-  exp_flow_demand_model_selection: z.number().min(0).max(100).optional(),
-  exp_flow_demand_generate_results: z.number().min(0).max(100).optional(),
-  exp_flow_production_inventory_calc: z.number().min(0).max(100).optional(),
-  exp_flow_production_service_level: z.number().min(0).max(100).optional(),
-  exp_flow_production_variable_calc: z.number().min(0).max(100).optional(),
-  exp_flow_production_plan_creation: z.number().min(0).max(100).optional(),
-  exp_flow_report_submission: z.number().min(0).max(100).optional(),
-  model_quality: z.number().min(0).max(100).optional(),
-  knowledge_test: z.number().min(0).max(100).optional(),
   report_quality: z.number().min(0).max(100).optional(),
   feedback: z.string().trim().optional(),
 }).refine((data) => {
@@ -248,54 +236,7 @@ export default (pool: Pool, JWT_SECRET: string) => {
           const fields: string[] = [];
           const values: any[] = [];
 
-          if (gradeData.exp_flow !== undefined) {
-            fields.push("exp_flow = ?");
-            values.push(gradeData.exp_flow);
-          }
-          if (gradeData.exp_flow_demand_data_preparation !== undefined) {
-            fields.push("exp_flow_demand_data_preparation = ?");
-            values.push(gradeData.exp_flow_demand_data_preparation);
-          }
-          if (gradeData.exp_flow_demand_descriptive_stats !== undefined) {
-            fields.push("exp_flow_demand_descriptive_stats = ?");
-            values.push(gradeData.exp_flow_demand_descriptive_stats);
-          }
-          if (gradeData.exp_flow_demand_model_selection !== undefined) {
-            fields.push("exp_flow_demand_model_selection = ?");
-            values.push(gradeData.exp_flow_demand_model_selection);
-          }
-          if (gradeData.exp_flow_demand_generate_results !== undefined) {
-            fields.push("exp_flow_demand_generate_results = ?");
-            values.push(gradeData.exp_flow_demand_generate_results);
-          }
-          if (gradeData.exp_flow_production_inventory_calc !== undefined) {
-            fields.push("exp_flow_production_inventory_calc = ?");
-            values.push(gradeData.exp_flow_production_inventory_calc);
-          }
-          if (gradeData.exp_flow_production_service_level !== undefined) {
-            fields.push("exp_flow_production_service_level = ?");
-            values.push(gradeData.exp_flow_production_service_level);
-          }
-          if (gradeData.exp_flow_production_variable_calc !== undefined) {
-            fields.push("exp_flow_production_variable_calc = ?");
-            values.push(gradeData.exp_flow_production_variable_calc);
-          }
-          if (gradeData.exp_flow_production_plan_creation !== undefined) {
-            fields.push("exp_flow_production_plan_creation = ?");
-            values.push(gradeData.exp_flow_production_plan_creation);
-          }
-          if (gradeData.exp_flow_report_submission !== undefined) {
-            fields.push("exp_flow_report_submission = ?");
-            values.push(gradeData.exp_flow_report_submission);
-          }
-          if (gradeData.model_quality !== undefined) {
-            fields.push("model_quality = ?");
-            values.push(gradeData.model_quality);
-          }
-          if (gradeData.knowledge_test !== undefined) {
-            fields.push("knowledge_test = ?");
-            values.push(gradeData.knowledge_test);
-          }
+
           if (gradeData.report_quality !== undefined) {
             fields.push("report_quality = ?");
             values.push(gradeData.report_quality);

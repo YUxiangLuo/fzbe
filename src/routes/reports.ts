@@ -79,35 +79,6 @@ export default (pool: Pool, JWT_SECRET: string) => {
             pdfPath,
           ]);
 
-          // Now, create the initial grade entry
-          const gradeSql = `
-            INSERT INTO experiment_grade (
-              experiment_id, student_id,
-              exp_flow,
-              exp_flow_demand_data_preparation, exp_flow_demand_descriptive_stats,
-              exp_flow_demand_model_selection, exp_flow_demand_generate_results,
-              exp_flow_production_inventory_calc, exp_flow_production_service_level,
-              exp_flow_production_variable_calc, exp_flow_production_plan_creation,
-              exp_flow_report_submission,
-              model_quality
-            )
-            VALUES (?, ?, 100, 100, 100, 100, 100, 100, 100, 100, 100, 100, 100)
-            ON DUPLICATE KEY UPDATE
-              exp_flow = 100,
-              exp_flow_demand_data_preparation = 100, exp_flow_demand_descriptive_stats = 100,
-              exp_flow_demand_model_selection = 100, exp_flow_demand_generate_results = 100,
-              exp_flow_production_inventory_calc = 100, exp_flow_production_service_level = 100,
-              exp_flow_production_variable_calc = 100, exp_flow_production_plan_creation = 100,
-              exp_flow_report_submission = 100,
-              model_quality = 100,
-              -- Reset other fields in case of re-submission
-              knowledge_test = 0,
-              report_quality = 0,
-              grader_id = NULL
-          `;
-
-          await connection.query(gradeSql, [experiment_id, studentId]);
-
           await connection.commit();
 
           let reportId = reportResult.insertId;

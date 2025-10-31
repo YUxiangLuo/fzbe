@@ -322,15 +322,7 @@ VALUES
 -- 13. Experiment Grades
 -- ========================================================
 
-INSERT INTO `experiment_grade` (`experiment_id`, `student_id`, `grader_id`,
-  `exp_flow`, `exp_flow_demand_data_preparation`, `exp_flow_demand_descriptive_stats`, `exp_flow_demand_model_selection`, `exp_flow_demand_generate_results`,
-  `exp_flow_production_inventory_calc`, `exp_flow_production_service_level`, `exp_flow_production_variable_calc`, `exp_flow_production_plan_creation`,
-  `exp_flow_report_submission`, `knowledge_test`, `model_quality`, `report_quality`, `created_at`)
-VALUES
-(1, 6, 2, 
-  38.5, 90, 88, 95, 92, 
-  85, 90, 88, 95, 
-  92, 100, 85, 92, '2024-02-20 10:00:00');
+INSERT INTO `experiment_grade` (`experiment_id`, `student_id`) VALUES (1, 6);
 
 -- ========================================================
 -- 14. Experiment Manuals

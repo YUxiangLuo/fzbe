@@ -356,22 +356,6 @@ CREATE TABLE `experiment_grade` (
     REFERENCES `users`(`user_id`) 
     ON DELETE SET NULL,
   
-  -- Add constraints to ensure grades are in valid range
-  CONSTRAINT `chk_grades_range` CHECK (
-    `exp_flow` >= 0 AND `exp_flow` <= 100 AND
-    `exp_flow_demand_data_preparation` >= 0 AND `exp_flow_demand_data_preparation` <= 100 AND
-    `exp_flow_demand_descriptive_stats` >= 0 AND `exp_flow_demand_descriptive_stats` <= 100 AND
-    `exp_flow_demand_model_selection` >= 0 AND `exp_flow_demand_model_selection` <= 100 AND
-    `exp_flow_demand_generate_results` >= 0 AND `exp_flow_demand_generate_results` <= 100 AND
-    `exp_flow_production_inventory_calc` >= 0 AND `exp_flow_production_inventory_calc` <= 100 AND
-    `exp_flow_production_service_level` >= 0 AND `exp_flow_production_service_level` <= 100 AND
-    `exp_flow_production_variable_calc` >= 0 AND `exp_flow_production_variable_calc` <= 100 AND
-    `exp_flow_production_plan_creation` >= 0 AND `exp_flow_production_plan_creation` <= 100 AND
-    `exp_flow_report_submission` >= 0 AND `exp_flow_report_submission` <= 100 AND
-    `knowledge_test` >= 0 AND `knowledge_test` <= 100 AND
-    `model_quality` >= 0 AND `model_quality` <= 100 AND
-    `report_quality` >= 0 AND `report_quality` <= 100
-  ),
   INDEX `idx_experiment_grade_experiment_id` (`experiment_id`)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 

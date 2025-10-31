@@ -513,7 +513,11 @@ export default (pool: Pool, JWT_SECRET: string) => {
       const data = c.req.valid("json");
 
       const connection = await pool.getConnection();
+      let transactionStarted = false;
       try {
+        await connection.beginTransaction();
+        transactionStarted = true;
+
         const sanitized = sanitizeForDb({ ...data, student_id: studentId });
         const columns = Object.keys(sanitized);
 
@@ -526,9 +530,19 @@ export default (pool: Pool, JWT_SECRET: string) => {
         );
 
         const experimentId = insertResult.insertId;
+
+        const gradeSql = `INSERT INTO experiment_grade (experiment_id, student_id) VALUES (?, ?)`;
+
+        await connection.query(gradeSql, [experimentId, studentId]);
+
+        await connection.commit();
+
         const row = await fetchExperimentById(pool, experimentId);
         return c.json(normalizeExperimentRow(row!), 201);
       } catch (error) {
+        if (transactionStarted) {
+          await connection.rollback();
+        }
         console.error("Error creating experiment status:", error);
         throw error;
       } finally {
