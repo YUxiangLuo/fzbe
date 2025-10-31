@@ -15,6 +15,8 @@ const BEST_MODEL_VALUES = [
   "ensemble_stacking",
 ] as const;
 const NORMALIZATION_VALUES = ["minmax", "zscore"] as const;
+const CAPACITY_MODE_VALUES = ["scenario", "auto", "custom"] as const;
+const CAPACITY_SCENARIO_VALUES = ["tight", "normal", "abundant"] as const;
 
 const BOOLEAN_FIELDS = new Set<string>([
   "moving_average_completed",
@@ -53,6 +55,8 @@ const INTEGER_FIELDS = new Set<string>([
   "arima_d",
   "arima_q",
   "production_forecast_periods",
+  "production_capacity",
+  "production_custom_capacity",
 ]);
 
 const FLOAT_FIELDS = new Set<string>([
@@ -276,6 +280,16 @@ const optionalFields: Record<string, z.ZodTypeAny> = {
   production_safety_stock_z_score: optionalFloat(),
   production_mps_table: optionalJson,
   production_forecast_results: optionalJson,
+  production_capacity_mode: z
+    .preprocess(stringPreprocess, z.enum(CAPACITY_MODE_VALUES))
+    .nullable()
+    .optional(),
+  production_capacity_scenario: z
+    .preprocess(stringPreprocess, z.enum(CAPACITY_SCENARIO_VALUES))
+    .nullable()
+    .optional(),
+  production_capacity: optionalInt(0),
+  production_custom_capacity: optionalInt(0),
   start_time: optionalString,
   last_activity_at: optionalString,
   completion_time: optionalString,

@@ -136,9 +136,13 @@ CREATE TABLE IF NOT EXISTS `experiment_status` (
   `production_safety_stock_z_score` FLOAT DEFAULT NULL,
   `production_mps_table` JSON DEFAULT NULL,
   `production_forecast_results` JSON DEFAULT NULL,
+  `production_capacity_mode` ENUM('scenario', 'auto', 'custom') DEFAULT NUll,
+  `production_capacity_scenario` ENUM('tight', 'normal', 'abundant') DEFAULT NUll,
+  `production_capacity` INT DEFAULT NULL,
+  `production_custom_capacity` INT DEFAULT NULL,
 
-  `start_time` TIMESTAMP DEFAULT NULL,
-  `last_activity_at` TIMESTAMP DEFAULT NULL,
+  `start_time` TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  `last_activity_at` TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
   `completion_time` TIMESTAMP DEFAULT NULL,
 
   FOREIGN KEY (`student_id`) REFERENCES `users`(`user_id`) ON DELETE CASCADE,
