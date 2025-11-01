@@ -30,7 +30,7 @@ export default (_pool: Pool, JWT_SECRET: string) => {
   toolsApi.use("*", jwt({ secret: JWT_SECRET }));
 
   toolsApi.post(
-    "/api/tools/adf",
+    "/api/v1/tools/adf",
     zValidator("json", adfRequestSchema),
     async (c) => {
       const { series } = c.req.valid("json") as { series: AdfInputPoint[] };

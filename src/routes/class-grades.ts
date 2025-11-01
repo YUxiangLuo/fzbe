@@ -83,9 +83,9 @@ export default (pool: Pool, JWT_SECRET: string) => {
     return Boolean(row);
   };
 
-  // GET /api/classes/:classId/reports - 获取班级报告
+  // GET /api/v1/classes/:classId/reports - 获取班级报告
   classGradesApi.get(
-    "/api/classes/:classId/reports",
+    "/api/v1/classes/:classId/reports",
     jwt({ secret: JWT_SECRET }),
     zValidator("param", classIdParamSchema),
     async (c) => {
@@ -154,9 +154,9 @@ export default (pool: Pool, JWT_SECRET: string) => {
     },
   );
 
-  // PUT /api/reports/:reportId - 批改报告
+  // PUT /api/v1/reports/:reportId - 批改报告
   classGradesApi.put(
-    "/api/reports/:reportId",
+    "/api/v1/reports/:reportId",
     jwt({ secret: JWT_SECRET }),
     zValidator("param", reportIdParamSchema),
     zValidator("json", gradeReportSchema),
@@ -275,9 +275,9 @@ export default (pool: Pool, JWT_SECRET: string) => {
     },
   );
 
-  // GET /api/classes/:classId/experiment-status - 获取班级实验状态
+  // GET /api/v1/classes/:classId/experiment-runs - 获取班级实验状态
   classGradesApi.get(
-    "/api/classes/:classId/experiment-status",
+    "/api/v1/classes/:classId/experiment-runs",
     jwt({ secret: JWT_SECRET }),
     zValidator("param", classIdParamSchema),
     async (c) => {
@@ -351,9 +351,9 @@ export default (pool: Pool, JWT_SECRET: string) => {
     },
   );
 
-  // GET /api/classes/:classId/grade-weights - 获取成绩权重
+  // GET /api/v1/classes/:classId/grading-policy - 获取成绩权重
   classGradesApi.get(
-    "/api/classes/:classId/grade-weights",
+    "/api/v1/classes/:classId/grading-policy",
     jwt({ secret: JWT_SECRET }),
     zValidator("param", classIdParamSchema),
     async (c) => {
@@ -407,9 +407,9 @@ export default (pool: Pool, JWT_SECRET: string) => {
     },
   );
 
-  // PUT /api/classes/:classId/grade-weights - 更新成绩权重
+  // PUT /api/v1/classes/:classId/grading-policy - 更新成绩权重
   classGradesApi.put(
-    "/api/classes/:classId/grade-weights",
+    "/api/v1/classes/:classId/grading-policy",
     jwt({ secret: JWT_SECRET }),
     zValidator("param", classIdParamSchema),
     zValidator("json", updateGradeWeightsSchema),
@@ -509,9 +509,9 @@ export default (pool: Pool, JWT_SECRET: string) => {
     },
   );
 
-  // GET /api/classes/:classId/latest-grades - 获取最新成绩
+  // GET /api/v1/classes/:classId/grade-summaries - 获取最新成绩
   classGradesApi.get(
-    "/api/classes/:classId/latest-grades",
+    "/api/v1/classes/:classId/grade-summaries",
     jwt({ secret: JWT_SECRET }),
     zValidator("param", classIdParamSchema),
     async (c) => {
@@ -631,9 +631,9 @@ export default (pool: Pool, JWT_SECRET: string) => {
     },
   );
 
-  // GET /api/classes/:classId/step-events - 获取步骤事件
+  // GET /api/v1/classes/:classId/experiment-events - 获取步骤事件
   classGradesApi.get(
-    "/api/classes/:classId/step-events",
+    "/api/v1/classes/:classId/experiment-events",
     jwt({ secret: JWT_SECRET }),
     zValidator("param", classIdParamSchema),
     async (c) => {

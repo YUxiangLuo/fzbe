@@ -53,8 +53,8 @@ export default (pool: Pool, JWT_SECRET: string) => {
 
   quizzesApi.use("*", jwt({ secret: JWT_SECRET }));
 
-  // GET /api/quiz/model-questions - 获取模型相关题目
-  quizzesApi.get("/api/quiz/model-questions", async (c) => {
+  // GET /api/v1/quizzes/model/questions - 获取模型相关题目
+  quizzesApi.get("/api/v1/quizzes/model/questions", async (c) => {
     try {
       const payload = c.get("jwtPayload");
       if (payload.role !== "Student") {
@@ -91,8 +91,8 @@ export default (pool: Pool, JWT_SECRET: string) => {
     }
   });
 
-  // GET /api/quiz/plan-questions - 获取生产计划题目
-  quizzesApi.get("/api/quiz/plan-questions", async (c) => {
+  // GET /api/v1/quizzes/plan/questions - 获取生产计划题目
+  quizzesApi.get("/api/v1/quizzes/plan/questions", async (c) => {
     try {
       const payload = c.get("jwtPayload");
       if (payload.role !== "Student") {
@@ -129,9 +129,9 @@ export default (pool: Pool, JWT_SECRET: string) => {
     }
   });
 
-  // POST /api/quiz/answers - 提交答案
+  // POST /api/v1/quizzes/answers - 提交答案
   quizzesApi.post(
-    "/api/quiz/answers",
+    "/api/v1/quizzes/answers",
     zValidator("json", batchSubmitAnswersSchema),
     async (c) => {
       try {

@@ -13,8 +13,8 @@ const loginSchema = z.object({
 export default (pool: Pool, JWT_SECRET: string) => {
   const authApi = new Hono();
 
-  // User login
-  authApi.post("/api/auth/login", zValidator("json", loginSchema), async (c) => {
+  // POST /api/v1/sessions - create an authenticated session (login)
+  authApi.post("/api/v1/sessions", zValidator("json", loginSchema), async (c) => {
     try {
       const { username, password } = c.req.valid("json");
 

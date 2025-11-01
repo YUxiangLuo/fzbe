@@ -90,7 +90,7 @@ app.use(
 );
 
 // --- Mount Routes ---
-// All routes now use /api/ prefix directly, so we don't need a nested structure
+// All routes now use the /api/v1 prefix directly, so we don't need a nested structure
 app.route("/", authRoutes(pool, JWT_SECRET));
 app.route("/", userRoutes(pool, JWT_SECRET));
 app.route("/", classRoutes(pool, JWT_SECRET));

@@ -480,8 +480,8 @@ export default (pool: Pool, JWT_SECRET: string) => {
 
   experimentsApi.use("*", jwt({ secret: JWT_SECRET }));
 
-  // 查询当前学生的实验状态
-  experimentsApi.get("/api/experiment-status/me", async (c) => {
+  // GET /api/v1/students/me/experiment-runs/active - 查询当前学生正在进行的实验状态
+  experimentsApi.get("/api/v1/students/me/experiment-runs/active", async (c) => {
     const payload = c.get("jwtPayload");
     if (payload.role !== "Student") {
       return c.json({ error: "Forbidden" }, 403);
@@ -502,7 +502,7 @@ export default (pool: Pool, JWT_SECRET: string) => {
 
   // 创建新的实验状态记录
   experimentsApi.post(
-    "/api/experiment-status",
+    "/api/v1/students/me/experiment-runs",
     zValidator("json", createExperimentSchema),
     async (c) => {
       const payload = c.get("jwtPayload");
@@ -553,7 +553,7 @@ export default (pool: Pool, JWT_SECRET: string) => {
 
   // 更新指定实验状态
   experimentsApi.put(
-    "/api/experiment-status/:experimentId",
+    "/api/v1/experiment-runs/:experimentId",
     zValidator("param", experimentIdParamSchema),
     zValidator("json", updateExperimentSchema),
     async (c) => {
@@ -609,14 +609,14 @@ export default (pool: Pool, JWT_SECRET: string) => {
   );
 
   const experimentEventSchema = z.object({
-    experiment_id: z.number().int().positive(),
     step_order: z.number().int().min(1).max(7),
     event_type: z.enum(["STARTED", "COMPLETED"]),
   });
 
   // 为实验步骤创建开始/结束事件
   experimentsApi.post(
-    "/api/experiments/events",
+    "/api/v1/experiment-runs/:experimentId/events",
+    zValidator("param", experimentIdParamSchema),
     zValidator("json", experimentEventSchema),
     async (c) => {
       const payload = c.get("jwtPayload");
@@ -624,7 +624,9 @@ export default (pool: Pool, JWT_SECRET: string) => {
         return c.json({ error: "Forbidden" }, 403);
       }
       const studentId = Number.parseInt(payload.sub, 10);
-      const { experiment_id, step_order, event_type } = c.req.valid("json");
+      const { experimentId } = c.req.valid("param");
+      const experiment_id = Number.parseInt(experimentId, 10);
+      const { step_order, event_type } = c.req.valid("json");
 
       const connection = await pool.getConnection();
       try {

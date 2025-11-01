@@ -328,7 +328,7 @@ export default (pool: Pool, JWT_SECRET: string) => {
   // ========== Base Model Training Routes ==========
 
   // MA Training
-  modelsApi.post("/api/model/ma/train", zValidator("json", trainMovingAverageSchema), async (c) => {
+  modelsApi.post("/api/v1/models/ma/training", zValidator("json", trainMovingAverageSchema), async (c) => {
     const payload = c.get("jwtPayload");
     if (payload.role !== "Student") {
       return c.json({ error: "Only students can train models" }, 403);
@@ -369,7 +369,7 @@ export default (pool: Pool, JWT_SECRET: string) => {
   });
 
   // ES Training
-  modelsApi.post("/api/model/es/train", zValidator("json", trainExponentialSmoothingSchema), async (c) => {
+  modelsApi.post("/api/v1/models/es/training", zValidator("json", trainExponentialSmoothingSchema), async (c) => {
     const payload = c.get("jwtPayload");
     if (payload.role !== "Student") {
       return c.json({ error: "Only students can train models" }, 403);
@@ -410,7 +410,7 @@ export default (pool: Pool, JWT_SECRET: string) => {
   });
 
   // ARIMA Training
-  modelsApi.post("/api/model/arima/train", zValidator("json", trainArimaSchema), async (c) => {
+  modelsApi.post("/api/v1/models/arima/training", zValidator("json", trainArimaSchema), async (c) => {
     const payload = c.get("jwtPayload");
     if (payload.role !== "Student") {
       return c.json({ error: "Only students can train models" }, 403);
@@ -451,7 +451,7 @@ export default (pool: Pool, JWT_SECRET: string) => {
   });
 
   // LSTM Training
-  modelsApi.post("/api/model/lstm/train", zValidator("json", trainLstmSchema), async (c) => {
+  modelsApi.post("/api/v1/models/lstm/training", zValidator("json", trainLstmSchema), async (c) => {
     const payload = c.get("jwtPayload");
     if (payload.role !== "Student") {
       return c.json({ error: "Only students can train models" }, 403);
@@ -509,51 +509,78 @@ export default (pool: Pool, JWT_SECRET: string) => {
   // ========== Ensemble Model Training Routes ==========
 
   // Weighted Average Training
-  modelsApi.post("/api/model/weighted-average/train", zValidator("json", trainWeightedAverageSchema), async (c) => {
-    const payload = c.get("jwtPayload");
-    if (payload.role !== "Student") {
-      return c.json({ error: "Only students can train models" }, 403);
-    }
-    const studentId = payload.sub;
-    const body = c.req.valid("json");
-
-    try {
-      const allData = await loadDatasetFromDb(pool, body.selected_industry, body.selected_company, body.selected_product);
-
-      if (body.data_window_evaluate_end_index >= allData.length) {
-        return c.json({ error: "Data window indices out of bounds", dataset_size: allData.length }, 400);
+  modelsApi.post(
+    "/api/v1/models/weighted-average/training",
+    zValidator("json", trainWeightedAverageSchema),
+    async (c) => {
+      const payload = c.get("jwtPayload");
+      if (payload.role !== "Student") {
+        return c.json({ error: "Only students can train models" }, 403);
       }
+      const studentId = payload.sub;
+      const body = c.req.valid("json");
 
-      const { dataFull } = prepareFullData(allData);
-      const modelPaths = body.ensemble_weighted_base_models.map(m =>
-        path.resolve(import.meta.dir, `../../py/trained_models/${studentId}_${m}.${m === "lstm" ? "pt" : "pkl"}`)
-      );
-      const ensembleSaveLoc = path.resolve(import.meta.dir, `../../py/trained_models/${studentId}_weighted_average_config.pkl`);
+      try {
+        const allData = await loadDatasetFromDb(
+          pool,
+          body.selected_industry,
+          body.selected_company,
+          body.selected_product,
+        );
 
-      const result = await runPythonMain([
-        "--method", "weighted_average",
-        "--data", dataFull,
-        "--eval_start", String(body.data_window_evaluate_start_index),
-        "--eval_end", String(body.data_window_evaluate_end_index),
-        "--weight_strategy", body.weight_strategy,
-        "--save_ensemble", ensembleSaveLoc,
-        "--models",
-        ...modelPaths,
-        "--pretty",
-      ], 30000); // 30-second timeout
+        if (body.data_window_evaluate_end_index >= allData.length) {
+          return c.json(
+            { error: "Data window indices out of bounds", dataset_size: allData.length },
+            400,
+          );
+        }
 
-      return c.json({ status: "success", results: result });
-    } catch (error: any) {
-      if (error.message.includes("timed out")) {
-        return c.json({ error: "Training timed out after 10 seconds" }, 504);
+        const { dataFull } = prepareFullData(allData);
+        const modelPaths = body.ensemble_weighted_base_models.map((m) =>
+          path.resolve(
+            import.meta.dir,
+            `../../py/trained_models/${studentId}_${m}.${m === "lstm" ? "pt" : "pkl"}`,
+          )
+        );
+        const ensembleSaveLoc = path.resolve(
+          import.meta.dir,
+          `../../py/trained_models/${studentId}_weighted_average_config.pkl`,
+        );
+
+        const result = await runPythonMain(
+          [
+            "--method",
+            "weighted_average",
+            "--data",
+            dataFull,
+            "--eval_start",
+            String(body.data_window_evaluate_start_index),
+            "--eval_end",
+            String(body.data_window_evaluate_end_index),
+            "--weight_strategy",
+            body.weight_strategy,
+            "--save_ensemble",
+            ensembleSaveLoc,
+            "--models",
+            ...modelPaths,
+            "--pretty",
+          ],
+          30000,
+        ); // 30-second timeout
+
+        return c.json({ status: "success", results: result });
+      } catch (error: any) {
+        if (error.message.includes("timed out")) {
+          return c.json({ error: "Training timed out after 10 seconds" }, 504);
+        }
+        console.error("Weighted Average training error:", error);
+        return c.json({ error: error.message }, 500);
       }
-      console.error("Weighted Average training error:", error);
-      return c.json({ error: error.message }, 500);
-    }
-  });
+    },
+  );
 
   // Boosting Training
-  modelsApi.post("/api/model/boosting/train", zValidator("json", trainBoostingSchema), async (c) => {
+  modelsApi.post("/api/v1/models/boosting/training", zValidator("json", trainBoostingSchema), async (c) => {
     const payload = c.get("jwtPayload");
     if (payload.role !== "Student") {
       return c.json({ error: "Only students can train models" }, 403);
@@ -652,7 +679,7 @@ export default (pool: Pool, JWT_SECRET: string) => {
   });
 
   // Stacking Training
-  modelsApi.post("/api/model/stacking/train", zValidator("json", trainStackingSchema), async (c) => {
+  modelsApi.post("/api/v1/models/stacking/training", zValidator("json", trainStackingSchema), async (c) => {
     const payload = c.get("jwtPayload");
     if (payload.role !== "Student") {
       return c.json({ error: "Only students can train models" }, 403);
@@ -698,7 +725,7 @@ export default (pool: Pool, JWT_SECRET: string) => {
   // ========== Prediction Routes ==========
 
   // Universal Prediction Endpoint
-  modelsApi.post("/api/model/predict", zValidator("json", predictSchema), async (c) => {
+  modelsApi.post("/api/v1/models/predictions", zValidator("json", predictSchema), async (c) => {
     const payload = c.get("jwtPayload");
     if (payload.role !== "Student") {
       return c.json({ error: "Only students can predict" }, 403);

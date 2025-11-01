@@ -7,8 +7,11 @@ import puppeteer from "puppeteer";
 import path from "path";
 import { mkdir } from "node:fs/promises";
 
+const experimentIdParamSchema = z.object({
+  experimentId: z.string().regex(/^\d+$/, { message: "experimentId must be a number" }),
+});
+
 const submitReportSchema = z.object({
-  experiment_id: z.number().int().positive(),
   report_content: z.string().trim().min(1).refine((val) => {
     try {
       // Attempt to decode to see if it's valid Base64
@@ -25,9 +28,10 @@ export default (pool: Pool, JWT_SECRET: string) => {
 
   reportsApi.use("*", jwt({ secret: JWT_SECRET }));
 
-  // POST /api/reports - 提交实验报告
+  // POST /api/v1/experiment-runs/:experimentId/report - 提交实验报告
   reportsApi.post(
-    "/api/reports",
+    "/api/v1/experiment-runs/:experimentId/report",
+    zValidator("param", experimentIdParamSchema),
     zValidator("json", submitReportSchema),
     async (c) => {
       let browser;
@@ -38,7 +42,9 @@ export default (pool: Pool, JWT_SECRET: string) => {
         }
         const studentId = Number.parseInt(payload.sub, 10);
 
-        const { experiment_id, report_content: base64Content } = c.req.valid("json");
+        const { experimentId } = c.req.valid("param");
+        const experiment_id = Number.parseInt(experimentId, 10);
+        const { report_content: base64Content } = c.req.valid("json");
 
         const report_content = Buffer.from(base64Content, "base64").toString("utf-8");
 

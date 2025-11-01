@@ -135,8 +135,8 @@ export default (pool: Pool, JWT_SECRET: string) => {
 
   questionBankApi.use("*", jwt({ secret: JWT_SECRET }));
 
-  // GET /api/question-bank - 获取所有题目
-  questionBankApi.get("/api/question-bank", async (c) => {
+  // GET /api/v1/question-bank/questions - 获取所有题目
+  questionBankApi.get("/api/v1/question-bank/questions", async (c) => {
     try {
       const payload = c.get("jwtPayload");
       if (payload.role !== "Admin" && payload.role !== "Teacher") {
@@ -165,9 +165,9 @@ export default (pool: Pool, JWT_SECRET: string) => {
     }
   });
 
-  // POST /api/question-bank - 创建新题目
+  // POST /api/v1/question-bank/questions - 创建新题目
   questionBankApi.post(
-    "/api/question-bank",
+    "/api/v1/question-bank/questions",
     zValidator("json", createQuestionSchema),
     async (c) => {
       try {
@@ -225,9 +225,9 @@ export default (pool: Pool, JWT_SECRET: string) => {
     },
   );
 
-  // PUT /api/question-bank/:questionId - 更新题目
+  // PUT /api/v1/question-bank/questions/:questionId - 更新题目
   questionBankApi.put(
-    "/api/question-bank/:questionId",
+    "/api/v1/question-bank/questions/:questionId",
     zValidator("param", questionIdParamSchema),
     zValidator("json", updateQuestionSchema),
     async (c) => {
@@ -309,9 +309,9 @@ export default (pool: Pool, JWT_SECRET: string) => {
     },
   );
 
-  // DELETE /api/question-bank/:questionId - 删除题目
+  // DELETE /api/v1/question-bank/questions/:questionId - 删除题目
   questionBankApi.delete(
-    "/api/question-bank/:questionId",
+    "/api/v1/question-bank/questions/:questionId",
     zValidator("param", questionIdParamSchema),
     async (c) => {
       try {

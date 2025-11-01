@@ -89,7 +89,7 @@ export default (pool: Pool, JWT_SECRET: string) => {
 
   // Create an assistant and assign them to classes
   usersApi.post(
-    "/api/assistants",
+    "/api/v1/assistants",
     jwt({ secret: JWT_SECRET }),
     zValidator("json", createAssistantSchema),
     async (c) => {
@@ -186,7 +186,7 @@ export default (pool: Pool, JWT_SECRET: string) => {
 
   // Admin: Create a new teacher user
   usersApi.post(
-    "/api/users/teachers",
+    "/api/v1/users/teachers",
     jwt({ secret: JWT_SECRET }),
     zValidator("json", createTeacherSchema),
     async (c) => {
@@ -231,7 +231,7 @@ export default (pool: Pool, JWT_SECRET: string) => {
 
   // Admin: Batch create teachers via CSV
   usersApi.post(
-    "/api/users/teachers/batch",
+    "/api/v1/users/teachers/batch",
     jwt({ secret: JWT_SECRET }),
     async (c) => {
       let tempCsvPath: string | null = null;
@@ -451,7 +451,7 @@ export default (pool: Pool, JWT_SECRET: string) => {
 
   // Get all assistants associated with a specific teacher through their classes
   usersApi.get(
-    "/api/teachers/:teacherId/assistants",
+    "/api/v1/teachers/:teacherId/assistants",
     jwt({ secret: JWT_SECRET }),
     zValidator("param", teacherIdParamSchema),
     async (c) => {
@@ -490,7 +490,7 @@ export default (pool: Pool, JWT_SECRET: string) => {
 
   // Get all users (Admin only)
   usersApi.get(
-    "/api/users",
+    "/api/v1/users",
     jwt({ secret: JWT_SECRET }),
     zValidator("query", paginationQuerySchema),
     async (c) => {
@@ -532,7 +532,7 @@ export default (pool: Pool, JWT_SECRET: string) => {
   );
 
   // Get all assistants (Admin and Teacher only)
-  usersApi.get("/api/assistants", jwt({ secret: JWT_SECRET }), async (c) => {
+  usersApi.get("/api/v1/assistants", jwt({ secret: JWT_SECRET }), async (c) => {
     try {
       const payload = c.get("jwtPayload");
       if (payload.role !== "Admin" && payload.role !== "Teacher") {
@@ -549,7 +549,7 @@ export default (pool: Pool, JWT_SECRET: string) => {
   });
 
   // Get current user's info
-  usersApi.get("/api/users/me", jwt({ secret: JWT_SECRET }), async (c) => {
+  usersApi.get("/api/v1/users/me", jwt({ secret: JWT_SECRET }), async (c) => {
     try {
       const payload = c.get("jwtPayload");
       const userId = payload.sub;
@@ -590,7 +590,7 @@ export default (pool: Pool, JWT_SECRET: string) => {
 
   // Update current user's info
   usersApi.put(
-    "/api/users/me",
+    "/api/v1/users/me",
     jwt({ secret: JWT_SECRET }),
     zValidator("json", updateUserSchema),
     async (c) => {
@@ -635,7 +635,7 @@ export default (pool: Pool, JWT_SECRET: string) => {
 
   // Change current user's password
   usersApi.put(
-    "/api/users/me/password",
+    "/api/v1/users/me/password",
     jwt({ secret: JWT_SECRET }),
     zValidator("json", changePasswordSchema),
     async (c) => {
@@ -686,7 +686,7 @@ export default (pool: Pool, JWT_SECRET: string) => {
 
   // Get user by ID
   usersApi.get(
-    "/api/users/:userId",
+    "/api/v1/users/:userId",
     jwt({ secret: JWT_SECRET }),
     zValidator("param", userIdParamSchema),
     async (c) => {
@@ -721,7 +721,7 @@ export default (pool: Pool, JWT_SECRET: string) => {
 
   // Admin: Force change user's password
   usersApi.put(
-    "/api/users/:userId/password",
+    "/api/v1/users/:userId/password",
     jwt({ secret: JWT_SECRET }),
     zValidator("param", userIdParamSchema),
     zValidator("json", adminChangePasswordSchema),
@@ -770,7 +770,7 @@ export default (pool: Pool, JWT_SECRET: string) => {
 
   // Teacher/Admin: Reset a student's password to default
   usersApi.post(
-    "/api/users/:userId/reset-password",
+    "/api/v1/users/:userId/reset-password",
     jwt({ secret: JWT_SECRET }),
     zValidator("param", userIdParamSchema),
     async (c) => {
@@ -837,7 +837,7 @@ export default (pool: Pool, JWT_SECRET: string) => {
 
   // Delete user by ID (Admin only)
   usersApi.delete(
-    "/api/users/:userId",
+    "/api/v1/users/:userId",
     jwt({ secret: JWT_SECRET }),
     zValidator("param", userIdParamSchema),
     async (c) => {

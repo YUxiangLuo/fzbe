@@ -57,9 +57,9 @@ export default (pool: Pool, JWT_SECRET: string) => {
     return Boolean(assignment);
   };
 
-  // POST /api/classes - 创建班级 (支持上传学生名单CSV)
+  // POST /api/v1/classes - 创建班级 (支持上传学生名单CSV)
   classesApi.post(
-    "/api/classes",
+    "/api/v1/classes",
     jwt({ secret: JWT_SECRET }),
     async (c) => {
       let tempCsvPath: string | null = null;
@@ -257,8 +257,8 @@ export default (pool: Pool, JWT_SECRET: string) => {
     },
   );
 
-  // GET /api/classes - 获取所有班级
-  classesApi.get("/api/classes", jwt({ secret: JWT_SECRET }), async (c) => {
+  // GET /api/v1/classes - 获取所有班级
+  classesApi.get("/api/v1/classes", jwt({ secret: JWT_SECRET }), async (c) => {
     try {
       const payload = c.get("jwtPayload");
       if (payload.role !== "Admin") {
@@ -275,9 +275,9 @@ export default (pool: Pool, JWT_SECRET: string) => {
     }
   });
 
-  // GET /api/classes/:classId - 获取班级详情
+  // GET /api/v1/classes/:classId - 获取班级详情
   classesApi.get(
-    "/api/classes/:classId",
+    "/api/v1/classes/:classId",
     jwt({ secret: JWT_SECRET }),
     zValidator("param", classIdParamSchema),
     async (c) => {
@@ -343,9 +343,9 @@ export default (pool: Pool, JWT_SECRET: string) => {
     },
   );
 
-  // PUT /api/classes/:classId - 更新班级
+  // PUT /api/v1/classes/:classId - 更新班级
   classesApi.put(
-    "/api/classes/:classId",
+    "/api/v1/classes/:classId",
     jwt({ secret: JWT_SECRET }),
     zValidator("param", classIdParamSchema),
     zValidator("json", updateClassSchema),
@@ -422,9 +422,9 @@ export default (pool: Pool, JWT_SECRET: string) => {
     },
   );
 
-  // DELETE /api/classes/:classId - 删除班级
+  // DELETE /api/v1/classes/:classId - 删除班级
   classesApi.delete(
-    "/api/classes/:classId",
+    "/api/v1/classes/:classId",
     jwt({ secret: JWT_SECRET }),
     zValidator("param", classIdParamSchema),
     async (c) => {
@@ -494,9 +494,9 @@ export default (pool: Pool, JWT_SECRET: string) => {
     },
   );
 
-  // GET /api/teachers/:teacherId/classes - 获取教师的班级
+  // GET /api/v1/teachers/:teacherId/classes - 获取教师的班级
   classesApi.get(
-    "/api/teachers/:teacherId/classes",
+    "/api/v1/teachers/:teacherId/classes",
     jwt({ secret: JWT_SECRET }),
     zValidator("param", teacherIdParamSchema),
     async (c) => {
@@ -531,9 +531,9 @@ export default (pool: Pool, JWT_SECRET: string) => {
     },
   );
 
-  // GET /api/assistants/:assistantId/classes - 获取助教的班级
+  // GET /api/v1/assistants/:assistantId/classes - 获取助教的班级
   classesApi.get(
-    "/api/assistants/:assistantId/classes",
+    "/api/v1/assistants/:assistantId/classes",
     jwt({ secret: JWT_SECRET }),
     zValidator("param", assistantIdParamSchema),
     async (c) => {

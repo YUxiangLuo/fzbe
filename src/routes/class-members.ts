@@ -47,9 +47,9 @@ export default (pool: Pool, JWT_SECRET: string) => {
     return Boolean(assignment);
   };
 
-  // POST /api/classes/:classId/students - 创建学生并加入班级
+  // POST /api/v1/classes/:classId/students - 创建学生并加入班级
   classMembersApi.post(
-    "/api/classes/:classId/students",
+    "/api/v1/classes/:classId/students",
     jwt({ secret: JWT_SECRET }),
     zValidator("param", classIdParamSchema),
     zValidator("json", createStudentSchema),
@@ -166,9 +166,9 @@ export default (pool: Pool, JWT_SECRET: string) => {
     },
   );
 
-  // GET /api/classes/:classId/students - 获取班级学生
+  // GET /api/v1/classes/:classId/students - 获取班级学生
   classMembersApi.get(
-    "/api/classes/:classId/students",
+    "/api/v1/classes/:classId/students",
     jwt({ secret: JWT_SECRET }),
     zValidator("param", classIdParamSchema),
     async (c) => {
@@ -221,9 +221,9 @@ export default (pool: Pool, JWT_SECRET: string) => {
     },
   );
 
-  // DELETE /api/classes/:classId/students/:studentId - 移除学生
+  // DELETE /api/v1/classes/:classId/students/:studentId - 移除学生
   classMembersApi.delete(
-    "/api/classes/:classId/students/:studentId",
+    "/api/v1/classes/:classId/students/:studentId",
     jwt({ secret: JWT_SECRET }),
     zValidator("param", classStudentParamSchema),
     async (c) => {
@@ -278,9 +278,9 @@ export default (pool: Pool, JWT_SECRET: string) => {
     },
   );
 
-  // POST /api/classes/:classId/assistants - 添加助教
+  // POST /api/v1/classes/:classId/assistants - 添加助教
   classMembersApi.post(
-    "/api/classes/:classId/assistants",
+    "/api/v1/classes/:classId/assistants",
     jwt({ secret: JWT_SECRET }),
     zValidator("param", classIdParamSchema),
     zValidator("json", addAssistantSchema),
@@ -326,9 +326,9 @@ export default (pool: Pool, JWT_SECRET: string) => {
     },
   );
 
-  // GET /api/classes/:classId/assistants - 获取班级助教
+  // GET /api/v1/classes/:classId/assistants - 获取班级助教
   classMembersApi.get(
-    "/api/classes/:classId/assistants",
+    "/api/v1/classes/:classId/assistants",
     jwt({ secret: JWT_SECRET }),
     zValidator("param", classIdParamSchema),
     async (c) => {
@@ -379,9 +379,9 @@ export default (pool: Pool, JWT_SECRET: string) => {
     },
   );
 
-  // DELETE /api/classes/:classId/assistants/:assistantId - 移除助教
+  // DELETE /api/v1/classes/:classId/assistants/:assistantId - 移除助教
   classMembersApi.delete(
-    "/api/classes/:classId/assistants/:assistantId",
+    "/api/v1/classes/:classId/assistants/:assistantId",
     jwt({ secret: JWT_SECRET }),
     zValidator("param", classAssistantParamSchema),
     async (c) => {
