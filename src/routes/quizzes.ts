@@ -143,74 +143,115 @@ export default (pool: Pool, JWT_SECRET: string) => {
 
         const { experiment_id, answers: submittedAnswers } = c.req.valid("json");
 
-        const questionIds = submittedAnswers.map(a => a.question_id);
+        const questionIds = submittedAnswers.map((a) => a.question_id);
         if (questionIds.length === 0) {
           return c.json({ error: "No answers provided" }, 400);
         }
 
-        // 1. Fetch all questions' data in one go
-        const placeholders = questionIds.map(() => '?').join(',');
-        const [questionRows]: any[] = await pool.query(
-          `SELECT question_id, correct_answers, knowledge_point FROM question_bank WHERE question_id IN (${placeholders})`,
-          questionIds
-        );
+        const connection = await pool.getConnection();
+        try {
+          await connection.beginTransaction();
 
-        // 2. Create a lookup map for easy access
-        const correctAnswersMap = new Map<number, { answers: string[], knowledge: string }>();
-        for (const row of questionRows) {
-          correctAnswersMap.set(row.question_id, {
-            answers: JSON.parse(row.correct_answers),
-            knowledge: row.knowledge_point || ''
-          });
-        }
-
-        const insertValues: any[] = [];
-        const resultsForFrontend: any[] = [];
-
-        // 3. Process each submitted answer
-        for (const submitted of submittedAnswers) {
-          const questionData = correctAnswersMap.get(submitted.question_id);
-          if (!questionData) {
-            continue; // Skip if the question doesn't exist in the DB
-          }
-
-          const isCorrect =
-            JSON.stringify([...submitted.submitted_answer].sort()) ===
-            JSON.stringify([...questionData.answers].sort());
-
-          // Infer quiz_type from knowledge_point
-          let quiz_type: 'quiz_about_model' | 'quiz_about_plan' = 'quiz_about_model';
-          if (questionData.knowledge.includes('生产计划')) {
-            quiz_type = 'quiz_about_plan';
-          }
-
-          insertValues.push([
-            experiment_id,
-            studentId,
-            submitted.question_id,
-            quiz_type,
-            JSON.stringify(submitted.submitted_answer),
-            isCorrect,
-          ]);
-
-          resultsForFrontend.push({
-            question_id: submitted.question_id,
-            is_correct: isCorrect,
-            correct_answers: questionData.answers,
-          });
-        }
-
-        // 4. Batch insert all processed answers
-        if (insertValues.length > 0) {
-          await pool.query(
-            `INSERT INTO quiz_answers
-               (experiment_id, student_id, question_id, quiz_type, submitted_answer, is_correct)
-             VALUES ?`,
-            [insertValues]
+          // 1. Fetch all questions' data in one go
+          const placeholders = questionIds.map(() => "?").join(",");
+          const [questionRows]: any[] = await connection.query(
+            `SELECT question_id, correct_answers, knowledge_point
+               FROM question_bank
+              WHERE question_id IN (${placeholders})`,
+            questionIds,
           );
-        }
 
-        return c.json(resultsForFrontend, 201);
+          // 2. Create a lookup map for easy access
+          const correctAnswersMap = new Map<number, { answers: string[]; knowledge: string }>();
+          for (const row of questionRows) {
+            correctAnswersMap.set(row.question_id, {
+              answers: Array.isArray(row.correct_answers)
+                ? row.correct_answers
+                : JSON.parse(row.correct_answers),
+              knowledge: row.knowledge_point || "",
+            });
+          }
+
+          const insertValues: any[] = [];
+          const resultsForFrontend: any[] = [];
+
+          // 3. Process each submitted answer
+          for (const submitted of submittedAnswers) {
+            const questionData = correctAnswersMap.get(submitted.question_id);
+            if (!questionData) {
+              continue; // Skip if the question doesn't exist in the DB
+            }
+
+            const isCorrect =
+              JSON.stringify([...submitted.submitted_answer].sort()) ===
+              JSON.stringify([...questionData.answers].sort());
+
+            // Infer quiz_type from knowledge_point
+            let quiz_type: "quiz_about_model" | "quiz_about_plan" = "quiz_about_model";
+            if (questionData.knowledge.includes("生产计划")) {
+              quiz_type = "quiz_about_plan";
+            }
+
+            insertValues.push([
+              experiment_id,
+              studentId,
+              submitted.question_id,
+              quiz_type,
+              JSON.stringify(submitted.submitted_answer),
+              isCorrect,
+            ]);
+
+            resultsForFrontend.push({
+              question_id: submitted.question_id,
+              is_correct: isCorrect,
+              correct_answers: questionData.answers,
+            });
+          }
+
+          // 4. Batch insert all processed answers
+          if (insertValues.length > 0) {
+            await connection.query(
+              `INSERT INTO quiz_answers
+                 (experiment_id, student_id, question_id, quiz_type, submitted_answer, is_correct)
+               VALUES ?`,
+              [insertValues],
+            );
+          }
+
+          // 5. If plan quiz submitted, update knowledge_test score in experiment_grade
+          if (insertValues.some((value) => value[3] === "quiz_about_plan")) {
+            const [[stats]]: any[] = await connection.query(
+              `SELECT
+                 SUM(is_correct) AS correct_count,
+                 COUNT(*) AS total_count
+               FROM quiz_answers
+              WHERE experiment_id = ? AND student_id = ?
+                AND quiz_type IN ('quiz_about_model', 'quiz_about_plan')`,
+              [experiment_id, studentId],
+            );
+
+            const totalCount = Number(stats?.total_count ?? 0);
+            const correctCount = Number(stats?.correct_count ?? 0);
+            const knowledgeScore =
+              totalCount > 0 ? Number(((correctCount / totalCount) * 100).toFixed(2)) : 0;
+
+            await connection.query(
+              `UPDATE experiment_grade
+                  SET knowledge_test = ?
+                WHERE experiment_id = ? AND student_id = ?`,
+              [knowledgeScore, experiment_id, studentId],
+            );
+          }
+
+          await connection.commit();
+          connection.release();
+
+          return c.json(resultsForFrontend, 201);
+        } catch (error) {
+          await connection.rollback();
+          connection.release();
+          throw error;
+        }
 
       } catch (error) {
         console.error("Error submitting batch quiz answers:", error);
