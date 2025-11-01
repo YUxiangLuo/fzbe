@@ -28,6 +28,100 @@ const EXP_FLOW_FIELDS = [
   "exp_flow_report_submission",
 ] as const;
 
+const computeExperimentScores = (
+  row: Record<string, any>,
+  weights: Record<string, number>,
+) => {
+  if (row.experiment_id === null || row.experiment_id === undefined) {
+    return { expFlowScore: null, finalScore: null };
+  }
+
+  let expFlowTotal = 0;
+  for (const field of EXP_FLOW_FIELDS) {
+    const stepScore = Number(row[field] ?? 0);
+    const weight = Number(weights[field] ?? 0);
+    if (Number.isFinite(stepScore) && Number.isFinite(weight)) {
+      expFlowTotal += stepScore * weight;
+    }
+  }
+  const expFlowScore = expFlowTotal / 100;
+
+  const knowledge = Number(row.knowledge_test ?? 0);
+  const modelQuality = Number(row.model_quality ?? 0);
+  const reportQuality = Number(row.report_quality ?? 0);
+  const expWeight = Number(weights.exp_flow_weight ?? 0);
+  const knowledgeWeight = Number(weights.knowledge_test_weight ?? 0);
+  const modelWeight = Number(weights.model_quality_weight ?? 0);
+  const reportWeight = Number(weights.report_quality_weight ?? 0);
+
+  const finalScore =
+    (Number.isFinite(expFlowScore) ? expFlowScore : 0) * (expWeight / 100) +
+    (Number.isFinite(knowledge) ? knowledge : 0) * (knowledgeWeight / 100) +
+    (Number.isFinite(modelQuality) ? modelQuality : 0) * (modelWeight / 100) +
+    (Number.isFinite(reportQuality) ? reportQuality : 0) * (reportWeight / 100);
+
+  return {
+    expFlowScore: Number.isFinite(expFlowScore) ? expFlowScore : null,
+    finalScore: Number.isFinite(finalScore) ? finalScore : null,
+  };
+};
+
+const LATEST_GRADE_SELECTION_SQL = `
+  SELECT
+    u.user_id,
+    u.username,
+    u.full_name,
+    u.email,
+    latest_report.report_id,
+    latest_report.submitted_at AS report_submitted_at,
+    latest_report.pdf_file_path,
+    COALESCE(eg_report.experiment_id, eg_latest.experiment_id) AS experiment_id,
+    COALESCE(eg_report.created_at, eg_latest.created_at) AS graded_at,
+    latest_report.feedback AS feedback,
+    COALESCE(eg_report.exp_flow_demand_data_preparation, eg_latest.exp_flow_demand_data_preparation) AS exp_flow_demand_data_preparation,
+    COALESCE(eg_report.exp_flow_demand_descriptive_stats, eg_latest.exp_flow_demand_descriptive_stats) AS exp_flow_demand_descriptive_stats,
+    COALESCE(eg_report.exp_flow_demand_model_selection, eg_latest.exp_flow_demand_model_selection) AS exp_flow_demand_model_selection,
+    COALESCE(eg_report.exp_flow_demand_generate_results, eg_latest.exp_flow_demand_generate_results) AS exp_flow_demand_generate_results,
+    COALESCE(eg_report.exp_flow_production_inventory_calc, eg_latest.exp_flow_production_inventory_calc) AS exp_flow_production_inventory_calc,
+    COALESCE(eg_report.exp_flow_production_service_level, eg_latest.exp_flow_production_service_level) AS exp_flow_production_service_level,
+    COALESCE(eg_report.exp_flow_production_variable_calc, eg_latest.exp_flow_production_variable_calc) AS exp_flow_production_variable_calc,
+    COALESCE(eg_report.exp_flow_production_plan_creation, eg_latest.exp_flow_production_plan_creation) AS exp_flow_production_plan_creation,
+    COALESCE(eg_report.exp_flow_report_submission, eg_latest.exp_flow_report_submission) AS exp_flow_report_submission,
+    COALESCE(eg_report.knowledge_test, eg_latest.knowledge_test) AS knowledge_test,
+    COALESCE(eg_report.model_quality, eg_latest.model_quality) AS model_quality,
+    COALESCE(eg_report.report_quality, eg_latest.report_quality) AS report_quality
+  FROM enrollments e
+  JOIN users u ON e.student_id = u.user_id
+  LEFT JOIN (
+    SELECT er.*
+    FROM experiment_reports er
+    JOIN (
+      SELECT student_id, MAX(submitted_at) AS max_submitted_at
+      FROM experiment_reports
+      GROUP BY student_id
+    ) recent
+      ON recent.student_id = er.student_id
+     AND recent.max_submitted_at = er.submitted_at
+  ) latest_report ON latest_report.student_id = u.user_id
+  LEFT JOIN experiment_grade eg_report
+    ON latest_report.experiment_id IS NOT NULL
+   AND eg_report.student_id = u.user_id
+   AND eg_report.experiment_id = latest_report.experiment_id
+  LEFT JOIN (
+    SELECT eg_inner.*
+    FROM experiment_grade eg_inner
+    JOIN (
+      SELECT student_id, MAX(created_at) AS max_graded_at
+      FROM experiment_grade
+      GROUP BY student_id
+    ) latest_grade
+      ON latest_grade.student_id = eg_inner.student_id
+     AND latest_grade.max_graded_at = eg_inner.created_at
+  ) eg_latest ON eg_latest.student_id = u.user_id
+  WHERE e.class_id = ?
+  ORDER BY u.username ASC
+`;
+
 const updateGradeWeightsSchema = z.object({
   exp_flow_weight: z.number().min(0).max(100).optional(),
   model_quality_weight: z.number().min(0).max(100).optional(),
@@ -137,27 +231,32 @@ export default (pool: Pool, JWT_SECRET: string) => {
           return c.json({ error: "Forbidden" }, 403);
         }
 
-        // Get all reports for students in this class
         const [reports]: any[] = await pool.query(
           `SELECT
-             er.report_id,
-             er.experiment_id,
-             er.student_id,
+             u.user_id,
              u.username,
              u.full_name,
-             er.submitted_at,
-             er.pdf_file_path,
-             eg.knowledge_test,
-             eg.report_quality,
-             eg.grader_id,
-             grader.full_name as grader_name
-           FROM experiment_reports er
-           JOIN users u ON er.student_id = u.user_id
-           LEFT JOIN experiment_grade eg ON er.experiment_id = eg.experiment_id AND er.student_id = eg.student_id
-           LEFT JOIN users grader ON eg.grader_id = grader.user_id
-           JOIN enrollments e ON u.user_id = e.student_id
+             latest.report_id,
+             latest.experiment_id,
+             latest.submitted_at,
+             latest.pdf_file_path,
+             latest.grade,
+             latest.feedback
+           FROM enrollments e
+           JOIN users u ON e.student_id = u.user_id
+           LEFT JOIN (
+             SELECT er.*
+             FROM experiment_reports er
+             JOIN (
+               SELECT student_id, MAX(submitted_at) AS max_submitted_at
+               FROM experiment_reports
+               GROUP BY student_id
+             ) recent
+               ON recent.student_id = er.student_id
+              AND recent.max_submitted_at = er.submitted_at
+           ) latest ON latest.student_id = u.user_id
            WHERE e.class_id = ?
-           ORDER BY er.submitted_at DESC`,
+           ORDER BY u.username ASC`,
           [classIdNumber],
         );
 
@@ -235,42 +334,56 @@ export default (pool: Pool, JWT_SECRET: string) => {
             return c.json({ error: "Forbidden" }, 403);
           }
 
-          // Build update query for experiment_grade
-          const fields: string[] = [];
-          const values: any[] = [];
-
+          if (
+            gradeData.report_quality === undefined &&
+            gradeData.feedback === undefined
+          ) {
+            await connection.rollback();
+            return c.json({ error: "No fields provided to update" }, 400);
+          }
 
           if (gradeData.report_quality !== undefined) {
-            fields.push("report_quality = ?");
-            values.push(gradeData.report_quality);
+            const [gradeResult]: any = await connection.query(
+              `
+                UPDATE experiment_grade
+                   SET report_quality = ?
+                 WHERE experiment_id = ? AND student_id = ?
+              `,
+              [gradeData.report_quality, experiment_id, student_id],
+            );
+
+            if (gradeResult.affectedRows === 0) {
+              await connection.rollback();
+              return c.json({ error: "Grade record not found" }, 404);
+            }
+          }
+
+          const reportUpdateFields: string[] = [];
+          const reportUpdateValues: any[] = [];
+
+          if (gradeData.report_quality !== undefined) {
+            reportUpdateFields.push("grade = ?");
+            reportUpdateValues.push(gradeData.report_quality);
           }
           if (gradeData.feedback !== undefined) {
-            fields.push("feedback = ?");
-            values.push(gradeData.feedback);
+            reportUpdateFields.push("feedback = ?");
+            reportUpdateValues.push(gradeData.feedback);
           }
 
-          fields.push("grader_id = ?");
-          values.push(payload.sub);
-
-          values.push(experiment_id);
-          values.push(student_id);
-
-          const sql = `
-            UPDATE experiment_grade
-            SET ${fields.join(", ")}
-            WHERE experiment_id = ? AND student_id = ?
-          `;
-
-          const [result]: any = await connection.query(sql, values);
-
-          if (result.affectedRows === 0) {
-            await connection.rollback();
-            return c.json({ error: "Grade record not found" }, 404);
+          if (reportUpdateFields.length > 0) {
+            reportUpdateValues.push(reportIdNumber);
+            await connection.query(
+              `
+                UPDATE experiment_reports
+                   SET ${reportUpdateFields.join(", ")}
+                 WHERE report_id = ?
+              `,
+              reportUpdateValues,
+            );
           }
 
           await connection.commit();
 
-          // Fetch updated grade
           const [updatedGrades]: any[] = await connection.query(
             "SELECT * FROM experiment_grade WHERE experiment_id = ? AND student_id = ?",
             [experiment_id, student_id],
@@ -613,39 +726,7 @@ export default (pool: Pool, JWT_SECRET: string) => {
       const weights = weightRows[0] as Record<string, number>;
 
       const [gradeRows]: any[] = await pool.query(
-        `SELECT
-           u.user_id,
-           u.username,
-           u.full_name,
-           u.email,
-           eg.experiment_id,
-           eg.created_at AS graded_at,
-           eg.grader_id,
-           eg.feedback,
-           eg.exp_flow_demand_data_preparation,
-           eg.exp_flow_demand_descriptive_stats,
-           eg.exp_flow_demand_model_selection,
-           eg.exp_flow_demand_generate_results,
-           eg.exp_flow_production_inventory_calc,
-           eg.exp_flow_production_service_level,
-           eg.exp_flow_production_variable_calc,
-           eg.exp_flow_production_plan_creation,
-           eg.exp_flow_report_submission,
-           eg.knowledge_test,
-           eg.model_quality,
-           eg.report_quality
-         FROM enrollments e
-         JOIN users u ON e.student_id = u.user_id
-         LEFT JOIN (
-           SELECT student_id, MAX(created_at) AS max_graded_at
-           FROM experiment_grade
-           GROUP BY student_id
-         ) latest ON latest.student_id = u.user_id
-         LEFT JOIN experiment_grade eg
-           ON eg.student_id = latest.student_id
-          AND eg.created_at = latest.max_graded_at
-        WHERE e.class_id = ?
-        ORDER BY u.username ASC`,
+        LATEST_GRADE_SELECTION_SQL,
         [classIdNumber],
       );
 
@@ -687,7 +768,6 @@ export default (pool: Pool, JWT_SECRET: string) => {
         "email",
         "experiment_id",
         "graded_at",
-        "grader_id",
         ...EXP_FLOW_FIELDS,
         "knowledge_test",
         "model_quality",
@@ -705,36 +785,11 @@ export default (pool: Pool, JWT_SECRET: string) => {
           ? row.graded_at.toISOString()
           : row.graded_at ?? "";
 
-        let expFlowScore: string = "";
-        let finalScore: string = "";
-
-        if (row.experiment_id !== null && row.experiment_id !== undefined) {
-          let expFlowTotal = 0;
-          for (const field of EXP_FLOW_FIELDS) {
-            const stepScore = Number(row[field] ?? 0);
-            const weight = Number(weights[field] ?? 0);
-            if (Number.isFinite(stepScore) && Number.isFinite(weight)) {
-              expFlowTotal += stepScore * weight;
-            }
-          }
-          const expFlowNumeric = expFlowTotal / 100;
-          const knowledge = Number(row.knowledge_test ?? 0);
-          const modelQuality = Number(row.model_quality ?? 0);
-          const reportQuality = Number(row.report_quality ?? 0);
-          const expWeight = Number(weights.exp_flow_weight ?? 0);
-          const knowledgeWeight = Number(weights.knowledge_test_weight ?? 0);
-          const modelWeight = Number(weights.model_quality_weight ?? 0);
-          const reportWeight = Number(weights.report_quality_weight ?? 0);
-
-          const finalNumeric =
-            expWeight * expFlowNumeric / 100 +
-            knowledgeWeight * knowledge / 100 +
-            modelWeight * modelQuality / 100 +
-            reportWeight * reportQuality / 100;
-
-          expFlowScore = Number.isFinite(expFlowNumeric) ? expFlowNumeric.toFixed(2) : "";
-          finalScore = Number.isFinite(finalNumeric) ? finalNumeric.toFixed(2) : "";
-        }
+        const { expFlowScore, finalScore } = computeExperimentScores(row, weights);
+        const expFlowScoreStr =
+          expFlowScore === null ? "" : Number(expFlowScore).toFixed(2);
+        const finalScoreStr =
+          finalScore === null ? "" : Number(finalScore).toFixed(2);
 
         const rowValues: string[] = [
           toCsvValue(studentId),
@@ -743,13 +798,12 @@ export default (pool: Pool, JWT_SECRET: string) => {
           toCsvValue(row.email),
           toCsvValue(row.experiment_id),
           toCsvValue(graded),
-          toCsvValue(row.grader_id),
           ...EXP_FLOW_FIELDS.map((field) => formatNumeric(row[field])),
           formatNumeric(row.knowledge_test),
           formatNumeric(row.model_quality),
           formatNumeric(row.report_quality),
-          toCsvValue(expFlowScore),
-          toCsvValue(finalScore),
+          toCsvValue(expFlowScoreStr),
+          toCsvValue(finalScoreStr),
           toCsvValue(row.feedback),
         ];
 
@@ -918,72 +972,45 @@ export default (pool: Pool, JWT_SECRET: string) => {
           return c.json({ error: "Forbidden" }, 403);
         }
 
-        // Get latest grades for all students in class
-        const [latestGrades]: any[] = await pool.query(
-          `SELECT
-             base.user_id,
-             base.username,
-             base.full_name,
-             base.experiment_id,
-             base.exp_flow_score,
-             base.model_quality,
-             base.knowledge_test,
-             base.report_quality,
-             base.feedback,
-             base.graded_at,
-             ROUND(
-               COALESCE(base.exp_flow_score, 0) * COALESCE(base.exp_flow_weight, 0) / 100 +
-               COALESCE(base.knowledge_test, 0) * COALESCE(base.knowledge_test_weight, 0) / 100 +
-               COALESCE(base.model_quality, 0) * COALESCE(base.model_quality_weight, 0) / 100 +
-               COALESCE(base.report_quality, 0) * COALESCE(base.report_quality_weight, 0) / 100,
-               2
-             ) AS final_score
-           FROM (
-             SELECT
-               u.user_id,
-               u.username,
-               u.full_name,
-               eg.experiment_id,
-               gw.exp_flow_weight AS exp_flow_weight,
-               gw.knowledge_test_weight AS knowledge_test_weight,
-               gw.model_quality_weight AS model_quality_weight,
-               gw.report_quality_weight AS report_quality_weight,
-               ROUND(
-                 (
-                   COALESCE(eg.exp_flow_demand_data_preparation, 0) * COALESCE(gw.exp_flow_demand_data_preparation, 0) +
-                   COALESCE(eg.exp_flow_demand_descriptive_stats, 0) * COALESCE(gw.exp_flow_demand_descriptive_stats, 0) +
-                   COALESCE(eg.exp_flow_demand_model_selection, 0) * COALESCE(gw.exp_flow_demand_model_selection, 0) +
-                   COALESCE(eg.exp_flow_demand_generate_results, 0) * COALESCE(gw.exp_flow_demand_generate_results, 0) +
-                   COALESCE(eg.exp_flow_production_inventory_calc, 0) * COALESCE(gw.exp_flow_production_inventory_calc, 0) +
-                   COALESCE(eg.exp_flow_production_service_level, 0) * COALESCE(gw.exp_flow_production_service_level, 0) +
-                   COALESCE(eg.exp_flow_production_variable_calc, 0) * COALESCE(gw.exp_flow_production_variable_calc, 0) +
-                   COALESCE(eg.exp_flow_production_plan_creation, 0) * COALESCE(gw.exp_flow_production_plan_creation, 0) +
-                   COALESCE(eg.exp_flow_report_submission, 0) * COALESCE(gw.exp_flow_report_submission, 0)
-                 ) / 100,
-                 2
-               ) AS exp_flow_score,
-               eg.model_quality,
-               eg.knowledge_test,
-               eg.report_quality,
-               eg.feedback,
-               eg.created_at AS graded_at
-             FROM enrollments e
-             JOIN users u ON e.student_id = u.user_id
-             LEFT JOIN (
-               SELECT student_id, MAX(created_at) AS max_graded_at
-               FROM experiment_grade
-               WHERE created_at IS NOT NULL
-               GROUP BY student_id
-             ) latest ON u.user_id = latest.student_id
-             LEFT JOIN experiment_grade eg
-               ON latest.student_id = eg.student_id
-               AND latest.max_graded_at = eg.created_at
-             LEFT JOIN grade_weights gw ON e.class_id = gw.class_id
-             WHERE e.class_id = ?
-           ) AS base
-           ORDER BY base.username ASC`,
+        const [weightRows]: any[] = await pool.query(
+          "SELECT * FROM grade_weights WHERE class_id = ?",
           [classIdNumber],
         );
+
+        if (weightRows.length === 0) {
+          return c.json({ error: "Grade weights not configured for this class" }, 404);
+        }
+
+        const weights = weightRows[0] as Record<string, number>;
+
+        const [gradeRows]: any[] = await pool.query(
+          LATEST_GRADE_SELECTION_SQL,
+          [classIdNumber],
+        );
+
+        const toNumberOrNull = (value: unknown) =>
+          value === null || value === undefined ? null : Number(value);
+
+        const latestGrades = (gradeRows as any[]).map((row: any) => {
+          const { expFlowScore, finalScore } = computeExperimentScores(row, weights);
+          const expFlowScoreRounded =
+            expFlowScore === null ? null : Number(expFlowScore.toFixed(2));
+          const finalScoreRounded =
+            finalScore === null ? null : Number(finalScore.toFixed(2));
+          return {
+            student_id: row.user_id,
+            username: row.username,
+            full_name: row.full_name,
+            experiment_id: row.experiment_id,
+            exp_flow_score: expFlowScoreRounded,
+            model_quality: toNumberOrNull(row.model_quality),
+            knowledge_test: toNumberOrNull(row.knowledge_test),
+            report_quality: toNumberOrNull(row.report_quality),
+            feedback: row.feedback ?? null,
+            graded_at: row.graded_at ?? null,
+            final_score: finalScoreRounded,
+          };
+        });
 
         return c.json(latestGrades);
       } catch (error) {

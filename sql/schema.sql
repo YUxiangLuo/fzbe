@@ -317,8 +317,6 @@ CREATE TABLE `experiment_grade` (
   `grade_id` INT AUTO_INCREMENT PRIMARY KEY,
   `experiment_id` INT NOT NULL,
   `student_id` INT NOT NULL,
-  `grader_id` INT DEFAULT NULL,
-
   -- All following fields have values from 0-100
   `exp_flow_demand_data_preparation` FLOAT DEFAULT 0,
   `exp_flow_demand_descriptive_stats` FLOAT DEFAULT 0,
@@ -343,10 +341,6 @@ CREATE TABLE `experiment_grade` (
     REFERENCES `users`(`user_id`)
     ON DELETE CASCADE,
 
-  FOREIGN KEY (`grader_id`) 
-    REFERENCES `users`(`user_id`) 
-    ON DELETE SET NULL,
-  
   INDEX `idx_experiment_grade_experiment_id` (`experiment_id`)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
