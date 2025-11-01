@@ -3,6 +3,9 @@ import { jwt } from "hono/jwt";
 import { z } from "zod";
 import { zValidator } from "@hono/zod-validator";
 import type { Pool, PoolConnection } from "mysql2/promise";
+import { access, copyFile, mkdtemp, rm } from "node:fs/promises";
+import path from "path";
+import os from "node:os";
 
 // Zod Schemas for Validation
 const classIdParamSchema = z.object({
@@ -12,6 +15,18 @@ const classIdParamSchema = z.object({
 const reportIdParamSchema = z.object({
   reportId: z.string().regex(/^\d+$/, { message: "reportId must be a number" }),
 });
+
+const EXP_FLOW_FIELDS = [
+  "exp_flow_demand_data_preparation",
+  "exp_flow_demand_descriptive_stats",
+  "exp_flow_demand_model_selection",
+  "exp_flow_demand_generate_results",
+  "exp_flow_production_inventory_calc",
+  "exp_flow_production_service_level",
+  "exp_flow_production_variable_calc",
+  "exp_flow_production_plan_creation",
+  "exp_flow_report_submission",
+] as const;
 
 const updateGradeWeightsSchema = z.object({
   exp_flow_weight: z.number().min(0).max(100).optional(),
@@ -404,6 +419,353 @@ export default (pool: Pool, JWT_SECRET: string) => {
         console.error("Error fetching grade weights:", error);
         throw error;
       }
+    },
+  );
+
+  // GET /api/v1/classes/:classId/report-archive - 导出班级报告ZIP
+  classGradesApi.get(
+    "/api/v1/classes/:classId/report-archive",
+    jwt({ secret: JWT_SECRET }),
+    zValidator("param", classIdParamSchema),
+    async (c) => {
+      const payload = c.get("jwtPayload");
+      const { classId } = c.req.valid("param");
+      const classIdNumber = Number.parseInt(classId, 10);
+
+      const [classRows]: any[] = await pool.query(
+        "SELECT teacher_id FROM classes WHERE class_id = ?",
+        [classIdNumber],
+      );
+
+      if (classRows.length === 0) {
+        return c.json({ error: "Class not found" }, 404);
+      }
+
+      let isAllowed = false;
+      if (payload.role === "Admin" || payload.sub === classRows[0].teacher_id) {
+        isAllowed = true;
+      } else if (payload.role === "Assistant") {
+        const assigned = await isAssistantAssignedToClass(
+          pool,
+          classIdNumber,
+          payload.sub,
+        );
+        if (assigned) {
+          isAllowed = true;
+        }
+      }
+
+      if (!isAllowed) {
+        return c.json({ error: "Forbidden" }, 403);
+      }
+
+      const [reports]: any[] = await pool.query(
+        `SELECT
+           er.pdf_file_path,
+           er.experiment_id,
+           er.student_id,
+           u.username,
+           u.full_name
+         FROM enrollments e
+         JOIN users u ON e.student_id = u.user_id
+         JOIN experiment_reports er ON er.student_id = e.student_id
+        WHERE e.class_id = ?
+          AND er.pdf_file_path IS NOT NULL`,
+        [classIdNumber],
+      );
+
+      if (reports.length === 0) {
+        return c.json({ error: "No reports found for this class" }, 404);
+      }
+
+      const tempDir = await mkdtemp(path.join(os.tmpdir(), "class-report-export-"));
+      const copiedFiles: string[] = [];
+      const usedNames = new Set<string>();
+
+      try {
+        for (const report of reports) {
+          const originalPath: string | null = report.pdf_file_path;
+          if (!originalPath) {
+            continue;
+          }
+
+          try {
+            await access(originalPath);
+          } catch {
+            continue;
+          }
+
+          const rawName =
+            (report.username as string | undefined) ||
+            (report.full_name as string | undefined) ||
+            `student_${report.student_id}`;
+          const baseName = `${rawName}_experiment_${report.experiment_id}`
+            .replace(/\s+/g, "_")
+            .replace(/[^a-zA-Z0-9_\-\.]/g, "_");
+
+          let candidate = `${baseName}.pdf`;
+          let suffix = 1;
+          while (usedNames.has(candidate)) {
+            candidate = `${baseName}_${suffix}.pdf`;
+            suffix += 1;
+          }
+          usedNames.add(candidate);
+
+          const destination = path.join(tempDir, candidate);
+          await copyFile(originalPath, destination);
+          copiedFiles.push(destination);
+        }
+
+        if (copiedFiles.length === 0) {
+          return c.json({ error: "No report files available for download" }, 404);
+        }
+
+        const zipFileName = `class-${classIdNumber}-reports.zip`;
+        const zipPath = path.join(tempDir, zipFileName);
+
+        const zipArgs = [
+          "zip",
+          "-j",
+          zipPath,
+          ...copiedFiles.map((filePath) => path.basename(filePath)),
+        ];
+        let zipProcess;
+        try {
+          zipProcess = Bun.spawn(zipArgs, {
+            cwd: tempDir,
+            stdout: "pipe",
+            stderr: "pipe",
+          });
+        } catch (spawnError) {
+          throw new Error(
+            `Failed to start zip command. Ensure 'zip' is installed on the server: ${spawnError}`,
+          );
+        }
+
+        const exitCode = await zipProcess.exited;
+        if (exitCode !== 0) {
+          const errorText = await new Response(zipProcess.stderr).text();
+          throw new Error(`zip command failed: ${errorText}`);
+        }
+
+        const zipFile = Bun.file(zipPath);
+        const zipBytes = await zipFile.arrayBuffer();
+
+        return c.newResponse(zipBytes, {
+          status: 200,
+          headers: {
+            "Content-Type": "application/zip",
+            "Content-Disposition": `attachment; filename="${zipFileName}"`,
+          },
+        });
+      } finally {
+        await rm(tempDir, { recursive: true, force: true });
+      }
+    },
+  );
+
+  // GET /api/v1/classes/:classId/grade-export.csv - 导出最新实验成绩CSV
+  classGradesApi.get(
+    "/api/v1/classes/:classId/grade-export.csv",
+    jwt({ secret: JWT_SECRET }),
+    zValidator("param", classIdParamSchema),
+    async (c) => {
+      const payload = c.get("jwtPayload");
+      const { classId } = c.req.valid("param");
+      const classIdNumber = Number.parseInt(classId, 10);
+
+      const [classRows]: any[] = await pool.query(
+        "SELECT teacher_id FROM classes WHERE class_id = ?",
+        [classIdNumber],
+      );
+
+      if (classRows.length === 0) {
+        return c.json({ error: "Class not found" }, 404);
+      }
+
+      let isAllowed = false;
+      if (payload.role === "Admin" || payload.sub === classRows[0].teacher_id) {
+        isAllowed = true;
+      } else if (payload.role === "Assistant") {
+        const assigned = await isAssistantAssignedToClass(
+          pool,
+          classIdNumber,
+          payload.sub,
+        );
+        if (assigned) {
+          isAllowed = true;
+        }
+      }
+
+      if (!isAllowed) {
+        return c.json({ error: "Forbidden" }, 403);
+      }
+
+      const [weightRows]: any[] = await pool.query(
+        "SELECT * FROM grade_weights WHERE class_id = ?",
+        [classIdNumber],
+      );
+
+      if (weightRows.length === 0) {
+        return c.json({ error: "Grade weights not configured for this class" }, 404);
+      }
+
+      const weights = weightRows[0] as Record<string, number>;
+
+      const [gradeRows]: any[] = await pool.query(
+        `SELECT
+           u.user_id,
+           u.username,
+           u.full_name,
+           u.email,
+           eg.experiment_id,
+           eg.created_at AS graded_at,
+           eg.grader_id,
+           eg.feedback,
+           eg.exp_flow_demand_data_preparation,
+           eg.exp_flow_demand_descriptive_stats,
+           eg.exp_flow_demand_model_selection,
+           eg.exp_flow_demand_generate_results,
+           eg.exp_flow_production_inventory_calc,
+           eg.exp_flow_production_service_level,
+           eg.exp_flow_production_variable_calc,
+           eg.exp_flow_production_plan_creation,
+           eg.exp_flow_report_submission,
+           eg.knowledge_test,
+           eg.model_quality,
+           eg.report_quality
+         FROM enrollments e
+         JOIN users u ON e.student_id = u.user_id
+         LEFT JOIN (
+           SELECT student_id, MAX(created_at) AS max_graded_at
+           FROM experiment_grade
+           GROUP BY student_id
+         ) latest ON latest.student_id = u.user_id
+         LEFT JOIN experiment_grade eg
+           ON eg.student_id = latest.student_id
+          AND eg.created_at = latest.max_graded_at
+        WHERE e.class_id = ?
+        ORDER BY u.username ASC`,
+        [classIdNumber],
+      );
+
+      if (gradeRows.length === 0) {
+        return c.json({ error: "No enrolled students found for this class" }, 404);
+      }
+
+      const toCsvValue = (value: unknown) => {
+        if (value === null || value === undefined) {
+          return "";
+        }
+        let str: string;
+        if (value instanceof Date) {
+          str = value.toISOString();
+        } else {
+          str = String(value);
+        }
+        if (/[",\n]/.test(str)) {
+          return `"${str.replace(/"/g, '""')}"`;
+        }
+        return str;
+      };
+
+      const formatNumeric = (value: unknown) => {
+        if (value === null || value === undefined) {
+          return "";
+        }
+        const num = Number(value);
+        if (!Number.isFinite(num)) {
+          return "";
+        }
+        return num.toFixed(2);
+      };
+
+      const header = [
+        "student_id",
+        "username",
+        "full_name",
+        "email",
+        "experiment_id",
+        "graded_at",
+        "grader_id",
+        ...EXP_FLOW_FIELDS,
+        "knowledge_test",
+        "model_quality",
+        "report_quality",
+        "exp_flow_score",
+        "final_score",
+        "feedback",
+      ];
+
+      const csvLines: string[] = [header.join(",")];
+
+      for (const row of gradeRows) {
+        const studentId = row.user_id;
+        const graded = row.graded_at instanceof Date
+          ? row.graded_at.toISOString()
+          : row.graded_at ?? "";
+
+        let expFlowScore: string = "";
+        let finalScore: string = "";
+
+        if (row.experiment_id !== null && row.experiment_id !== undefined) {
+          let expFlowTotal = 0;
+          for (const field of EXP_FLOW_FIELDS) {
+            const stepScore = Number(row[field] ?? 0);
+            const weight = Number(weights[field] ?? 0);
+            if (Number.isFinite(stepScore) && Number.isFinite(weight)) {
+              expFlowTotal += stepScore * weight;
+            }
+          }
+          const expFlowNumeric = expFlowTotal / 100;
+          const knowledge = Number(row.knowledge_test ?? 0);
+          const modelQuality = Number(row.model_quality ?? 0);
+          const reportQuality = Number(row.report_quality ?? 0);
+          const expWeight = Number(weights.exp_flow_weight ?? 0);
+          const knowledgeWeight = Number(weights.knowledge_test_weight ?? 0);
+          const modelWeight = Number(weights.model_quality_weight ?? 0);
+          const reportWeight = Number(weights.report_quality_weight ?? 0);
+
+          const finalNumeric =
+            expWeight * expFlowNumeric / 100 +
+            knowledgeWeight * knowledge / 100 +
+            modelWeight * modelQuality / 100 +
+            reportWeight * reportQuality / 100;
+
+          expFlowScore = Number.isFinite(expFlowNumeric) ? expFlowNumeric.toFixed(2) : "";
+          finalScore = Number.isFinite(finalNumeric) ? finalNumeric.toFixed(2) : "";
+        }
+
+        const rowValues: string[] = [
+          toCsvValue(studentId),
+          toCsvValue(row.username),
+          toCsvValue(row.full_name),
+          toCsvValue(row.email),
+          toCsvValue(row.experiment_id),
+          toCsvValue(graded),
+          toCsvValue(row.grader_id),
+          ...EXP_FLOW_FIELDS.map((field) => formatNumeric(row[field])),
+          formatNumeric(row.knowledge_test),
+          formatNumeric(row.model_quality),
+          formatNumeric(row.report_quality),
+          toCsvValue(expFlowScore),
+          toCsvValue(finalScore),
+          toCsvValue(row.feedback),
+        ];
+
+        csvLines.push(rowValues.join(","));
+      }
+
+      const csvContent = "\uFEFF" + csvLines.join("\n");
+      const fileName = `class-${classIdNumber}-grades.csv`;
+
+      return c.newResponse(csvContent, {
+        status: 200,
+        headers: {
+          "Content-Type": "text/csv; charset=utf-8",
+          "Content-Disposition": `attachment; filename="${fileName}"`,
+        },
+      });
     },
   );
 
