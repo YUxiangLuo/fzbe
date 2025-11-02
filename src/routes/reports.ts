@@ -26,11 +26,12 @@ const submitReportSchema = z.object({
 export default (pool: Pool, JWT_SECRET: string) => {
   const reportsApi = new Hono();
 
-  reportsApi.use("*", jwt({ secret: JWT_SECRET }));
+  const authMiddleware = jwt({ secret: JWT_SECRET });
 
   // POST /api/v1/experiment-runs/:experimentId/report - 提交实验报告
   reportsApi.post(
     "/api/v1/experiment-runs/:experimentId/report",
+    authMiddleware,
     zValidator("param", experimentIdParamSchema),
     zValidator("json", submitReportSchema),
     async (c) => {

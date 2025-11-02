@@ -60,6 +60,7 @@ CREATE TABLE IF NOT EXISTS `experiment_status` (
 
   -- Values range from 1-7, representing a total of seven steps
   `current_step` INT UNSIGNED NOT NULL DEFAULT 1,
+  `total_active_duration_seconds` INT UNSIGNED NOT NULL DEFAULT 0,
   `selected_industry` VARCHAR(255) DEFAULT NULL,
   `selected_company` VARCHAR(255) DEFAULT NULL,
   `selected_product` VARCHAR(255) DEFAULT NULL,

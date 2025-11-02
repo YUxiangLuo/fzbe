@@ -57,6 +57,7 @@ const INTEGER_FIELDS = new Set<string>([
   "production_forecast_periods",
   "production_capacity",
   "production_custom_capacity",
+  "total_active_duration_seconds",
 ]);
 
 const FLOAT_FIELDS = new Set<string>([
@@ -293,6 +294,7 @@ const optionalFields: Record<string, z.ZodTypeAny> = {
   start_time: optionalString,
   last_activity_at: optionalString,
   completion_time: optionalString,
+  total_active_duration_seconds: optionalInt(0),
 };
 
 const createExperimentSchema = z.object({
@@ -519,6 +521,7 @@ export default (pool: Pool, JWT_SECRET: string) => {
         transactionStarted = true;
 
         const sanitized = sanitizeForDb({ ...data, student_id: studentId });
+        delete sanitized.total_active_duration_seconds;
         const columns = Object.keys(sanitized);
 
         const placeholders = columns.map(() => "?").join(", ");
@@ -568,8 +571,9 @@ export default (pool: Pool, JWT_SECRET: string) => {
       const body = c.req.valid("json");
 
       const sanitized = sanitizeForDb(body);
-      const columns = Object.keys(sanitized);
-      if (columns.length === 0) {
+      delete sanitized.total_active_duration_seconds;
+
+      if (Object.keys(sanitized).length === 0) {
         return c.json({ error: "No fields provided to update" }, 400);
       }
 
@@ -589,6 +593,42 @@ export default (pool: Pool, JWT_SECRET: string) => {
         if (row.student_id !== studentId) {
           return c.json({ error: "Forbidden" }, 403);
         }
+
+        if (Object.prototype.hasOwnProperty.call(sanitized, "last_activity_at")) {
+          const newValue = sanitized["last_activity_at"];
+          let newTimestamp: Date | null = null;
+
+          if (newValue instanceof Date) {
+            newTimestamp = newValue;
+          } else if (typeof newValue === "string") {
+            const parsed = new Date(newValue);
+            if (!Number.isNaN(parsed.getTime())) {
+              newTimestamp = parsed;
+              sanitized["last_activity_at"] = parsed;
+            }
+          }
+
+          const previousLastValue = row.last_activity_at ?? row.start_time ?? null;
+          const previousLast =
+            previousLastValue instanceof Date
+              ? previousLastValue
+              : previousLastValue
+                ? new Date(previousLastValue as string)
+                : null;
+
+          if (newTimestamp && previousLast) {
+            const diffMs = newTimestamp.getTime() - previousLast.getTime();
+            const maxGapMs = 6 * 60 * 60 * 1000;
+            if (diffMs > 0 && diffMs <= maxGapMs) {
+              const prevTotal = Number(row.total_active_duration_seconds ?? 0);
+              const additionalSeconds = Math.max(1, Math.floor(diffMs / 1000));
+              const updatedTotal = prevTotal + additionalSeconds;
+              sanitized.total_active_duration_seconds = updatedTotal;
+            }
+          }
+        }
+
+        const columns = Object.keys(sanitized);
 
         const assignments = columns.map((col) => `${col} = ?`).join(", ");
         const values = columns.map((key) => sanitized[key]);
@@ -629,6 +669,7 @@ export default (pool: Pool, JWT_SECRET: string) => {
       const { step_order, event_type } = c.req.valid("json");
 
       const connection = await pool.getConnection();
+      let transactionStarted = false;
       try {
         // 验证该实验是否属于当前学生
         const [experimentRows] = await connection.query<RowDataPacket[]>(
@@ -646,6 +687,7 @@ export default (pool: Pool, JWT_SECRET: string) => {
         // --- 新的优化逻辑开始 ---
         if (event_type === "COMPLETED") {
           await connection.beginTransaction();
+          transactionStarted = true;
 
           // 1. 获取当前实验最新的事件，并锁定该行以待更新
           const [latestEventRows] = await connection.query<RowDataPacket[]>(
@@ -681,7 +723,7 @@ export default (pool: Pool, JWT_SECRET: string) => {
         );
 
         // 如果在事务中，则提交
-        if (event_type === "COMPLETED") {
+        if (transactionStarted) {
           await connection.commit();
         }
 
@@ -692,7 +734,7 @@ export default (pool: Pool, JWT_SECRET: string) => {
 
       } catch (error) {
         // 如果在事务中且发生错误，则回滚
-        if (connection.connection._fatalError === null && event_type === "COMPLETED") {
+        if (transactionStarted) {
           await connection.rollback();
         }
         console.error("Error creating experiment step event:", error);

@@ -28,6 +28,27 @@ const EXP_FLOW_FIELDS = [
   "exp_flow_report_submission",
 ] as const;
 
+const STEP_COUNT = 7;
+
+const toIsoString = (value: unknown): string | null => {
+  if (!value) {
+    return null;
+  }
+  if (value instanceof Date) {
+    return value.toISOString();
+  }
+  if (typeof value === "string") {
+    const trimmed = value.trim();
+    if (!trimmed) {
+      return null;
+    }
+    const parsed = new Date(trimmed);
+    return Number.isNaN(parsed.getTime()) ? null : parsed.toISOString();
+  }
+  const parsed = new Date(value as any);
+  return Number.isNaN(parsed.getTime()) ? null : parsed.toISOString();
+};
+
 const computeExperimentScores = (
   row: Record<string, any>,
   weights: Record<string, number>,
@@ -66,6 +87,128 @@ const computeExperimentScores = (
   };
 };
 
+type RawStepEvent = {
+  event_id: number;
+  experiment_id: number;
+  student_id: number;
+  step_order: number;
+  event_type: "STARTED" | "COMPLETED";
+  event_timestamp: unknown;
+};
+
+type NormalizedStepEvent = {
+  event_id: number;
+  experiment_id: number;
+  student_id: number;
+  step_order: number;
+  event_type: "STARTED" | "COMPLETED";
+  event_timestamp: string | null;
+};
+
+type StepSummary = {
+  step_order: number;
+  started_at: string | null;
+  completed_at: string | null;
+  latest_event_type: "STARTED" | "COMPLETED" | null;
+};
+
+const createEmptyStepSummaries = (): StepSummary[] =>
+  Array.from({ length: STEP_COUNT }, (_, index) => ({
+    step_order: index + 1,
+    started_at: null,
+    completed_at: null,
+    latest_event_type: null,
+  }));
+
+const buildNormalizedStepTimeline = (events: RawStepEvent[]) => {
+  if (!events.length) {
+    return { timeline: [] as NormalizedStepEvent[], steps: createEmptyStepSummaries() };
+  }
+
+  const steps = createEmptyStepSummaries();
+  const timeline: NormalizedStepEvent[] = [];
+  let highestRetainedStep = 0;
+
+  const recomputeHighest = () => {
+    highestRetainedStep = 0;
+    for (const item of timeline) {
+      if (item.step_order > highestRetainedStep) {
+        highestRetainedStep = item.step_order;
+      }
+    }
+  };
+
+  const dropStepsFrom = (step: number) => {
+    for (let i = timeline.length - 1; i >= 0; i--) {
+      if (timeline[i].step_order >= step) {
+        timeline.splice(i, 1);
+      }
+    }
+    for (let s = step; s <= STEP_COUNT; s++) {
+      const idx = s - 1;
+      steps[idx] = {
+        step_order: s,
+        started_at: null,
+        completed_at: null,
+        latest_event_type: null,
+      };
+    }
+    recomputeHighest();
+  };
+
+  for (const rawEvent of events) {
+    const step = Number(rawEvent.step_order);
+    if (!Number.isInteger(step) || step < 1 || step > STEP_COUNT) {
+      continue;
+    }
+
+    const normalizedEvent: NormalizedStepEvent = {
+      event_id: rawEvent.event_id,
+      experiment_id: rawEvent.experiment_id,
+      student_id: rawEvent.student_id,
+      step_order: step,
+      event_type: rawEvent.event_type,
+      event_timestamp: toIsoString(rawEvent.event_timestamp),
+    };
+
+    if (rawEvent.event_type === "STARTED") {
+      if (step <= highestRetainedStep) {
+        dropStepsFrom(step);
+      }
+      timeline.push(normalizedEvent);
+      const stepRecord = steps[step - 1];
+      stepRecord.started_at = normalizedEvent.event_timestamp;
+      stepRecord.completed_at = null;
+      stepRecord.latest_event_type = "STARTED";
+      if (step > highestRetainedStep) {
+        highestRetainedStep = step;
+      }
+      continue;
+    }
+
+    if (rawEvent.event_type === "COMPLETED") {
+      for (let i = timeline.length - 1; i >= 0; i--) {
+        if (
+          timeline[i].step_order === step &&
+          timeline[i].event_type === "COMPLETED"
+        ) {
+          timeline.splice(i, 1);
+          break;
+        }
+      }
+      timeline.push(normalizedEvent);
+      const stepRecord = steps[step - 1];
+      stepRecord.completed_at = normalizedEvent.event_timestamp;
+      stepRecord.latest_event_type = "COMPLETED";
+      if (step > highestRetainedStep) {
+        highestRetainedStep = step;
+      }
+    }
+  }
+
+  return { timeline, steps };
+};
+
 const LATEST_GRADE_SELECTION_SQL = `
   SELECT
     u.user_id,
@@ -74,7 +217,6 @@ const LATEST_GRADE_SELECTION_SQL = `
     u.email,
     latest.experiment_id,
     latest.start_time AS experiment_started_at,
-    grade.created_at AS grade_created_at,
     grade.exp_flow_demand_data_preparation,
     grade.exp_flow_demand_descriptive_stats,
     grade.exp_flow_demand_model_selection,
@@ -110,6 +252,20 @@ const LATEST_GRADE_SELECTION_SQL = `
   ORDER BY u.username ASC
 `;
 
+const optionalGradeValue = z
+  .number()
+  .min(0, { message: "grade must be between 0 and 100" })
+  .max(100, { message: "grade must be between 0 and 100" })
+  .optional();
+
+const optionalFeedbackValue = z
+  .string()
+  .transform((value) => {
+    const trimmed = value.trim();
+    return trimmed.length ? trimmed : null;
+  })
+  .optional();
+
 const updateGradeWeightsSchema = z.object({
   exp_flow_weight: z.number().min(0).max(100).optional(),
   model_quality_weight: z.number().min(0).max(100).optional(),
@@ -122,15 +278,17 @@ const updateGradeWeightsSchema = z.object({
   message: "At least one weight field must be provided",
 });
 
-const gradeReportSchema = z.object({
-  report_quality: z.number().min(0).max(100).optional(),
-  feedback: z.string().trim().optional(),
-}).refine((data) => {
-  // At least one field must be provided
-  return Object.values(data).some(v => v !== undefined);
-}, {
-  message: "At least one grade field must be provided",
-});
+const gradeReportSchema = z
+  .object({
+    grade: optionalGradeValue,
+    feedback: optionalFeedbackValue,
+  })
+  .refine(
+    (data) => data.grade !== undefined || data.feedback !== undefined,
+    {
+      message: "At least one grade field must be provided",
+    },
+  );
 
 export default (pool: Pool, JWT_SECRET: string) => {
   const classGradesApi = new Hono();
@@ -229,7 +387,8 @@ export default (pool: Pool, JWT_SECRET: string) => {
              latest.submitted_at,
              latest.pdf_file_path,
              latest.grade,
-             latest.feedback
+             latest.feedback,
+             grader.full_name AS grader_name
            FROM enrollments e
            JOIN users u ON e.student_id = u.user_id
            LEFT JOIN (
@@ -239,10 +398,11 @@ export default (pool: Pool, JWT_SECRET: string) => {
                SELECT student_id, MAX(submitted_at) AS max_submitted_at
                FROM experiment_reports
                GROUP BY student_id
-             ) recent
-               ON recent.student_id = er.student_id
-              AND recent.max_submitted_at = er.submitted_at
+              ) recent
+                ON recent.student_id = er.student_id
+               AND recent.max_submitted_at = er.submitted_at
            ) latest ON latest.student_id = u.user_id
+           LEFT JOIN users grader ON latest.graded_by = grader.user_id
            WHERE e.class_id = ?
            ORDER BY u.username ASC`,
           [classIdNumber],
@@ -275,7 +435,7 @@ export default (pool: Pool, JWT_SECRET: string) => {
 
         const { reportId } = c.req.valid("param");
         const reportIdNumber = Number.parseInt(reportId, 10);
-        const gradeData = c.req.valid("json");
+        const { grade, feedback } = c.req.valid("json");
 
         const connection = await pool.getConnection();
         try {
@@ -322,22 +482,14 @@ export default (pool: Pool, JWT_SECRET: string) => {
             return c.json({ error: "Forbidden" }, 403);
           }
 
-          if (
-            gradeData.report_quality === undefined &&
-            gradeData.feedback === undefined
-          ) {
-            await connection.rollback();
-            return c.json({ error: "No fields provided to update" }, 400);
-          }
-
-          if (gradeData.report_quality !== undefined) {
+          if (grade !== undefined) {
             const [gradeResult]: any = await connection.query(
               `
                 UPDATE experiment_grade
                    SET report_quality = ?
                  WHERE experiment_id = ? AND student_id = ?
               `,
-              [gradeData.report_quality, experiment_id, student_id],
+              [grade, experiment_id, student_id],
             );
 
             if (gradeResult.affectedRows === 0) {
@@ -349,16 +501,19 @@ export default (pool: Pool, JWT_SECRET: string) => {
           const reportUpdateFields: string[] = [];
           const reportUpdateValues: any[] = [];
 
-          if (gradeData.report_quality !== undefined) {
+          if (grade !== undefined) {
             reportUpdateFields.push("grade = ?");
-            reportUpdateValues.push(gradeData.report_quality);
+            reportUpdateValues.push(grade);
           }
-          if (gradeData.feedback !== undefined) {
+          if (feedback !== undefined) {
             reportUpdateFields.push("feedback = ?");
-            reportUpdateValues.push(gradeData.feedback);
+            reportUpdateValues.push(feedback);
           }
 
           if (reportUpdateFields.length > 0) {
+            const graderId = Number.parseInt(String(payload.sub), 10);
+            reportUpdateFields.push("graded_by = ?");
+            reportUpdateValues.push(Number.isFinite(graderId) ? graderId : null);
             reportUpdateValues.push(reportIdNumber);
             await connection.query(
               `
@@ -372,12 +527,43 @@ export default (pool: Pool, JWT_SECRET: string) => {
 
           await connection.commit();
 
-          const [updatedGrades]: any[] = await connection.query(
-            "SELECT * FROM experiment_grade WHERE experiment_id = ? AND student_id = ?",
-            [experiment_id, student_id],
+          const [[updatedReport]]: any[] = await connection.query(
+            `
+              SELECT
+                u.user_id,
+                u.username,
+                u.full_name,
+                er.report_id,
+                er.experiment_id,
+                er.submitted_at,
+                er.pdf_file_path,
+                er.grade,
+                er.feedback,
+                grader.full_name AS grader_name
+              FROM experiment_reports er
+              JOIN users u ON u.user_id = er.student_id
+              LEFT JOIN users grader ON er.graded_by = grader.user_id
+              WHERE er.report_id = ?
+            `,
+            [reportIdNumber],
           );
 
-          return c.json(updatedGrades[0]);
+          return c.json(
+            updatedReport
+              ? {
+                  user_id: updatedReport.user_id,
+                  username: updatedReport.username ?? null,
+                  full_name: updatedReport.full_name ?? null,
+                  report_id: updatedReport.report_id,
+                  experiment_id: updatedReport.experiment_id,
+                  submitted_at: updatedReport.submitted_at ?? null,
+                  pdf_file_path: updatedReport.pdf_file_path ?? null,
+                  grade: updatedReport.grade ?? null,
+                  feedback: updatedReport.feedback ?? null,
+                  grader_name: updatedReport.grader_name ?? null,
+                }
+              : null,
+          );
         } catch (error) {
           await connection.rollback();
           throw error;
@@ -755,23 +941,18 @@ export default (pool: Pool, JWT_SECRET: string) => {
         "full_name",
         "email",
         "experiment_id",
-        "graded_at",
         ...EXP_FLOW_FIELDS,
         "knowledge_test",
         "model_quality",
         "report_quality",
         "exp_flow_score",
         "final_score",
-        "feedback",
       ];
 
       const csvLines: string[] = [header.join(",")];
 
       for (const row of gradeRows) {
         const studentId = row.user_id;
-        const graded = row.grade_created_at instanceof Date
-          ? row.grade_created_at.toISOString()
-          : row.grade_created_at ?? "";
 
         const { expFlowScore, finalScore } = computeExperimentScores(row, weights);
         const expFlowScoreStr =
@@ -785,14 +966,12 @@ export default (pool: Pool, JWT_SECRET: string) => {
           toCsvValue(row.full_name),
           toCsvValue(row.email),
           toCsvValue(row.experiment_id),
-          toCsvValue(graded),
           ...EXP_FLOW_FIELDS.map((field) => formatNumeric(row[field])),
           formatNumeric(row.knowledge_test),
           formatNumeric(row.model_quality),
           formatNumeric(row.report_quality),
           toCsvValue(expFlowScoreStr),
           toCsvValue(finalScoreStr),
-          toCsvValue(row.feedback),
         ];
 
         csvLines.push(rowValues.join(","));
@@ -976,8 +1155,13 @@ export default (pool: Pool, JWT_SECRET: string) => {
           [classIdNumber],
         );
 
-        const toNumberOrNull = (value: unknown) =>
-          value === null || value === undefined ? null : Number(value);
+        const toNumberOrNull = (value: unknown) => {
+          if (value === null || value === undefined) {
+            return null;
+          }
+          const num = Number(value);
+          return Number.isFinite(num) ? num : null;
+        };
 
         const latestGrades = (gradeRows as any[]).map((row: any) => {
           const { expFlowScore, finalScore } = computeExperimentScores(row, weights);
@@ -1050,27 +1234,112 @@ export default (pool: Pool, JWT_SECRET: string) => {
           return c.json({ error: "Forbidden" }, 403);
         }
 
-        // Get step events for experiments of students in class
-        const [stepEvents]: any[] = await pool.query(
-          `SELECT
-             se.event_id,
-             se.experiment_id,
-             se.student_id,
-             u.username,
-             u.full_name,
-             se.step_order,
-             se.event_type,
-             se.event_timestamp
-           FROM experiment_step_events se
-           JOIN experiment_status es ON se.experiment_id = es.experiment_id
-           JOIN users u ON se.student_id = u.user_id
-           JOIN enrollments e ON u.user_id = e.student_id
-           WHERE e.class_id = ?
-           ORDER BY se.event_timestamp DESC`,
-          [classIdNumber],
+        const [studentExperimentRows]: any[] = await pool.query(
+          `
+            WITH ranked AS (
+              SELECT
+                es.*,
+                ROW_NUMBER() OVER (
+                  PARTITION BY es.student_id
+                  ORDER BY COALESCE(es.last_activity_at, es.completion_time, es.start_time) DESC,
+                           es.experiment_id DESC
+                ) AS rn
+              FROM experiment_status es
+              JOIN enrollments e ON es.student_id = e.student_id
+              WHERE e.class_id = ?
+            )
+            SELECT
+              u.user_id AS student_id,
+              u.username,
+              u.full_name,
+              latest.experiment_id,
+              latest.status,
+              latest.current_step,
+              latest.highest_completed_step,
+              latest.start_time,
+              latest.last_activity_at,
+              latest.completion_time
+            FROM enrollments e
+            JOIN users u ON e.student_id = u.user_id
+            LEFT JOIN (
+              SELECT *
+              FROM ranked
+              WHERE rn = 1
+            ) latest ON latest.student_id = u.user_id
+            WHERE e.class_id = ?
+            ORDER BY u.username ASC
+          `,
+          [classIdNumber, classIdNumber],
         );
 
-        return c.json(stepEvents);
+        const experimentIds = Array.from(
+          new Set(
+            (studentExperimentRows as any[])
+              .map((row: any) => row.experiment_id)
+              .filter((id: unknown): id is number => Number.isInteger(id)),
+          ),
+        );
+
+        let eventsByExperiment = new Map<number, RawStepEvent[]>();
+
+        if (experimentIds.length > 0) {
+          const placeholders = experimentIds.map(() => "?").join(", ");
+          const [eventRows]: any[] = await pool.query(
+            `
+              SELECT
+                se.event_id,
+                se.experiment_id,
+                se.student_id,
+                se.step_order,
+                se.event_type,
+                se.event_timestamp
+              FROM experiment_step_events se
+              WHERE se.experiment_id IN (${placeholders})
+              ORDER BY se.experiment_id ASC, se.event_timestamp ASC, se.event_id ASC
+            `,
+            experimentIds,
+          );
+
+          const rows = eventRows as RawStepEvent[];
+          eventsByExperiment = rows.reduce(
+            (acc: Map<number, RawStepEvent[]>, event: RawStepEvent) => {
+              if (!acc.has(event.experiment_id)) {
+                acc.set(event.experiment_id, []);
+              }
+              acc.get(event.experiment_id)!.push(event);
+              return acc;
+            },
+            new Map<number, RawStepEvent[]>(),
+          );
+        }
+
+        const responsePayload = (studentExperimentRows as any[]).map((row: any) => {
+          const experimentId = Number.isInteger(row.experiment_id)
+            ? (row.experiment_id as number)
+            : null;
+          const timelineData = experimentId
+            ? buildNormalizedStepTimeline(
+              eventsByExperiment.get(experimentId) ?? [],
+            )
+            : { timeline: [] as NormalizedStepEvent[], steps: createEmptyStepSummaries() };
+
+          return {
+            student_id: row.student_id,
+            username: row.username,
+            full_name: row.full_name,
+            experiment_id: experimentId,
+            status: row.status ?? null,
+            current_step: row.current_step ?? null,
+            highest_completed_step: row.highest_completed_step ?? null,
+            start_time: toIsoString(row.start_time),
+            last_activity_at: toIsoString(row.last_activity_at),
+            completion_time: toIsoString(row.completion_time),
+            timeline: timelineData.timeline,
+            steps: timelineData.steps,
+          };
+        });
+
+        return c.json(responsePayload);
       } catch (error) {
         console.error("Error fetching step events:", error);
         throw error;
