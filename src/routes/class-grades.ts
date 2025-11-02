@@ -72,52 +72,40 @@ const LATEST_GRADE_SELECTION_SQL = `
     u.username,
     u.full_name,
     u.email,
-    latest_report.report_id,
-    latest_report.submitted_at AS report_submitted_at,
-    latest_report.pdf_file_path,
-    COALESCE(eg_report.experiment_id, eg_latest.experiment_id) AS experiment_id,
-    COALESCE(eg_report.created_at, eg_latest.created_at) AS graded_at,
-    latest_report.feedback AS feedback,
-    COALESCE(eg_report.exp_flow_demand_data_preparation, eg_latest.exp_flow_demand_data_preparation) AS exp_flow_demand_data_preparation,
-    COALESCE(eg_report.exp_flow_demand_descriptive_stats, eg_latest.exp_flow_demand_descriptive_stats) AS exp_flow_demand_descriptive_stats,
-    COALESCE(eg_report.exp_flow_demand_model_selection, eg_latest.exp_flow_demand_model_selection) AS exp_flow_demand_model_selection,
-    COALESCE(eg_report.exp_flow_demand_generate_results, eg_latest.exp_flow_demand_generate_results) AS exp_flow_demand_generate_results,
-    COALESCE(eg_report.exp_flow_production_inventory_calc, eg_latest.exp_flow_production_inventory_calc) AS exp_flow_production_inventory_calc,
-    COALESCE(eg_report.exp_flow_production_service_level, eg_latest.exp_flow_production_service_level) AS exp_flow_production_service_level,
-    COALESCE(eg_report.exp_flow_production_variable_calc, eg_latest.exp_flow_production_variable_calc) AS exp_flow_production_variable_calc,
-    COALESCE(eg_report.exp_flow_production_plan_creation, eg_latest.exp_flow_production_plan_creation) AS exp_flow_production_plan_creation,
-    COALESCE(eg_report.exp_flow_report_submission, eg_latest.exp_flow_report_submission) AS exp_flow_report_submission,
-    COALESCE(eg_report.knowledge_test, eg_latest.knowledge_test) AS knowledge_test,
-    COALESCE(eg_report.model_quality, eg_latest.model_quality) AS model_quality,
-    COALESCE(eg_report.report_quality, eg_latest.report_quality) AS report_quality
+    latest.experiment_id,
+    latest.start_time AS experiment_started_at,
+    grade.created_at AS grade_created_at,
+    grade.exp_flow_demand_data_preparation,
+    grade.exp_flow_demand_descriptive_stats,
+    grade.exp_flow_demand_model_selection,
+    grade.exp_flow_demand_generate_results,
+    grade.exp_flow_production_inventory_calc,
+    grade.exp_flow_production_service_level,
+    grade.exp_flow_production_variable_calc,
+    grade.exp_flow_production_plan_creation,
+    grade.exp_flow_report_submission,
+    grade.knowledge_test,
+    grade.model_quality,
+    grade.report_quality
   FROM enrollments e
   JOIN users u ON e.student_id = u.user_id
   LEFT JOIN (
-    SELECT er.*
-    FROM experiment_reports er
-    JOIN (
-      SELECT student_id, MAX(submitted_at) AS max_submitted_at
-      FROM experiment_reports
-      GROUP BY student_id
-    ) recent
-      ON recent.student_id = er.student_id
-     AND recent.max_submitted_at = er.submitted_at
-  ) latest_report ON latest_report.student_id = u.user_id
-  LEFT JOIN experiment_grade eg_report
-    ON latest_report.experiment_id IS NOT NULL
-   AND eg_report.student_id = u.user_id
-   AND eg_report.experiment_id = latest_report.experiment_id
-  LEFT JOIN (
-    SELECT eg_inner.*
-    FROM experiment_grade eg_inner
-    JOIN (
-      SELECT student_id, MAX(created_at) AS max_graded_at
-      FROM experiment_grade
-      GROUP BY student_id
-    ) latest_grade
-      ON latest_grade.student_id = eg_inner.student_id
-     AND latest_grade.max_graded_at = eg_inner.created_at
-  ) eg_latest ON eg_latest.student_id = u.user_id
+    SELECT *
+    FROM (
+      SELECT
+        es.*,
+        ROW_NUMBER() OVER (
+          PARTITION BY es.student_id
+          ORDER BY COALESCE(es.last_activity_at, es.completion_time, es.start_time) DESC,
+                   es.experiment_id DESC
+        ) AS rn
+      FROM experiment_status es
+    ) ranked
+    WHERE ranked.rn = 1
+  ) latest ON latest.student_id = u.user_id
+  LEFT JOIN experiment_grade grade
+    ON grade.student_id = latest.student_id
+   AND grade.experiment_id = latest.experiment_id
   WHERE e.class_id = ?
   ORDER BY u.username ASC
 `;
@@ -781,9 +769,9 @@ export default (pool: Pool, JWT_SECRET: string) => {
 
       for (const row of gradeRows) {
         const studentId = row.user_id;
-        const graded = row.graded_at instanceof Date
-          ? row.graded_at.toISOString()
-          : row.graded_at ?? "";
+        const graded = row.grade_created_at instanceof Date
+          ? row.grade_created_at.toISOString()
+          : row.grade_created_at ?? "";
 
         const { expFlowScore, finalScore } = computeExperimentScores(row, weights);
         const expFlowScoreStr =
@@ -993,22 +981,17 @@ export default (pool: Pool, JWT_SECRET: string) => {
 
         const latestGrades = (gradeRows as any[]).map((row: any) => {
           const { expFlowScore, finalScore } = computeExperimentScores(row, weights);
-          const expFlowScoreRounded =
-            expFlowScore === null ? null : Number(expFlowScore.toFixed(2));
-          const finalScoreRounded =
-            finalScore === null ? null : Number(finalScore.toFixed(2));
           return {
             student_id: row.user_id,
             username: row.username,
             full_name: row.full_name,
             experiment_id: row.experiment_id,
-            exp_flow_score: expFlowScoreRounded,
+            exp_flow_score:
+              expFlowScore === null ? null : Number(expFlowScore.toFixed(2)),
             model_quality: toNumberOrNull(row.model_quality),
             knowledge_test: toNumberOrNull(row.knowledge_test),
             report_quality: toNumberOrNull(row.report_quality),
-            feedback: row.feedback ?? null,
-            graded_at: row.graded_at ?? null,
-            final_score: finalScoreRounded,
+            final_score: finalScore === null ? null : Number(finalScore.toFixed(2)),
           };
         });
 
