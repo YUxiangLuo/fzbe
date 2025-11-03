@@ -59,6 +59,12 @@ const adminChangePasswordSchema = z.object({
     .min(6, { message: "New password must be at least 6 characters long" }),
 });
 
+const userSearchQuerySchema = z.object({
+  q: z.string().trim().min(1, { message: "Search term is required" }),
+  page: z.coerce.number().int().min(1).optional().default(1),
+  limit: z.coerce.number().int().min(1).max(100).optional().default(10),
+});
+
 const userIdParamSchema = z.object({
   userId: z.string().regex(/^\d+$/, { message: "userId must be a number" }),
 });
@@ -86,6 +92,71 @@ const createAssistantSchema = registerSchema
 
 export default (pool: Pool, JWT_SECRET: string) => {
   const usersApi = new Hono();
+
+  // Admin: Fuzzy search users by name/email/phone
+  usersApi.get(
+    "/api/v1/users/search",
+    jwt({ secret: JWT_SECRET }),
+    zValidator("query", userSearchQuerySchema),
+    async (c) => {
+      try {
+        const payload = c.get("jwtPayload");
+        if (payload.role !== "Admin") {
+          return c.json({ error: "Forbidden" }, 403);
+        }
+
+        const { q, page, limit } = c.req.valid("query");
+        const term = q.trim();
+        if (!term) {
+          return c.json({ error: "Search term is required" }, 400);
+        }
+
+        const likeTerm = `%${term}%`;
+        const offset = (page - 1) * limit;
+
+        const [countRows]: any[] = await pool.query(
+          `SELECT COUNT(*) AS total
+             FROM users
+            WHERE full_name LIKE ?
+               OR email LIKE ?
+               OR phone_number LIKE ?`,
+          [likeTerm, likeTerm, likeTerm],
+        );
+        const totalItems = Number(countRows[0]?.total ?? 0);
+        const totalPages = Math.ceil(totalItems / limit);
+
+        const [dataRows]: any[] = await pool.query(
+          `SELECT
+             user_id,
+             username,
+             full_name,
+             email,
+             role,
+             created_at
+           FROM users
+           WHERE full_name LIKE ?
+              OR email LIKE ?
+              OR phone_number LIKE ?
+           ORDER BY user_id ASC
+           LIMIT ? OFFSET ?`,
+          [likeTerm, likeTerm, likeTerm, limit, offset],
+        );
+
+        return c.json({
+          data: dataRows,
+          pagination: {
+            currentPage: page,
+            pageSize: limit,
+            totalItems,
+            totalPages,
+          },
+        });
+      } catch (error) {
+        console.error("Error searching users:", error);
+        throw error;
+      }
+    },
+  );
 
   // Create an assistant and assign them to classes
   usersApi.post(
