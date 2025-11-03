@@ -241,7 +241,11 @@ export default (pool: Pool, JWT_SECRET: string) => {
     async (c) => {
       try {
         const payload = c.get("jwtPayload");
-        if (payload.role !== "Admin" && payload.role !== "Teacher") {
+        if (
+          payload.role !== "Admin" &&
+          payload.role !== "Teacher" &&
+          payload.role !== "Assistant"
+        ) {
           return c.json({ error: "Forbidden" }, 403);
         }
 
@@ -324,7 +328,11 @@ export default (pool: Pool, JWT_SECRET: string) => {
     async (c) => {
       try {
         const payload = c.get("jwtPayload");
-        if (payload.role !== "Admin" && payload.role !== "Teacher") {
+        if (
+          payload.role !== "Admin" &&
+          payload.role !== "Teacher" &&
+          payload.role !== "Assistant"
+        ) {
           return c.json({ error: "Forbidden" }, 403);
         }
 
