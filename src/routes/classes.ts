@@ -198,25 +198,44 @@ export default (pool: Pool, JWT_SECRET: string) => {
 
               const defaultPasswordHash = getDefaultPasswordHash();
 
-              for (const record of studentRecords) {
-                const [userResult]: any = await connection.query(
-                  "INSERT INTO users (username, password_hash, full_name, email, role) VALUES (?, ?, ?, ?, 'Student')",
-                  [record.studentId, defaultPasswordHash, record.fullName, record.email]
-                );
-                const userId = userResult.insertId;
-                createdStudentsCount++;
+              // Batch insert all students at once for better performance
+              const studentValues = studentRecords.map(record => [
+                record.studentId,
+                defaultPasswordHash,
+                record.fullName,
+                record.email,
+                "Student"
+              ]);
 
-                await connection.query(
-                  "INSERT INTO enrollments (student_id, class_id) VALUES (?, ?)",
-                  [userId, classId]
-                );
+              const [userResult]: any = await connection.query(
+                "INSERT INTO users (username, password_hash, full_name, email, role) VALUES ?",
+                [studentValues]
+              );
+
+              // Calculate user IDs: MySQL returns the first insertId, subsequent IDs are consecutive
+              const firstUserId = userResult.insertId;
+              createdStudentsCount = studentRecords.length;
+
+              // Batch insert enrollments
+              const enrollmentValues = studentRecords.map((record, index) => [
+                firstUserId + index,
+                classId
+              ]);
+
+              await connection.query(
+                "INSERT INTO enrollments (student_id, class_id) VALUES ?",
+                [enrollmentValues]
+              );
+
+              // Build response array
+              studentRecords.forEach((record, index) => {
                 createdStudents.push({
-                  user_id: userId,
+                  user_id: firstUserId + index,
                   username: record.studentId,
                   full_name: record.fullName,
                   email: record.email
                 });
-              }
+              });
             }
           }
 

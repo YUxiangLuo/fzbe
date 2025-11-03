@@ -7,6 +7,8 @@ import fs from "fs";
 import type { Pool } from "mysql2/promise";
 import csv from "csv-parser";
 
+const TRAINING_TIMEOUT = 30000; 
+
 // ========== Common Schemas ==========
 const baseDataSchema = z.object({
   selected_industry: z.string().min(1),
@@ -356,7 +358,7 @@ export default (pool: Pool, JWT_SECRET: string) => {
         "--window", String(body.moving_average_window),
         "--save_model", modelSaveLoc,
         "--pretty",
-      ], 30000); // 30-second timeout
+      ], TRAINING_TIMEOUT); // 30-second timeout
 
       return c.json({ status: "success", results: result });
     } catch (error: any) {
@@ -397,7 +399,7 @@ export default (pool: Pool, JWT_SECRET: string) => {
         "--alpha", String(body.exponential_smoothing_alpha),
         "--save_model", modelSaveLoc,
         "--pretty",
-      ], 30000); // 30-second timeout
+      ], TRAINING_TIMEOUT); // 30-second timeout
 
       return c.json({ status: "success", results: result });
     } catch (error: any) {
@@ -438,7 +440,7 @@ export default (pool: Pool, JWT_SECRET: string) => {
         "--d", String(body.arima_d),
         "--save_model", modelSaveLoc,
         "--pretty",
-      ], 30000); // 30-second timeout
+      ], TRAINING_TIMEOUT); // 30-second timeout
 
       return c.json({ status: "success", results: result });
     } catch (error: any) {
@@ -490,7 +492,7 @@ export default (pool: Pool, JWT_SECRET: string) => {
         "--norm", body.lstm_normalization,
         "--save_model", modelSaveLoc,
         "--pretty",
-      ], 30000); // 30-second timeout
+      ], TRAINING_TIMEOUT); // 30-second timeout
 
       return c.json({
         status: "success",
@@ -565,7 +567,7 @@ export default (pool: Pool, JWT_SECRET: string) => {
             ...modelPaths,
             "--pretty",
           ],
-          30000,
+          TRAINING_TIMEOUT,
         ); // 30-second timeout
 
         return c.json({ status: "success", results: result });
@@ -662,7 +664,7 @@ export default (pool: Pool, JWT_SECRET: string) => {
         "--models",
         ...modelPaths,
         "--pretty",
-      ], 10000); // 10-second timeout
+      ], TRAINING_TIMEOUT); // 10-second timeout
 
       return c.json({
         status: "success",
@@ -710,7 +712,7 @@ export default (pool: Pool, JWT_SECRET: string) => {
         "--models",
         ...modelPaths,
         "--pretty",
-      ], 10000); // 10-second timeout
+      ], TRAINING_TIMEOUT); // 10-second timeout
 
       return c.json({ status: "success", results: result });
     } catch (error: any) {

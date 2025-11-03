@@ -377,6 +377,7 @@ export default (pool: Pool, JWT_SECRET: string) => {
           return c.json({ error: "Forbidden" }, 403);
         }
 
+        // Optimized: Use window function instead of self-join with GROUP BY
         const [reports]: any[] = await pool.query(
           `SELECT
              u.user_id,
@@ -392,15 +393,16 @@ export default (pool: Pool, JWT_SECRET: string) => {
            FROM enrollments e
            JOIN users u ON e.student_id = u.user_id
            LEFT JOIN (
-             SELECT er.*
-             FROM experiment_reports er
-             JOIN (
-               SELECT student_id, MAX(submitted_at) AS max_submitted_at
-               FROM experiment_reports
-               GROUP BY student_id
-              ) recent
-                ON recent.student_id = er.student_id
-               AND recent.max_submitted_at = er.submitted_at
+             SELECT * FROM (
+               SELECT
+                 er.*,
+                 ROW_NUMBER() OVER (
+                   PARTITION BY er.student_id
+                   ORDER BY er.submitted_at DESC, er.report_id DESC
+                 ) AS rn
+               FROM experiment_reports er
+             ) ranked
+             WHERE ranked.rn = 1
            ) latest ON latest.student_id = u.user_id
            LEFT JOIN users grader ON latest.graded_by = grader.user_id
            WHERE e.class_id = ?

@@ -2,6 +2,11 @@
 -- Virtual Simulation System Database Schema File
 -- Compatible with MariaDB / MySQL
 -- Fixed Version with Improvements (No DELIMITER)
+--
+-- Performance Optimizations Included (2025-11-03):
+-- - Added composite indexes for faster queries
+-- - Added FULLTEXT index for user search
+-- - Optimized experiment status and grade queries
 -- --------------------------------------------------------
 
 -- ========================================================
@@ -16,7 +21,9 @@ CREATE TABLE IF NOT EXISTS `users` (
   `email` VARCHAR(255) NOT NULL UNIQUE,
   `phone_number` VARCHAR(50),
   `role` ENUM('Student', 'Teacher', 'Assistant', 'Admin') NOT NULL,
-  `created_at` TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+  `created_at` TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  -- Performance optimization: fulltext index for user search
+  FULLTEXT INDEX `ft_user_search` (`full_name`, `email`, `phone_number`)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
 CREATE TABLE IF NOT EXISTS `classes` (
@@ -25,7 +32,8 @@ CREATE TABLE IF NOT EXISTS `classes` (
   `class_code` VARCHAR(255) UNIQUE,
   `teacher_id` INT NULL,
   `created_at` TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-  FOREIGN KEY (`teacher_id`) REFERENCES `users`(`user_id`) ON DELETE SET NULL
+  FOREIGN KEY (`teacher_id`) REFERENCES `users`(`user_id`) ON DELETE SET NULL,
+  INDEX `idx_teacher_id` (`teacher_id`)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
 CREATE TABLE IF NOT EXISTS `enrollments` (
@@ -34,7 +42,9 @@ CREATE TABLE IF NOT EXISTS `enrollments` (
   `class_id` INT NOT NULL,
   FOREIGN KEY (`student_id`) REFERENCES `users`(`user_id`) ON DELETE CASCADE,
   FOREIGN KEY (`class_id`) REFERENCES `classes`(`class_id`) ON DELETE CASCADE,
-  UNIQUE KEY `student_class_unique` (`student_id`, `class_id`)
+  UNIQUE KEY `student_class_unique` (`student_id`, `class_id`),
+  INDEX `idx_student_class` (`student_id`, `class_id`),
+  INDEX `idx_class_student` (`class_id`, `student_id`)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
 CREATE TABLE IF NOT EXISTS `class_assistants` (
@@ -151,7 +161,9 @@ CREATE TABLE IF NOT EXISTS `experiment_status` (
   -- Add constraint to ensure step values are valid
   CONSTRAINT `chk_current_step` CHECK (`current_step` BETWEEN 1 AND 7),
   CONSTRAINT `chk_highest_step` CHECK (`highest_completed_step` <= 7),
-  INDEX `idx_student_status_completion` (`student_id`, `status`, `completion_time` DESC)
+  INDEX `idx_student_status_completion` (`student_id`, `status`, `completion_time` DESC),
+  -- Performance optimization: composite index for fetching latest non-completed experiments
+  INDEX `idx_student_status_id` (`student_id`, `status`, `experiment_id` DESC)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
 CREATE TABLE IF NOT EXISTS `experiment_step_events` (
@@ -206,7 +218,10 @@ CREATE TABLE IF NOT EXISTS `question_bank` (
   `correct_answers` JSON NOT NULL,
 
   `creator_id` INT,
-  FOREIGN KEY (`creator_id`) REFERENCES `users`(`user_id`) ON DELETE SET NULL
+  FOREIGN KEY (`creator_id`) REFERENCES `users`(`user_id`) ON DELETE SET NULL,
+  -- Performance optimization: indexes for filtering and creator queries
+  INDEX `idx_knowledge_point` (`knowledge_point`),
+  INDEX `idx_creator` (`creator_id`)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
 CREATE TABLE IF NOT EXISTS `quiz_answers` (
@@ -269,9 +284,12 @@ CREATE TABLE IF NOT EXISTS `experiment_reports` (
   
   -- Add constraint to ensure grade is in valid range
   CONSTRAINT `chk_report_grade` CHECK (`grade` IS NULL OR (`grade` >= 0 AND `grade` <= 100)),
-  
+
   -- Ensure that each student can only submit one report per experiment
-  UNIQUE KEY `student_experiment_unique` (`student_id`, `experiment_id`)
+  UNIQUE KEY `student_experiment_unique` (`student_id`, `experiment_id`),
+
+  -- Performance optimization: index for fetching latest reports
+  INDEX `idx_student_submitted` (`student_id`, `submitted_at` DESC, `report_id` DESC)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
 CREATE TABLE `grade_weights` (
@@ -337,12 +355,14 @@ CREATE TABLE `experiment_grade` (
   FOREIGN KEY (`experiment_id`)
     REFERENCES `experiment_status`(`experiment_id`)
     ON DELETE CASCADE,
-  
+
   FOREIGN KEY (`student_id`)
     REFERENCES `users`(`user_id`)
     ON DELETE CASCADE,
 
-  INDEX `idx_experiment_grade_experiment_id` (`experiment_id`)
+  INDEX `idx_experiment_grade_experiment_id` (`experiment_id`),
+  -- Performance optimization: composite index for grade queries
+  INDEX `idx_student_experiment` (`student_id`, `experiment_id`)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
 -- ========================================================

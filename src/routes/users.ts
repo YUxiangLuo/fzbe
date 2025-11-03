@@ -111,45 +111,103 @@ export default (pool: Pool, JWT_SECRET: string) => {
           return c.json({ error: "Search term is required" }, 400);
         }
 
-        const likeTerm = `%${term}%`;
         const offset = (page - 1) * limit;
 
-        const [countRows]: any[] = await pool.query(
-          `SELECT COUNT(*) AS total
-             FROM users
+        // Use FULLTEXT search if the term is suitable (alphanumeric)
+        // Fallback to LIKE for special characters or short terms
+        const useFullText = term.length >= 2 && /^[\w\s@.-]+$/.test(term);
+
+        let countQuery: string;
+        let dataQuery: string;
+        let queryParams: any[];
+
+        if (useFullText) {
+          // Use FULLTEXT search with BOOLEAN MODE for better performance
+          // Prepare search term for boolean mode (add wildcard for partial matching)
+          const searchTerm = term.split(/\s+/).map(word => `+${word}*`).join(' ');
+
+          countQuery = `
+            SELECT COUNT(*) AS total
+              FROM users
+             WHERE MATCH(full_name, email, phone_number) AGAINST(? IN BOOLEAN MODE)
+          `;
+
+          dataQuery = `
+            SELECT
+              user_id,
+              username,
+              full_name,
+              email,
+              role,
+              created_at,
+              MATCH(full_name, email, phone_number) AGAINST(? IN BOOLEAN MODE) AS relevance
+            FROM users
+            WHERE MATCH(full_name, email, phone_number) AGAINST(? IN BOOLEAN MODE)
+            ORDER BY relevance DESC, user_id ASC
+            LIMIT ? OFFSET ?
+          `;
+
+          queryParams = [searchTerm];
+        } else {
+          // Fallback to LIKE search for special cases
+          const likeTerm = `%${term}%`;
+
+          countQuery = `
+            SELECT COUNT(*) AS total
+              FROM users
+             WHERE full_name LIKE ?
+                OR email LIKE ?
+                OR phone_number LIKE ?
+          `;
+
+          dataQuery = `
+            SELECT
+              user_id,
+              username,
+              full_name,
+              email,
+              role,
+              created_at
+            FROM users
             WHERE full_name LIKE ?
                OR email LIKE ?
-               OR phone_number LIKE ?`,
-          [likeTerm, likeTerm, likeTerm],
+               OR phone_number LIKE ?
+            ORDER BY user_id ASC
+            LIMIT ? OFFSET ?
+          `;
+
+          queryParams = [likeTerm, likeTerm, likeTerm];
+        }
+
+        // Execute count query
+        const [countRows]: any[] = await pool.query(
+          countQuery,
+          queryParams
         );
         const totalItems = Number(countRows[0]?.total ?? 0);
         const totalPages = Math.ceil(totalItems / limit);
 
+        // Execute data query
         const [dataRows]: any[] = await pool.query(
-          `SELECT
-             user_id,
-             username,
-             full_name,
-             email,
-             role,
-             created_at
-           FROM users
-           WHERE full_name LIKE ?
-              OR email LIKE ?
-              OR phone_number LIKE ?
-           ORDER BY user_id ASC
-           LIMIT ? OFFSET ?`,
-          [likeTerm, likeTerm, likeTerm, limit, offset],
+          dataQuery,
+          useFullText ? [queryParams[0], queryParams[0], limit, offset] : [...queryParams, limit, offset]
         );
 
+        // Remove relevance field from results if present
+        const results = dataRows.map((row: any) => {
+          const { relevance, ...rest } = row;
+          return rest;
+        });
+
         return c.json({
-          data: dataRows,
+          data: results,
           pagination: {
             currentPage: page,
             pageSize: limit,
             totalItems,
             totalPages,
           },
+          searchMethod: useFullText ? 'fulltext' : 'like', // For debugging
         });
       } catch (error) {
         console.error("Error searching users:", error);
@@ -464,33 +522,30 @@ export default (pool: Pool, JWT_SECRET: string) => {
             }
           }
 
-          const createdTeachers: Array<{
-            user_id: number;
-            username: string;
-            full_name: string;
-            phone_number: string;
-            email: string;
-          }> = [];
+          // Batch insert all teachers at once for better performance
+          const teacherValues = teacherRows.map((row) => [
+            row.username,
+            DEFAULT_PASSWORD_HASH,
+            row.fullName,
+            row.email,
+            "Teacher",
+            row.phone,
+          ]);
 
-          for (const row of teacherRows) {
-            const [result]: any = await connection.query(
-              "INSERT INTO users (username, password_hash, full_name, email, role, phone_number) VALUES (?, ?, ?, ?, 'Teacher', ?)",
-              [
-                row.username,
-                DEFAULT_PASSWORD_HASH,
-                row.fullName,
-                row.email,
-                row.phone,
-              ],
-            );
-            createdTeachers.push({
-              user_id: result.insertId,
-              username: row.username,
-              full_name: row.fullName,
-              phone_number: row.phone,
-              email: row.email,
-            });
-          }
+          const [result]: any = await connection.query(
+            "INSERT INTO users (username, password_hash, full_name, email, role, phone_number) VALUES ?",
+            [teacherValues],
+          );
+
+          // Calculate user IDs: MySQL returns the first insertId, subsequent IDs are consecutive
+          const firstInsertId = result.insertId;
+          const createdTeachers = teacherRows.map((row, index) => ({
+            user_id: firstInsertId + index,
+            username: row.username,
+            full_name: row.fullName,
+            phone_number: row.phone,
+            email: row.email,
+          }));
 
           await connection.commit();
 

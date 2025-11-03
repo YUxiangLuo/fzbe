@@ -464,17 +464,18 @@ const fetchExperimentById = async (pool: Pool, experimentId: number) => {
 };
 
 const fetchLatestNotCompletedExperimentForStudent = async (pool: Pool, studentId: number) => {
+  // Optimized: Filter in database instead of application layer
+  // Uses idx_student_status_id index for better performance
   const [rows] = await pool.query<RowDataPacket[]>(
     `SELECT *
        FROM experiment_status
       WHERE student_id = ?
+        AND status != 'Completed'
       ORDER BY experiment_id DESC
       LIMIT 1`,
     [studentId],
   );
-  const row0 = rows[0] as any;
-  if(row0 && row0.status!=="Completed") return rows[0];
-  else return undefined;
+  return rows[0];
 };
 
 export default (pool: Pool, JWT_SECRET: string) => {

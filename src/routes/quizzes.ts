@@ -61,26 +61,43 @@ export default (pool: Pool, JWT_SECRET: string) => {
         return c.json({ error: "Forbidden" }, 403);
       }
 
-      const sql = `
-        SELECT qb.question_id,
-               qb.knowledge_point,
-               qb.question_type,
-               qb.question_text,
-               qb.options,
-               qb.creator_id,
-               creator.full_name AS creator_name
-          FROM question_bank qb
-     LEFT JOIN users creator ON creator.user_id = qb.creator_id
-         WHERE qb.knowledge_point LIKE '%模型%'
-      ORDER BY RAND()
-         LIMIT 4
-      `;
+      // Step 1: Get all question IDs matching the criteria (uses index)
+      const [idRows]: any[] = await pool.query(
+        `SELECT question_id FROM question_bank WHERE knowledge_point LIKE '%模型%'`
+      );
 
-      const [rows]: any[] = await pool.query(sql);
-
-      if (rows.length === 0) {
+      if (idRows.length === 0) {
         return c.json({ error: "No model-related questions available" }, 404);
       }
+
+      // Step 2: Randomly select up to 4 question IDs in application layer
+      const allIds = idRows.map((row: any) => row.question_id);
+      const selectedIds: number[] = [];
+      const count = Math.min(4, allIds.length);
+
+      // Fisher-Yates shuffle to get random questions
+      const shuffled = [...allIds];
+      for (let i = shuffled.length - 1; i > 0; i--) {
+        const j = Math.floor(Math.random() * (i + 1));
+        [shuffled[i], shuffled[j]] = [shuffled[j], shuffled[i]];
+      }
+      selectedIds.push(...shuffled.slice(0, count));
+
+      // Step 3: Fetch full details for selected questions (uses primary key)
+      const placeholders = selectedIds.map(() => '?').join(',');
+      const [rows]: any[] = await pool.query(
+        `SELECT qb.question_id,
+                qb.knowledge_point,
+                qb.question_type,
+                qb.question_text,
+                qb.options,
+                qb.creator_id,
+                creator.full_name AS creator_name
+           FROM question_bank qb
+      LEFT JOIN users creator ON creator.user_id = qb.creator_id
+          WHERE qb.question_id IN (${placeholders})`,
+        selectedIds
+      );
 
       const normalized = rows.map((row: any) => normalizeQuestionRow(row, false));
       return c.json(normalized);
@@ -99,26 +116,43 @@ export default (pool: Pool, JWT_SECRET: string) => {
         return c.json({ error: "Forbidden" }, 403);
       }
 
-      const sql = `
-        SELECT qb.question_id,
-               qb.knowledge_point,
-               qb.question_type,
-               qb.question_text,
-               qb.options,
-               qb.creator_id,
-               creator.full_name AS creator_name
-          FROM question_bank qb
-     LEFT JOIN users creator ON creator.user_id = qb.creator_id
-         WHERE qb.knowledge_point LIKE '%生产计划%'
-      ORDER BY RAND()
-         LIMIT 4
-      `;
+      // Step 1: Get all question IDs matching the criteria (uses index)
+      const [idRows]: any[] = await pool.query(
+        `SELECT question_id FROM question_bank WHERE knowledge_point LIKE '%生产计划%'`
+      );
 
-      const [rows]: any[] = await pool.query(sql);
-
-      if (rows.length === 0) {
+      if (idRows.length === 0) {
         return c.json({ error: "No plan-related questions available" }, 404);
       }
+
+      // Step 2: Randomly select up to 4 question IDs in application layer
+      const allIds = idRows.map((row: any) => row.question_id);
+      const selectedIds: number[] = [];
+      const count = Math.min(4, allIds.length);
+
+      // Fisher-Yates shuffle to get random questions
+      const shuffled = [...allIds];
+      for (let i = shuffled.length - 1; i > 0; i--) {
+        const j = Math.floor(Math.random() * (i + 1));
+        [shuffled[i], shuffled[j]] = [shuffled[j], shuffled[i]];
+      }
+      selectedIds.push(...shuffled.slice(0, count));
+
+      // Step 3: Fetch full details for selected questions (uses primary key)
+      const placeholders = selectedIds.map(() => '?').join(',');
+      const [rows]: any[] = await pool.query(
+        `SELECT qb.question_id,
+                qb.knowledge_point,
+                qb.question_type,
+                qb.question_text,
+                qb.options,
+                qb.creator_id,
+                creator.full_name AS creator_name
+           FROM question_bank qb
+      LEFT JOIN users creator ON creator.user_id = qb.creator_id
+          WHERE qb.question_id IN (${placeholders})`,
+        selectedIds
+      );
 
       const normalized = rows.map((row: any) => normalizeQuestionRow(row, false));
       return c.json(normalized);
