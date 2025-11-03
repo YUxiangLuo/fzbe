@@ -779,7 +779,11 @@ export default (pool: Pool, JWT_SECRET: string) => {
         const { userId } = c.req.valid("param");
         const targetUserId = parseInt(userId, 10);
 
-        if (payload.role !== "Admin" && payload.role !== "Teacher") {
+        if (
+          payload.role !== "Admin" &&
+          payload.role !== "Teacher" &&
+          payload.role !== "Assistant"
+        ) {
           return c.json({ error: "Forbidden" }, 403);
         }
 
@@ -800,7 +804,8 @@ export default (pool: Pool, JWT_SECRET: string) => {
 
         // 2. Authorization check for teachers
         if (payload.role === "Teacher") {
-          const teacherId = payload.sub;
+          const teacherIdParsed = Number.parseInt(String(payload.sub), 10);
+          const teacherId = Number.isNaN(teacherIdParsed) ? payload.sub : teacherIdParsed;
           const [enrollmentRows]: any[] = await pool.query(
             `SELECT 1
                FROM enrollments e
@@ -812,6 +817,23 @@ export default (pool: Pool, JWT_SECRET: string) => {
 
           if (enrollmentRows.length === 0) {
             return c.json({ error: "Forbidden: Student is not in one of your classes" }, 403);
+          }
+        } else if (payload.role === "Assistant") {
+          const assistantIdParsed = Number.parseInt(String(payload.sub), 10);
+          const assistantId = Number.isNaN(assistantIdParsed) ? payload.sub : assistantIdParsed;
+          const [assignmentRows]: any[] = await pool.query(
+            `SELECT 1
+               FROM enrollments e
+               JOIN class_assistants ca ON e.class_id = ca.class_id
+              WHERE e.student_id = ? AND ca.assistant_id = ?
+              LIMIT 1`,
+            [targetUserId, assistantId],
+          );
+
+          if (assignmentRows.length === 0) {
+            return c.json({
+              error: "Forbidden: Student is not assigned to one of your classes",
+            }, 403);
           }
         }
         // Admins are allowed to proceed

@@ -624,28 +624,88 @@ export default (pool: Pool, JWT_SECRET: string) => {
           return c.json({ error: "Forbidden" }, 403);
         }
 
-        // Get experiment status for all students in class
-        const [experimentStatus]: any[] = await pool.query(
+        const [studentRows]: any[] = await pool.query(
           `SELECT
              u.user_id,
              u.username,
-             u.full_name,
-             e.enrollment_id,
-             COUNT(DISTINCT es.experiment_id) AS total_experiments,
-             SUM(CASE WHEN es.status = 'Completed' THEN 1 ELSE 0 END) AS completed_experiments,
-             SUM(CASE WHEN er.report_id IS NOT NULL THEN 1 ELSE 0 END) AS submitted_reports,
-             MAX(COALESCE(es.last_activity_at, es.start_time)) AS last_experiment_date
+             u.full_name
            FROM enrollments e
            JOIN users u ON e.student_id = u.user_id
-           LEFT JOIN experiment_status es ON u.user_id = es.student_id
-           LEFT JOIN experiment_reports er ON es.experiment_id = er.experiment_id
            WHERE e.class_id = ?
-           GROUP BY u.user_id, e.enrollment_id
            ORDER BY u.username ASC`,
           [classIdNumber],
         );
 
-        return c.json(experimentStatus);
+        if (studentRows.length === 0) {
+          return c.json([]);
+        }
+
+        const studentIds = Array.from(
+          new Set(
+            studentRows.map((row: any) => Number.parseInt(String(row.user_id), 10)),
+          ),
+        );
+        const statusesByStudent = new Map<number, any[]>();
+
+        if (studentIds.length > 0) {
+          const placeholders = studentIds.map(() => "?").join(", ");
+          const [statusRows]: any[] = await pool.query(
+            `
+              SELECT
+                experiment_id,
+                student_id,
+                status,
+                current_step,
+                highest_completed_step,
+                total_active_duration_seconds,
+                selected_industry,
+                selected_company,
+                selected_product,
+                start_time,
+                last_activity_at,
+                completion_time
+              FROM experiment_status
+              WHERE student_id IN (${placeholders})
+              ORDER BY student_id ASC, experiment_id ASC
+            `,
+            studentIds,
+          );
+
+          for (const row of statusRows) {
+            const studentId = Number.parseInt(String(row.student_id), 10);
+            const normalized = {
+              experiment_id: row.experiment_id,
+              status: row.status,
+              current_step: row.current_step,
+              highest_completed_step: row.highest_completed_step,
+              total_active_duration_seconds: row.total_active_duration_seconds,
+              selected_industry: row.selected_industry ?? null,
+              selected_company: row.selected_company ?? null,
+              selected_product: row.selected_product ?? null,
+              start_time: toIsoString(row.start_time),
+              last_activity_at: toIsoString(row.last_activity_at),
+              completion_time: toIsoString(row.completion_time),
+            };
+            if (!statusesByStudent.has(studentId)) {
+              statusesByStudent.set(studentId, []);
+            }
+            statusesByStudent.get(studentId)!.push(normalized);
+          }
+        }
+
+        const responsePayload = studentRows.map(
+          (student: { user_id: number; username: string; full_name: string }) => {
+            const studentId = Number.parseInt(String(student.user_id), 10);
+            return {
+              student_id: studentId,
+              username: student.username,
+              full_name: student.full_name,
+              experiments: statusesByStudent.get(studentId) ?? [],
+            };
+          },
+        );
+
+        return c.json(responsePayload);
       } catch (error) {
         console.error("Error fetching experiment status:", error);
         throw error;
