@@ -481,10 +481,8 @@ const fetchLatestNotCompletedExperimentForStudent = async (pool: Pool, studentId
 export default (pool: Pool, JWT_SECRET: string) => {
   const experimentsApi = new Hono();
 
-  experimentsApi.use("*", jwt({ secret: JWT_SECRET }));
-
   // GET /api/v1/students/me/experiment-runs/active - 查询当前学生正在进行的实验状态
-  experimentsApi.get("/api/v1/students/me/experiment-runs/active", async (c) => {
+  experimentsApi.get("/api/v1/students/me/experiment-runs/active", jwt({ secret: JWT_SECRET }), async (c) => {
     const payload = c.get("jwtPayload");
     if (payload.role !== "Student") {
       return c.json({ error: "Forbidden" }, 403);
@@ -506,6 +504,7 @@ export default (pool: Pool, JWT_SECRET: string) => {
   // 创建新的实验状态记录
   experimentsApi.post(
     "/api/v1/students/me/experiment-runs",
+    jwt({ secret: JWT_SECRET }),
     zValidator("json", createExperimentSchema),
     async (c) => {
       const payload = c.get("jwtPayload");
@@ -558,6 +557,7 @@ export default (pool: Pool, JWT_SECRET: string) => {
   // 更新指定实验状态
   experimentsApi.put(
     "/api/v1/experiment-runs/:experimentId",
+    jwt({ secret: JWT_SECRET }),
     zValidator("param", experimentIdParamSchema),
     zValidator("json", updateExperimentSchema),
     async (c) => {

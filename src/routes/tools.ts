@@ -27,10 +27,9 @@ const adfRequestSchema = z.object({
 export default (_pool: Pool, JWT_SECRET: string) => {
   const toolsApi = new Hono();
 
-  toolsApi.use("*", jwt({ secret: JWT_SECRET }));
-
   toolsApi.post(
     "/api/v1/tools/adf",
+    jwt({ secret: JWT_SECRET }),
     zValidator("json", adfRequestSchema),
     async (c) => {
       const { series } = c.req.valid("json") as { series: AdfInputPoint[] };

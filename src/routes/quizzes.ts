@@ -51,10 +51,8 @@ const batchSubmitAnswersSchema = z.object({
 export default (pool: Pool, JWT_SECRET: string) => {
   const quizzesApi = new Hono();
 
-  quizzesApi.use("*", jwt({ secret: JWT_SECRET }));
-
   // GET /api/v1/quizzes/model/questions - 获取模型相关题目
-  quizzesApi.get("/api/v1/quizzes/model/questions", async (c) => {
+  quizzesApi.get("/api/v1/quizzes/model/questions", jwt({ secret: JWT_SECRET }), async (c) => {
     try {
       const payload = c.get("jwtPayload");
       if (payload.role !== "Student") {
@@ -109,7 +107,7 @@ export default (pool: Pool, JWT_SECRET: string) => {
   });
 
   // GET /api/v1/quizzes/plan/questions - 获取生产计划题目
-  quizzesApi.get("/api/v1/quizzes/plan/questions", async (c) => {
+  quizzesApi.get("/api/v1/quizzes/plan/questions", jwt({ secret: JWT_SECRET }), async (c) => {
     try {
       const payload = c.get("jwtPayload");
       if (payload.role !== "Student") {
@@ -166,6 +164,7 @@ export default (pool: Pool, JWT_SECRET: string) => {
   // POST /api/v1/quizzes/answers - 提交答案
   quizzesApi.post(
     "/api/v1/quizzes/answers",
+    jwt({ secret: JWT_SECRET }),
     zValidator("json", batchSubmitAnswersSchema),
     async (c) => {
       try {
