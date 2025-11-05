@@ -7,28 +7,36 @@ import { getDefaultPasswordHash } from "../utils";
 
 // Zod Schemas for Validation
 const classIdParamSchema = z.object({
-  classId: z.string().regex(/^\d+$/, { message: "classId must be a number" }),
+  classId: z.string().regex(/^\d+$/, "classId must be a number"),
 });
 
 const classAssistantParamSchema = z.object({
-  classId: z.string().regex(/^\d+$/),
-  assistantId: z.string().regex(/^\d+$/),
+  classId: z.string().regex(/^\d+$/, "classId must be a number"),
+  assistantId: z.string().regex(/^\d+$/, "assistantId must be a number"),
 });
 
 const classStudentParamSchema = z.object({
-  classId: z.string().regex(/^\d+$/),
-  studentId: z.string().regex(/^\d+$/),
+  classId: z.string().regex(/^\d+$/, "classId must be a number"),
+  studentId: z.string().regex(/^\d+$/, "studentId must be a number"),
 });
 
 const createStudentSchema = z.object({
-  username: z.string().min(1, { message: "学号 is required" }),
-  full_name: z.string().min(1, { message: "姓名 is required" }),
-  email: z.string().email().optional(),
+  username: z.string().min(1, "学号 is required"),
+  full_name: z.string().min(1, "姓名 is required"),
+  email: z.string().regex(/^[^\s@]+@[^\s@]+\.[^\s@]+$/, "Invalid email format").optional(),
   phone_number: z.string().optional(),
 });
 
 const addAssistantSchema = z.object({
   assistant_id: z.number().int().min(1),
+});
+
+const joinClassSchema = z.object({
+  class_code: z.string().optional(), // Optional class code for verification
+});
+
+const enrollStudentSchema = z.object({
+  student_id: z.number().int().positive("Student ID must be a positive integer"),
 });
 
 export default (pool: Pool, JWT_SECRET: string) => {
@@ -45,6 +53,36 @@ export default (pool: Pool, JWT_SECRET: string) => {
       [classId, assistantId],
     );
     return Boolean(assignment);
+  };
+
+  const checkClassAccess = async (
+    db: Queryable,
+    classId: number,
+    payload: any,
+    allowAssistants: boolean = true,
+  ): Promise<{ allowed: boolean; teacherId: number | null }> => {
+    const [classRows]: any[] = await db.query(
+      "SELECT teacher_id FROM classes WHERE class_id = ?",
+      [classId],
+    );
+
+    if (classRows.length === 0) {
+      return { allowed: false, teacherId: null };
+    }
+
+    const teacherId = classRows[0].teacher_id;
+    let isAllowed = false;
+
+    if (payload.role === "Admin" || payload.sub === teacherId) {
+      isAllowed = true;
+    } else if (allowAssistants && payload.role === "Assistant") {
+      const assigned = await isAssistantAssignedToClass(db, classId, payload.sub);
+      if (assigned) {
+        isAllowed = true;
+      }
+    }
+
+    return { allowed: isAllowed, teacherId };
   };
 
   // POST /api/v1/classes/:classId/students - 创建学生并加入班级
@@ -71,32 +109,19 @@ export default (pool: Pool, JWT_SECRET: string) => {
       try {
         await connection.beginTransaction();
 
-        const [classRows]: any[] = await connection.query(
-          "SELECT teacher_id FROM classes WHERE class_id = ?",
-          [classIdNumber],
+        const { allowed, teacherId } = await checkClassAccess(
+          connection,
+          classIdNumber,
+          payload,
+          true,
         );
 
-        if (classRows.length === 0) {
+        if (teacherId === null) {
           await connection.rollback();
           return c.json({ error: "Class not found" }, 404);
         }
 
-        const classOwner = classRows[0].teacher_id;
-        let isAllowed = false;
-        if (payload.role === "Admin" || payload.sub === classOwner) {
-          isAllowed = true;
-        } else if (payload.role === "Assistant") {
-          const assigned = await isAssistantAssignedToClass(
-            connection,
-            classIdNumber,
-            payload.sub,
-          );
-          if (assigned) {
-            isAllowed = true;
-          }
-        }
-
-        if (!isAllowed) {
+        if (!allowed) {
           await connection.rollback();
           return c.json({ error: "Forbidden" }, 403);
         }
@@ -166,6 +191,106 @@ export default (pool: Pool, JWT_SECRET: string) => {
     },
   );
 
+  // POST /api/v1/classes/:classId/enroll - 教师添加已存在的学生到班级
+  classMembersApi.post(
+    "/api/v1/classes/:classId/enroll",
+    jwt({ secret: JWT_SECRET }),
+    zValidator("param", classIdParamSchema),
+    zValidator("json", enrollStudentSchema),
+    async (c) => {
+      try {
+        const payload = c.get("jwtPayload");
+        const { classId } = c.req.valid("param");
+        const classIdNumber = Number.parseInt(classId, 10);
+        const { student_id } = c.req.valid("json");
+
+        // Only Teacher and Admin can enroll students
+        if (payload.role !== "Teacher" && payload.role !== "Admin") {
+          return c.json({ error: "Forbidden" }, 403);
+        }
+
+        // Check class access
+        const { allowed, teacherId } = await checkClassAccess(
+          pool,
+          classIdNumber,
+          payload,
+          false, // Only Teacher and Admin
+        );
+
+        if (teacherId === null) {
+          return c.json({ error: "Class not found" }, 404);
+        }
+
+        if (!allowed) {
+          return c.json({ error: "Forbidden: You can only enroll students to your own classes" }, 403);
+        }
+
+        // Verify the user exists and is a student
+        const [userRows]: any[] = await pool.query(
+          "SELECT user_id, role, full_name FROM users WHERE user_id = ?",
+          [student_id],
+        );
+
+        if (userRows.length === 0) {
+          return c.json({ error: "Student not found" }, 404);
+        }
+
+        if (userRows[0].role !== "Student") {
+          return c.json({ error: "User is not a student" }, 400);
+        }
+
+        // Check if student is already in any class
+        const [existingEnrollments]: any[] = await pool.query(
+          `SELECT e.class_id, c.class_name
+           FROM enrollments e
+           JOIN classes c ON e.class_id = c.class_id
+           WHERE e.student_id = ?
+           LIMIT 1`,
+          [student_id],
+        );
+
+        if (existingEnrollments.length > 0) {
+          const currentClass = existingEnrollments[0];
+          return c.json(
+            {
+              error: "Student already enrolled in a class",
+              message: "This student is already enrolled in another class",
+              current_class: {
+                class_id: currentClass.class_id,
+                class_name: currentClass.class_name,
+              },
+            },
+            409,
+          );
+        }
+
+        // Enroll the student
+        await pool.query(
+          "INSERT INTO enrollments (student_id, class_id) VALUES (?, ?)",
+          [student_id, classIdNumber],
+        );
+
+        return c.json(
+          {
+            message: "Student enrolled successfully",
+            student: {
+              user_id: userRows[0].user_id,
+              full_name: userRows[0].full_name,
+            },
+            class_id: classIdNumber,
+          },
+          201,
+        );
+      } catch (error: any) {
+        if (error.code === "ER_DUP_ENTRY") {
+          return c.json({ error: "Student already enrolled in this class" }, 409);
+        }
+        console.error("Error enrolling student:", error);
+        throw error;
+      }
+    },
+  );
+
   // GET /api/v1/classes/:classId/students - 获取班级学生
   classMembersApi.get(
     "/api/v1/classes/:classId/students",
@@ -177,30 +302,18 @@ export default (pool: Pool, JWT_SECRET: string) => {
         const { classId } = c.req.valid("param");
         const classIdNumber = Number.parseInt(classId, 10);
 
-        const [classRows]: any[] = await pool.query(
-          "SELECT teacher_id FROM classes WHERE class_id = ?",
-          [classIdNumber],
+        const { allowed, teacherId } = await checkClassAccess(
+          pool,
+          classIdNumber,
+          payload,
+          true,
         );
 
-        if (classRows.length === 0) {
+        if (teacherId === null) {
           return c.json({ error: "Class not found" }, 404);
         }
 
-        const classOwner = classRows[0].teacher_id;
-        let isAllowed = false;
-        if (payload.role === "Admin" || payload.sub === classOwner) {
-          isAllowed = true;
-        } else if (payload.role === "Assistant") {
-          const [[assignment]]: any[] = await pool.query(
-            "SELECT 1 FROM class_assistants WHERE class_id = ? AND assistant_id = ?",
-            [classIdNumber, payload.sub],
-          );
-          if (assignment) {
-            isAllowed = true;
-          }
-        }
-
-        if (!isAllowed) {
+        if (!allowed) {
           return c.json({ error: "Forbidden" }, 403);
         }
 
@@ -233,32 +346,33 @@ export default (pool: Pool, JWT_SECRET: string) => {
         const classIdNumber = Number.parseInt(classId, 10);
         const studentIdNumber = Number.parseInt(studentId, 10);
 
-        const [classRows]: any[] = await pool.query(
-          "SELECT teacher_id FROM classes WHERE class_id = ?",
-          [classIdNumber],
+        const { allowed, teacherId } = await checkClassAccess(
+          pool,
+          classIdNumber,
+          payload,
+          true,
         );
 
-        if (classRows.length === 0) {
+        if (teacherId === null) {
           return c.json({ error: "Class not found" }, 404);
         }
 
-        const classOwner = classRows[0].teacher_id;
-        let isAllowed = false;
-        if (payload.role === "Admin" || payload.sub === classOwner) {
-          isAllowed = true;
-        } else if (payload.role === "Assistant") {
-          const assigned = await isAssistantAssignedToClass(
-            pool,
-            classIdNumber,
-            payload.sub,
-          );
-          if (assigned) {
-            isAllowed = true;
-          }
+        if (!allowed) {
+          return c.json({ error: "Forbidden" }, 403);
         }
 
-        if (!isAllowed) {
-          return c.json({ error: "Forbidden" }, 403);
+        // Verify that the user is actually a student
+        const [userRows]: any[] = await pool.query(
+          "SELECT role FROM users WHERE user_id = ?",
+          [studentIdNumber],
+        );
+
+        if (userRows.length === 0) {
+          return c.json({ error: "User not found" }, 404);
+        }
+
+        if (userRows[0].role !== "Student") {
+          return c.json({ error: "User is not a student" }, 400);
         }
 
         const [result]: any = await pool.query(
@@ -278,6 +392,98 @@ export default (pool: Pool, JWT_SECRET: string) => {
     },
   );
 
+  // POST /api/v1/classes/:classId/join - 学生自主加入班级
+  classMembersApi.post(
+    "/api/v1/classes/:classId/join",
+    jwt({ secret: JWT_SECRET }),
+    zValidator("param", classIdParamSchema),
+    zValidator("json", joinClassSchema),
+    async (c) => {
+      try {
+        const payload = c.get("jwtPayload");
+        const { classId } = c.req.valid("param");
+        const classIdNumber = Number.parseInt(classId, 10);
+        const { class_code } = c.req.valid("json");
+
+        // Verify user is a student
+        if (payload.role !== "Student") {
+          return c.json({ error: "Only students can join classes" }, 403);
+        }
+
+        const studentId = payload.sub;
+
+        // Check if student is already in any class
+        const [existingEnrollments]: any[] = await pool.query(
+          `SELECT e.class_id, c.class_name, c.class_code
+           FROM enrollments e
+           JOIN classes c ON e.class_id = c.class_id
+           WHERE e.student_id = ?
+           LIMIT 1`,
+          [studentId],
+        );
+
+        if (existingEnrollments.length > 0) {
+          const currentClass = existingEnrollments[0];
+          return c.json(
+            {
+              error: "Already enrolled in a class",
+              message: "You are already enrolled in another class. Please leave your current class before joining a new one.",
+              current_class: {
+                class_id: currentClass.class_id,
+                class_name: currentClass.class_name,
+              },
+            },
+            409,
+          );
+        }
+
+        // Check if class exists and get class info
+        const [classRows]: any[] = await pool.query(
+          "SELECT class_id, class_name, class_code, teacher_id FROM classes WHERE class_id = ?",
+          [classIdNumber],
+        );
+
+        if (classRows.length === 0) {
+          return c.json({ error: "Class not found" }, 404);
+        }
+
+        const classInfo = classRows[0];
+
+        // Verify class code if the class has one
+        if (classInfo.class_code) {
+          if (!class_code) {
+            return c.json({ error: "Class code is required for this class" }, 400);
+          }
+          if (class_code !== classInfo.class_code) {
+            return c.json({ error: "Invalid class code" }, 403);
+          }
+        }
+
+        // Create enrollment
+        await pool.query(
+          "INSERT INTO enrollments (student_id, class_id) VALUES (?, ?)",
+          [studentId, classIdNumber],
+        );
+
+        // Return success with class info
+        return c.json(
+          {
+            message: "Successfully joined class",
+            class: {
+              class_id: classInfo.class_id,
+              class_name: classInfo.class_name,
+              teacher_id: classInfo.teacher_id,
+            },
+          },
+          201,
+        );
+      } catch (error) {
+        console.error("Error joining class:", error);
+        throw error;
+      }
+    },
+  );
+
   // POST /api/v1/classes/:classId/assistants - 添加助教
   classMembersApi.post(
     "/api/v1/classes/:classId/assistants",
@@ -291,14 +497,18 @@ export default (pool: Pool, JWT_SECRET: string) => {
         const classIdNumber = Number.parseInt(classId, 10);
         const { assistant_id } = c.req.valid("json");
 
-        const [classRows]: any[] = await pool.query(
-          "SELECT teacher_id FROM classes WHERE class_id = ?",
-          [classIdNumber],
+        const { allowed, teacherId } = await checkClassAccess(
+          pool,
+          classIdNumber,
+          payload,
+          false, // Only Admin and Teacher can add assistants
         );
-        if (classRows.length === 0) {
+
+        if (teacherId === null) {
           return c.json({ error: "Class not found" }, 404);
         }
-        if (payload.role !== "Admin" && payload.sub !== classRows[0].teacher_id) {
+
+        if (!allowed) {
           return c.json({ error: "Forbidden" }, 403);
         }
 
@@ -337,29 +547,18 @@ export default (pool: Pool, JWT_SECRET: string) => {
         const { classId } = c.req.valid("param");
         const classIdNumber = Number.parseInt(classId, 10);
 
-        const [classRows]: any[] = await pool.query(
-          "SELECT teacher_id FROM classes WHERE class_id = ?",
-          [classIdNumber],
+        const { allowed, teacherId } = await checkClassAccess(
+          pool,
+          classIdNumber,
+          payload,
+          true,
         );
-        if (classRows.length === 0) {
+
+        if (teacherId === null) {
           return c.json({ error: "Class not found" }, 404);
         }
 
-        const classOwner = classRows[0].teacher_id;
-        let isAllowed = false;
-        if (payload.role === "Admin" || payload.sub === classOwner) {
-          isAllowed = true;
-        } else if (payload.role === "Assistant") {
-          const [[assignment]]: any[] = await pool.query(
-            "SELECT 1 FROM class_assistants WHERE class_id = ? AND assistant_id = ?",
-            [classIdNumber, payload.sub],
-          );
-          if (assignment) {
-            isAllowed = true;
-          }
-        }
-
-        if (!isAllowed) {
+        if (!allowed) {
           return c.json({ error: "Forbidden" }, 403);
         }
 
@@ -391,14 +590,18 @@ export default (pool: Pool, JWT_SECRET: string) => {
         const classIdNumber = Number.parseInt(classId, 10);
         const assistantIdNumber = Number.parseInt(assistantId, 10);
 
-        const [classRows]: any[] = await pool.query(
-          "SELECT teacher_id FROM classes WHERE class_id = ?",
-          [classIdNumber],
+        const { allowed, teacherId } = await checkClassAccess(
+          pool,
+          classIdNumber,
+          payload,
+          false, // Only Admin and Teacher can remove assistants
         );
-        if (classRows.length === 0) {
+
+        if (teacherId === null) {
           return c.json({ error: "Class not found" }, 404);
         }
-        if (payload.role !== "Admin" && payload.sub !== classRows[0].teacher_id) {
+
+        if (!allowed) {
           return c.json({ error: "Forbidden" }, 403);
         }
 

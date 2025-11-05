@@ -86,12 +86,138 @@ const createAssistantSchema = registerSchema
   })
   .omit({ role: true }); // Role is fixed to 'Assistant', so we don't need it from the input.
 
+// Self-registration schemas for different roles
+const roleParamSchema = z.object({
+  role: z.enum(["Student", "Teacher", "Assistant"], "Invalid role. Must be Student, Teacher, or Assistant"),
+});
+
+const studentSelfRegisterSchema = z.object({
+  username: z
+    .string()
+    .min(8, "Student username must be at least 8 digits")
+    .regex(/^\d+$/, "Student username must contain only digits"),
+  password: z
+    .string()
+    .min(8, "Password must be at least 8 characters long")
+    .regex(/^(?=.*[A-Za-z])(?=.*\d).+$/, "Password must contain both letters and numbers"),
+  name: z
+    .string()
+    .min(1, "Name is required")
+    .regex(/^[\u4e00-\u9fa5a-zA-Z\s]+$/, "Name can only contain Chinese characters, English letters, and spaces"),
+  email: z.string().regex(/^[^\s@]+@[^\s@]+\.[^\s@]+$/, "Invalid email format"),
+});
+
+const teacherAssistantSelfRegisterSchema = z.object({
+  username: z
+    .string()
+    .min(3, "Username must be at least 3 characters long")
+    .regex(/^[a-zA-Z0-9]+$/, "Username can only contain letters and numbers"),
+  password: z
+    .string()
+    .min(8, "Password must be at least 8 characters long")
+    .regex(/^(?=.*[A-Za-z])(?=.*\d).+$/, "Password must contain both letters and numbers"),
+  name: z
+    .string()
+    .min(1, "Name is required")
+    .regex(/^[\u4e00-\u9fa5a-zA-Z\s]+$/, "Name can only contain Chinese characters, English letters, and spaces"),
+  email: z.string().regex(/^[^\s@]+@[^\s@]+\.[^\s@]+$/, "Invalid email format"),
+  phone: z
+    .string()
+    .length(11, "Phone number must be exactly 11 digits")
+    .regex(/^\d{11}$/, "Phone number must contain only digits"),
+});
+
 // Teacher-centric grade weights have been removed. All grade weights are now class-centric
 // via the `grade_weights` table keyed by `class_id`. Any legacy teacher-based initialization
 // logic has been deleted.
 
 export default (pool: Pool, JWT_SECRET: string) => {
   const usersApi = new Hono();
+
+  // Self-registration endpoint (no authentication required)
+  usersApi.post(
+    "/api/v1/users/register/:role",
+    zValidator("param", roleParamSchema),
+    async (c) => {
+      try {
+        const { role } = c.req.valid("param");
+        const body = await c.req.json();
+
+        // Validate request body based on role
+        let validatedData: any;
+        if (role === "Student") {
+          const result = studentSelfRegisterSchema.safeParse(body);
+          if (!result.success) {
+            return c.json(
+              { error: "Validation failed", details: result.error.issues },
+              400
+            );
+          }
+          validatedData = result.data;
+        } else if (role === "Teacher" || role === "Assistant") {
+          const result = teacherAssistantSelfRegisterSchema.safeParse(body);
+          if (!result.success) {
+            return c.json(
+              { error: "Validation failed", details: result.error.issues },
+              400
+            );
+          }
+          validatedData = result.data;
+        } else {
+          return c.json({ error: "Invalid role" }, 400);
+        }
+
+        const { username, password, name, email } = validatedData;
+        const phone = validatedData.phone || null;
+
+        // Hash the password
+        const password_hash = await Bun.password.hash(password, {
+          algorithm: "bcrypt",
+          cost: 10,
+        });
+
+        try {
+          // Insert the new user
+          const [result]: any = await pool.query(
+            "INSERT INTO users (username, password_hash, full_name, email, phone_number, role) VALUES (?, ?, ?, ?, ?, ?)",
+            [username, password_hash, name, email, phone, role]
+          );
+
+          const newUserId = result.insertId;
+
+          // Return the created user (without password hash)
+          return c.json(
+            {
+              user_id: newUserId,
+              username,
+              full_name: name,
+              email,
+              phone_number: phone,
+              role,
+              message: `${role} account created successfully`,
+            },
+            201
+          );
+        } catch (error: any) {
+          if (error.code === "ER_DUP_ENTRY") {
+            if (error.message.includes("users.username")) {
+              return c.json({ error: "Username already exists" }, 409);
+            }
+            if (error.message.includes("users.email")) {
+              return c.json({ error: "Email already exists" }, 409);
+            }
+            if (error.message.includes("users.phone_number")) {
+              return c.json({ error: "Phone number already exists" }, 409);
+            }
+          }
+          throw error;
+        }
+      } catch (error) {
+        console.error("Error during self-registration:", error);
+        return c.json({ error: "Registration failed" }, 500);
+      }
+    }
+  );
 
   // Admin: Fuzzy search users by name/email/phone
   usersApi.get(
@@ -488,27 +614,34 @@ export default (pool: Pool, JWT_SECRET: string) => {
             new Set(teacherRows.map((row) => row.phone)),
           );
 
-          const placeholdersSegments: string[] = [];
-          const values: any[] = [];
+          // Optimized conflict detection using UNION ALL for better index usage
+          const queries: string[] = [];
+          const allParams: any[] = [];
 
-          const pushSegment = (label: string, items: string[]) => {
-            if (items.length > 0) {
-              placeholdersSegments.push(
-                `${label} IN (${items.map(() => "?").join(", ")})`,
-              );
-              values.push(...items);
-            }
-          };
-
-          pushSegment("username", usernames);
-          pushSegment("phone_number", phones);
-          pushSegment("email", emails);
-
-          if (placeholdersSegments.length > 0) {
-            const [existing]: any[] = await connection.query(
-              `SELECT username, phone_number, email FROM users WHERE ${placeholdersSegments.join(" OR ")}`,
-              values,
+          if (usernames.length > 0) {
+            queries.push(
+              `SELECT DISTINCT username, phone_number, email FROM users WHERE username IN (${usernames.map(() => "?").join(", ")})`
             );
+            allParams.push(...usernames);
+          }
+
+          if (phones.length > 0) {
+            queries.push(
+              `SELECT DISTINCT username, phone_number, email FROM users WHERE phone_number IN (${phones.map(() => "?").join(", ")})`
+            );
+            allParams.push(...phones);
+          }
+
+          if (emails.length > 0) {
+            queries.push(
+              `SELECT DISTINCT username, phone_number, email FROM users WHERE email IN (${emails.map(() => "?").join(", ")})`
+            );
+            allParams.push(...emails);
+          }
+
+          if (queries.length > 0) {
+            const unionQuery = queries.join(" UNION ");
+            const [existing]: any[] = await connection.query(unionQuery, allParams);
 
             if (existing.length > 0) {
               await connection.rollback();
@@ -691,6 +824,7 @@ export default (pool: Pool, JWT_SECRET: string) => {
       }
 
       if (user.role === "Student") {
+        // Fetch all classes the student is enrolled in
         const [classRows]: any[] = await pool.query(
           `SELECT c.class_id,
                   c.class_name,
@@ -701,9 +835,12 @@ export default (pool: Pool, JWT_SECRET: string) => {
              JOIN classes c ON c.class_id = e.class_id
         LEFT JOIN users teacher ON teacher.user_id = c.teacher_id
             WHERE e.student_id = ?
-            LIMIT 1`,
+         ORDER BY e.enrollment_id ASC`,
           [userId],
         );
+        // Return all classes for full transparency
+        user.classes = classRows;
+        // For backward compatibility, also return the first class as user.class
         user.class = classRows[0] ?? null;
       }
 
@@ -930,8 +1067,7 @@ export default (pool: Pool, JWT_SECRET: string) => {
 
         // 2. Authorization check for teachers
         if (payload.role === "Teacher") {
-          const teacherIdParsed = Number.parseInt(String(payload.sub), 10);
-          const teacherId = Number.isNaN(teacherIdParsed) ? payload.sub : teacherIdParsed;
+          const teacherId = Number(payload.sub);
           const [enrollmentRows]: any[] = await pool.query(
             `SELECT 1
                FROM enrollments e
@@ -945,8 +1081,7 @@ export default (pool: Pool, JWT_SECRET: string) => {
             return c.json({ error: "Forbidden: Student is not in one of your classes" }, 403);
           }
         } else if (payload.role === "Assistant") {
-          const assistantIdParsed = Number.parseInt(String(payload.sub), 10);
-          const assistantId = Number.isNaN(assistantIdParsed) ? payload.sub : assistantIdParsed;
+          const assistantId = Number(payload.sub);
           const [assignmentRows]: any[] = await pool.query(
             `SELECT 1
                FROM enrollments e
