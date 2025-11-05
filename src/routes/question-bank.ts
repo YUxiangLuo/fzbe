@@ -133,10 +133,9 @@ const normalizeQuestionRow = (row: any, includeAnswers = true) => {
 export default (pool: Pool, JWT_SECRET: string) => {
   const questionBankApi = new Hono();
 
-  questionBankApi.use("*", jwt({ secret: JWT_SECRET }));
 
   // GET /api/v1/question-bank/questions - 获取所有题目
-  questionBankApi.get("/api/v1/question-bank/questions", async (c) => {
+  questionBankApi.get("/api/v1/question-bank/questions", jwt({ secret: JWT_SECRET }), async (c) => {
     try {
       const payload = c.get("jwtPayload");
       if (
@@ -172,6 +171,7 @@ export default (pool: Pool, JWT_SECRET: string) => {
   // POST /api/v1/question-bank/questions - 创建新题目
   questionBankApi.post(
     "/api/v1/question-bank/questions",
+    jwt({ secret: JWT_SECRET }),
     zValidator("json", createQuestionSchema),
     async (c) => {
       try {
@@ -236,6 +236,7 @@ export default (pool: Pool, JWT_SECRET: string) => {
   // PUT /api/v1/question-bank/questions/:questionId - 更新题目
   questionBankApi.put(
     "/api/v1/question-bank/questions/:questionId",
+    jwt({ secret: JWT_SECRET }),
     zValidator("param", questionIdParamSchema),
     zValidator("json", updateQuestionSchema),
     async (c) => {
@@ -324,6 +325,7 @@ export default (pool: Pool, JWT_SECRET: string) => {
   // DELETE /api/v1/question-bank/questions/:questionId - 删除题目
   questionBankApi.delete(
     "/api/v1/question-bank/questions/:questionId",
+    jwt({ secret: JWT_SECRET }),
     zValidator("param", questionIdParamSchema),
     async (c) => {
       try {

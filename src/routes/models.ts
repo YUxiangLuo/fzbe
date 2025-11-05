@@ -325,12 +325,11 @@ async function runPythonMain(args: string[], timeoutMs?: number): Promise<any> {
 export default (pool: Pool, JWT_SECRET: string) => {
   const modelsApi = new Hono();
 
-  modelsApi.use("*", jwt({ secret: JWT_SECRET }));
 
   // ========== Base Model Training Routes ==========
 
   // MA Training
-  modelsApi.post("/api/v1/models/ma/training", zValidator("json", trainMovingAverageSchema), async (c) => {
+  modelsApi.post("/api/v1/models/ma/training", jwt({ secret: JWT_SECRET }), zValidator("json", trainMovingAverageSchema), async (c) => {
     const payload = c.get("jwtPayload");
     if (payload.role !== "Student") {
       return c.json({ error: "Only students can train models" }, 403);
@@ -371,7 +370,7 @@ export default (pool: Pool, JWT_SECRET: string) => {
   });
 
   // ES Training
-  modelsApi.post("/api/v1/models/es/training", zValidator("json", trainExponentialSmoothingSchema), async (c) => {
+  modelsApi.post("/api/v1/models/es/training", jwt({ secret: JWT_SECRET }), zValidator("json", trainExponentialSmoothingSchema), async (c) => {
     const payload = c.get("jwtPayload");
     if (payload.role !== "Student") {
       return c.json({ error: "Only students can train models" }, 403);
@@ -412,7 +411,7 @@ export default (pool: Pool, JWT_SECRET: string) => {
   });
 
   // ARIMA Training
-  modelsApi.post("/api/v1/models/arima/training", zValidator("json", trainArimaSchema), async (c) => {
+  modelsApi.post("/api/v1/models/arima/training", jwt({ secret: JWT_SECRET }), zValidator("json", trainArimaSchema), async (c) => {
     const payload = c.get("jwtPayload");
     if (payload.role !== "Student") {
       return c.json({ error: "Only students can train models" }, 403);
@@ -453,7 +452,7 @@ export default (pool: Pool, JWT_SECRET: string) => {
   });
 
   // LSTM Training
-  modelsApi.post("/api/v1/models/lstm/training", zValidator("json", trainLstmSchema), async (c) => {
+  modelsApi.post("/api/v1/models/lstm/training", jwt({ secret: JWT_SECRET }), zValidator("json", trainLstmSchema), async (c) => {
     const payload = c.get("jwtPayload");
     if (payload.role !== "Student") {
       return c.json({ error: "Only students can train models" }, 403);
@@ -513,6 +512,7 @@ export default (pool: Pool, JWT_SECRET: string) => {
   // Weighted Average Training
   modelsApi.post(
     "/api/v1/models/weighted-average/training",
+    jwt({ secret: JWT_SECRET }),
     zValidator("json", trainWeightedAverageSchema),
     async (c) => {
       const payload = c.get("jwtPayload");
@@ -582,7 +582,7 @@ export default (pool: Pool, JWT_SECRET: string) => {
   );
 
   // Boosting Training
-  modelsApi.post("/api/v1/models/boosting/training", zValidator("json", trainBoostingSchema), async (c) => {
+  modelsApi.post("/api/v1/models/boosting/training", jwt({ secret: JWT_SECRET }), zValidator("json", trainBoostingSchema), async (c) => {
     const payload = c.get("jwtPayload");
     if (payload.role !== "Student") {
       return c.json({ error: "Only students can train models" }, 403);
@@ -681,7 +681,7 @@ export default (pool: Pool, JWT_SECRET: string) => {
   });
 
   // Stacking Training
-  modelsApi.post("/api/v1/models/stacking/training", zValidator("json", trainStackingSchema), async (c) => {
+  modelsApi.post("/api/v1/models/stacking/training", jwt({ secret: JWT_SECRET }), zValidator("json", trainStackingSchema), async (c) => {
     const payload = c.get("jwtPayload");
     if (payload.role !== "Student") {
       return c.json({ error: "Only students can train models" }, 403);
@@ -727,7 +727,7 @@ export default (pool: Pool, JWT_SECRET: string) => {
   // ========== Prediction Routes ==========
 
   // Universal Prediction Endpoint
-  modelsApi.post("/api/v1/models/predictions", zValidator("json", predictSchema), async (c) => {
+  modelsApi.post("/api/v1/models/predictions", jwt({ secret: JWT_SECRET }), zValidator("json", predictSchema), async (c) => {
     const payload = c.get("jwtPayload");
     if (payload.role !== "Student") {
       return c.json({ error: "Only students can predict" }, 403);

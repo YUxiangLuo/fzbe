@@ -657,6 +657,7 @@ export default (pool: Pool, JWT_SECRET: string) => {
   // 为实验步骤创建开始/结束事件
   experimentsApi.post(
     "/api/v1/experiment-runs/:experimentId/events",
+    jwt({ secret: JWT_SECRET }),
     zValidator("param", experimentIdParamSchema),
     zValidator("json", experimentEventSchema),
     async (c) => {
