@@ -3,7 +3,7 @@ import { jwt } from "hono/jwt";
 import { z } from "zod";
 import { zValidator } from "@hono/zod-validator";
 import type { Pool } from "mysql2/promise";
-import puppeteer from "puppeteer";
+import puppeteer from "puppeteer-core";
 import path from "path";
 import { mkdir } from "node:fs/promises";
 import { handleUnexpectedError } from "../utils/error-handler";
@@ -77,6 +77,7 @@ export default (pool: Pool, JWT_SECRET: string) => {
         const pdfPath = path.join(reportsDir, uniqueFilename);
 
         browser = await puppeteer.launch({
+          executablePath: "/usr/bin/chromium",
           headless: true,
           args: ["--no-sandbox", "--disable-setuid-sandbox"],
         });

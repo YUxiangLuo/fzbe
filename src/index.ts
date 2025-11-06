@@ -62,7 +62,7 @@ logger.info("Database connection pool created.");
 const app = new Hono();
 
 // --- Global Middleware ---
-app.use(timestampedLogger);
+// app.use(timestampedLogger);
 app.use(cors());
 app.use(
   "/manuals/*",
@@ -78,6 +78,12 @@ app.use(
 );
 app.use(
   "/reports/*",
+  serveStatic({
+    root: path.resolve(import.meta.dir, "../uploads"),
+  }),
+);
+app.use(
+  "/exports/*",
   serveStatic({
     root: path.resolve(import.meta.dir, "../uploads"),
   }),

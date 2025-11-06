@@ -3,7 +3,7 @@ import { jwt } from "hono/jwt";
 import { z } from "zod";
 import { zValidator } from "@hono/zod-validator";
 import type { Pool, PoolConnection } from "mysql2/promise";
-import { access, copyFile, mkdtemp, rm } from "node:fs/promises";
+import { access, copyFile, mkdtemp, rm, mkdir } from "node:fs/promises";
 import path from "path";
 import os from "node:os";
 import { handleUnexpectedError } from "../utils/error-handler";
@@ -30,6 +30,7 @@ const EXP_FLOW_FIELDS = [
 ] as const;
 
 const STEP_COUNT = 7;
+const EXPORTS_DIR = path.resolve(import.meta.dir, "../../uploads", "exports");
 
 const toIsoString = (value: unknown): string | null => {
   if (!value) {
@@ -908,15 +909,14 @@ export default (pool: Pool, JWT_SECRET: string) => {
           throw new Error(`zip command failed: ${errorText}`);
         }
 
-        const zipFile = Bun.file(zipPath);
-        const zipBytes = await zipFile.arrayBuffer();
+        await mkdir(EXPORTS_DIR, { recursive: true });
+        const exportFileName = `class-${classIdNumber}-reports-${Date.now()}.zip`;
+        const exportFilePath = path.join(EXPORTS_DIR, exportFileName);
+        await copyFile(zipPath, exportFilePath);
+        const relativePath = `uploads/exports/${exportFileName}`;
 
-        return c.newResponse(zipBytes, {
-          status: 200,
-          headers: {
-            "Content-Type": "application/zip",
-            "Content-Disposition": `attachment; filename="${zipFileName}"`,
-          },
+        return c.json({
+          file_path: relativePath,
         });
       } finally {
         await rm(tempDir, { recursive: true, force: true });
@@ -1051,14 +1051,15 @@ export default (pool: Pool, JWT_SECRET: string) => {
       }
 
       const csvContent = "\uFEFF" + csvLines.join("\n");
-      const fileName = `class-${classIdNumber}-grades.csv`;
 
-      return c.newResponse(csvContent, {
-        status: 200,
-        headers: {
-          "Content-Type": "text/csv; charset=utf-8",
-          "Content-Disposition": `attachment; filename="${fileName}"`,
-        },
+      await mkdir(EXPORTS_DIR, { recursive: true });
+      const exportFileName = `class-${classIdNumber}-grades-${Date.now()}.csv`;
+      const exportFilePath = path.join(EXPORTS_DIR, exportFileName);
+      await Bun.write(exportFilePath, csvContent);
+      const relativePath = `uploads/exports/${exportFileName}`;
+
+      return c.json({
+        file_path: relativePath,
       });
     },
   );
