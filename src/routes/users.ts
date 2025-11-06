@@ -809,8 +809,18 @@ export default (pool: Pool, JWT_SECRET: string) => {
       const userId = payload.sub;
 
       const [rows]: any[] = await pool.query(
-        "SELECT user_id, username, full_name, email, phone_number, role, created_at FROM users WHERE user_id = ?",
-        [userId],
+        `SELECT
+           user_id,
+           username,
+           full_name,
+           email,
+           phone_number,
+           role,
+           created_at,
+           CASE WHEN password_hash = ? THEN TRUE ELSE FALSE END AS must_change_password
+         FROM users
+        WHERE user_id = ?`,
+        [DEFAULT_PASSWORD_HASH, userId],
       );
       const user = rows[0];
 
@@ -876,8 +886,18 @@ export default (pool: Pool, JWT_SECRET: string) => {
         await pool.query(sql, values);
 
         const [rows]: any[] = await pool.query(
-          "SELECT user_id, username, full_name, email, phone_number, role, created_at FROM users WHERE user_id = ?",
-          [userId],
+          `SELECT
+             user_id,
+             username,
+             full_name,
+             email,
+             phone_number,
+             role,
+             created_at,
+             CASE WHEN password_hash = ? THEN TRUE ELSE FALSE END AS must_change_password
+           FROM users
+          WHERE user_id = ?`,
+          [DEFAULT_PASSWORD_HASH, userId],
         );
         return c.json(rows[0]);
       } catch (error: any) {
@@ -958,8 +978,17 @@ export default (pool: Pool, JWT_SECRET: string) => {
         }
 
         const [rows]: any[] = await pool.query(
-          "SELECT user_id, username, full_name, email, role, created_at FROM users WHERE user_id = ?",
-          [targetUserId],
+          `SELECT
+             user_id,
+             username,
+             full_name,
+             email,
+             role,
+             created_at,
+             CASE WHEN password_hash = ? THEN TRUE ELSE FALSE END AS must_change_password
+           FROM users
+          WHERE user_id = ?`,
+          [DEFAULT_PASSWORD_HASH, targetUserId],
         );
         const user = rows[0];
 

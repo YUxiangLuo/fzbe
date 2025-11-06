@@ -6,6 +6,8 @@ import type { Pool, PoolConnection } from "mysql2/promise";
 import { getDefaultPasswordHash } from "../utils";
 import { handleUnexpectedError } from "../utils/error-handler";
 
+const DEFAULT_PASSWORD_HASH = getDefaultPasswordHash();
+
 // Zod Schemas for Validation
 const classIdParamSchema = z.object({
   classId: z.string().regex(/^\d+$/, "classId must be a number"),
@@ -127,7 +129,7 @@ export default (pool: Pool, JWT_SECRET: string) => {
           return c.json({ error: "Forbidden" }, 403);
         }
 
-        const defaultPasswordHash = getDefaultPasswordHash();
+        const defaultPasswordHash = DEFAULT_PASSWORD_HASH;
         const studentEmail = email || `${username}@student.edu`;
 
         const [userResult]: any = await connection.query(
@@ -155,11 +157,12 @@ export default (pool: Pool, JWT_SECRET: string) => {
                   u.email,
                   u.phone_number,
                   u.role,
-                  u.created_at
+                  u.created_at,
+                  CASE WHEN u.password_hash = ? THEN TRUE ELSE FALSE END AS must_change_password
              FROM users u
             WHERE u.user_id = ?
             LIMIT 1`,
-          [newStudentId],
+          [DEFAULT_PASSWORD_HASH, newStudentId],
         );
 
         if (studentRows.length === 0) {
