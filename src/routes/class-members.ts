@@ -4,6 +4,7 @@ import { z } from "zod";
 import { zValidator } from "@hono/zod-validator";
 import type { Pool, PoolConnection } from "mysql2/promise";
 import { getDefaultPasswordHash } from "../utils";
+import { handleUnexpectedError } from "../utils/error-handler";
 
 // Zod Schemas for Validation
 const classIdParamSchema = z.object({
@@ -183,8 +184,11 @@ export default (pool: Pool, JWT_SECRET: string) => {
           return c.json({ error: "学生创建冲突" }, 409);
         }
 
-        console.error("Error creating student and enrolling in class:", error);
-        throw error;
+        return handleUnexpectedError(
+          c,
+          error,
+          "Failed to create student and enroll in class",
+        );
       } finally {
         connection.release();
       }
@@ -203,90 +207,107 @@ export default (pool: Pool, JWT_SECRET: string) => {
         const { classId } = c.req.valid("param");
         const classIdNumber = Number.parseInt(classId, 10);
         const { student_id } = c.req.valid("json");
+        const connection = await pool.getConnection();
+        let transactionStarted = false;
 
-        // Only Teacher and Admin can enroll students
-        if (payload.role !== "Teacher" && payload.role !== "Admin") {
-          return c.json({ error: "Forbidden" }, 403);
-        }
+        try {
+          await connection.beginTransaction();
+          transactionStarted = true;
 
-        // Check class access
-        const { allowed, teacherId } = await checkClassAccess(
-          pool,
-          classIdNumber,
-          payload,
-          false, // Only Teacher and Admin
-        );
+          // Only Teacher and Admin can enroll students
+          if (payload.role !== "Teacher" && payload.role !== "Admin") {
+            await connection.rollback();
+            return c.json({ error: "Forbidden" }, 403);
+          }
 
-        if (teacherId === null) {
-          return c.json({ error: "Class not found" }, 404);
-        }
+          const { allowed, teacherId } = await checkClassAccess(
+            connection,
+            classIdNumber,
+            payload,
+            false, // Only Teacher and Admin
+          );
 
-        if (!allowed) {
-          return c.json({ error: "Forbidden: You can only enroll students to your own classes" }, 403);
-        }
+          if (teacherId === null) {
+            await connection.rollback();
+            return c.json({ error: "Class not found" }, 404);
+          }
 
-        // Verify the user exists and is a student
-        const [userRows]: any[] = await pool.query(
-          "SELECT user_id, role, full_name FROM users WHERE user_id = ?",
-          [student_id],
-        );
+          if (!allowed) {
+            await connection.rollback();
+            return c.json({ error: "Forbidden: You can only enroll students to your own classes" }, 403);
+          }
 
-        if (userRows.length === 0) {
-          return c.json({ error: "Student not found" }, 404);
-        }
+          const [[studentLock]]: any[] = await connection.query(
+            "SELECT user_id, role, full_name FROM users WHERE user_id = ? LIMIT 1 FOR UPDATE",
+            [student_id],
+          );
 
-        if (userRows[0].role !== "Student") {
-          return c.json({ error: "User is not a student" }, 400);
-        }
+          if (!studentLock) {
+            await connection.rollback();
+            return c.json({ error: "Student not found" }, 404);
+          }
 
-        // Check if student is already in any class
-        const [existingEnrollments]: any[] = await pool.query(
-          `SELECT e.class_id, c.class_name
-           FROM enrollments e
-           JOIN classes c ON e.class_id = c.class_id
-           WHERE e.student_id = ?
-           LIMIT 1`,
-          [student_id],
-        );
+          if (studentLock.role !== "Student") {
+            await connection.rollback();
+            return c.json({ error: "User is not a student" }, 400);
+          }
 
-        if (existingEnrollments.length > 0) {
-          const currentClass = existingEnrollments[0];
+          const [existingEnrollments]: any[] = await connection.query(
+            `SELECT e.class_id, c.class_name
+               FROM enrollments e
+               JOIN classes c ON e.class_id = c.class_id
+              WHERE e.student_id = ?
+              LIMIT 1`,
+            [student_id],
+          );
+
+          if (existingEnrollments.length > 0) {
+            const currentClass = existingEnrollments[0];
+            await connection.rollback();
+            return c.json(
+              {
+                error: "Student already enrolled in a class",
+                message: "This student is already enrolled in another class",
+                current_class: {
+                  class_id: currentClass.class_id,
+                  class_name: currentClass.class_name,
+                },
+              },
+              409,
+            );
+          }
+
+          await connection.query(
+            "INSERT INTO enrollments (student_id, class_id) VALUES (?, ?)",
+            [student_id, classIdNumber],
+          );
+
+          await connection.commit();
+
           return c.json(
             {
-              error: "Student already enrolled in a class",
-              message: "This student is already enrolled in another class",
-              current_class: {
-                class_id: currentClass.class_id,
-                class_name: currentClass.class_name,
+              message: "Student enrolled successfully",
+              student: {
+                user_id: studentLock.user_id,
+                full_name: studentLock.full_name,
               },
+              class_id: classIdNumber,
             },
-            409,
+            201,
           );
+        } catch (error: any) {
+          if (transactionStarted) {
+            await connection.rollback();
+          }
+          if (error?.code === "ER_DUP_ENTRY") {
+            return c.json({ error: "Student already enrolled in this class" }, 409);
+          }
+          return handleUnexpectedError(c, error, "Failed to enroll student");
+        } finally {
+          connection.release();
         }
-
-        // Enroll the student
-        await pool.query(
-          "INSERT INTO enrollments (student_id, class_id) VALUES (?, ?)",
-          [student_id, classIdNumber],
-        );
-
-        return c.json(
-          {
-            message: "Student enrolled successfully",
-            student: {
-              user_id: userRows[0].user_id,
-              full_name: userRows[0].full_name,
-            },
-            class_id: classIdNumber,
-          },
-          201,
-        );
       } catch (error: any) {
-        if (error.code === "ER_DUP_ENTRY") {
-          return c.json({ error: "Student already enrolled in this class" }, 409);
-        }
-        console.error("Error enrolling student:", error);
-        throw error;
+        return handleUnexpectedError(c, error, "Failed to enroll student");
       }
     },
   );
@@ -328,8 +349,7 @@ export default (pool: Pool, JWT_SECRET: string) => {
 
         return c.json(students);
       } catch (error) {
-        console.error("Error fetching students for class:", error);
-        throw error;
+        return handleUnexpectedError(c, error, "Failed to fetch class students");
       }
     },
   );
@@ -386,8 +406,7 @@ export default (pool: Pool, JWT_SECRET: string) => {
 
         return c.json({ message: "Student removed from class" });
       } catch (error) {
-        console.error("Error removing student from class:", error);
-        throw error;
+        return handleUnexpectedError(c, error, "Failed to remove student from class");
       }
     },
   );
@@ -411,75 +430,147 @@ export default (pool: Pool, JWT_SECRET: string) => {
         }
 
         const studentId = payload.sub;
+        const connection = await pool.getConnection();
+        let transactionStarted = false;
 
-        // Check if student is already in any class
-        const [existingEnrollments]: any[] = await pool.query(
-          `SELECT e.class_id, c.class_name, c.class_code
-           FROM enrollments e
-           JOIN classes c ON e.class_id = c.class_id
-           WHERE e.student_id = ?
-           LIMIT 1`,
+        try {
+          await connection.beginTransaction();
+          transactionStarted = true;
+
+          await connection.query(
+            "SELECT user_id FROM users WHERE user_id = ? LIMIT 1 FOR UPDATE",
+            [studentId],
+          );
+
+          const [existingEnrollments]: any[] = await connection.query(
+            `SELECT e.class_id, c.class_name
+               FROM enrollments e
+               JOIN classes c ON e.class_id = c.class_id
+              WHERE e.student_id = ?
+              LIMIT 1`,
+            [studentId],
+          );
+
+          if (existingEnrollments.length > 0) {
+            const currentClass = existingEnrollments[0];
+            await connection.rollback();
+            return c.json(
+              {
+                error: "Already enrolled in a class",
+                message: "You are already enrolled in another class. Please leave your current class before joining a new one.",
+                current_class: {
+                  class_id: currentClass.class_id,
+                  class_name: currentClass.class_name,
+                },
+              },
+              409,
+            );
+          }
+
+          const [classRows]: any[] = await connection.query(
+            "SELECT class_id, class_name, class_code, teacher_id FROM classes WHERE class_id = ? LIMIT 1 FOR UPDATE",
+            [classIdNumber],
+          );
+
+          if (classRows.length === 0) {
+            await connection.rollback();
+            return c.json({ error: "Class not found" }, 404);
+          }
+
+          const classInfo = classRows[0];
+
+          if (classInfo.class_code) {
+            if (!class_code) {
+              await connection.rollback();
+              return c.json({ error: "Class code is required for this class" }, 400);
+            }
+            if (class_code !== classInfo.class_code) {
+              await connection.rollback();
+              return c.json({ error: "Invalid class code" }, 403);
+            }
+          }
+
+          await connection.query(
+            "INSERT INTO enrollments (student_id, class_id) VALUES (?, ?)",
+            [studentId, classIdNumber],
+          );
+
+          await connection.commit();
+
+          return c.json(
+            {
+              message: "Successfully joined class",
+              class: {
+                class_id: classInfo.class_id,
+                class_name: classInfo.class_name,
+                teacher_id: classInfo.teacher_id,
+              },
+            },
+            201,
+          );
+        } catch (error) {
+          if (transactionStarted) {
+            await connection.rollback();
+          }
+          return handleUnexpectedError(c, error, "Failed to join class");
+        } finally {
+          connection.release();
+        }
+      } catch (error) {
+        return handleUnexpectedError(c, error, "Failed to join class");
+      }
+    },
+  );
+
+  // GET /api/v1/classes/joinable - 学生查看可加入的班级列表
+  classMembersApi.get(
+    "/api/v1/classes/joinable",
+    jwt({ secret: JWT_SECRET }),
+    async (c) => {
+      try {
+        const payload = c.get("jwtPayload");
+        if (payload.role !== "Student") {
+          return c.json({ error: "Only students can view joinable classes" }, 403);
+        }
+
+        const studentId = Number(payload.sub);
+
+        const [[existingEnrollment]]: any[] = await pool.query(
+          `SELECT e.class_id
+             FROM enrollments e
+            WHERE e.student_id = ?
+            LIMIT 1`,
           [studentId],
         );
 
-        if (existingEnrollments.length > 0) {
-          const currentClass = existingEnrollments[0];
+        if (existingEnrollment) {
           return c.json(
             {
               error: "Already enrolled in a class",
-              message: "You are already enrolled in another class. Please leave your current class before joining a new one.",
-              current_class: {
-                class_id: currentClass.class_id,
-                class_name: currentClass.class_name,
-              },
+              message: "You are already enrolled in a class. Please leave it before joining a new one.",
+              current_class_id: existingEnrollment.class_id,
             },
             409,
           );
         }
 
-        // Check if class exists and get class info
-        const [classRows]: any[] = await pool.query(
-          "SELECT class_id, class_name, class_code, teacher_id FROM classes WHERE class_id = ?",
-          [classIdNumber],
+        const [rows]: any[] = await pool.query(
+          `SELECT
+             c.class_id,
+             c.class_name,
+             c.class_code IS NOT NULL AS requires_class_code,
+             c.created_at,
+             teacher.user_id AS teacher_id,
+             teacher.full_name AS teacher_name,
+             teacher.email AS teacher_email
+           FROM classes c
+           LEFT JOIN users teacher ON teacher.user_id = c.teacher_id
+           ORDER BY c.class_id ASC`,
         );
 
-        if (classRows.length === 0) {
-          return c.json({ error: "Class not found" }, 404);
-        }
-
-        const classInfo = classRows[0];
-
-        // Verify class code if the class has one
-        if (classInfo.class_code) {
-          if (!class_code) {
-            return c.json({ error: "Class code is required for this class" }, 400);
-          }
-          if (class_code !== classInfo.class_code) {
-            return c.json({ error: "Invalid class code" }, 403);
-          }
-        }
-
-        // Create enrollment
-        await pool.query(
-          "INSERT INTO enrollments (student_id, class_id) VALUES (?, ?)",
-          [studentId, classIdNumber],
-        );
-
-        // Return success with class info
-        return c.json(
-          {
-            message: "Successfully joined class",
-            class: {
-              class_id: classInfo.class_id,
-              class_name: classInfo.class_name,
-              teacher_id: classInfo.teacher_id,
-            },
-          },
-          201,
-        );
+        return c.json(rows);
       } catch (error) {
-        console.error("Error joining class:", error);
-        throw error;
+        return handleUnexpectedError(c, error, "Failed to load joinable classes");
       }
     },
   );
@@ -530,8 +621,7 @@ export default (pool: Pool, JWT_SECRET: string) => {
         if (error.code === "ER_DUP_ENTRY") {
           return c.json({ error: "Assistant already assigned to this class" }, 409);
         }
-        console.error("Error adding assistant to class:", error);
-        throw error;
+        return handleUnexpectedError(c, error, "Failed to add assistant to class");
       }
     },
   );
@@ -572,8 +662,7 @@ export default (pool: Pool, JWT_SECRET: string) => {
 
         return c.json(rows);
       } catch (error) {
-        console.error("Error fetching assistants for class:", error);
-        throw error;
+        return handleUnexpectedError(c, error, "Failed to fetch class assistants");
       }
     },
   );
@@ -616,8 +705,7 @@ export default (pool: Pool, JWT_SECRET: string) => {
 
         return c.json({ message: "Assistant removed successfully" });
       } catch (error) {
-        console.error("Error removing assistant from class:", error);
-        throw error;
+        return handleUnexpectedError(c, error, "Failed to remove assistant from class");
       }
     },
   );

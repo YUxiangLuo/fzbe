@@ -8,6 +8,7 @@ import path from "path";
 import type { Pool, ResultSetHeader, RowDataPacket } from "mysql2/promise";
 import { parseCsvSegments, getCsvHeaders } from "../utils";
 import csv from "csv-parser";
+import { handleUnexpectedError, logWarning } from "../utils/error-handler";
 
 // Helper to convert an array of objects to a CSV string
 const toCsvString = (data: Record<string, string>[]): string => {
@@ -87,6 +88,29 @@ const isNodeError = (error: unknown): error is NodeJS.ErrnoException => {
   return typeof error === "object" && error !== null && "code" in error;
 };
 
+const uploadsRoot = path.resolve(import.meta.dir, "../../uploads");
+
+const toPublicFilePath = (absolutePath: string | null | undefined) => {
+  if (!absolutePath) {
+    return null;
+  }
+  const relative = path.relative(uploadsRoot, absolutePath);
+  if (!relative || relative.startsWith("..")) {
+    return `uploads/${path.basename(absolutePath)}`.replace(/\\/g, "/");
+  }
+  return `uploads/${relative}`.replace(/\\/g, "/");
+};
+
+const normalizeDatasetRow = (row: any) => {
+  if (!row) {
+    return row;
+  }
+  return {
+    ...row,
+    file_path: toPublicFilePath(row.file_path),
+  };
+};
+
 export default (pool: Pool, JWT_SECRET: string) => {
   const datasetsApi = new Hono();
 
@@ -94,6 +118,7 @@ export default (pool: Pool, JWT_SECRET: string) => {
   datasetsApi.post("/api/v1/datasets", jwt({ secret: JWT_SECRET }), async (c) => {
     let tempUploadPath: string | null = null;
     let datasetDirectory: string | null = null;
+    let uploadSucceeded = false;
 
     try {
       const payload = c.get("jwtPayload");
@@ -253,31 +278,51 @@ export default (pool: Pool, JWT_SECRET: string) => {
           "SELECT * FROM datasets WHERE dataset_id = ?",
           [datasetId],
         );
-        return c.json(rows[0], 201);
+        uploadSucceeded = true;
+        return c.json(normalizeDatasetRow(rows[0]), 201);
       } catch (dbError) {
         try {
           await connection.rollback();
         } catch (rollbackError) {
-          console.error("Rollback failed:", rollbackError);
+          logWarning("Rollback failed during dataset upload", {
+            error:
+              rollbackError instanceof Error
+                ? rollbackError.message
+                : String(rollbackError),
+          });
         }
-        throw dbError; // Rethrow the original error
+
+        if (datasetDirectory) {
+          await rm(datasetDirectory, { recursive: true, force: true }).catch(
+            (err) =>
+              logWarning("Failed to cleanup dataset directory", {
+                error: err instanceof Error ? err.message : String(err),
+              }),
+          );
+        }
+
+        return handleUnexpectedError(c, dbError, "Failed to upload dataset");
       } finally {
         connection.release();
       }
     } catch (error) {
-      console.error("Error uploading dataset:", error);
-      // Cleanup directory if it was created
-      if (datasetDirectory) {
-        await rm(datasetDirectory, { recursive: true, force: true }).catch(
-          (err) => console.error("Failed to cleanup dataset directory:", err),
-        );
-      }
-      throw error;
+      return handleUnexpectedError(c, error, "Failed to upload dataset");
     } finally {
       // Always cleanup the temporary file
+      if (!uploadSucceeded && datasetDirectory) {
+        await rm(datasetDirectory, { recursive: true, force: true }).catch(
+          (err) =>
+            logWarning("Failed to cleanup dataset directory", {
+              error: err instanceof Error ? err.message : String(err),
+            }),
+        );
+      }
+
       if (tempUploadPath) {
         await unlink(tempUploadPath).catch((err) =>
-          console.error("Failed to cleanup temp file:", err),
+          logWarning("Failed to cleanup temp file", {
+            error: err instanceof Error ? err.message : String(err),
+          }),
         );
       }
     }
@@ -289,10 +334,10 @@ export default (pool: Pool, JWT_SECRET: string) => {
       const [rows] = await pool.query<DatasetRow[]>(
         "SELECT * FROM datasets ORDER BY uploaded_at DESC",
       );
-      return c.json(rows);
+      const normalized = (rows as any[]).map((row) => normalizeDatasetRow(row));
+      return c.json(normalized);
     } catch (error) {
-      console.error("Error fetching datasets:", error);
-      throw error;
+      return handleUnexpectedError(c, error, "Failed to fetch datasets");
     }
   });
 
@@ -304,8 +349,7 @@ export default (pool: Pool, JWT_SECRET: string) => {
       );
       return c.json(rows.map((row) => row.industry_name));
     } catch (error) {
-      console.error("Error fetching industries:", error);
-      throw error;
+      return handleUnexpectedError(c, error, "Failed to fetch industries");
     }
   });
 
@@ -322,8 +366,7 @@ export default (pool: Pool, JWT_SECRET: string) => {
         );
         return c.json(rows.map((row) => row.company_name));
       } catch (error) {
-        console.error("Error fetching companies by industry:", error);
-        throw error;
+        return handleUnexpectedError(c, error, "Failed to fetch companies");
       }
     },
   );
@@ -344,8 +387,7 @@ export default (pool: Pool, JWT_SECRET: string) => {
         );
         return c.json(rows.map((row) => row.product_name));
       } catch (error) {
-        console.error("Error fetching products by industry and company:", error);
-        throw error;
+        return handleUnexpectedError(c, error, "Failed to fetch products");
       }
     },
   );
@@ -374,7 +416,7 @@ export default (pool: Pool, JWT_SECRET: string) => {
         const { file_path: filePath } = segment;
         const fileExists = await Bun.file(filePath).exists();
         if (!fileExists) {
-          console.error(`File not found on disk for product segment: ${filePath}`);
+          logWarning("Product segment file missing on disk", { filePath });
           return c.json({ error: "Product segment file is missing" }, 404);
         }
 
@@ -413,8 +455,7 @@ export default (pool: Pool, JWT_SECRET: string) => {
 
         return c.json({ fields });
       } catch (error) {
-        console.error("Error fetching product fields:", error);
-        throw error;
+        return handleUnexpectedError(c, error, "Failed to fetch product fields");
       }
     },
   );
@@ -445,7 +486,7 @@ export default (pool: Pool, JWT_SECRET: string) => {
         // Gracefully handle cases where the file is missing from the filesystem
         const fileExists = await Bun.file(filePath).exists();
         if (!fileExists) {
-          console.error(`File not found on disk for product segment: ${filePath}`);
+          logWarning("Product sales data file missing on disk", { filePath });
           return c.json({ error: "Product sales data file is missing" }, 404);
         }
 
@@ -525,8 +566,7 @@ export default (pool: Pool, JWT_SECRET: string) => {
           monthlySales,
         });
       } catch (error) {
-        console.error("Error fetching product sales data:", error);
-        throw error;
+        return handleUnexpectedError(c, error, "Failed to fetch product sales data");
       }
     },
   );
@@ -546,10 +586,9 @@ export default (pool: Pool, JWT_SECRET: string) => {
         if (rows.length === 0) {
           return c.json({ error: "Dataset not found" }, 404);
         }
-        return c.json(rows[0]);
+        return c.json(normalizeDatasetRow(rows[0]));
       } catch (error) {
-        console.error("Error fetching dataset:", error);
-        throw error;
+        return handleUnexpectedError(c, error, "Failed to fetch dataset");
       }
     },
   );
@@ -561,42 +600,46 @@ export default (pool: Pool, JWT_SECRET: string) => {
     zValidator("param", datasetIdParamSchema),
     zValidator("json", updateDatasetSchema),
     async (c) => {
-      const payload = c.get("jwtPayload");
-      if (payload.role !== "Admin") {
-        return c.json({ error: "Forbidden" }, 403);
+      try {
+        const payload = c.get("jwtPayload");
+        if (payload.role !== "Admin") {
+          return c.json({ error: "Forbidden" }, 403);
+        }
+
+        const { datasetId } = c.req.valid("param");
+        const { data_name, description } = c.req.valid("json");
+
+        const fields = [];
+        const values = [];
+        if (data_name) {
+          fields.push("data_name = ?");
+          values.push(data_name);
+        }
+        if (description !== undefined) {
+          fields.push("description = ?");
+          values.push(description);
+        }
+
+        if (fields.length === 0) {
+          return c.json({ error: "No fields to update" }, 400);
+        }
+
+        values.push(datasetId);
+        const sql = `UPDATE datasets SET ${fields.join(", ")} WHERE dataset_id = ?`;
+        const [result] = await pool.query<ResultSetHeader>(sql, values);
+
+        if (result.affectedRows === 0) {
+          return c.json({ error: "Dataset not found" }, 404);
+        }
+
+        const [rows] = await pool.query<DatasetRow[]>(
+          "SELECT * FROM datasets WHERE dataset_id = ?",
+          [datasetId],
+        );
+        return c.json(normalizeDatasetRow(rows[0]));
+      } catch (error) {
+        return handleUnexpectedError(c, error, "Failed to update dataset");
       }
-
-      const { datasetId } = c.req.valid("param");
-      const { data_name, description } = c.req.valid("json");
-
-      const fields = [];
-      const values = [];
-      if (data_name) {
-        fields.push("data_name = ?");
-        values.push(data_name);
-      }
-      if (description !== undefined) {
-        fields.push("description = ?");
-        values.push(description);
-      }
-
-      if (fields.length === 0) {
-        return c.json({ error: "No fields to update" }, 400);
-      }
-
-      values.push(datasetId);
-      const sql = `UPDATE datasets SET ${fields.join(", ")} WHERE dataset_id = ?`;
-      const [result] = await pool.query<ResultSetHeader>(sql, values);
-
-      if (result.affectedRows === 0) {
-        return c.json({ error: "Dataset not found" }, 404);
-      }
-
-      const [rows] = await pool.query<DatasetRow[]>(
-        "SELECT * FROM datasets WHERE dataset_id = ?",
-        [datasetId],
-      );
-      return c.json(rows[0]);
     },
   );
 
@@ -625,8 +668,11 @@ export default (pool: Pool, JWT_SECRET: string) => {
         }
 
         // Delete the original file itself
-        await rm(dataset.file_path, { force: true, recursive: false }).catch(err => 
-          console.error(`Could not delete dataset file: ${dataset.file_path}`, err)
+        await rm(dataset.file_path, { force: true, recursive: false }).catch((err) =>
+          logWarning("Failed to delete dataset file", {
+            filePath: dataset.file_path,
+            error: err instanceof Error ? err.message : String(err),
+          }),
         );
 
         // Delete the associated directory which contains segment files
@@ -636,8 +682,12 @@ export default (pool: Pool, JWT_SECRET: string) => {
           "datasets",
           datasetId,
         );
-        await rm(datasetSegmentsDirectory, { recursive: true, force: true }).catch(err => 
-          console.error(`Could not delete segments directory: ${datasetSegmentsDirectory}`, err)
+        await rm(datasetSegmentsDirectory, { recursive: true, force: true }).catch(
+          (err) =>
+            logWarning("Failed to delete dataset segments directory", {
+              directory: datasetSegmentsDirectory,
+              error: err instanceof Error ? err.message : String(err),
+            }),
         );
 
         const [result] = await pool.query<ResultSetHeader>(
@@ -652,8 +702,7 @@ export default (pool: Pool, JWT_SECRET: string) => {
 
         return c.json({ message: "Dataset and all associated files deleted successfully" });
       } catch (error) {
-        console.error("Error deleting dataset:", error);
-        throw error;
+        return handleUnexpectedError(c, error, "Failed to delete dataset");
       }
     },
   );

@@ -8,6 +8,7 @@ import { createReadStream } from "node:fs";
 import { unlink, mkdir } from "node:fs/promises";
 import path from "path";
 import { getDefaultPasswordHash } from "../utils";
+import { handleUnexpectedError, logWarning } from "../utils/error-handler";
 
 // Zod Schemas for Validation
 const classIdParamSchema = z.object({
@@ -256,7 +257,7 @@ export default (pool: Pool, JWT_SECRET: string) => {
 
         } catch (error) {
           await connection.rollback();
-          throw error;
+          return handleUnexpectedError(c, error, "Failed to create class");
         } finally {
           connection.release();
         }
@@ -264,12 +265,13 @@ export default (pool: Pool, JWT_SECRET: string) => {
         if (error.code === "ER_DUP_ENTRY") {
           return c.json({ error: "Class code already exists" }, 409);
         }
-        console.error("Error creating class:", error);
-        throw error;
+        return handleUnexpectedError(c, error, "Failed to create class");
       } finally {
         if (tempCsvPath) {
           await unlink(tempCsvPath).catch((err) =>
-            console.error("Failed to cleanup temp CSV file:", err)
+            logWarning("Failed to cleanup temp CSV file", {
+              error: err instanceof Error ? err.message : String(err),
+            })
           );
         }
       }
@@ -289,8 +291,7 @@ export default (pool: Pool, JWT_SECRET: string) => {
       );
       return c.json(rows);
     } catch (error) {
-      console.error("Error fetching classes:", error);
-      throw error;
+      return handleUnexpectedError(c, error, "Failed to fetch classes");
     }
   });
 
@@ -356,8 +357,7 @@ export default (pool: Pool, JWT_SECRET: string) => {
         const response = { ...classInfo, students: studentRows, assistants: assistantRows };
         return c.json(response);
       } catch (error) {
-        console.error("Error fetching class details:", error);
-        throw error;
+        return handleUnexpectedError(c, error, "Failed to fetch class details");
       }
     },
   );
@@ -425,7 +425,7 @@ export default (pool: Pool, JWT_SECRET: string) => {
           if (error.code === "ER_DUP_ENTRY") {
             return c.json({ error: "Class code already exists" }, 409);
           }
-          throw error;
+          return handleUnexpectedError(c, error, "Failed to update class");
         }
 
         const [updatedRows]: any[] = await pool.query(
@@ -435,8 +435,7 @@ export default (pool: Pool, JWT_SECRET: string) => {
 
         return c.json(updatedRows[0]);
       } catch (error) {
-        console.error("Error updating class:", error);
-        throw error;
+        return handleUnexpectedError(c, error, "Failed to update class");
       }
     },
   );
@@ -505,8 +504,7 @@ export default (pool: Pool, JWT_SECRET: string) => {
         });
       } catch (error) {
         await connection.rollback();
-        console.error("Error deleting class:", error);
-        throw error;
+        return handleUnexpectedError(c, error, "Failed to delete class");
       } finally {
         connection.release();
       }
@@ -544,8 +542,7 @@ export default (pool: Pool, JWT_SECRET: string) => {
 
         return c.json(classRows);
       } catch (error) {
-        console.error("Error fetching classes for teacher:", error);
-        throw error;
+        return handleUnexpectedError(c, error, "Failed to fetch classes for teacher");
       }
     },
   );
@@ -585,8 +582,7 @@ export default (pool: Pool, JWT_SECRET: string) => {
 
         return c.json(classRows);
       } catch (error) {
-        console.error("Error fetching classes for assistant:", error);
-        throw error;
+        return handleUnexpectedError(c, error, "Failed to fetch classes for assistant");
       }
     },
   );

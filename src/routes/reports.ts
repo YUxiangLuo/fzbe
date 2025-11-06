@@ -6,6 +6,7 @@ import type { Pool } from "mysql2/promise";
 import puppeteer from "puppeteer";
 import path from "path";
 import { mkdir } from "node:fs/promises";
+import { handleUnexpectedError } from "../utils/error-handler";
 
 const experimentIdParamSchema = z.object({
   experimentId: z.string().regex(/^\d+$/, { message: "experimentId must be a number" }),
@@ -46,6 +47,25 @@ export default (pool: Pool, JWT_SECRET: string) => {
         const { experimentId } = c.req.valid("param");
         const experiment_id = Number.parseInt(experimentId, 10);
         const { report_content: base64Content } = c.req.valid("json");
+
+        const [[ownership]]: any[] = await pool.query(
+          `SELECT student_id
+             FROM experiment_status
+            WHERE experiment_id = ?
+            LIMIT 1`,
+          [experiment_id],
+        );
+
+        if (!ownership) {
+          return c.json({ error: "Experiment not found" }, 404);
+        }
+
+        if (Number.parseInt(String(ownership.student_id), 10) !== studentId) {
+          return c.json(
+            { error: "Forbidden: Experiment does not belong to the current user" },
+            403,
+          );
+        }
 
         const report_content = Buffer.from(base64Content, "base64").toString("utf-8");
 
@@ -114,15 +134,19 @@ export default (pool: Pool, JWT_SECRET: string) => {
           );
         } catch (dbError) {
           await connection.rollback();
-          throw dbError; // Re-throw to be caught by the outer try-catch
+          return handleUnexpectedError(
+            c,
+            dbError,
+            "An internal server error occurred while processing the report.",
+          );
         } finally {
           connection.release();
         }
       } catch (error) {
-        console.error("Error submitting experiment report:", error);
-        return c.json(
-          { error: "An internal server error occurred while processing the report." },
-          500,
+        return handleUnexpectedError(
+          c,
+          error,
+          "An internal server error occurred while processing the report.",
         );
       } finally {
         if (browser) {

@@ -3,6 +3,7 @@ import { sign } from "hono/jwt";
 import { z } from "zod";
 import { zValidator } from "@hono/zod-validator";
 import type { Pool } from "mysql2/promise";
+import { handleUnexpectedError } from "../utils/error-handler";
 
 // Zod Schema for Validation
 const loginSchema = z.object({
@@ -47,8 +48,7 @@ export default (pool: Pool, JWT_SECRET: string) => {
       const token = await sign(payload, JWT_SECRET);
       return c.json({ token });
     } catch (error) {
-      console.error("Login error:", error);
-      throw error;
+      return handleUnexpectedError(c, error, "Login failed");
     }
   });
 

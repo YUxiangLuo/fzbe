@@ -5,6 +5,7 @@ import { zValidator } from "@hono/zod-validator";
 import { rm } from "node:fs/promises";
 import type { Pool } from "mysql2/promise";
 import path from "path";
+import { handleUnexpectedError } from "../utils/error-handler";
 
 // Zod Schemas for Validation
 const manualIdParamSchema = z.object({
@@ -16,6 +17,29 @@ const updateManualSchema = z.object({
   description: z.string().optional(),
   is_active: z.boolean().optional(),
 });
+
+const uploadsRoot = path.resolve(import.meta.dir, "../../uploads");
+
+const toPublicFilePath = (absolutePath: string | null | undefined) => {
+  if (!absolutePath) {
+    return null;
+  }
+  const relative = path.relative(uploadsRoot, absolutePath);
+  if (!relative || relative.startsWith("..")) {
+    return `uploads/${path.basename(absolutePath)}`.replace(/\\/g, "/");
+  }
+  return `uploads/${relative}`.replace(/\\/g, "/");
+};
+
+const normalizeManualRow = (row: any) => {
+  if (!row) {
+    return row;
+  }
+  return {
+    ...row,
+    file_path: toPublicFilePath(row.file_path),
+  };
+};
 
 export default (pool: Pool, JWT_SECRET: string) => {
   const manualsApi = new Hono();
@@ -78,10 +102,9 @@ export default (pool: Pool, JWT_SECRET: string) => {
         [result.insertId],
       );
 
-      return c.json(rows[0], 201);
+      return c.json(normalizeManualRow(rows[0]), 201);
     } catch (error) {
-      console.error("Error uploading manual:", error);
-      throw error;
+      return handleUnexpectedError(c, error, "Failed to upload manual");
     }
   });
 
@@ -98,10 +121,10 @@ export default (pool: Pool, JWT_SECRET: string) => {
           LEFT JOIN users u ON m.uploader_id = u.user_id
           ORDER BY m.uploaded_at DESC
       `);
-      return c.json(rows);
+      const normalized = (rows as any[]).map((row) => normalizeManualRow(row));
+      return c.json(normalized);
     } catch (error) {
-      console.error("Error fetching manuals:", error);
-      throw error;
+      return handleUnexpectedError(c, error, "Failed to fetch manuals");
     }
   });
 
@@ -119,10 +142,9 @@ export default (pool: Pool, JWT_SECRET: string) => {
       if (!manual) {
         return c.json({ error: "No active manual found" }, 404);
       }
-      return c.json(manual);
+      return c.json(normalizeManualRow(manual));
     } catch (error) {
-      console.error("Error fetching active manual:", error);
-      throw error;
+      return handleUnexpectedError(c, error, "Failed to fetch active manual");
     }
   });
 
@@ -191,11 +213,10 @@ export default (pool: Pool, JWT_SECRET: string) => {
            WHERE m.manual_id = ?`,
           [manualIdNumber],
         );
-        return c.json(rows[0]);
+        return c.json(normalizeManualRow(rows[0]));
       } catch (error) {
         await connection.rollback();
-        console.error("Error updating manual:", error);
-        throw error;
+        return handleUnexpectedError(c, error, "Failed to update manual");
       } finally {
         connection.release();
       }
@@ -236,8 +257,7 @@ export default (pool: Pool, JWT_SECRET: string) => {
 
         return c.json({ message: "Manual deleted successfully" });
       } catch (error) {
-        console.error("Error deleting manual:", error);
-        throw error;
+        return handleUnexpectedError(c, error, "Failed to delete manual");
       }
     },
   );

@@ -6,6 +6,8 @@ import path from "path";
 import fs from "fs";
 import type { Pool } from "mysql2/promise";
 import csv from "csv-parser";
+import { handleUnexpectedError } from "../utils/error-handler";
+import logger from "../logger";
 
 const TRAINING_TIMEOUT = 30000; 
 
@@ -289,13 +291,19 @@ async function runPythonMain(args: string[], timeoutMs?: number): Promise<any> {
       await proc.exited;
 
       if (proc.exitCode !== 0) {
-        console.error("Python error:", stderr);
+        logger.error(
+          { stderr },
+          "Python execution failed",
+        );
         reject(new Error(`Python execution failed: ${stderr}`));
       } else {
         try {
           resolve(JSON.parse(stdout));
         } catch (e) {
-          console.error("Failed to parse python output:", stdout);
+          logger.error(
+            { stdout },
+            "Failed to parse python output",
+          );
           reject(new Error("Invalid output from python"));
         }
       }
@@ -364,8 +372,9 @@ export default (pool: Pool, JWT_SECRET: string) => {
       if (error.message.includes("timed out")) {
         return c.json({ error: "Training timed out after 10 seconds" }, 504);
       }
-      console.error("MA training error:", error);
-      return c.json({ error: error.message }, 500);
+      const message =
+        error instanceof Error ? error.message : "MA training failed";
+      return handleUnexpectedError(c, error, message);
     }
   });
 
@@ -405,8 +414,9 @@ export default (pool: Pool, JWT_SECRET: string) => {
       if (error.message.includes("timed out")) {
         return c.json({ error: "Training timed out after 10 seconds" }, 504);
       }
-      console.error("ES training error:", error);
-      return c.json({ error: error.message }, 500);
+      const message =
+        error instanceof Error ? error.message : "ES training failed";
+      return handleUnexpectedError(c, error, message);
     }
   });
 
@@ -446,8 +456,9 @@ export default (pool: Pool, JWT_SECRET: string) => {
       if (error.message.includes("timed out")) {
         return c.json({ error: "Training timed out after 10 seconds" }, 504);
       }
-      console.error("ARIMA training error:", error);
-      return c.json({ error: error.message }, 500);
+      const message =
+        error instanceof Error ? error.message : "ARIMA training failed";
+      return handleUnexpectedError(c, error, message);
     }
   });
 
@@ -502,8 +513,9 @@ export default (pool: Pool, JWT_SECRET: string) => {
       if (error.message.includes("timed out")) {
         return c.json({ error: "Training timed out after 10 seconds" }, 504);
       }
-      console.error("LSTM training error:", error);
-      return c.json({ error: error.message }, 500);
+      const message =
+        error instanceof Error ? error.message : "LSTM training failed";
+      return handleUnexpectedError(c, error, message);
     }
   });
 
@@ -575,8 +587,9 @@ export default (pool: Pool, JWT_SECRET: string) => {
         if (error.message.includes("timed out")) {
           return c.json({ error: "Training timed out after 10 seconds" }, 504);
         }
-        console.error("Weighted Average training error:", error);
-        return c.json({ error: error.message }, 500);
+        const message =
+          error instanceof Error ? error.message : "Weighted average training failed";
+        return handleUnexpectedError(c, error, message);
       }
     },
   );
@@ -675,8 +688,9 @@ export default (pool: Pool, JWT_SECRET: string) => {
       if (error.message.includes("timed out")) {
         return c.json({ error: "Training timed out after 10 seconds" }, 504);
       }
-      console.error("Boosting training error:", error);
-      return c.json({ error: error.message }, 500);
+      const message =
+        error instanceof Error ? error.message : "Boosting training failed";
+      return handleUnexpectedError(c, error, message);
     }
   });
 
@@ -719,8 +733,9 @@ export default (pool: Pool, JWT_SECRET: string) => {
       if (error.message.includes("timed out")) {
         return c.json({ error: "Training timed out after 10 seconds" }, 504);
       }
-      console.error("Stacking training error:", error);
-      return c.json({ error: error.message }, 500);
+      const message =
+        error instanceof Error ? error.message : "Stacking training failed";
+      return handleUnexpectedError(c, error, message);
     }
   });
 
@@ -764,8 +779,9 @@ export default (pool: Pool, JWT_SECRET: string) => {
 
       return c.json({ status: "success", results: result });
     } catch (error: any) {
-      console.error("Prediction error:", error);
-      return c.json({ error: error.message }, 500);
+      const message =
+        error instanceof Error ? error.message : "Prediction failed";
+      return handleUnexpectedError(c, error, message);
     }
   });
 

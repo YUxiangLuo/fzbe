@@ -6,6 +6,7 @@ import type { Pool, PoolConnection } from "mysql2/promise";
 import { access, copyFile, mkdtemp, rm } from "node:fs/promises";
 import path from "path";
 import os from "node:os";
+import { handleUnexpectedError } from "../utils/error-handler";
 
 // Zod Schemas for Validation
 const classIdParamSchema = z.object({
@@ -140,12 +141,16 @@ const buildNormalizedStepTimeline = (events: RawStepEvent[]) => {
 
   const dropStepsFrom = (step: number) => {
     for (let i = timeline.length - 1; i >= 0; i--) {
-      if (timeline[i].step_order >= step) {
+      const timelineEntry = timeline[i];
+      if (timelineEntry && timelineEntry.step_order >= step) {
         timeline.splice(i, 1);
       }
     }
     for (let s = step; s <= STEP_COUNT; s++) {
       const idx = s - 1;
+      if (idx < 0 || idx >= steps.length) {
+        continue;
+      }
       steps[idx] = {
         step_order: s,
         started_at: null,
@@ -176,7 +181,11 @@ const buildNormalizedStepTimeline = (events: RawStepEvent[]) => {
         dropStepsFrom(step);
       }
       timeline.push(normalizedEvent);
-      const stepRecord = steps[step - 1];
+      const recordIndex = step - 1;
+      const stepRecord = steps[recordIndex];
+      if (!stepRecord) {
+        continue;
+      }
       stepRecord.started_at = normalizedEvent.event_timestamp;
       stepRecord.completed_at = null;
       stepRecord.latest_event_type = "STARTED";
@@ -188,16 +197,22 @@ const buildNormalizedStepTimeline = (events: RawStepEvent[]) => {
 
     if (rawEvent.event_type === "COMPLETED") {
       for (let i = timeline.length - 1; i >= 0; i--) {
+        const existing = timeline[i];
         if (
-          timeline[i].step_order === step &&
-          timeline[i].event_type === "COMPLETED"
+          existing &&
+          existing.step_order === step &&
+          existing.event_type === "COMPLETED"
         ) {
           timeline.splice(i, 1);
           break;
         }
       }
       timeline.push(normalizedEvent);
-      const stepRecord = steps[step - 1];
+      const recordIndex = step - 1;
+      const stepRecord = steps[recordIndex];
+      if (!stepRecord) {
+        continue;
+      }
       stepRecord.completed_at = normalizedEvent.event_timestamp;
       stepRecord.latest_event_type = "COMPLETED";
       if (step > highestRetainedStep) {
@@ -412,8 +427,7 @@ export default (pool: Pool, JWT_SECRET: string) => {
 
         return c.json(reports);
       } catch (error) {
-        console.error("Error fetching class reports:", error);
-        throw error;
+        return handleUnexpectedError(c, error, "Failed to fetch class reports");
       }
     },
   );
@@ -568,13 +582,12 @@ export default (pool: Pool, JWT_SECRET: string) => {
           );
         } catch (error) {
           await connection.rollback();
-          throw error;
+          return handleUnexpectedError(c, error, "Failed to grade report");
         } finally {
           connection.release();
         }
       } catch (error) {
-        console.error("Error grading report:", error);
-        throw error;
+        return handleUnexpectedError(c, error, "Failed to grade report");
       }
     },
   );
@@ -709,8 +722,7 @@ export default (pool: Pool, JWT_SECRET: string) => {
 
         return c.json(responsePayload);
       } catch (error) {
-        console.error("Error fetching experiment status:", error);
-        throw error;
+        return handleUnexpectedError(c, error, "Failed to fetch experiment status");
       }
     },
   );
@@ -765,8 +777,7 @@ export default (pool: Pool, JWT_SECRET: string) => {
 
         return c.json(weights[0]);
       } catch (error) {
-        console.error("Error fetching grade weights:", error);
-        throw error;
+        return handleUnexpectedError(c, error, "Failed to fetch grade weights");
       }
     },
   );
@@ -1148,8 +1159,7 @@ export default (pool: Pool, JWT_SECRET: string) => {
 
         return c.json(updatedWeights[0]);
       } catch (error) {
-        console.error("Error updating grade weights:", error);
-        throw error;
+        return handleUnexpectedError(c, error, "Failed to update grade weights");
       }
     },
   );
@@ -1243,8 +1253,7 @@ export default (pool: Pool, JWT_SECRET: string) => {
 
         return c.json(latestGrades);
       } catch (error) {
-        console.error("Error fetching latest grades:", error);
-        throw error;
+        return handleUnexpectedError(c, error, "Failed to fetch latest grades");
       }
     },
   );
@@ -1403,8 +1412,7 @@ export default (pool: Pool, JWT_SECRET: string) => {
 
         return c.json(responsePayload);
       } catch (error) {
-        console.error("Error fetching step events:", error);
-        throw error;
+        return handleUnexpectedError(c, error, "Failed to fetch experiment step events");
       }
     },
   );

@@ -8,6 +8,7 @@ import csv from "csv-parser";
 import path from "path";
 import { mkdir, unlink } from "node:fs/promises";
 import { createReadStream } from "node:fs";
+import { handleUnexpectedError, logWarning } from "../utils/error-handler";
 
 // Zod Schemas for Validation
 const registerSchema = z.object({
@@ -210,11 +211,10 @@ export default (pool: Pool, JWT_SECRET: string) => {
               return c.json({ error: "Phone number already exists" }, 409);
             }
           }
-          throw error;
+          return handleUnexpectedError(c, error, "Registration failed");
         }
       } catch (error) {
-        console.error("Error during self-registration:", error);
-        return c.json({ error: "Registration failed" }, 500);
+        return handleUnexpectedError(c, error, "Registration failed");
       }
     }
   );
@@ -336,8 +336,7 @@ export default (pool: Pool, JWT_SECRET: string) => {
           searchMethod: useFullText ? 'fulltext' : 'like', // For debugging
         });
       } catch (error) {
-        console.error("Error searching users:", error);
-        throw error;
+        return handleUnexpectedError(c, error, "Failed to search users");
       }
     },
   );
@@ -431,8 +430,7 @@ export default (pool: Pool, JWT_SECRET: string) => {
             return c.json({ error: "Email already exists" }, 409);
           }
         }
-        console.error("Error creating and assigning assistant:", error);
-        throw error;
+        return handleUnexpectedError(c, error, "Failed to create assistant");
       } finally {
         connection.release();
       }
@@ -478,8 +476,7 @@ export default (pool: Pool, JWT_SECRET: string) => {
             return c.json({ error: "Email already exists" }, 409);
           }
         }
-        console.error("Error creating teacher:", error);
-        throw error;
+        return handleUnexpectedError(c, error, "Failed to create teacher");
       }
     },
   );
@@ -691,17 +688,18 @@ export default (pool: Pool, JWT_SECRET: string) => {
           );
         } catch (error) {
           await connection.rollback();
-          throw error;
+          return handleUnexpectedError(c, error, "Failed to batch create teachers");
         } finally {
           connection.release();
         }
       } catch (error) {
-        console.error("Error batch creating teachers:", error);
-        throw error;
+        return handleUnexpectedError(c, error, "Failed to batch create teachers");
       } finally {
         if (tempCsvPath) {
           await unlink(tempCsvPath).catch((err) =>
-            console.error("Failed to cleanup temp teacher CSV:", err),
+            logWarning("Failed to cleanup temp teacher CSV", {
+              error: err instanceof Error ? err.message : String(err),
+            }),
           );
         }
       }
@@ -741,8 +739,7 @@ export default (pool: Pool, JWT_SECRET: string) => {
 
         return c.json(assistantRows);
       } catch (error) {
-        console.error("Error fetching assistants for teacher:", error);
-        throw error;
+        return handleUnexpectedError(c, error, "Failed to fetch assistants for teacher");
       }
     },
   );
@@ -784,8 +781,7 @@ export default (pool: Pool, JWT_SECRET: string) => {
           },
         });
       } catch (error) {
-        console.error("Error fetching users:", error);
-        throw error;
+        return handleUnexpectedError(c, error, "Failed to fetch users");
       }
     },
   );
@@ -802,8 +798,7 @@ export default (pool: Pool, JWT_SECRET: string) => {
       );
       return c.json(rows);
     } catch (error) {
-      console.error("Error fetching assistants:", error);
-      throw error;
+      return handleUnexpectedError(c, error, "Failed to fetch assistants");
     }
   });
 
@@ -846,8 +841,7 @@ export default (pool: Pool, JWT_SECRET: string) => {
 
       return c.json(user);
     } catch (error) {
-      console.error("Error fetching current user:", error);
-      throw error;
+      return handleUnexpectedError(c, error, "Failed to fetch current user");
     }
   });
 
@@ -890,8 +884,7 @@ export default (pool: Pool, JWT_SECRET: string) => {
         if (error.code === "ER_DUP_ENTRY") {
           return c.json({ error: "Email already exists" }, 409);
         }
-        console.error("Error updating user:", error);
-        throw error;
+        return handleUnexpectedError(c, error, "Failed to update user");
       }
     },
   );
@@ -941,8 +934,7 @@ export default (pool: Pool, JWT_SECRET: string) => {
 
         return c.json({ message: "Password updated successfully" });
       } catch (error) {
-        console.error("Error changing password:", error);
-        throw error;
+        return handleUnexpectedError(c, error, "Failed to change password");
       }
     },
   );
@@ -971,16 +963,15 @@ export default (pool: Pool, JWT_SECRET: string) => {
         );
         const user = rows[0];
 
-        if (!user) {
-          return c.json({ error: "User not found" }, 404);
-        }
-        return c.json(user);
-      } catch (error) {
-        console.error("Error fetching user by ID:", error);
-        throw error;
+      if (!user) {
+        return c.json({ error: "User not found" }, 404);
       }
-    },
-  );
+      return c.json(user);
+    } catch (error) {
+      return handleUnexpectedError(c, error, "Failed to fetch user");
+    }
+  },
+);
 
   // Admin: Force change user's password
   usersApi.put(
@@ -1025,8 +1016,7 @@ export default (pool: Pool, JWT_SECRET: string) => {
 
         return c.json({ message: "Password updated successfully for user" });
       } catch (error) {
-        console.error("Error force changing password:", error);
-        throw error;
+        return handleUnexpectedError(c, error, "Failed to force change password");
       }
     },
   );
@@ -1112,8 +1102,7 @@ export default (pool: Pool, JWT_SECRET: string) => {
 
         return c.json({ message: "Password reset to default successfully" });
       } catch (error) {
-        console.error("Error resetting password:", error);
-        throw error;
+        return handleUnexpectedError(c, error, "Failed to reset password");
       }
     },
   );
@@ -1210,14 +1199,12 @@ export default (pool: Pool, JWT_SECRET: string) => {
           });
         } catch (error) {
           await connection.rollback();
-          console.error("Error deleting user with cleanup:", error);
-          throw error;
+          return handleUnexpectedError(c, error, "Failed to delete user");
         } finally {
           connection.release();
         }
       } catch (error) {
-        console.error("Error deleting user:", error);
-        throw error;
+        return handleUnexpectedError(c, error, "Failed to delete user");
       }
     },
   );

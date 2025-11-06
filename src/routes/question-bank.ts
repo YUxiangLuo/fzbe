@@ -3,6 +3,7 @@ import { jwt } from "hono/jwt";
 import { z } from "zod";
 import { zValidator } from "@hono/zod-validator";
 import type { Pool } from "mysql2/promise";
+import { handleUnexpectedError } from "../utils/error-handler";
 
 const optionsSchema = z.union([
   z.record(z.string(), z.string()),
@@ -163,8 +164,7 @@ export default (pool: Pool, JWT_SECRET: string) => {
       const normalized = (questions as any[]).map((row) => normalizeQuestionRow(row, true));
       return c.json(normalized);
     } catch (error) {
-      console.error("Error fetching question bank:", error);
-      throw error;
+      return handleUnexpectedError(c, error, "Failed to fetch question bank");
     }
   });
 
@@ -227,8 +227,7 @@ export default (pool: Pool, JWT_SECRET: string) => {
         const createdQuestion = (rows as any[])[0];
         return c.json(normalizeQuestionRow(createdQuestion, true), 201);
       } catch (error) {
-        console.error("Error creating question bank item:", error);
-        throw error;
+        return handleUnexpectedError(c, error, "Failed to create question");
       }
     },
   );
@@ -316,8 +315,7 @@ export default (pool: Pool, JWT_SECRET: string) => {
 
         return c.json(normalizeQuestionRow((rows as any[])[0], true));
       } catch (error) {
-        console.error("Error updating question bank item:", error);
-        throw error;
+        return handleUnexpectedError(c, error, "Failed to update question");
       }
     },
   );
@@ -352,8 +350,7 @@ export default (pool: Pool, JWT_SECRET: string) => {
 
         return c.json({ message: "Question deleted successfully" });
       } catch (error) {
-        console.error("Error deleting question bank item:", error);
-        throw error;
+        return handleUnexpectedError(c, error, "Failed to delete question");
       }
     },
   );

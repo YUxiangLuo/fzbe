@@ -19,15 +19,21 @@ import reportsRoutes from "./routes/reports";
 import modelsApi from "./routes/models";
 import experimentsRoutes from "./routes/experiments";
 import toolsRoutes from "./routes/tools";
+import logger from "./logger";
 
 // --- Custom Logger Middleware ---
 const timestampedLogger = async (c: Context, next: Next) => {
   const start = Date.now();
   await next();
   const duration = Date.now() - start;
-  const timestamp = new Date().toISOString();
-  console.log(
-    `[${timestamp}] ${c.req.method} ${c.req.path} | ${c.res.status} | ${duration}ms`,
+  logger.info(
+    {
+      method: c.req.method,
+      path: c.req.path,
+      status: c.res.status,
+      duration,
+    },
+    "request completed",
   );
 };
 
@@ -50,7 +56,7 @@ const pool = mysql.createPool({
   charset: 'utf8mb4'
 });
 
-console.log("Database connection pool created.");
+logger.info("Database connection pool created.");
 
 // --- Hono App Initialization ---
 const app = new Hono();
@@ -109,7 +115,14 @@ app.route("/", toolsRoutes(pool, JWT_SECRET));
 app.notFound((c) => c.json({ message: "Not Found" }, 404));
 
 app.onError((err, c) => {
-  console.error("Global error handler:", err);
+  logger.error(
+    {
+      err: err instanceof Error ? { message: err.message, stack: err.stack } : err,
+      path: c.req.path,
+      method: c.req.method,
+    },
+    "Unhandled error",
+  );
   if (err instanceof HTTPException) {
     return c.json({ error: err.message }, err.status);
   }
@@ -118,7 +131,7 @@ app.onError((err, c) => {
 
 // --- Server Startup ---
 const port = PORT ? parseInt(PORT, 10) : 3000;
-console.log(`Server listening on http://localhost:${port}`);
+logger.info(`Server listening on http://localhost:${port}`);
 
 export default {
   port,

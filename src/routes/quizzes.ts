@@ -3,6 +3,7 @@ import { jwt } from "hono/jwt";
 import { z } from "zod";
 import { zValidator } from "@hono/zod-validator";
 import type { Pool } from "mysql2/promise";
+import { handleUnexpectedError } from "../utils/error-handler";
 
 const parseJsonField = (value: unknown) => {
   if (value === null || value === undefined) return value;
@@ -101,8 +102,7 @@ export default (pool: Pool, JWT_SECRET: string) => {
       return c.json(normalized);
 
     } catch (error) {
-      console.error("Error fetching random model questions:", error);
-      throw error;
+      return handleUnexpectedError(c, error, "Failed to fetch model quiz questions");
     }
   });
 
@@ -156,8 +156,7 @@ export default (pool: Pool, JWT_SECRET: string) => {
       return c.json(normalized);
 
     } catch (error) {
-      console.error("Error fetching random plan questions:", error);
-      throw error;
+      return handleUnexpectedError(c, error, "Failed to fetch plan quiz questions");
     }
   });
 
@@ -182,8 +181,40 @@ export default (pool: Pool, JWT_SECRET: string) => {
         }
 
         const connection = await pool.getConnection();
+        let released = false;
+        const releaseConnection = () => {
+          if (!released) {
+            connection.release();
+            released = true;
+          }
+        };
+        let transactionStarted = false;
         try {
+          const [[experimentOwnership]]: any[] = await connection.query(
+            `SELECT student_id
+               FROM experiment_status
+              WHERE experiment_id = ?
+              LIMIT 1`,
+            [experiment_id],
+          );
+
+          if (!experimentOwnership) {
+            releaseConnection();
+            return c.json({ error: "Experiment not found" }, 404);
+          }
+
+          if (
+            Number.parseInt(String(experimentOwnership.student_id), 10) !== studentId
+          ) {
+            releaseConnection();
+            return c.json(
+              { error: "Forbidden: Experiment does not belong to the current user" },
+              403,
+            );
+          }
+
           await connection.beginTransaction();
+          transactionStarted = true;
 
           // 1. Fetch all questions' data in one go
           const placeholders = questionIds.map(() => "?").join(",");
@@ -277,18 +308,19 @@ export default (pool: Pool, JWT_SECRET: string) => {
           }
 
           await connection.commit();
-          connection.release();
+          releaseConnection();
 
           return c.json(resultsForFrontend, 201);
         } catch (error) {
-          await connection.rollback();
-          connection.release();
-          throw error;
+          if (transactionStarted) {
+            await connection.rollback();
+          }
+          releaseConnection();
+          return handleUnexpectedError(c, error, "Failed to submit quiz answers");
         }
 
       } catch (error) {
-        console.error("Error submitting batch quiz answers:", error);
-        throw error;
+        return handleUnexpectedError(c, error, "Failed to submit quiz answers");
       }
     },
   );

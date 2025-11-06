@@ -5,6 +5,7 @@ import { zValidator } from "@hono/zod-validator";
 import type { Pool } from "mysql2/promise";
 import { runAdf } from "../utils";
 import type { AdfInputPoint } from "../utils";
+import { handleUnexpectedError } from "../utils/error-handler";
 
 const adfPointSchema = z.object({
   month: z
@@ -38,10 +39,7 @@ export default (_pool: Pool, JWT_SECRET: string) => {
         const result = await runAdf(series);
         return c.json({ result });
       } catch (error) {
-        console.error("ADF calculation failed:", error);
-        const message =
-          error instanceof Error ? error.message : "Unknown error occurred";
-        return c.json({ error: "ADF 检验失败", details: message }, 500);
+        return handleUnexpectedError(c, error, "ADF 检验失败");
       }
     },
   );

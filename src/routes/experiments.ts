@@ -3,6 +3,7 @@ import { jwt } from "hono/jwt";
 import { z } from "zod";
 import { zValidator } from "@hono/zod-validator";
 import type { Pool, ResultSetHeader, RowDataPacket } from "mysql2/promise";
+import { handleUnexpectedError } from "../utils/error-handler";
 
 const STATUS_VALUES = ["Not Started", "In Progress", "Completed"] as const;
 const BEST_MODEL_VALUES = [
@@ -496,8 +497,7 @@ export default (pool: Pool, JWT_SECRET: string) => {
       }
       return c.json(normalizeExperimentRow(row));
     } catch (error) {
-      console.error("Error fetching experiment status:", error);
-      throw error;
+      return handleUnexpectedError(c, error, "Failed to fetch experiment status");
     }
   });
 
@@ -546,8 +546,7 @@ export default (pool: Pool, JWT_SECRET: string) => {
         if (transactionStarted) {
           await connection.rollback();
         }
-        console.error("Error creating experiment status:", error);
-        throw error;
+        return handleUnexpectedError(c, error, "Failed to create experiment status");
       } finally {
         connection.release();
       }
@@ -643,8 +642,7 @@ export default (pool: Pool, JWT_SECRET: string) => {
         const updatedRow = await fetchExperimentById(pool, experimentIdNumber);
         return c.json(normalizeExperimentRow(updatedRow!));
       } catch (error) {
-        console.error("Error updating experiment status:", error);
-        throw error;
+        return handleUnexpectedError(c, error, "Failed to update experiment status");
       }
     },
   );
@@ -702,7 +700,8 @@ export default (pool: Pool, JWT_SECRET: string) => {
             [experiment_id]
           );
 
-          const latestStepOrder = latestEventRows.length > 0 ? latestEventRows[0].step_order : 0;
+          const latestStepOrderRow = latestEventRows[0] as { step_order?: number } | undefined;
+          const latestStepOrder = latestStepOrderRow?.step_order ?? 0;
 
           // 2. 如果最新步骤比当前要完成的步骤还要靠后，说明发生了“跳回”完成
           if (latestStepOrder > step_order) {
@@ -735,12 +734,10 @@ export default (pool: Pool, JWT_SECRET: string) => {
         }, 201);
 
       } catch (error) {
-        // 如果在事务中且发生错误，则回滚
         if (transactionStarted) {
           await connection.rollback();
         }
-        console.error("Error creating experiment step event:", error);
-        throw error;
+        return handleUnexpectedError(c, error, "Failed to create experiment step event");
       } finally {
         connection.release();
       }
