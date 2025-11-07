@@ -6,6 +6,7 @@ import { rm } from "node:fs/promises";
 import type { Pool } from "mysql2/promise";
 import path from "path";
 import { handleUnexpectedError } from "../utils/error-handler";
+import { validateFile, generateUniqueFilename, FileValidationError } from "../utils/file-validator";
 
 // Zod Schemas for Validation
 const manualIdParamSchema = z.object({
@@ -62,24 +63,24 @@ export default (pool: Pool, JWT_SECRET: string) => {
         return c.json({ error: "file is required" }, 400);
       }
 
-      if (
-        file.type &&
-        file.type !== "application/pdf" &&
-        !file.type.includes("pdf")
-      ) {
-        return c.json({ error: "Invalid file type, only PDF is allowed" }, 400);
-      }
-
-      const maxSizeBytes = 50 * 1024 * 1024;
-      if (file.size > maxSizeBytes) {
-        return c.json({ error: "PDF file size cannot exceed 50MB" }, 413);
-      }
-
       if (!fileName || typeof fileName !== "string") {
         return c.json({ error: "file_name is required" }, 400);
       }
 
-      const uniqueFilename = `${Date.now()}-${file.name}`;
+      // Comprehensive file validation
+      try {
+        await validateFile(file, "pdf", {
+          maxSize: 50 * 1024 * 1024, // 50MB
+          checkMagicBytes: true,
+        });
+      } catch (error) {
+        if (error instanceof FileValidationError) {
+          return c.json({ error: error.message }, 400);
+        }
+        throw error;
+      }
+
+      const uniqueFilename = generateUniqueFilename(file.name);
       const uploadPath = path.resolve(
         import.meta.dir,
         "../../uploads",

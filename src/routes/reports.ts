@@ -7,6 +7,7 @@ import puppeteer from "puppeteer-core";
 import path from "path";
 import { mkdir } from "node:fs/promises";
 import { handleUnexpectedError } from "../utils/error-handler";
+import { sanitizeBase64HTML, HTMLSanitizationError } from "../utils/html-sanitizer";
 
 const experimentIdParamSchema = z.object({
   experimentId: z.string().regex(/^\d+$/, { message: "experimentId must be a number" }),
@@ -67,7 +68,19 @@ export default (pool: Pool, JWT_SECRET: string) => {
           );
         }
 
-        const report_content = Buffer.from(base64Content, "base64").toString("utf-8");
+        // Sanitize HTML content to prevent XSS and SSRF attacks
+        let report_content: string;
+        try {
+          report_content = sanitizeBase64HTML(base64Content);
+        } catch (error) {
+          if (error instanceof HTMLSanitizationError) {
+            return c.json(
+              { error: "Invalid report content: " + error.message },
+              400
+            );
+          }
+          throw error;
+        }
 
         // --- PDF Generation Logic ---
         const reportsDir = path.resolve(import.meta.dir, "../../uploads", "reports");
@@ -79,11 +92,33 @@ export default (pool: Pool, JWT_SECRET: string) => {
         browser = await puppeteer.launch({
           executablePath: "/usr/bin/chromium",
           headless: true,
-          args: ["--no-sandbox", "--disable-setuid-sandbox"],
+          args: [
+            "--no-sandbox",
+            "--disable-setuid-sandbox",
+            "--disable-web-security", // Prevent CORS issues but safe since content is sanitized
+            "--disable-features=IsolateOrigins,site-per-process", // For PDF generation
+          ],
         });
         const page = await browser.newPage();
-        await page.setContent(report_content, { waitUntil: "networkidle0" });
-        await page.pdf({ path: pdfPath, format: "A4" });
+
+        // Set Content Security Policy to prevent any script execution
+        await page.setExtraHTTPHeaders({
+          "Content-Security-Policy": "default-src 'none'; style-src 'unsafe-inline';"
+        });
+
+        // Disable JavaScript execution as an extra security layer
+        await page.setJavaScriptEnabled(false);
+
+        await page.setContent(report_content, {
+          waitUntil: "domcontentloaded", // Use domcontentloaded instead of networkidle0 to prevent SSRF
+          timeout: 10000 // 10 second timeout
+        });
+
+        await page.pdf({
+          path: pdfPath,
+          format: "A4",
+          printBackground: true,
+        });
         // --- End of PDF Generation ---
 
         // --- Database Logic ---

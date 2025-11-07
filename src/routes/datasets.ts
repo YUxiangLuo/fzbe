@@ -9,6 +9,7 @@ import type { Pool, ResultSetHeader, RowDataPacket } from "mysql2/promise";
 import { parseCsvSegments, getCsvHeaders } from "../utils";
 import csv from "csv-parser";
 import { handleUnexpectedError, logWarning } from "../utils/error-handler";
+import { validateFile, generateUniqueFilename, FileValidationError } from "../utils/file-validator";
 
 // Helper to convert an array of objects to a CSV string
 const toCsvString = (data: Record<string, string>[]): string => {
@@ -135,27 +136,27 @@ export default (pool: Pool, JWT_SECRET: string) => {
         return c.json({ error: "CSV file is required" }, 400);
       }
 
-      if (
-        file.type &&
-        file.type !== "text/csv" &&
-        !file.type.includes("csv")
-      ) {
-        return c.json({ error: "Invalid file type, only CSV is allowed" }, 400);
-      }
-
-      const maxSizeBytes = 50 * 1024 * 1024;
-      if (file.size > maxSizeBytes) {
-        return c.json({ error: "CSV file size cannot exceed 50MB" }, 413);
-      }
-
       if (!dataName || typeof dataName !== "string") {
         return c.json({ error: "data_name is required" }, 400);
+      }
+
+      // Comprehensive file validation
+      try {
+        await validateFile(file, "csv", {
+          maxSize: 50 * 1024 * 1024, // 50MB
+          checkMagicBytes: false, // CSV has no reliable magic bytes
+        });
+      } catch (error) {
+        if (error instanceof FileValidationError) {
+          return c.json({ error: error.message }, 400);
+        }
+        throw error;
       }
 
       // 1. Save to a temporary location first
       const tempDir = path.resolve(import.meta.dir, "../../uploads", "temp");
       await mkdir(tempDir, { recursive: true });
-      const uniqueFilename = `${Date.now()}-${file.name}`;
+      const uniqueFilename = generateUniqueFilename(file.name);
       tempUploadPath = path.join(tempDir, uniqueFilename);
       await Bun.write(tempUploadPath, file);
 

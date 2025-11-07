@@ -291,7 +291,7 @@ CREATE TABLE IF NOT EXISTS `experiment_reports` (
   INDEX `idx_student_submitted` (`student_id`, `submitted_at` DESC, `report_id` DESC)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
-CREATE TABLE `grade_weights` (
+CREATE TABLE IF NOT EXISTS `grade_weights` (
   `weight_id` INT AUTO_INCREMENT PRIMARY KEY,
   `class_id` INT NOT NULL UNIQUE,
 
@@ -331,7 +331,7 @@ CREATE TABLE `grade_weights` (
   )
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
-CREATE TABLE `experiment_grade` (
+CREATE TABLE IF NOT EXISTS `experiment_grade` (
   `grade_id` INT AUTO_INCREMENT PRIMARY KEY,
   `experiment_id` INT NOT NULL,
   `student_id` INT NOT NULL,

@@ -32,6 +32,15 @@ const createTeacherSchema = z.object({
   username: z.string().min(3),
   full_name: z.string().min(1),
   email: z.string().email().optional(),
+  phone: z
+    .string()
+    .length(11, "手机号必须为11位")
+    .regex(/^1\d{10}$/, "手机号必须以1开头的11位数字")
+    .optional(),
+  password: z
+    .string()
+    .min(6, "密码必须至少6位")
+    .optional(),
 });
 
 const updateUserSchema = z
@@ -58,6 +67,13 @@ const adminChangePasswordSchema = z.object({
   newPassword: z
     .string()
     .min(6, { message: "New password must be at least 6 characters long" }),
+});
+
+const resetPasswordSchema = z.object({
+  newPassword: z
+    .string()
+    .min(6, { message: "New password must be at least 6 characters long" })
+    .optional(),
 });
 
 const userSearchQuerySchema = z.object({
@@ -99,8 +115,7 @@ const studentSelfRegisterSchema = z.object({
     .regex(/^\d+$/, "Student username must contain only digits"),
   password: z
     .string()
-    .min(8, "Password must be at least 8 characters long")
-    .regex(/^(?=.*[A-Za-z])(?=.*\d).+$/, "Password must contain both letters and numbers"),
+    .min(6, "Password must be at least 6 characters long"),
   name: z
     .string()
     .min(1, "Name is required")
@@ -115,8 +130,7 @@ const teacherAssistantSelfRegisterSchema = z.object({
     .regex(/^[a-zA-Z0-9]+$/, "Username can only contain letters and numbers"),
   password: z
     .string()
-    .min(8, "Password must be at least 8 characters long")
-    .regex(/^(?=.*[A-Za-z])(?=.*\d).+$/, "Password must contain both letters and numbers"),
+    .min(6, "Password must be at least 6 characters long"),
   name: z
     .string()
     .min(1, "Name is required")
@@ -449,12 +463,23 @@ export default (pool: Pool, JWT_SECRET: string) => {
           return c.json({ error: "Forbidden" }, 403);
         }
 
-        const { username, full_name, email } = c.req.valid("json");
+        const { username, full_name, email, phone, password } = c.req.valid("json");
         const teacherEmail = email ?? `${username}@${TEACHER_EMAIL_DOMAIN}`;
 
+        // Use provided password or default
+        let password_hash: string;
+        if (password) {
+          password_hash = await Bun.password.hash(password, {
+            algorithm: "bcrypt",
+            cost: 10,
+          });
+        } else {
+          password_hash = DEFAULT_PASSWORD_HASH;
+        }
+
         const [result]: any = await pool.query(
-          "INSERT INTO users (username, password_hash, full_name, email, role) VALUES (?, ?, ?, ?, 'Teacher')",
-          [username, DEFAULT_PASSWORD_HASH, full_name, teacherEmail],
+          "INSERT INTO users (username, password_hash, full_name, email, phone_number, role) VALUES (?, ?, ?, ?, ?, 'Teacher')",
+          [username, password_hash, full_name, teacherEmail, phone || null],
         );
 
         const newTeacherId = result.insertId;
@@ -464,6 +489,7 @@ export default (pool: Pool, JWT_SECRET: string) => {
           username,
           full_name,
           email: teacherEmail,
+          phone_number: phone || null,
           role: "Teacher",
         };
         return c.json(newUser, 201);
@@ -474,6 +500,9 @@ export default (pool: Pool, JWT_SECRET: string) => {
           }
           if (error.message.includes("users.email")) {
             return c.json({ error: "Email already exists" }, 409);
+          }
+          if (error.message.includes("users.phone_number")) {
+            return c.json({ error: "Phone number already exists" }, 409);
           }
         }
         return handleUnexpectedError(c, error, "Failed to create teacher");
@@ -495,9 +524,20 @@ export default (pool: Pool, JWT_SECRET: string) => {
 
         const body = await c.req.parseBody();
         const file = body["file"];
+        const password = body["password"];
 
         if (!(file instanceof File)) {
           return c.json({ error: "CSV 文件缺失或类型错误" }, 400);
+        }
+
+        // Validate password if provided
+        if (password !== undefined && password !== null && password !== "") {
+          if (typeof password !== "string") {
+            return c.json({ error: "密码必须是字符串类型" }, 400);
+          }
+          if (password.length < 6) {
+            return c.json({ error: "统一密码必须至少6位" }, 400);
+          }
         }
 
         if (
@@ -652,10 +692,21 @@ export default (pool: Pool, JWT_SECRET: string) => {
             }
           }
 
+          // Hash password if provided, otherwise use default
+          let password_hash: string;
+          if (password && typeof password === "string" && password.trim().length >= 6) {
+            password_hash = await Bun.password.hash(password.trim(), {
+              algorithm: "bcrypt",
+              cost: 10,
+            });
+          } else {
+            password_hash = DEFAULT_PASSWORD_HASH;
+          }
+
           // Batch insert all teachers at once for better performance
           const teacherValues = teacherRows.map((row) => [
             row.username,
-            DEFAULT_PASSWORD_HASH,
+            password_hash,
             row.fullName,
             row.email,
             "Teacher",
@@ -799,6 +850,35 @@ export default (pool: Pool, JWT_SECRET: string) => {
       return c.json(rows);
     } catch (error) {
       return handleUnexpectedError(c, error, "Failed to fetch assistants");
+    }
+  });
+
+  // Get students not enrolled in any class (for Teacher/Assistant)
+  usersApi.get("/api/v1/students/unenrolled", jwt({ secret: JWT_SECRET }), async (c) => {
+    try {
+      const payload = c.get("jwtPayload");
+
+      if (
+        payload.role !== "Admin" &&
+        payload.role !== "Teacher" &&
+        payload.role !== "Assistant"
+      ) {
+        return c.json({ error: "Forbidden" }, 403);
+      }
+
+      const [rows] = await pool.query(
+        `SELECT u.user_id, u.username, u.full_name, u.email, u.phone_number, u.created_at
+           FROM users u
+          WHERE u.role = 'Student'
+            AND NOT EXISTS (
+              SELECT 1 FROM enrollments e WHERE e.student_id = u.user_id
+            )
+          ORDER BY u.created_at DESC`
+      );
+
+      return c.json(rows);
+    } catch (error) {
+      return handleUnexpectedError(c, error, "Failed to fetch unenrolled students");
     }
   });
 
@@ -1050,16 +1130,18 @@ export default (pool: Pool, JWT_SECRET: string) => {
     },
   );
 
-  // Teacher/Admin: Reset a student's password to default
+  // Teacher/Admin/Assistant: Reset a student's password
   usersApi.post(
     "/api/v1/users/:userId/reset-password",
     jwt({ secret: JWT_SECRET }),
     zValidator("param", userIdParamSchema),
+    zValidator("json", resetPasswordSchema),
     async (c) => {
       try {
         const payload = c.get("jwtPayload");
         const { userId } = c.req.valid("param");
         const targetUserId = parseInt(userId, 10);
+        const { newPassword } = c.req.valid("json");
 
         if (
           payload.role !== "Admin" &&
@@ -1118,10 +1200,23 @@ export default (pool: Pool, JWT_SECRET: string) => {
         }
         // Admins are allowed to proceed
 
-        // 3. Update password to the default hash
+        // 3. Determine password hash: custom or default
+        let password_hash: string;
+        if (newPassword) {
+          // Use custom password
+          password_hash = await Bun.password.hash(newPassword, {
+            algorithm: "bcrypt",
+            cost: 10,
+          });
+        } else {
+          // Use default password
+          password_hash = DEFAULT_PASSWORD_HASH;
+        }
+
+        // 4. Update password
         const [result]: any = await pool.query(
           "UPDATE users SET password_hash = ? WHERE user_id = ?",
-          [DEFAULT_PASSWORD_HASH, targetUserId],
+          [password_hash, targetUserId],
         );
 
         if (result.affectedRows === 0) {
@@ -1129,7 +1224,11 @@ export default (pool: Pool, JWT_SECRET: string) => {
           return c.json({ error: "User not found" }, 404);
         }
 
-        return c.json({ message: "Password reset to default successfully" });
+        const message = newPassword
+          ? "Password updated successfully"
+          : "Password reset to default successfully";
+
+        return c.json({ message });
       } catch (error) {
         return handleUnexpectedError(c, error, "Failed to reset password");
       }

@@ -28,6 +28,10 @@ const createStudentSchema = z.object({
   full_name: z.string().min(1, "姓名 is required"),
   email: z.string().regex(/^[^\s@]+@[^\s@]+\.[^\s@]+$/, "Invalid email format").optional(),
   phone_number: z.string().optional(),
+  password: z
+    .string()
+    .min(6, "密码必须至少6位")
+    .optional(),
 });
 
 const addAssistantSchema = z.object({
@@ -98,7 +102,7 @@ export default (pool: Pool, JWT_SECRET: string) => {
       const payload = c.get("jwtPayload");
       const { classId } = c.req.valid("param");
       const classIdNumber = Number.parseInt(classId, 10);
-      const { username, full_name, email, phone_number } = c.req.valid("json");
+      const { username, full_name, email, phone_number, password } = c.req.valid("json");
 
       if (
         payload.role !== "Admin" &&
@@ -129,14 +133,24 @@ export default (pool: Pool, JWT_SECRET: string) => {
           return c.json({ error: "Forbidden" }, 403);
         }
 
-        const defaultPasswordHash = DEFAULT_PASSWORD_HASH;
+        // Use provided password or default
+        let password_hash: string;
+        if (password) {
+          password_hash = await Bun.password.hash(password, {
+            algorithm: "bcrypt",
+            cost: 10,
+          });
+        } else {
+          password_hash = DEFAULT_PASSWORD_HASH;
+        }
+
         const studentEmail = email || `${username}@student.edu`;
 
         const [userResult]: any = await connection.query(
           "INSERT INTO users (username, password_hash, full_name, email, role, phone_number) VALUES (?, ?, ?, ?, 'Student', ?)",
           [
             username,
-            defaultPasswordHash,
+            password_hash,
             full_name,
             studentEmail,
             phone_number || null,
@@ -217,8 +231,12 @@ export default (pool: Pool, JWT_SECRET: string) => {
           await connection.beginTransaction();
           transactionStarted = true;
 
-          // Only Teacher and Admin can enroll students
-          if (payload.role !== "Teacher" && payload.role !== "Admin") {
+          // Teacher, Assistant and Admin can enroll students
+          if (
+            payload.role !== "Teacher" &&
+            payload.role !== "Assistant" &&
+            payload.role !== "Admin"
+          ) {
             await connection.rollback();
             return c.json({ error: "Forbidden" }, 403);
           }
@@ -227,7 +245,7 @@ export default (pool: Pool, JWT_SECRET: string) => {
             connection,
             classIdNumber,
             payload,
-            false, // Only Teacher and Admin
+            true, // Allow Teacher, Assistant and Admin
           );
 
           if (teacherId === null) {

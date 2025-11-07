@@ -9,6 +9,7 @@ import { unlink, mkdir } from "node:fs/promises";
 import path from "path";
 import { getDefaultPasswordHash } from "../utils";
 import { handleUnexpectedError, logWarning } from "../utils/error-handler";
+import { validateFile, generateUniqueFilename, FileValidationError } from "../utils/file-validator";
 
 // Zod Schemas for Validation
 const classIdParamSchema = z.object({
@@ -76,15 +77,23 @@ export default (pool: Pool, JWT_SECRET: string) => {
         const class_code = body["class_code"];
         const studentListFile = body["student_list"];
 
-        if (studentListFile instanceof File) {
-          const maxSize = 5 * 1024 * 1024; // 5MB
-          if (studentListFile.size > maxSize) {
-            return c.json({ error: "CSV file size cannot exceed 5MB" }, 413);
-          }
-        }
-
         if (!class_name || typeof class_name !== "string") {
           return c.json({ error: "class_name is required" }, 400);
+        }
+
+        // Validate student list CSV if provided
+        if (studentListFile instanceof File) {
+          try {
+            await validateFile(studentListFile, "csv", {
+              maxSize: 5 * 1024 * 1024, // 5MB
+              checkMagicBytes: false, // CSV has no reliable magic bytes
+            });
+          } catch (error) {
+            if (error instanceof FileValidationError) {
+              return c.json({ error: error.message }, 400);
+            }
+            throw error;
+          }
         }
 
         const teacher_id = payload.sub;
@@ -111,7 +120,7 @@ export default (pool: Pool, JWT_SECRET: string) => {
           if (studentListFile instanceof File) {
             const tempDir = path.resolve(import.meta.dir, "../../uploads", "temp");
             await mkdir(tempDir, { recursive: true });
-            const uniqueFilename = `${Date.now()}-${studentListFile.name}`;
+            const uniqueFilename = generateUniqueFilename(studentListFile.name);
             tempCsvPath = path.join(tempDir, uniqueFilename);
             await Bun.write(tempCsvPath, studentListFile);
 
