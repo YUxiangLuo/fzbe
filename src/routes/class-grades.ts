@@ -393,37 +393,45 @@ export default (pool: Pool, JWT_SECRET: string) => {
           return c.json({ error: "Forbidden" }, 403);
         }
 
-        // Optimized: Use window function instead of self-join with GROUP BY
         const [reports]: any[] = await pool.query(
           `SELECT
              u.user_id,
              u.username,
              u.full_name,
-             latest.report_id,
+             er.report_id,
              latest.experiment_id,
-             latest.submitted_at,
-             latest.pdf_file_path,
-             latest.grade,
-             latest.feedback,
+             er.submitted_at,
+             er.pdf_file_path,
+             er.grade,
+             er.feedback,
              grader.full_name AS grader_name
            FROM enrollments e
            JOIN users u ON e.student_id = u.user_id
            LEFT JOIN (
-             SELECT * FROM (
+             SELECT
+               ranked.student_id,
+               ranked.experiment_id
+             FROM (
                SELECT
-                 er.*,
+                 es.student_id,
+                 es.experiment_id,
                  ROW_NUMBER() OVER (
-                   PARTITION BY er.student_id
-                   ORDER BY er.submitted_at DESC, er.report_id DESC
+                   PARTITION BY es.student_id
+                   ORDER BY es.experiment_id DESC
                  ) AS rn
-               FROM experiment_reports er
+               FROM experiment_status es
+               JOIN enrollments e2 ON e2.student_id = es.student_id
+               WHERE e2.class_id = ?
              ) ranked
              WHERE ranked.rn = 1
-           ) latest ON latest.student_id = u.user_id
-           LEFT JOIN users grader ON latest.graded_by = grader.user_id
+           ) latest ON latest.student_id = e.student_id
+           LEFT JOIN experiment_reports er
+             ON er.student_id = latest.student_id
+            AND er.experiment_id = latest.experiment_id
+           LEFT JOIN users grader ON er.graded_by = grader.user_id
            WHERE e.class_id = ?
            ORDER BY u.username ASC`,
-          [classIdNumber],
+          [classIdNumber, classIdNumber],
         );
 
         return c.json(reports);
@@ -827,11 +835,20 @@ export default (pool: Pool, JWT_SECRET: string) => {
            er.student_id,
            u.username,
            u.full_name
-         FROM enrollments e
-         JOIN users u ON e.student_id = u.user_id
-         JOIN experiment_reports er ON er.student_id = e.student_id
-        WHERE e.class_id = ?
-          AND er.pdf_file_path IS NOT NULL`,
+         FROM (
+           SELECT
+             es.student_id,
+             MAX(es.experiment_id) AS latest_experiment_id
+           FROM experiment_status es
+           JOIN enrollments e ON es.student_id = e.student_id
+          WHERE e.class_id = ?
+          GROUP BY es.student_id
+         ) latest
+         JOIN experiment_reports er
+           ON er.student_id = latest.student_id
+          AND er.experiment_id = latest.latest_experiment_id
+         JOIN users u ON u.user_id = latest.student_id
+        WHERE er.pdf_file_path IS NOT NULL`,
         [classIdNumber],
       );
 

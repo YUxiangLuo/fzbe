@@ -715,7 +715,7 @@ export default (pool: Pool, JWT_SECRET: string) => {
 
           if (newTimestamp && previousLast) {
             const diffMs = newTimestamp.getTime() - previousLast.getTime();
-            const maxGapMs = 6 * 60 * 60 * 1000;
+            const maxGapMs = 1 * 60 * 60 * 1000;
             if (diffMs > 0 && diffMs <= maxGapMs) {
               const prevTotal = Number(row.total_active_duration_seconds ?? 0);
               const additionalSeconds = Math.max(1, Math.floor(diffMs / 1000));
