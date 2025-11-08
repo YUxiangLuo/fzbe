@@ -3,27 +3,105 @@ import { jwt } from "hono/jwt";
 import { z } from "zod";
 import { zValidator } from "@hono/zod-validator";
 import type { Pool } from "mysql2/promise";
+import { marked } from "marked";
 import puppeteer from "puppeteer-core";
 import path from "path";
 import { mkdir } from "node:fs/promises";
 import { handleUnexpectedError } from "../utils/error-handler";
-import { sanitizeBase64HTML, HTMLSanitizationError } from "../utils/html-sanitizer";
+import { sanitizeHTML, HTMLSanitizationError } from "../utils/html-sanitizer";
 
 const experimentIdParamSchema = z.object({
   experimentId: z.string().regex(/^\d+$/, { message: "experimentId must be a number" }),
 });
 
 const submitReportSchema = z.object({
-  report_content: z.string().trim().min(1).refine((val) => {
-    try {
-      // Attempt to decode to see if it's valid Base64
-      Buffer.from(val, 'base64');
-      return true;
-    } catch (e) {
-      return false;
-    }
-  }, { message: "report_content must be a valid Base64 encoded string" }),
+  report_content: z.string().trim().min(1),
 });
+
+async function markdownToSanitizedHtml(markdown: string): Promise<string> {
+  const parsed = await marked.parse(markdown);
+
+  if (typeof parsed !== "string") {
+    throw new HTMLSanitizationError("Failed to convert Markdown to HTML");
+  }
+
+  return sanitizeHTML(parsed);
+}
+
+function buildPdfDocument(content: string): string {
+  return `<!DOCTYPE html>
+  <html lang="en">
+    <head>
+      <meta charset="UTF-8" />
+      <title>Experiment Report</title>
+      <style>
+        :root {
+          color-scheme: light;
+        }
+        body {
+          font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Arial, sans-serif;
+          margin: 0;
+          padding: 40px;
+          line-height: 1.6;
+          color: #1f2933;
+          background-color: #ffffff;
+        }
+        .report-content h1,
+        .report-content h2,
+        .report-content h3,
+        .report-content h4,
+        .report-content h5,
+        .report-content h6 {
+          margin-top: 1.8rem;
+          margin-bottom: 0.6rem;
+        }
+        .report-content pre {
+          background-color: #f8fafc;
+          padding: 14px;
+          border-radius: 6px;
+          overflow-x: auto;
+          font-family: "SFMono-Regular", Consolas, "Liberation Mono", Menlo, monospace;
+          font-size: 0.9rem;
+        }
+        .report-content code {
+          font-family: "SFMono-Regular", Consolas, "Liberation Mono", Menlo, monospace;
+          background: #f1f5f9;
+          padding: 2px 4px;
+          border-radius: 4px;
+        }
+        .report-content table {
+          border-collapse: collapse;
+          width: 100%;
+          margin: 1.2rem 0;
+        }
+        .report-content th,
+        .report-content td {
+          border: 1px solid #cbd5f5;
+          padding: 8px 10px;
+          text-align: left;
+        }
+        .report-content ul,
+        .report-content ol {
+          padding-left: 1.4rem;
+        }
+        .report-content blockquote {
+          border-left: 4px solid #94a3b8;
+          padding-left: 12px;
+          color: #475569;
+          margin: 1rem 0;
+        }
+        .report-content hr {
+          border: none;
+          border-top: 1px solid #e2e8f0;
+          margin: 2rem 0;
+        }
+      </style>
+    </head>
+    <body>
+      <main class="report-content">${content}</main>
+    </body>
+  </html>`;
+}
 
 export default (pool: Pool, JWT_SECRET: string) => {
   const reportsApi = new Hono();
@@ -47,7 +125,7 @@ export default (pool: Pool, JWT_SECRET: string) => {
 
         const { experimentId } = c.req.valid("param");
         const experiment_id = Number.parseInt(experimentId, 10);
-        const { report_content: base64Content } = c.req.valid("json");
+        const { report_content: markdownContent } = c.req.valid("json");
 
         const [[ownership]]: any[] = await pool.query(
           `SELECT student_id
@@ -68,10 +146,10 @@ export default (pool: Pool, JWT_SECRET: string) => {
           );
         }
 
-        // Sanitize HTML content to prevent XSS and SSRF attacks
-        let report_content: string;
+        // Convert Markdown to sanitized HTML to prevent XSS/SSRF
+        let sanitizedReportContent: string;
         try {
-          report_content = sanitizeBase64HTML(base64Content);
+          sanitizedReportContent = await markdownToSanitizedHtml(markdownContent);
         } catch (error) {
           if (error instanceof HTMLSanitizationError) {
             return c.json(
@@ -81,6 +159,8 @@ export default (pool: Pool, JWT_SECRET: string) => {
           }
           throw error;
         }
+
+        const htmlDocument = buildPdfDocument(sanitizedReportContent);
 
         // --- PDF Generation Logic ---
         const reportsDir = path.resolve(import.meta.dir, "../../uploads", "reports");
@@ -109,7 +189,7 @@ export default (pool: Pool, JWT_SECRET: string) => {
         // Disable JavaScript execution as an extra security layer
         await page.setJavaScriptEnabled(false);
 
-        await page.setContent(report_content, {
+        await page.setContent(htmlDocument, {
           waitUntil: "domcontentloaded", // Use domcontentloaded instead of networkidle0 to prevent SSRF
           timeout: 10000 // 10 second timeout
         });
@@ -138,7 +218,7 @@ export default (pool: Pool, JWT_SECRET: string) => {
           const [reportResult]: any = await connection.query(reportSql, [
             experiment_id,
             studentId,
-            report_content,
+            sanitizedReportContent,
             pdfPath,
           ]);
 

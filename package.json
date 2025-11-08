@@ -18,6 +18,7 @@
     "@hono/zod-validator": "^0.7.2",
     "csv-parser": "^3.2.0",
     "hono": "^4.8.5",
+    "marked": "^17.0.0",
     "mysql2": "^3.15.3",
     "pino": "^10.1.0",
     "puppeteer-core": "^24.29.0",

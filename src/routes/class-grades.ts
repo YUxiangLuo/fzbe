@@ -1009,17 +1009,25 @@ export default (pool: Pool, JWT_SECRET: string) => {
       };
 
       const header = [
-        "student_id",
-        "username",
-        "full_name",
-        "email",
-        "experiment_id",
-        ...EXP_FLOW_FIELDS,
-        "knowledge_test",
-        "model_quality",
-        "report_quality",
-        "exp_flow_score",
-        "final_score",
+        "学生ID",
+        "学号",
+        "姓名",
+        "邮箱",
+        "实验ID",
+        "数据准备",
+        "描述性统计",
+        "预测模型选择",
+        "生成预测结果",
+        "库存变量参数计算",
+        "服务水平参数计算",
+        "生产变量参数计算",
+        "制定生产计划",
+        "提交实验报告",
+        "知识点测试",
+        "模型选择",
+        "实验报告",
+        "实验流程",
+        "最终得分",
       ];
 
       const csvLines: string[] = [header.join(",")];
