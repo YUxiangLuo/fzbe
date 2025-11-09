@@ -19,24 +19,6 @@ const NORMALIZATION_VALUES = ["minmax", "zscore"] as const;
 const CAPACITY_MODE_VALUES = ["scenario", "auto", "custom"] as const;
 const CAPACITY_SCENARIO_VALUES = ["tight", "normal", "abundant"] as const;
 
-const STEP_COUNT = 7;
-
-const EXP_FLOW_GRADE_COLUMNS = [
-  "exp_flow_demand_data_preparation",
-  "exp_flow_demand_descriptive_stats",
-  "exp_flow_demand_model_selection",
-  "exp_flow_demand_generate_results",
-  "exp_flow_production_inventory_calc",
-  "exp_flow_production_service_level",
-  "exp_flow_production_variable_calc",
-  "exp_flow_production_plan_creation",
-  "exp_flow_report_submission",
-] as const;
-
-const EXP_FLOW_GRADE_UPDATE_SET = EXP_FLOW_GRADE_COLUMNS.map(
-  (col) => `${col} = ?`,
-).join(", ");
-
 const BOOLEAN_FIELDS = new Set<string>([
   "moving_average_completed",
   "exponential_smoothing_completed",
@@ -767,8 +749,6 @@ export default (pool: Pool, JWT_SECRET: string) => {
 
       const connection = await pool.getConnection();
       let transactionStarted = false;
-      let resetExpFlow = false;
-      let markExpFlowComplete = false;
       try {
         // 验证该实验是否属于当前学生
         const [experimentRows] = await connection.query<RowDataPacket[]>(
@@ -804,7 +784,6 @@ export default (pool: Pool, JWT_SECRET: string) => {
 
           // 2. 如果最新步骤比当前要完成的步骤还要靠后，说明发生了“跳回”完成
           if (latestStepOrder > step_order) {
-            resetExpFlow = true;
             // 3. 自动插入一个10秒前的 "STARTED" 事件
             const syntheticStartedTimestamp = new Date(Date.now() - 10000);
             await connection.query<ResultSetHeader>(
@@ -812,10 +791,6 @@ export default (pool: Pool, JWT_SECRET: string) => {
                VALUES (?, ?, ?, ?, ?)`,
               [experiment_id, studentId, step_order, "STARTED", syntheticStartedTimestamp]
             );
-          }
-
-          if (step_order === STEP_COUNT) {
-            markExpFlowComplete = true;
           }
         }
         // --- 新的优化逻辑结束 ---
@@ -829,19 +804,6 @@ export default (pool: Pool, JWT_SECRET: string) => {
 
         // 如果在事务中，则提交
         if (transactionStarted) {
-          if (resetExpFlow) {
-            const zeroValues = EXP_FLOW_GRADE_COLUMNS.map(() => 0);
-            await connection.query(
-              `UPDATE experiment_grade SET ${EXP_FLOW_GRADE_UPDATE_SET} WHERE experiment_id = ? AND student_id = ?`,
-              [...zeroValues, experiment_id, studentId],
-            );
-          } else if (markExpFlowComplete) {
-            const fullValues = EXP_FLOW_GRADE_COLUMNS.map(() => 100);
-            await connection.query(
-              `UPDATE experiment_grade SET ${EXP_FLOW_GRADE_UPDATE_SET} WHERE experiment_id = ? AND student_id = ?`,
-              [...fullValues, experiment_id, studentId],
-            );
-          }
           await connection.commit();
         }
 

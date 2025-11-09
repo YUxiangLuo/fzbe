@@ -222,6 +222,29 @@ export default (pool: Pool, JWT_SECRET: string) => {
             pdfPath,
           ]);
 
+
+
+          // 提交报告成功则实验流程所有步骤都100分
+          const EXP_FLOW_GRADE_COLUMNS = [
+            "exp_flow_demand_data_preparation",
+            "exp_flow_demand_descriptive_stats",
+            "exp_flow_demand_model_selection",
+            "exp_flow_demand_generate_results",
+            "exp_flow_production_inventory_calc",
+            "exp_flow_production_service_level",
+            "exp_flow_production_variable_calc",
+            "exp_flow_production_plan_creation",
+            "exp_flow_report_submission",
+          ] as const;
+          const EXP_FLOW_GRADE_UPDATE_SET = EXP_FLOW_GRADE_COLUMNS.map(
+            (col) => `${col} = ?`,
+          ).join(", ");
+          const fullValues = EXP_FLOW_GRADE_COLUMNS.map(() => 100);
+          await connection.query(
+            `UPDATE experiment_grade SET ${EXP_FLOW_GRADE_UPDATE_SET} WHERE experiment_id = ? AND student_id = ?`,
+            [...fullValues, experiment_id, studentId],
+          );
+
           await connection.commit();
 
           let reportId = reportResult.insertId;
