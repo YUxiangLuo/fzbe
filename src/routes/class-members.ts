@@ -364,7 +364,7 @@ export default (pool: Pool, JWT_SECRET: string) => {
              FROM users u
              JOIN enrollments e ON u.user_id = e.student_id
             WHERE e.class_id = ?
-            ORDER BY u.full_name ASC`,
+            ORDER BY u.username ASC`,
           [classIdNumber],
         );
 

@@ -32,6 +32,35 @@ const EXP_FLOW_FIELDS = [
 const STEP_COUNT = 7;
 const EXPORTS_DIR = path.resolve(import.meta.dir, "../../uploads", "exports");
 
+const EXPERIMENT_GRADE_FIELDS = [
+  "exp_flow_demand_data_preparation",
+  "exp_flow_demand_descriptive_stats",
+  "exp_flow_demand_model_selection",
+  "exp_flow_demand_generate_results",
+  "exp_flow_production_inventory_calc",
+  "exp_flow_production_service_level",
+  "exp_flow_production_variable_calc",
+  "exp_flow_production_plan_creation",
+  "exp_flow_report_submission",
+  "model_quality",
+] as const;
+
+const EXPERIMENT_GRADE_SELECT_FRAGMENT = EXPERIMENT_GRADE_FIELDS.length
+  ? `,\n             ${EXPERIMENT_GRADE_FIELDS.map(
+      (column) => `eg.${column} AS grade_${column}`,
+    ).join(",\n             ")}`
+  : "";
+
+const EXPERIMENT_GRADE_MUTABLE_FIELDS = [...EXPERIMENT_GRADE_FIELDS] as const;
+
+const toNumberOrNull = (value: unknown): number | null => {
+  if (value === null || value === undefined) {
+    return null;
+  }
+  const num = Number(value);
+  return Number.isFinite(num) ? num : null;
+};
+
 const toIsoString = (value: unknown): string | null => {
   if (!value) {
     return null;
@@ -55,37 +84,86 @@ const computeExperimentScores = (
   row: Record<string, any>,
   weights: Record<string, number>,
 ) => {
-  if (row.experiment_id === null || row.experiment_id === undefined) {
-    return { expFlowScore: null, finalScore: null };
-  }
+  const hasExperiment =
+    row.experiment_id !== null && row.experiment_id !== undefined;
 
-  let expFlowTotal = 0;
-  for (const field of EXP_FLOW_FIELDS) {
-    const stepScore = Number(row[field] ?? 0);
+  const expFlowComponents = EXP_FLOW_FIELDS.map((field) => {
+    const score = hasExperiment ? toNumberOrNull(row[field]) : null;
     const weight = Number(weights[field] ?? 0);
-    if (Number.isFinite(stepScore) && Number.isFinite(weight)) {
-      expFlowTotal += stepScore * weight;
-    }
-  }
-  const expFlowScore = expFlowTotal / 100;
+    const weighted =
+      score === null || !Number.isFinite(weight)
+        ? null
+        : (score * weight) / 100;
+    return {
+      field,
+      score,
+      weight,
+      weighted_score: weighted,
+    };
+  });
 
-  const knowledge = Number(row.knowledge_test ?? 0);
-  const modelQuality = Number(row.model_quality ?? 0);
-  const reportQuality = Number(row.report_quality ?? 0);
+  const expFlowScoreRaw = expFlowComponents.reduce((sum, component) => {
+    if (component.weighted_score === null) {
+      return sum;
+    }
+    return sum + component.weighted_score;
+  }, 0);
+  const expFlowScore = hasExperiment
+    ? expFlowComponents.some((component) => component.weighted_score !== null)
+      ? expFlowScoreRaw
+      : null
+    : null;
+
+  const knowledge = hasExperiment ? toNumberOrNull(row.knowledge_test) : null;
+  const modelQuality = hasExperiment ? toNumberOrNull(row.model_quality) : null;
+  const reportQuality = hasExperiment ? toNumberOrNull(row.report_quality) : null;
   const expWeight = Number(weights.exp_flow_weight ?? 0);
   const knowledgeWeight = Number(weights.knowledge_test_weight ?? 0);
   const modelWeight = Number(weights.model_quality_weight ?? 0);
   const reportWeight = Number(weights.report_quality_weight ?? 0);
 
-  const finalScore =
-    (Number.isFinite(expFlowScore) ? expFlowScore : 0) * (expWeight / 100) +
-    (Number.isFinite(knowledge) ? knowledge : 0) * (knowledgeWeight / 100) +
-    (Number.isFinite(modelQuality) ? modelQuality : 0) * (modelWeight / 100) +
-    (Number.isFinite(reportQuality) ? reportQuality : 0) * (reportWeight / 100);
+  const buildFinalComponent = (
+    score: number | null,
+    weight: number,
+  ): { score: number | null; weight: number; weighted_score: number | null } => {
+    const normalizedWeight = Number.isFinite(weight) ? weight : 0;
+    return {
+      score,
+      weight: normalizedWeight,
+      weighted_score:
+        score === null ? null : (score * normalizedWeight) / 100,
+    };
+  };
+
+  const finalScoreComponents = {
+    exp_flow: buildFinalComponent(expFlowScore, expWeight),
+    knowledge_test: buildFinalComponent(knowledge, knowledgeWeight),
+    model_quality: buildFinalComponent(modelQuality, modelWeight),
+    report_quality: buildFinalComponent(reportQuality, reportWeight),
+  };
+
+  const finalScoreRaw = Object.values(finalScoreComponents).reduce(
+    (sum, component) => {
+      if (component.weighted_score === null) {
+        return sum;
+      }
+      return sum + component.weighted_score;
+    },
+    0,
+  );
+  const finalScore = hasExperiment
+    ? Object.values(finalScoreComponents).some(
+        (component) => component.weighted_score !== null,
+      )
+      ? finalScoreRaw
+      : null
+    : null;
 
   return {
     expFlowScore: Number.isFinite(expFlowScore) ? expFlowScore : null,
     finalScore: Number.isFinite(finalScore) ? finalScore : null,
+    expFlowComponents,
+    finalScoreComponents,
   };
 };
 
@@ -268,17 +346,46 @@ const LATEST_GRADE_SELECTION_SQL = `
   ORDER BY u.username ASC
 `;
 
-const optionalGradeValue = z
-  .number()
-  .min(0, { message: "grade must be between 0 and 100" })
-  .max(100, { message: "grade must be between 0 and 100" })
-  .optional();
+const createOptionalGradeValue = () =>
+  z
+    .number()
+    .min(0, { message: "grade must be between 0 and 100" })
+    .max(100, { message: "grade must be between 0 and 100" })
+    .optional();
+
+const optionalGradeValue = createOptionalGradeValue();
 
 const optionalFeedbackValue = z
   .string()
   .transform((value) => {
     const trimmed = value.trim();
     return trimmed.length ? trimmed : null;
+  })
+  .optional();
+
+const experimentGradeFieldSchemas = EXPERIMENT_GRADE_MUTABLE_FIELDS.reduce(
+  (acc, field) => {
+    acc[field] = createOptionalGradeValue();
+    return acc;
+  },
+  {} as Record<
+    (typeof EXPERIMENT_GRADE_MUTABLE_FIELDS)[number],
+    ReturnType<typeof createOptionalGradeValue>
+  >,
+);
+
+const experimentGradeUpdateSchema = z
+  .object(experimentGradeFieldSchemas)
+  .superRefine((data, ctx) => {
+    const hasValue = EXPERIMENT_GRADE_MUTABLE_FIELDS.some(
+      (field) => data[field] !== undefined,
+    );
+    if (!hasValue) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: "At least one experiment_grade field must be provided",
+      });
+    }
   })
   .optional();
 
@@ -298,11 +405,15 @@ const gradeReportSchema = z
   .object({
     grade: optionalGradeValue,
     feedback: optionalFeedbackValue,
+    experiment_grade: experimentGradeUpdateSchema,
   })
   .refine(
-    (data) => data.grade !== undefined || data.feedback !== undefined,
+    (data) =>
+      data.grade !== undefined ||
+      data.feedback !== undefined ||
+      data.experiment_grade !== undefined,
     {
-      message: "At least one grade field must be provided",
+      message: "At least one of grade, feedback, or experiment_grade must be provided",
     },
   );
 
@@ -393,7 +504,7 @@ export default (pool: Pool, JWT_SECRET: string) => {
           return c.json({ error: "Forbidden" }, 403);
         }
 
-        const [reports]: any[] = await pool.query(
+        const [reportRows]: any[] = await pool.query(
           `SELECT
              u.user_id,
              u.username,
@@ -404,7 +515,7 @@ export default (pool: Pool, JWT_SECRET: string) => {
              er.pdf_file_path,
              er.grade,
              er.feedback,
-             grader.full_name AS grader_name
+             grader.full_name AS grader_name${EXPERIMENT_GRADE_SELECT_FRAGMENT}
            FROM enrollments e
            JOIN users u ON e.student_id = u.user_id
            LEFT JOIN (
@@ -428,11 +539,35 @@ export default (pool: Pool, JWT_SECRET: string) => {
            LEFT JOIN experiment_reports er
              ON er.student_id = latest.student_id
             AND er.experiment_id = latest.experiment_id
+           LEFT JOIN experiment_grade eg
+             ON eg.student_id = latest.student_id
+            AND eg.experiment_id = latest.experiment_id
            LEFT JOIN users grader ON er.graded_by = grader.user_id
            WHERE e.class_id = ?
            ORDER BY u.username ASC`,
           [classIdNumber, classIdNumber],
         );
+
+        const reports = (reportRows as Record<string, any>[]).map((row) => {
+          const sanitizedRow: Record<string, any> = { ...row };
+          const gradePayload: Record<string, any> = {};
+          let hasGrade = false;
+
+          for (const column of EXPERIMENT_GRADE_FIELDS) {
+            const alias = `grade_${column}`;
+            const value = sanitizedRow[alias];
+            gradePayload[column] = value ?? null;
+            if (value !== null && value !== undefined) {
+              hasGrade = true;
+            }
+            delete sanitizedRow[alias];
+          }
+
+          return {
+            ...sanitizedRow,
+            experiment_grade: hasGrade ? gradePayload : null,
+          };
+        });
 
         return c.json(reports);
       } catch (error) {
@@ -460,7 +595,11 @@ export default (pool: Pool, JWT_SECRET: string) => {
 
         const { reportId } = c.req.valid("param");
         const reportIdNumber = Number.parseInt(reportId, 10);
-        const { grade, feedback } = c.req.valid("json");
+        const {
+          grade,
+          feedback,
+          experiment_grade: experimentGradeInput,
+        } = c.req.valid("json");
 
         const connection = await pool.getConnection();
         try {
@@ -507,14 +646,32 @@ export default (pool: Pool, JWT_SECRET: string) => {
             return c.json({ error: "Forbidden" }, 403);
           }
 
+          const experimentGradeUpdateFields: string[] = [];
+          const experimentGradeUpdateValues: any[] = [];
+
+          if (experimentGradeInput) {
+            for (const field of EXPERIMENT_GRADE_MUTABLE_FIELDS) {
+              const value = experimentGradeInput[field];
+              if (value !== undefined) {
+                experimentGradeUpdateFields.push(`${field} = ?`);
+                experimentGradeUpdateValues.push(value);
+              }
+            }
+          }
+
           if (grade !== undefined) {
+            experimentGradeUpdateFields.push("report_quality = ?");
+            experimentGradeUpdateValues.push(grade);
+          }
+
+          if (experimentGradeUpdateFields.length > 0) {
             const [gradeResult]: any = await connection.query(
               `
                 UPDATE experiment_grade
-                   SET report_quality = ?
+                   SET ${experimentGradeUpdateFields.join(", ")}
                  WHERE experiment_id = ? AND student_id = ?
               `,
-              [grade, experiment_id, student_id],
+              [...experimentGradeUpdateValues, experiment_id, student_id],
             );
 
             if (gradeResult.affectedRows === 0) {
@@ -573,6 +730,29 @@ export default (pool: Pool, JWT_SECRET: string) => {
             [reportIdNumber],
           );
 
+          const gradeSelectList = EXPERIMENT_GRADE_MUTABLE_FIELDS.join(", ");
+          const [[updatedExperimentGrade]]: any[] = await connection.query(
+            `
+              SELECT ${gradeSelectList}
+                FROM experiment_grade
+               WHERE experiment_id = ? AND student_id = ?
+               LIMIT 1
+            `,
+            [experiment_id, student_id],
+          );
+
+          const experimentGradeResponse = updatedExperimentGrade
+            ? EXPERIMENT_GRADE_FIELDS.reduce<Record<string, number | null>>(
+                (acc, field) => {
+                  const value = updatedExperimentGrade[field];
+                  acc[field] =
+                    value === null || value === undefined ? null : Number(value);
+                  return acc;
+                },
+                {},
+              )
+            : null;
+
           return c.json(
             updatedReport
               ? {
@@ -586,6 +766,7 @@ export default (pool: Pool, JWT_SECRET: string) => {
                   grade: updatedReport.grade ?? null,
                   feedback: updatedReport.feedback ?? null,
                   grader_name: updatedReport.grader_name ?? null,
+                  experiment_grade: experimentGradeResponse,
                 }
               : null,
           );
@@ -717,17 +898,23 @@ export default (pool: Pool, JWT_SECRET: string) => {
           }
         }
 
-        const responsePayload = studentRows.map(
-          (student: { user_id: number; username: string; full_name: string }) => {
-            const studentId = Number.parseInt(String(student.user_id), 10);
-            return {
-              student_id: studentId,
-              username: student.username,
-              full_name: student.full_name,
-              experiments: statusesByStudent.get(studentId) ?? [],
-            };
-          },
-        );
+        const responsePayload = studentRows
+          .map(
+            (student: {
+              user_id: number;
+              username: string;
+              full_name: string;
+            }) => {
+              const studentId = Number.parseInt(String(student.user_id), 10);
+              return {
+                student_id: studentId,
+                username: student.username,
+                full_name: student.full_name,
+                experiments: statusesByStudent.get(studentId) ?? [],
+              };
+            },
+          )
+          .sort((a, b) => a.username.localeCompare(b.username));
 
         return c.json(responsePayload);
       } catch (error) {
@@ -1253,16 +1440,45 @@ export default (pool: Pool, JWT_SECRET: string) => {
           [classIdNumber],
         );
 
-        const toNumberOrNull = (value: unknown) => {
-          if (value === null || value === undefined) {
-            return null;
-          }
-          const num = Number(value);
-          return Number.isFinite(num) ? num : null;
-        };
-
         const latestGrades = (gradeRows as any[]).map((row: any) => {
-          const { expFlowScore, finalScore } = computeExperimentScores(row, weights);
+          const {
+            expFlowScore,
+            finalScore,
+            expFlowComponents,
+            finalScoreComponents,
+          } = computeExperimentScores(row, weights);
+          const formatScore = (value: number | null) =>
+            value === null ? null : Number(value.toFixed(2));
+          const expFlowBreakdown = expFlowComponents.map((component) => ({
+            field: component.field,
+            score:
+              component.score === null
+                ? null
+                : Number(component.score.toFixed(2)),
+            weight: component.weight,
+            weighted_score: formatScore(component.weighted_score),
+          }));
+          const formatFinalComponent = (component: {
+            score: number | null;
+            weight: number;
+            weighted_score: number | null;
+          }) => ({
+            score: formatScore(component.score),
+            weight: component.weight,
+            weighted_score: formatScore(component.weighted_score),
+          });
+          const finalScoreBreakdown = {
+            exp_flow: formatFinalComponent(finalScoreComponents.exp_flow),
+            knowledge_test: formatFinalComponent(
+              finalScoreComponents.knowledge_test,
+            ),
+            model_quality: formatFinalComponent(
+              finalScoreComponents.model_quality,
+            ),
+            report_quality: formatFinalComponent(
+              finalScoreComponents.report_quality,
+            ),
+          };
           return {
             student_id: row.user_id,
             username: row.username,
@@ -1274,6 +1490,8 @@ export default (pool: Pool, JWT_SECRET: string) => {
             knowledge_test: toNumberOrNull(row.knowledge_test),
             report_quality: toNumberOrNull(row.report_quality),
             final_score: finalScore === null ? null : Number(finalScore.toFixed(2)),
+            exp_flow_breakdown: expFlowBreakdown,
+            final_score_breakdown: finalScoreBreakdown,
           };
         });
 
