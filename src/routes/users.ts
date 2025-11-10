@@ -253,9 +253,10 @@ export default (pool: Pool, JWT_SECRET: string) => {
 
         const offset = (page - 1) * limit;
 
-        // Use FULLTEXT search if the term is suitable (alphanumeric)
-        // Fallback to LIKE for special characters or short terms
-        const useFullText = term.length >= 2 && /^[\w\s@.-]+$/.test(term);
+        // Use FULLTEXT search only for longer terms (> 4 chars) to avoid min token size issues
+        // For short terms (1-4 chars) or potential pinyin searches, use LIKE for better fuzzy matching
+        // Fallback to LIKE for special characters
+        const useFullText = term.length > 4 && /^[\w\s@.-]+$/.test(term);
 
         let countQuery: string;
         let dataQuery: string;
@@ -525,6 +526,7 @@ export default (pool: Pool, JWT_SECRET: string) => {
         const body = await c.req.parseBody();
         const file = body["file"];
         const password = body["password"];
+        let normalizedPassword: string | null = null;
 
         if (!(file instanceof File)) {
           return c.json({ error: "CSV 文件缺失或类型错误" }, 400);
@@ -535,9 +537,11 @@ export default (pool: Pool, JWT_SECRET: string) => {
           if (typeof password !== "string") {
             return c.json({ error: "密码必须是字符串类型" }, 400);
           }
-          if (password.length < 6) {
+          const trimmedPassword = password.trim();
+          if (trimmedPassword.length < 6) {
             return c.json({ error: "统一密码必须至少6位" }, 400);
           }
+          normalizedPassword = trimmedPassword;
         }
 
         if (
@@ -692,21 +696,29 @@ export default (pool: Pool, JWT_SECRET: string) => {
             }
           }
 
-          // Hash password if provided, otherwise use default
-          let password_hash: string;
-          if (password && typeof password === "string" && password.trim().length >= 6) {
-            password_hash = await Bun.password.hash(password.trim(), {
+          // Hash passwords: use provided custom password for all, otherwise default to each teacher's phone number
+          let hashedPasswords: string[];
+          if (normalizedPassword) {
+            const hashed = await Bun.password.hash(normalizedPassword, {
               algorithm: "bcrypt",
               cost: 10,
             });
+            hashedPasswords = teacherRows.map(() => hashed);
           } else {
-            password_hash = DEFAULT_PASSWORD_HASH;
+            hashedPasswords = await Promise.all(
+              teacherRows.map((row) =>
+                Bun.password.hash(row.phone, {
+                  algorithm: "bcrypt",
+                  cost: 10,
+                }),
+              ),
+            );
           }
 
           // Batch insert all teachers at once for better performance
-          const teacherValues = teacherRows.map((row) => [
+          const teacherValues = teacherRows.map((row, index) => [
             row.username,
-            password_hash,
+            hashedPasswords[index],
             row.fullName,
             row.email,
             "Teacher",
@@ -897,15 +909,43 @@ export default (pool: Pool, JWT_SECRET: string) => {
            phone_number,
            role,
            created_at,
-           CASE WHEN password_hash = ? THEN TRUE ELSE FALSE END AS must_change_password
+           password_hash
          FROM users
         WHERE user_id = ?`,
-        [DEFAULT_PASSWORD_HASH, userId],
+        [userId],
       );
       const user = rows[0];
 
       if (!user) {
         return c.json({ error: "User not found" }, 404);
+      }
+
+      const passwordHash: string | null = user.password_hash ?? null;
+      delete user.password_hash;
+
+      const shouldAuditPassword =
+        user.role === "Student" || user.role === "Teacher";
+      if (shouldAuditPassword) {
+        let mustChangePassword = false;
+        if (passwordHash) {
+          const matchesDefault = passwordHash === DEFAULT_PASSWORD_HASH;
+          let matchesIdentifier = false;
+
+          if (user.role === "Student") {
+            matchesIdentifier = await Bun.password.verify(
+              user.username,
+              passwordHash,
+            ).catch(() => false);
+          } else if (user.role === "Teacher" && user.phone_number) {
+            matchesIdentifier = await Bun.password.verify(
+              user.phone_number,
+              passwordHash,
+            ).catch(() => false);
+          }
+
+          mustChangePassword = Boolean(matchesDefault || matchesIdentifier);
+        }
+        user.must_change_password = mustChangePassword;
       }
 
       if (user.role === "Student") {
@@ -927,6 +967,8 @@ export default (pool: Pool, JWT_SECRET: string) => {
         user.classes = classRows;
         // For backward compatibility, also return the first class as user.class
         user.class = classRows[0] ?? null;
+      } else if (!shouldAuditPassword) {
+        delete user.must_change_password;
       }
 
       return c.json(user);
@@ -973,11 +1015,10 @@ export default (pool: Pool, JWT_SECRET: string) => {
              email,
              phone_number,
              role,
-             created_at,
-             CASE WHEN password_hash = ? THEN TRUE ELSE FALSE END AS must_change_password
+             created_at
            FROM users
           WHERE user_id = ?`,
-          [DEFAULT_PASSWORD_HASH, userId],
+          [userId],
         );
         return c.json(rows[0]);
       } catch (error: any) {
@@ -1064,11 +1105,10 @@ export default (pool: Pool, JWT_SECRET: string) => {
              full_name,
              email,
              role,
-             created_at,
-             CASE WHEN password_hash = ? THEN TRUE ELSE FALSE END AS must_change_password
+             created_at
            FROM users
           WHERE user_id = ?`,
-          [DEFAULT_PASSWORD_HASH, targetUserId],
+          [targetUserId],
         );
         const user = rows[0];
 

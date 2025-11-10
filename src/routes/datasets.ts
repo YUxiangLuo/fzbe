@@ -492,6 +492,8 @@ export default (pool: Pool, JWT_SECRET: string) => {
         }
 
         const monthlySales: Array<{ month: string; sales: number }> = [];
+        const csvData: string[][] = [];
+        let headers: string[] = [];
         let unit = "";
 
         const normalizeYear = (value: unknown) => {
@@ -526,9 +528,23 @@ export default (pool: Pool, JWT_SECRET: string) => {
             }),
           );
 
+          let isFirstRow = true;
+
           stream
             .on("data", (row: Record<string, unknown>) => {
               try {
+                // 第一行：获取列名并存储到csvData
+                if (isFirstRow) {
+                  headers = Object.keys(row);
+                  csvData.push(headers);
+                  isFirstRow = false;
+                }
+
+                // 按照列名顺序提取值，组成数据行
+                const dataRow = headers.map((header) => String(row[header] ?? "").trim());
+                csvData.push(dataRow);
+
+                // 继续处理月度销量数据
                 const year = normalizeYear(row["年份"]);
                 const month = normalizeMonth(row["月份"]);
 
@@ -565,6 +581,7 @@ export default (pool: Pool, JWT_SECRET: string) => {
             unit,
           },
           monthlySales,
+          csvData,
         });
       } catch (error) {
         return handleUnexpectedError(c, error, "Failed to fetch product sales data");

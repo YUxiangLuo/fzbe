@@ -6,10 +6,53 @@ Weighted Average Ensemble for combining multiple trained models.
 
 import json
 import sys
+import os
 from typing import List, Tuple
 import numpy as np
 from joblib_compat import load_joblib, dump_joblib
 from models.utils import rmse, mae, mape, r2_score, get_model_predictions
+
+
+# ---------- Helper Functions ----------
+def _extract_model_names(model_paths: List[str]) -> List[str]:
+    """Extract model names from file paths for display purposes.
+
+    Supports patterns like:
+    - {studentId}_ma.pkl → ma
+    - {studentId}_weighted_average_config.pkl → weighted_average
+    - {prefix}_{studentId}_arima.pkl → arima
+    """
+    # Known model types (order matters for multi-word models)
+    known_models = [
+        'weighted_average', 'boosting', 'stacking',  # Multi-word first
+        'ma', 'es', 'arima', 'lstm'  # Single-word after
+    ]
+
+    model_names = []
+    for path in model_paths:
+        # Get filename without extension
+        filename = os.path.basename(path)
+        name_without_ext = os.path.splitext(filename)[0]
+
+        # Remove '_config' suffix if present
+        if name_without_ext.endswith('_config'):
+            name_without_ext = name_without_ext[:-7]
+
+        # Try to match known model types
+        model_type = None
+        for known in known_models:
+            if name_without_ext.endswith('_' + known) or name_without_ext == known:
+                model_type = known
+                break
+
+        if model_type:
+            model_names.append(model_type)
+        else:
+            # Fallback: use the last part after splitting by '_'
+            parts = name_without_ext.split('_')
+            model_names.append(parts[-1] if parts else name_without_ext)
+
+    return model_names
 
 
 # ---------- Weighting Strategies ----------
@@ -132,6 +175,7 @@ def run(args) -> None:
             "mode": "ensemble_loaded_predict",
             "strategy": strategy,
             "n_models": len(model_paths),
+            "model_names": _extract_model_names(model_paths),
             "weights": weights,
             "forecast_steps": steps,
             "predictions": predictions_with_std,
@@ -205,6 +249,7 @@ def run(args) -> None:
         "mode": "ensemble_train_eval",
         "strategy": strategy,
         "n_models": len(model_paths),
+        "model_names": _extract_model_names(model_paths),
         "weights": [float(w) for w in weights],
         "eval_range": {"start": es, "end": ee},
         "metrics": {

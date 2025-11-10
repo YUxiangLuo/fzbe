@@ -7,7 +7,6 @@ import csv from "csv-parser";
 import { createReadStream } from "node:fs";
 import { unlink, mkdir } from "node:fs/promises";
 import path from "path";
-import { getDefaultPasswordHash } from "../utils";
 import { handleUnexpectedError, logWarning } from "../utils/error-handler";
 import { validateFile, generateUniqueFilename, FileValidationError } from "../utils/file-validator";
 
@@ -206,15 +205,22 @@ export default (pool: Pool, JWT_SECRET: string) => {
                 }, 409);
               }
 
-              const defaultPasswordHash = getDefaultPasswordHash();
+              const hashedPasswords = await Promise.all(
+                studentRecords.map((record) =>
+                  Bun.password.hash(record.studentId, {
+                    algorithm: "bcrypt",
+                    cost: 10,
+                  }),
+                ),
+              );
 
               // Batch insert all students at once for better performance
-              const studentValues = studentRecords.map(record => [
+              const studentValues = studentRecords.map((record, index) => [
                 record.studentId,
-                defaultPasswordHash,
+                hashedPasswords[index],
                 record.fullName,
                 record.email,
-                "Student"
+                "Student",
               ]);
 
               const [userResult]: any = await connection.query(

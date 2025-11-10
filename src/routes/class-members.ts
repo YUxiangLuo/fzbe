@@ -171,12 +171,11 @@ export default (pool: Pool, JWT_SECRET: string) => {
                   u.email,
                   u.phone_number,
                   u.role,
-                  u.created_at,
-                  CASE WHEN u.password_hash = ? THEN TRUE ELSE FALSE END AS must_change_password
+                  u.created_at
              FROM users u
             WHERE u.user_id = ?
             LIMIT 1`,
-          [DEFAULT_PASSWORD_HASH, newStudentId],
+          [newStudentId],
         );
 
         if (studentRows.length === 0) {
