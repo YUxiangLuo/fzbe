@@ -1,7 +1,7 @@
-# src/models/boosting.py
+# py/src/models/boosting.py
 # -*- coding: utf-8 -*-
 """
-Boosting Ensemble: AdaBoost.R2 implementation.
+AdaBoost.R2 Ensemble: A regression-specific variant of AdaBoost.
 """
 
 import json
@@ -16,16 +16,23 @@ from models.utils import rmse, mae, mape, r2_score, get_model_predictions
 
 
 # ---------- Ensemble Prediction ----------
-def _ensemble_predict_boosting(predictions: List[List[float]], learning_rate: float = 1.0) -> List[float]:
-    """Boosting ensemble (summation)"""
-    if not predictions:
+def _ensemble_predict_adaboost_r2(predictions: List[List[float]], model_betas: List[float]) -> List[float]:
+    """AdaBoost.R2 ensemble (weighted average)"""
+    if not predictions or not model_betas:
         return []
-    lr = float(learning_rate)
-    ensemble_pred = [0.0] * len(predictions[0])
-    for stage in predictions:
-        for j, val in enumerate(stage):
-            ensemble_pred[j] += lr * float(val)
-    return ensemble_pred
+    
+    # Weights are log(1/beta), which is proportional to model performance.
+    model_weights = np.array([np.log(1.0 / beta) for beta in model_betas if beta > 0 and beta < 1])
+    
+    if len(model_weights) != len(predictions):
+        raise ValueError("Number of model weights must match number of prediction sets.")
+
+    # Use weighted average for the final prediction.
+    # predictions shape: (n_models, n_steps)
+    # weights shape: (n_models,)
+    # np.average with axis=0 computes the weighted average across models for each step.
+    ensemble_pred = np.average(predictions, axis=0, weights=model_weights)
+    return ensemble_pred.tolist()
 
 
 # ---------- Main Entry Point ----------
@@ -41,8 +48,11 @@ def run(args) -> None:
     if load_ensemble_path:
         config = load_joblib(load_ensemble_path)
         model_paths = config["model_paths"]
-        strategy = config.get("strategy", "boosting")
-        learning_rate_cfg = float(config.get("learning_rate", learning_rate))
+        strategy = config.get("strategy", "adaboost_r2")
+        model_betas = config.get("model_betas")
+
+        if model_betas is None:
+            raise ValueError("Loaded ensemble is not a valid AdaBoost.R2 model (missing model_betas).")
 
         steps = None
         if hasattr(args, "eval_start") and hasattr(args, "eval_end"):
@@ -62,18 +72,17 @@ def run(args) -> None:
         
         data = getattr(args, "data", None)
         predictions = get_model_predictions(model_paths, steps, data)
-        ensemble_pred = _ensemble_predict_boosting(predictions, learning_rate_cfg)
+        ensemble_pred = _ensemble_predict_adaboost_r2(predictions, model_betas)
         
         std_dev = config.get("std_dev_residuals", 0.0)
         predictions_with_std = [{"prediction": p, "std_dev": std_dev} for p in ensemble_pred]
 
         out = {
-            "mode": "boosting_loaded_predict",
+            "mode": "adaboost_r2_loaded_predict",
             "strategy": strategy,
             "n_models": len(model_paths),
             "forecast_steps": steps,
             "predictions": predictions_with_std,
-            "learning_rate": learning_rate_cfg,
         }
         
         if hasattr(args, "data") and hasattr(args, "eval_start") and hasattr(args, "eval_end"):
@@ -97,7 +106,7 @@ def run(args) -> None:
     
     # ========== Training Mode ==========
     if not hasattr(args, "models") or not args.models:
-        raise ValueError("Must provide --models <path1> <path2> ... for boosting training")
+        raise ValueError("Must provide --models <path1> <path2> ... for AdaBoost.R2 training")
     
     model_paths = args.models if isinstance(args.models, list) else [args.models]
     
@@ -116,28 +125,33 @@ def run(args) -> None:
 
     from models import arima, lstm, ma as ma_model, es as es_model
 
-    temp_dir = tempfile.mkdtemp(prefix="boosting_ensemble_")
-    print(f"Boosting: Storing models in {temp_dir}", file=sys.stderr)
+    temp_dir = tempfile.mkdtemp(prefix="adaboost_r2_ensemble_")
+    print(f"AdaBoost.R2: Storing base models in {temp_dir}", file=sys.stderr)
 
-    y_train = np.array(sales[ts : te + 1])
+    train_arr = arr[ts : te + 1]
+    y_train = np.array([float(it.get("sales", it.get("y"))) for it in train_arr])
     y_eval_true = sales[es : ee + 1]
     
-    # AdaBoost.R2 implementation
-    n_train = len(y_train)
-    weights = np.ones(n_train) / n_train
-    
-    final_eval_predictions = np.zeros(len(y_eval_true))
+    sample_weights = np.ones(len(y_train)) / len(y_train)
     trained_models = []
+    model_betas = []
+    discarded_models_info = []
 
     for i, model_path in enumerate(model_paths):
-        print(f"Boosting Step {i+1}/{len(model_paths)}: Training with base model {model_path}", file=sys.stderr)
+        print(f"AdaBoost.R2 Step {i+1}/{len(model_paths)}: Training with base model {model_path}", file=sys.stderr)
 
-        # Resample training data based on weights
-        resample_indices = np.random.choice(np.arange(n_train), size=n_train, p=weights, replace=True)
-        resampled_y_train = y_train[resample_indices]
-        
+        # Resample training data based on current sample weights.
+        # NOTE: This is a key part of AdaBoost. For time series models, this shuffling
+        # may disrupt temporal dependencies. This implementation proceeds as it is the
+        # standard way to implement AdaBoost with learners that don't support sample weights.
+        resample_indices = np.random.choice(len(train_arr), size=len(train_arr), p=sample_weights, replace=True)
+        resampled_train_arr = [train_arr[idx] for idx in resample_indices]
+
         temp_args = deepcopy(args)
+        temp_args.data = json.dumps(resampled_train_arr)
 
+        # Set up a valid train/eval split for the sub-model training on resampled data.
+        resampled_len = len(resampled_train_arr)
         model_type = "unknown"
         path_lower = model_path.lower()
         if "arima" in path_lower: model_type = "arima"
@@ -146,97 +160,94 @@ def run(args) -> None:
         elif "ma" in path_lower: model_type = "ma"
 
         if model_type == "lstm":
-            resampled_data = [{"ts": f"rs_{i}", "y": val, "x": {"year": 0, "month_of_year": 0, "day_of_week": 0, "is_holiday": 0}} for i, val in enumerate(resampled_y_train)]
-            temp_args.data = json.dumps(resampled_data)
-        else:
-            temp_args.data = json.dumps([{"month": f"rs_{i}", "sales": val} for i, val in enumerate(resampled_y_train)])
-
-        resampled_len = len(resampled_y_train)
-
-        if model_type == "lstm":
             lookback = int(getattr(args, "lookback", 4))
             min_eval_len = lookback + 1
             if resampled_len < min_eval_len + 1:
-                print(f"Warning: Resampled data length ({resampled_len}) is too short for LSTM with lookback {lookback}. Stopping boosting.", file=sys.stderr)
+                print(f"Warning: Resampled data length ({resampled_len}) is too short for LSTM with lookback {lookback}. Stopping.", file=sys.stderr)
                 break
             temp_args.train_end = resampled_len - min_eval_len - 1
             temp_args.eval_start = resampled_len - min_eval_len
             temp_args.eval_end = resampled_len - 1
         else:
             if resampled_len < 2:
-                print(f"Warning: Resampled data length ({resampled_len}) is too short to train model {model_path}. Stopping boosting.", file=sys.stderr)
+                print(f"Warning: Resampled data length ({resampled_len}) is too short for {model_path}. Stopping.", file=sys.stderr)
                 break
             temp_args.train_end = resampled_len - 2
             temp_args.eval_start = resampled_len - 1
             temp_args.eval_end = resampled_len - 1
-        
         temp_args.train_start = 0
 
-        model_filename = f"model_{i+1}_{os.path.basename(model_path)}"
+        model_filename = f"adaboost_model_{i+1}_{os.path.basename(model_path)}"
         new_model_path = os.path.join(temp_dir, model_filename)
         temp_args.save_model = new_model_path
 
         original_stdout = sys.stdout
         sys.stdout = sys.stderr
         try:
-            if model_type == "arima":
-                if not hasattr(args, "d"): raise ValueError("ARIMA model for boosting requires --d")
-                arima.run(temp_args)
-            elif model_type == "lstm":
-                if not hasattr(args, "feature_types"): raise ValueError("LSTM model for boosting requires --feature_types.")
-                lstm.run(temp_args)
-            elif model_type == "es":
-                if not hasattr(args, "alpha"): raise ValueError("ES model for boosting requires --alpha")
-                es_model.run(temp_args)
-            elif model_type == "ma":
-                if not hasattr(args, "window"): raise ValueError("MA model for boosting requires --window")
-                ma_model.run(temp_args)
-            else:
-                raise ValueError(f"Cannot determine model type for boosting from path: {model_path}")
+            if model_type == "arima": arima.run(temp_args)
+            elif model_type == "lstm": lstm.run(temp_args)
+            elif model_type == "es": es_model.run(temp_args)
+            elif model_type == "ma": ma_model.run(temp_args)
+            else: raise ValueError(f"Cannot determine model type for boosting from path: {model_path}")
         finally:
             sys.stdout = original_stdout
-
+        
         trained_models.append(new_model_path)
 
-        # Predict on original training set to update weights
-        if model_type == "lstm":
-            original_train_data = json.dumps([{"ts": f"orig_{i}", "y": val, "x": {"year": 0, "month_of_year": 0, "day_of_week": 0, "is_holiday": 0}} for i, val in enumerate(y_train)])
-        else:
-            original_train_data = json.dumps([{"month": f"orig_{i}", "sales": val} for i, val in enumerate(y_train)])
+        # Get predictions on the *original* training set to calculate errors.
+        train_preds = get_model_predictions([new_model_path], len(y_train), json.dumps(train_arr))[0]
         
-        train_preds = get_model_predictions([new_model_path], n_train, original_train_data)[0]
-        
-        # Calculate errors on the original training set
-        errors = np.abs(y_train - train_preds)
+        errors = np.abs(y_train - np.array(train_preds))
         max_error = np.max(errors)
-        if max_error > 0:
-            normalized_errors = errors / max_error
-            
-            # Update weights
-            beta = np.sum(weights * normalized_errors)
-            if beta >= 0.5:
-                print(f"Warning: Beta ({beta:.4f}) >= 0.5. Model may be poor. Stopping boosting.", file=sys.stderr)
-                break
-            
-            if beta < 1e-9: # Avoid division by zero if model is perfect
-                beta = 1e-9
+        if max_error == 0:
+            print("Model is perfect, no errors to boost. Stopping.", file=sys.stderr)
+            model_betas.append(1e-10) # Add a very small beta
+            break
+        
+        normalized_errors = errors / max_error
+        model_error = np.sum(sample_weights * normalized_errors)
 
-            new_weights = weights * np.power(beta, 1 - normalized_errors)
-            weights = new_weights / np.sum(new_weights)
+        if model_error >= 0.5:
+            print(f"Model error is {model_error:.4f} >= 0.5, stopping training.", file=sys.stderr)
+            # Remove the last trained model as it's too weak.
+            trained_models.pop()
+            discarded_models_info.append({
+                "path": model_path,
+                "reason": f"Model error ({model_error:.4f}) was >= 0.5"
+            })
+            break
+        
+        beta = model_error / (1.0 - model_error)
+        model_betas.append(beta)
 
-        # Get predictions on the original evaluation set
-        eval_preds = get_model_predictions([new_model_path], len(y_eval_true), data=None)[0]
-        final_eval_predictions += learning_rate * np.array(eval_preds, dtype=float)
+        # Update sample weights
+        # The learning_rate parameter is used here as shrinkage.
+        update_exponents = learning_rate * (1.0 - normalized_errors)
+        sample_weights *= np.power(beta, update_exponents)
+        sample_weights /= np.sum(sample_weights)
 
-    ensemble_pred = final_eval_predictions.tolist()
+    if not trained_models:
+        raise RuntimeError("AdaBoost.R2 training failed to produce any valid models.")
+
+    # Get predictions on the original evaluation set from all trained models.
+    all_eval_preds = get_model_predictions(trained_models, len(y_eval_true), data=None)
+    ensemble_pred = _ensemble_predict_adaboost_r2(all_eval_preds, model_betas)
 
     residuals = np.array(y_eval_true) - np.array(ensemble_pred)
     std_dev_residuals = float(np.std(residuals))
 
+    notes = [
+        f"AdaBoost.R2 ensemble trained. Base models stored in {temp_dir}",
+        f"Learning rate (shrinkage) applied during weight update: {learning_rate}",
+    ]
+    for discarded in discarded_models_info:
+        notes.append(f"Discarded base model '{os.path.basename(discarded['path'])}': {discarded['reason']}")
+
     out = {
-        "mode": "boosting_train_eval",
-        "strategy": "boosting",
+        "mode": "adaboost_r2_train_eval",
+        "strategy": "adaboost_r2",
         "n_models": len(trained_models),
+        "trained_base_models": [os.path.basename(p) for p in trained_models],
         "eval_range": {"start": es, "end": ee},
         "learning_rate": learning_rate,
         "metrics": {
@@ -247,17 +258,14 @@ def run(args) -> None:
         },
         "eval_y_true": [float(v) for v in y_eval_true],
         "eval_predictions": [float(v) for v in ensemble_pred],
-        "notes": [
-            f"AdaBoost.R2 ensemble trained. Models stored in {temp_dir}",
-            f"Learning rate (shrinkage) applied at each stage: {learning_rate}",
-        ],
+        "notes": notes,
     }
     
     if save_ensemble_path:
         config = {
             "model_paths": trained_models, 
-            "weights": None, 
-            "strategy": "boosting",
+            "model_betas": model_betas,
+            "strategy": "adaboost_r2",
             "std_dev_residuals": std_dev_residuals,
             "learning_rate": learning_rate,
         }

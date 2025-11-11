@@ -80,7 +80,7 @@ CREATE TABLE IF NOT EXISTS `experiment_status` (
   `data_window_evaluate_end_index` INT UNSIGNED DEFAULT NULL,
 
   `moving_average_completed` BOOLEAN DEFAULT false,
-  `moving_average_window` INT DEFAULT 2,
+  `moving_average_window` INT DEFAULT NULL,
   `moving_average_metrics_rmse` FLOAT DEFAULT NULL,
   `moving_average_metrics_mae` FLOAT DEFAULT NULL,
   `moving_average_metrics_r2` FLOAT DEFAULT NULL,
