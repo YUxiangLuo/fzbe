@@ -1752,9 +1752,9 @@ export default (pool: Pool, JWT_SECRET: string) => {
 
               seenPhones.add(phone);
 
-              const username = `asst_${phone}`;
+              const username = `assit_${phone}`;
 
-              const email = `asst_${phone}@assistant.edu`;
+              const email = `assit_${phone}@assistant.edu`;
 
 
 
@@ -2204,7 +2204,7 @@ export default (pool: Pool, JWT_SECRET: string) => {
       delete user.password_hash;
 
       const shouldAuditPassword =
-        user.role === "Student" || user.role === "Teacher";
+        user.role === "Student" || user.role === "Teacher" || user.role === "Assistant";
       if (shouldAuditPassword) {
         let mustChangePassword = false;
         if (passwordHash) {
@@ -2217,6 +2217,11 @@ export default (pool: Pool, JWT_SECRET: string) => {
               passwordHash,
             ).catch(() => false);
           } else if (user.role === "Teacher" && user.phone_number) {
+            matchesIdentifier = await Bun.password.verify(
+              user.phone_number,
+              passwordHash,
+            ).catch(() => false);
+          } else if (user.role === "Assistant" && user.phone_number) {
             matchesIdentifier = await Bun.password.verify(
               user.phone_number,
               passwordHash,
