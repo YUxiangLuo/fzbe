@@ -1752,9 +1752,9 @@ export default (pool: Pool, JWT_SECRET: string) => {
 
               seenPhones.add(phone);
 
-              const username = `assit_${phone}`;
+              const username = `ta_${phone}`;
 
-              const email = `assit_${phone}@assistant.edu`;
+              const email = `ta_${phone}@assistant.edu`;
 
 
 
