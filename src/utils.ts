@@ -169,9 +169,21 @@ export async function runAdf(data: AdfInputPoint[]): Promise<AdfResult> {
   }
 
   try {
-    const parsed = JSON.parse(stdout);
-    return parsed as AdfResult;
-  } catch {
+    const parsed = JSON.parse(stdout) as AdfResult;
+    // 过滤掉包含 error 字段的结果项，避免前端访问 null 值崩溃
+    const validResults = parsed.filter((item) => !item.error);
+
+    // 如果所有结果都被过滤掉了（数据量太少），抛出错误
+    if (validResults.length === 0) {
+      throw new Error("数据量不足，无法进行 ADF 检测");
+    }
+
+    return validResults;
+  } catch (error) {
+    // 如果是我们抛出的错误，直接传递
+    if (error instanceof Error) {
+      throw error;
+    }
     throw new Error(`Failed to parse ADF result: ${stdout}`);
   }
 }

@@ -20,8 +20,8 @@ const adfPointSchema = z.object({
 });
 
 const adfRequestSchema = z.object({
-  series: z.array(adfPointSchema).min(3, {
-    message: "series 至少需要包含 3 条数据点",
+  series: z.array(adfPointSchema).min(4, {
+    message: "series 至少需要包含 4 条数据点才能进行可靠的 ADF 检验",
   }),
 });
 
@@ -39,7 +39,7 @@ export default (_pool: Pool, JWT_SECRET: string) => {
         const result = await runAdf(series);
         return c.json({ result });
       } catch (error) {
-        return handleUnexpectedError(c, error, "ADF 检验失败");
+        return handleUnexpectedError(c, error, "ADF 检测失败");
       }
     },
   );
