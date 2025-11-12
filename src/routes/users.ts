@@ -146,632 +146,1912 @@ const teacherAssistantSelfRegisterSchema = z.object({
 // via the `grade_weights` table keyed by `class_id`. Any legacy teacher-based initialization
 // logic has been deleted.
 
+const ASSISTANT_EMAIL_DOMAIN = "assistant.edu";
+
+
+
+const createAssistantSingleSchema = z.object({
+
+  username: z.string().min(3),
+
+  full_name: z.string().min(1),
+
+  email: z.string().email().optional(),
+
+  phone: z
+
+    .string()
+
+    .length(11, "手机号必须为11位")
+
+    .regex(/^1\d{10}$/, "手机号必须以1开头的11位数字")
+
+    .optional(),
+
+  password: z
+
+    .string()
+
+    .min(6, "密码必须至少6位")
+
+    .optional(),
+
+});
+
+
+
 export default (pool: Pool, JWT_SECRET: string) => {
+
   const usersApi = new Hono();
 
+
+
   // Self-registration endpoint (no authentication required)
+
   usersApi.post(
+
     "/api/v1/users/register/:role",
+
     zValidator("param", roleParamSchema),
+
     async (c) => {
+
       try {
+
         const { role } = c.req.valid("param");
+
         const body = await c.req.json();
 
+
+
         // Validate request body based on role
+
         let validatedData: any;
+
         if (role === "Student") {
+
           const result = studentSelfRegisterSchema.safeParse(body);
+
           if (!result.success) {
+
             return c.json(
+
               { error: "Validation failed", details: result.error.issues },
+
               400
+
             );
+
           }
+
           validatedData = result.data;
+
         } else if (role === "Teacher" || role === "Assistant") {
+
           const result = teacherAssistantSelfRegisterSchema.safeParse(body);
+
           if (!result.success) {
+
             return c.json(
+
               { error: "Validation failed", details: result.error.issues },
+
               400
+
             );
+
           }
+
           validatedData = result.data;
+
         } else {
+
           return c.json({ error: "Invalid role" }, 400);
+
         }
 
+
+
         const { username, password, name, email } = validatedData;
+
         const phone = validatedData.phone || null;
 
+
+
         // Hash the password
+
         const password_hash = await Bun.password.hash(password, {
+
           algorithm: "bcrypt",
+
           cost: 10,
+
         });
 
+
+
         try {
+
           // Insert the new user
+
           const [result]: any = await pool.query(
+
             "INSERT INTO users (username, password_hash, full_name, email, phone_number, role) VALUES (?, ?, ?, ?, ?, ?)",
+
             [username, password_hash, name, email, phone, role]
+
           );
+
+
 
           const newUserId = result.insertId;
 
+
+
           // Return the created user (without password hash)
+
           return c.json(
+
             {
+
               user_id: newUserId,
+
               username,
+
               full_name: name,
+
               email,
+
               phone_number: phone,
+
               role,
+
               message: `${role} account created successfully`,
+
             },
+
             201
+
           );
+
         } catch (error: any) {
+
           if (error.code === "ER_DUP_ENTRY") {
+
             if (error.message.includes("users.username")) {
+
               return c.json({ error: "Username already exists" }, 409);
+
             }
+
             if (error.message.includes("users.email")) {
+
               return c.json({ error: "Email already exists" }, 409);
+
             }
+
             if (error.message.includes("users.phone_number")) {
+
               return c.json({ error: "Phone number already exists" }, 409);
+
             }
+
           }
+
           return handleUnexpectedError(c, error, "Registration failed");
+
         }
+
       } catch (error) {
+
         return handleUnexpectedError(c, error, "Registration failed");
+
       }
+
     }
+
   );
 
-  // Admin: Fuzzy search users by name/email/phone
-  usersApi.get(
-    "/api/v1/users/search",
+
+
+  // Admin: Create a new assistant user without assigning to classes
+
+  usersApi.post(
+
+    "/api/v1/users/assistants",
+
     jwt({ secret: JWT_SECRET }),
-    zValidator("query", userSearchQuerySchema),
+
+    zValidator("json", createAssistantSingleSchema),
+
     async (c) => {
+
       try {
+
         const payload = c.get("jwtPayload");
+
         if (payload.role !== "Admin") {
+
           return c.json({ error: "Forbidden" }, 403);
+
         }
 
-        const { q, page, limit } = c.req.valid("query");
-        const term = q.trim();
-        if (!term) {
-          return c.json({ error: "Search term is required" }, 400);
+
+
+        const { username, full_name, email, phone, password } = c.req.valid("json");
+
+        const assistantEmail = email ?? `${username}@${ASSISTANT_EMAIL_DOMAIN}`;
+
+
+
+        let password_hash: string;
+
+        if (password) {
+
+          password_hash = await Bun.password.hash(password, {
+
+            algorithm: "bcrypt",
+
+            cost: 10,
+
+          });
+
+        } else {
+
+          password_hash = DEFAULT_PASSWORD_HASH;
+
         }
+
+
+
+        const [result]: any = await pool.query(
+
+          "INSERT INTO users (username, password_hash, full_name, email, phone_number, role) VALUES (?, ?, ?, ?, ?, 'Assistant')",
+
+          [username, password_hash, full_name, assistantEmail, phone || null],
+
+        );
+
+
+
+        const newAssistantId = result.insertId;
+
+
+
+        const newUser = {
+
+          user_id: newAssistantId,
+
+          username,
+
+          full_name,
+
+          email: assistantEmail,
+
+          phone_number: phone || null,
+
+          role: "Assistant",
+
+        };
+
+        return c.json(newUser, 201);
+
+      } catch (error: any) {
+
+        if (error.code === "ER_DUP_ENTRY") {
+
+          if (error.message.includes("users.username")) {
+
+            return c.json({ error: "Username already exists" }, 409);
+
+          }
+
+          if (error.message.includes("users.email")) {
+
+            return c.json({ error: "Email already exists" }, 409);
+
+          }
+
+          if (error.message.includes("users.phone_number")) {
+
+            return c.json({ error: "Phone number already exists" }, 409);
+
+          }
+
+        }
+
+        return handleUnexpectedError(c, error, "Failed to create assistant");
+
+      }
+
+    },
+
+  );
+
+
+
+  // Admin: Fuzzy search users by name/email/phone
+
+  usersApi.get(
+
+    "/api/v1/users/search",
+
+    jwt({ secret: JWT_SECRET }),
+
+    zValidator("query", userSearchQuerySchema),
+
+    async (c) => {
+
+      try {
+
+        const payload = c.get("jwtPayload");
+
+        if (payload.role !== "Admin") {
+
+          return c.json({ error: "Forbidden" }, 403);
+
+        }
+
+
+
+        const { q, page, limit } = c.req.valid("query");
+
+        const term = q.trim();
+
+        if (!term) {
+
+          return c.json({ error: "Search term is required" }, 400);
+
+        }
+
+
 
         const offset = (page - 1) * limit;
 
+
+
         // Use FULLTEXT search only for longer terms (> 4 chars) to avoid min token size issues
+
         // For short terms (1-4 chars) or potential pinyin searches, use LIKE for better fuzzy matching
+
         // Fallback to LIKE for special characters
+
         const useFullText = term.length > 4 && /^[\w\s@.-]+$/.test(term);
 
+
+
         let countQuery: string;
+
         let dataQuery: string;
+
         let queryParams: any[];
 
+
+
         if (useFullText) {
+
           // Use FULLTEXT search with BOOLEAN MODE for better performance
+
           // Prepare search term for boolean mode (add wildcard for partial matching)
+
           const searchTerm = term.split(/\s+/).map(word => `+${word}*`).join(' ');
 
+
+
           countQuery = `
+
             SELECT COUNT(*) AS total
+
               FROM users
+
              WHERE MATCH(full_name, email, phone_number) AGAINST(? IN BOOLEAN MODE)
+
           `;
 
+
+
           dataQuery = `
+
             SELECT
+
               user_id,
+
               username,
+
               full_name,
+
               email,
+
               role,
+
               created_at,
+
               MATCH(full_name, email, phone_number) AGAINST(? IN BOOLEAN MODE) AS relevance
+
             FROM users
+
             WHERE MATCH(full_name, email, phone_number) AGAINST(? IN BOOLEAN MODE)
+
             ORDER BY relevance DESC, user_id ASC
+
             LIMIT ? OFFSET ?
+
           `;
+
+
 
           queryParams = [searchTerm];
+
         } else {
+
           // Fallback to LIKE search for special cases
+
           const likeTerm = `%${term}%`;
 
+
+
           countQuery = `
+
             SELECT COUNT(*) AS total
+
               FROM users
+
              WHERE full_name LIKE ?
+
                 OR email LIKE ?
+
                 OR phone_number LIKE ?
+
           `;
+
+
 
           dataQuery = `
+
             SELECT
+
               user_id,
+
               username,
+
               full_name,
+
               email,
+
               role,
+
               created_at
+
             FROM users
+
             WHERE full_name LIKE ?
+
                OR email LIKE ?
+
                OR phone_number LIKE ?
+
             ORDER BY user_id ASC
+
             LIMIT ? OFFSET ?
+
           `;
 
+
+
           queryParams = [likeTerm, likeTerm, likeTerm];
+
         }
+
+
 
         // Execute count query
+
         const [countRows]: any[] = await pool.query(
+
           countQuery,
+
           queryParams
+
         );
+
         const totalItems = Number(countRows[0]?.total ?? 0);
+
         const totalPages = Math.ceil(totalItems / limit);
 
+
+
         // Execute data query
+
         const [dataRows]: any[] = await pool.query(
+
           dataQuery,
+
           useFullText ? [queryParams[0], queryParams[0], limit, offset] : [...queryParams, limit, offset]
+
         );
+
+
 
         // Remove relevance field from results if present
+
         const results = dataRows.map((row: any) => {
+
           const { relevance, ...rest } = row;
+
           return rest;
+
         });
+
+
 
         return c.json({
+
           data: results,
+
           pagination: {
+
             currentPage: page,
+
             pageSize: limit,
+
             totalItems,
+
             totalPages,
+
           },
+
           searchMethod: useFullText ? 'fulltext' : 'like', // For debugging
+
         });
+
       } catch (error) {
+
         return handleUnexpectedError(c, error, "Failed to search users");
+
       }
+
     },
+
   );
 
+
+
   // Create an assistant and assign them to classes
+
   usersApi.post(
+
     "/api/v1/assistants",
+
     jwt({ secret: JWT_SECRET }),
+
     zValidator("json", createAssistantSchema),
+
     async (c) => {
+
       const payload = c.get("jwtPayload");
+
       if (payload.role !== "Admin" && payload.role !== "Teacher") {
+
         return c.json({ error: "Forbidden" }, 403);
+
       }
 
-      const { username, password, full_name, email, phone_number, class_ids } =
-        c.req.valid("json");
+
+
+      const { username, password, full_name, email, phone_number, class_ids } = c.req.valid("json");
+
+
 
       const connection = await pool.getConnection();
+
       try {
+
         await connection.beginTransaction();
 
+
+
         // 1. Validate class IDs
+
         const placeholders = class_ids.map(() => "?").join(",");
+
         const [classRows]: any[] = await connection.query(
+
           `SELECT class_id, teacher_id FROM classes WHERE class_id IN (${placeholders})`,
+
           class_ids,
+
         );
+
+
 
         if (classRows.length !== class_ids.length) {
+
           await connection.rollback();
+
           return c.json({ error: "One or more class IDs are invalid" }, 400);
+
         }
+
+
 
         // 2. If user is a teacher, verify they own all the classes
+
         if (payload.role === "Teacher") {
+
           const teacherId = payload.sub;
+
           for (const row of classRows) {
+
             if (row.teacher_id !== teacherId) {
+
               await connection.rollback();
+
               return c.json(
+
                 {
+
                   error: `Forbidden to assign assistant to class ID ${row.class_id} which you do not own.`,
+
                 },
+
                 403,
+
               );
+
             }
+
           }
+
         }
 
+
+
         // 3. Create the new user with 'Assistant' role
+
         const password_hash = await Bun.password.hash(password, {
+
           algorithm: "bcrypt",
+
           cost: 10,
+
         });
+
         const [userResult]: any = await connection.query(
+
           "INSERT INTO users (username, password_hash, full_name, email, role, phone_number) VALUES (?, ?, ?, ?, 'Assistant', ?)",
+
           [username, password_hash, full_name, email, phone_number || null],
+
         );
+
         const newAssistantId = userResult.insertId;
 
+
+
         // 4. Assign the new assistant to the classes
+
         const assignmentValues = class_ids.map((classId) => [
+
           classId,
+
           newAssistantId,
+
         ]);
+
         await connection.query(
+
           "INSERT INTO class_assistants (class_id, assistant_id) VALUES ?",
+
           [assignmentValues],
+
         );
+
+
 
         await connection.commit();
 
+
+
         const newUser = {
+
           user_id: newAssistantId,
+
           username,
+
           full_name,
+
           email,
+
           phone_number: phone_number || null,
+
           role: "Assistant",
+
           assigned_classes: class_ids,
+
         };
+
         return c.json(newUser, 201);
+
       } catch (error: any) {
+
         await connection.rollback();
+
         if (error.code === "ER_DUP_ENTRY") {
+
           if (error.message.includes("users.username")) {
+
             return c.json({ error: "Username already exists" }, 409);
+
           }
+
           if (error.message.includes("users.email")) {
+
             return c.json({ error: "Email already exists" }, 409);
+
           }
+
         }
+
         return handleUnexpectedError(c, error, "Failed to create assistant");
+
       } finally {
+
         connection.release();
+
       }
+
     },
+
   );
 
+
+
   // Admin: Create a new teacher user
+
   usersApi.post(
+
     "/api/v1/users/teachers",
+
     jwt({ secret: JWT_SECRET }),
+
     zValidator("json", createTeacherSchema),
+
     async (c) => {
+
       try {
+
         const payload = c.get("jwtPayload");
+
         if (payload.role !== "Admin") {
+
           return c.json({ error: "Forbidden" }, 403);
+
         }
+
+
 
         const { username, full_name, email, phone, password } = c.req.valid("json");
+
         const teacherEmail = email ?? `${username}@${TEACHER_EMAIL_DOMAIN}`;
 
+
+
         // Use provided password or default
+
         let password_hash: string;
+
         if (password) {
+
           password_hash = await Bun.password.hash(password, {
+
             algorithm: "bcrypt",
+
             cost: 10,
+
           });
+
         } else {
+
           password_hash = DEFAULT_PASSWORD_HASH;
+
         }
 
+
+
         const [result]: any = await pool.query(
+
           "INSERT INTO users (username, password_hash, full_name, email, phone_number, role) VALUES (?, ?, ?, ?, ?, 'Teacher')",
+
           [username, password_hash, full_name, teacherEmail, phone || null],
+
         );
+
+
 
         const newTeacherId = result.insertId;
 
+
+
         const newUser = {
+
           user_id: newTeacherId,
+
           username,
+
           full_name,
+
           email: teacherEmail,
+
           phone_number: phone || null,
+
           role: "Teacher",
+
         };
+
         return c.json(newUser, 201);
+
       } catch (error: any) {
+
         if (error.code === "ER_DUP_ENTRY") {
+
           if (error.message.includes("users.username")) {
+
             return c.json({ error: "Username already exists" }, 409);
+
           }
+
           if (error.message.includes("users.email")) {
+
             return c.json({ error: "Email already exists" }, 409);
+
           }
+
           if (error.message.includes("users.phone_number")) {
+
             return c.json({ error: "Phone number already exists" }, 409);
+
           }
+
         }
+
         return handleUnexpectedError(c, error, "Failed to create teacher");
+
       }
+
     },
+
   );
 
+
+
   // Admin: Batch create teachers via CSV
+
   usersApi.post(
+
     "/api/v1/users/teachers/batch",
+
     jwt({ secret: JWT_SECRET }),
+
     async (c) => {
+
       let tempCsvPath: string | null = null;
+
       try {
+
         const payload = c.get("jwtPayload");
+
         if (payload.role !== "Admin") {
+
           return c.json({ error: "Forbidden" }, 403);
+
         }
+
+
 
         const body = await c.req.parseBody();
+
         const file = body["file"];
+
         const password = body["password"];
+
         let normalizedPassword: string | null = null;
 
+
+
         if (!(file instanceof File)) {
+
           return c.json({ error: "CSV 文件缺失或类型错误" }, 400);
+
         }
+
+
 
         // Validate password if provided
+
         if (password !== undefined && password !== null && password !== "") {
+
           if (typeof password !== "string") {
+
             return c.json({ error: "密码必须是字符串类型" }, 400);
+
           }
+
           const trimmedPassword = password.trim();
+
           if (trimmedPassword.length < 6) {
+
             return c.json({ error: "统一密码必须至少6位" }, 400);
+
           }
+
           normalizedPassword = trimmedPassword;
+
         }
+
+
 
         if (
+
           file.type &&
+
           file.type !== "text/csv" &&
+
           !file.type.includes("csv")
+
         ) {
+
           return c.json({ error: "仅支持上传 CSV 文件" }, 400);
+
         }
+
+
 
         const maxSizeBytes = 5 * 1024 * 1024;
+
         if (file.size > maxSizeBytes) {
+
           return c.json({ error: "CSV 文件大小不能超过 5MB" }, 413);
+
         }
+
+
 
         const tempDir = path.resolve(import.meta.dir, "../../uploads", "temp");
+
         await mkdir(tempDir, { recursive: true });
+
         tempCsvPath = path.join(
+
           tempDir,
+
           `teachers-${Date.now()}-${file.name.replace(/[\/\\?%*:|"<>]/g, "-")}`,
+
         );
+
         await Bun.write(tempCsvPath, file);
 
+
+
         const teacherRows: Array<{
+
           row: number;
+
           fullName: string;
+
           phone: string;
+
           username: string;
+
           email: string;
+
         }> = [];
+
         const invalidRows: Array<{ row: number; reason: string }> = [];
+
         const seenPhones = new Set<string>();
+
         let rowNumber = 0;
 
+
+
         await new Promise<void>((resolve, reject) => {
+
           createReadStream(tempCsvPath!)
+
             .pipe(
+
               csv({
+
                 mapHeaders: ({ header }) => header.replace(/^\uFEFF/, "").trim(),
+
               }),
+
             )
+
             .on("data", (row: Record<string, string>) => {
+
               rowNumber += 1;
+
               const fullName = row["姓名"]?.trim() ?? "";
+
               const phone = row["手机号"]?.trim() ?? "";
 
+
+
               if (!fullName || !phone) {
+
                 invalidRows.push({ row: rowNumber, reason: "姓名或手机号缺失" });
+
                 return;
+
               }
+
+
 
               if (fullName.length < MIN_TEACHER_NAME_LENGTH) {
+
                 invalidRows.push({
+
                   row: rowNumber,
+
                   reason: `姓名长度需至少 ${MIN_TEACHER_NAME_LENGTH} 个字符`,
+
                 });
+
                 return;
+
               }
+
+
 
               if (!PHONE_REGEX.test(phone)) {
+
                 invalidRows.push({
+
                   row: rowNumber,
+
                   reason: `手机号 ${phone} 格式不正确，应为 6-15 位数字`,
+
                 });
+
                 return;
+
               }
+
+
 
               if (seenPhones.has(phone)) {
+
                 invalidRows.push({
+
                   row: rowNumber,
+
                   reason: `CSV 内存在重复手机号 ${phone}`,
+
                 });
+
                 return;
+
               }
 
+
+
               seenPhones.add(phone);
+
               const username = `prof_${phone}`;
+
               const email = `prof_${phone}@${TEACHER_EMAIL_DOMAIN}`;
 
+
+
               teacherRows.push({ row: rowNumber, fullName, phone, username, email });
+
             })
+
             .on("end", resolve)
+
             .on("error", reject);
+
         });
 
+
+
         if (invalidRows.length > 0) {
+
           return c.json(
+
             {
+
               error: "CSV 文件包含无效记录",
+
               invalid_rows: invalidRows.slice(0, 10),
+
             },
+
             400,
+
           );
+
         }
+
+
 
         if (teacherRows.length === 0) {
+
           return c.json({ error: "CSV 文件未包含有效的教师记录" }, 400);
+
         }
 
+
+
         const connection = await pool.getConnection();
+
         try {
+
           await connection.beginTransaction();
 
+
+
           const usernames = Array.from(
+
             new Set(teacherRows.map((row) => row.username)),
+
           );
+
           const emails = Array.from(
+
             new Set(teacherRows.map((row) => row.email)),
+
           );
+
           const phones = Array.from(
+
             new Set(teacherRows.map((row) => row.phone)),
+
           );
+
+
 
           // Optimized conflict detection using UNION ALL for better index usage
+
           const queries: string[] = [];
+
           const allParams: any[] = [];
 
+
+
           if (usernames.length > 0) {
+
             queries.push(
+
               `SELECT DISTINCT username, phone_number, email FROM users WHERE username IN (${usernames.map(() => "?").join(", ")})`
+
             );
+
             allParams.push(...usernames);
+
           }
+
+
 
           if (phones.length > 0) {
+
             queries.push(
+
               `SELECT DISTINCT username, phone_number, email FROM users WHERE phone_number IN (${phones.map(() => "?").join(", ")})`
+
             );
+
             allParams.push(...phones);
+
           }
+
+
 
           if (emails.length > 0) {
+
             queries.push(
+
               `SELECT DISTINCT username, phone_number, email FROM users WHERE email IN (${emails.map(() => "?").join(", ")})`
+
             );
+
             allParams.push(...emails);
+
           }
+
+
 
           if (queries.length > 0) {
+
             const unionQuery = queries.join(" UNION ");
+
             const [existing]: any[] = await connection.query(unionQuery, allParams);
 
+
+
             if (existing.length > 0) {
+
               await connection.rollback();
+
               return c.json(
+
                 {
+
                   error: "部分教师信息已存在，批量创建已取消",
+
                   conflicts: existing.slice(0, 10),
+
                 },
+
                 409,
+
               );
+
             }
+
           }
+
+
 
           // Hash passwords: use provided custom password for all, otherwise default to each teacher's phone number
+
           let hashedPasswords: string[];
+
           if (normalizedPassword) {
+
             const hashed = await Bun.password.hash(normalizedPassword, {
+
               algorithm: "bcrypt",
+
               cost: 10,
+
             });
+
             hashedPasswords = teacherRows.map(() => hashed);
+
           } else {
+
             hashedPasswords = await Promise.all(
+
               teacherRows.map((row) =>
+
                 Bun.password.hash(row.phone, {
+
                   algorithm: "bcrypt",
+
                   cost: 10,
+
                 }),
+
               ),
+
             );
+
           }
 
+
+
           // Batch insert all teachers at once for better performance
+
           const teacherValues = teacherRows.map((row, index) => [
+
             row.username,
+
             hashedPasswords[index],
+
             row.fullName,
+
             row.email,
+
             "Teacher",
+
             row.phone,
+
           ]);
 
+
+
           const [result]: any = await connection.query(
+
             "INSERT INTO users (username, password_hash, full_name, email, role, phone_number) VALUES ?",
+
             [teacherValues],
+
           );
 
+
+
           // Calculate user IDs: MySQL returns the first insertId, subsequent IDs are consecutive
+
           const firstInsertId = result.insertId;
+
           const createdTeachers = teacherRows.map((row, index) => ({
+
             user_id: firstInsertId + index,
+
             username: row.username,
+
             full_name: row.fullName,
+
             phone_number: row.phone,
+
             email: row.email,
+
           }));
+
+
 
           await connection.commit();
 
+
+
           return c.json(
+
             {
+
               created: createdTeachers.length,
+
               teachers: createdTeachers,
+
             },
+
             201,
+
           );
+
         } catch (error) {
+
           await connection.rollback();
+
           return handleUnexpectedError(c, error, "Failed to batch create teachers");
+
         } finally {
+
           connection.release();
+
         }
+
       } catch (error) {
+
         return handleUnexpectedError(c, error, "Failed to batch create teachers");
+
       } finally {
+
         if (tempCsvPath) {
+
           await unlink(tempCsvPath).catch((err) =>
+
             logWarning("Failed to cleanup temp teacher CSV", {
+
               error: err instanceof Error ? err.message : String(err),
+
             }),
+
           );
+
         }
+
       }
+
     },
+
   );
 
+
+
+  // Admin: Batch create assistants via CSV
+
+  usersApi.post(
+
+    "/api/v1/users/assistants/batch",
+
+    jwt({ secret: JWT_SECRET }),
+
+    async (c) => {
+
+      let tempCsvPath: string | null = null;
+
+      try {
+
+        const payload = c.get("jwtPayload");
+
+        if (payload.role !== "Admin") {
+
+          return c.json({ error: "Forbidden" }, 403);
+
+        }
+
+
+
+        const body = await c.req.parseBody();
+
+        const file = body["file"];
+
+        const password = body["password"];
+
+        let normalizedPassword: string | null = null;
+
+
+
+        if (!(file instanceof File)) {
+
+          return c.json({ error: "CSV 文件缺失或类型错误" }, 400);
+
+        }
+
+
+
+        if (password !== undefined && password !== null && password !== "") {
+
+          if (typeof password !== "string") {
+
+            return c.json({ error: "密码必须是字符串类型" }, 400);
+
+          }
+
+          const trimmedPassword = password.trim();
+
+          if (trimmedPassword.length < 6) {
+
+            return c.json({ error: "统一密码必须至少6位" }, 400);
+
+          }
+
+          normalizedPassword = trimmedPassword;
+
+        }
+
+
+
+        if (
+
+          file.type &&
+
+          file.type !== "text/csv" &&
+
+          !file.type.includes("csv")
+
+        ) {
+
+          return c.json({ error: "仅支持上传 CSV 文件" }, 400);
+
+        }
+
+
+
+        const maxSizeBytes = 5 * 1024 * 1024;
+
+        if (file.size > maxSizeBytes) {
+
+          return c.json({ error: "CSV 文件大小不能超过 5MB" }, 413);
+
+        }
+
+
+
+        const tempDir = path.resolve(import.meta.dir, "../../uploads", "temp");
+
+        await mkdir(tempDir, { recursive: true });
+
+        tempCsvPath = path.join(
+
+          tempDir,
+
+          `assistants-${Date.now()}-${file.name.replace(/[\/\\?%*:|"<>]/g, "-")}`,
+
+        );
+
+        await Bun.write(tempCsvPath, file);
+
+
+
+        const assistantRows: Array<{
+
+          row: number;
+
+          fullName: string;
+
+          phone: string;
+
+          username: string;
+
+          email: string;
+
+        }> = [];
+
+        const invalidRows: Array<{ row: number; reason: string }> = [];
+
+        const seenPhones = new Set<string>();
+
+        let rowNumber = 0;
+
+
+
+        await new Promise<void>((resolve, reject) => {
+
+          createReadStream(tempCsvPath!)
+
+            .pipe(
+
+              csv({
+
+                mapHeaders: ({ header }) => header.replace(/^\uFEFF/, "").trim(),
+
+              }),
+
+            )
+
+            .on("data", (row: Record<string, string>) => {
+
+              rowNumber += 1;
+
+              const fullName = row["姓名"]?.trim() ?? "";
+
+              const phone = row["手机号"]?.trim() ?? "";
+
+
+
+              if (!fullName || !phone) {
+
+                invalidRows.push({ row: rowNumber, reason: "姓名或手机号缺失" });
+
+                return;
+
+              }
+
+
+
+              if (fullName.length < MIN_TEACHER_NAME_LENGTH) {
+
+                invalidRows.push({
+
+                  row: rowNumber,
+
+                  reason: `姓名长度需至少 ${MIN_TEACHER_NAME_LENGTH} 个字符`,
+
+                });
+
+                return;
+
+              }
+
+
+
+              if (!PHONE_REGEX.test(phone)) {
+
+                invalidRows.push({
+
+                  row: rowNumber,
+
+                  reason: `手机号 ${phone} 格式不正确，应为 6-15 位数字`,
+
+                });
+
+                return;
+
+              }
+
+
+
+              if (seenPhones.has(phone)) {
+
+                invalidRows.push({
+
+                  row: rowNumber,
+
+                  reason: `CSV 内存在重复手机号 ${phone}`,
+
+                });
+
+                return;
+
+              }
+
+
+
+              seenPhones.add(phone);
+
+              const username = `asst_${phone}`;
+
+              const email = `asst_${phone}@assistant.edu`;
+
+
+
+              assistantRows.push({ row: rowNumber, fullName, phone, username, email });
+
+            })
+
+            .on("end", resolve)
+
+            .on("error", reject);
+
+        });
+
+
+
+        if (invalidRows.length > 0) {
+
+          return c.json(
+
+            {
+
+              error: "CSV 文件包含无效记录",
+
+              invalid_rows: invalidRows.slice(0, 10),
+
+            },
+
+            400,
+
+          );
+
+        }
+
+
+
+        if (assistantRows.length === 0) {
+
+          return c.json({ error: "CSV 文件未包含有效的助教记录" }, 400);
+
+        }
+
+
+
+        const connection = await pool.getConnection();
+
+        try {
+
+          await connection.beginTransaction();
+
+
+
+          const usernames = Array.from(
+
+            new Set(assistantRows.map((row) => row.username)),
+
+          );
+
+          const emails = Array.from(
+
+            new Set(assistantRows.map((row) => row.email)),
+
+          );
+
+          const phones = Array.from(
+
+            new Set(assistantRows.map((row) => row.phone)),
+
+          );
+
+
+
+          const queries: string[] = [];
+
+          const allParams: any[] = [];
+
+
+
+          if (usernames.length > 0) {
+
+            queries.push(
+
+              `SELECT DISTINCT username, phone_number, email FROM users WHERE username IN (${usernames.map(() => "?").join(", ")})`
+
+            );
+
+            allParams.push(...usernames);
+
+          }
+
+
+
+          if (phones.length > 0) {
+
+            queries.push(
+
+              `SELECT DISTINCT username, phone_number, email FROM users WHERE phone_number IN (${phones.map(() => "?").join(", ")})`
+
+            );
+
+            allParams.push(...phones);
+
+          }
+
+
+
+          if (emails.length > 0) {
+
+            queries.push(
+
+              `SELECT DISTINCT username, phone_number, email FROM users WHERE email IN (${emails.map(() => "?").join(", ")})`
+
+            );
+
+            allParams.push(...emails);
+
+          }
+
+
+
+          if (queries.length > 0) {
+
+            const unionQuery = queries.join(" UNION ");
+
+            const [existing]: any[] = await connection.query(unionQuery, allParams);
+
+
+
+            if (existing.length > 0) {
+
+              await connection.rollback();
+
+              return c.json(
+
+                {
+
+                  error: "部分助教信息已存在，批量创建已取消",
+
+                  conflicts: existing.slice(0, 10),
+
+                },
+
+                409,
+
+              );
+
+            }
+
+          }
+
+
+
+          let hashedPasswords: string[];
+
+          if (normalizedPassword) {
+
+            const hashed = await Bun.password.hash(normalizedPassword, {
+
+              algorithm: "bcrypt",
+
+              cost: 10,
+
+            });
+
+            hashedPasswords = assistantRows.map(() => hashed);
+
+          } else {
+
+            hashedPasswords = await Promise.all(
+
+              assistantRows.map((row) =>
+
+                Bun.password.hash(row.phone, {
+
+                  algorithm: "bcrypt",
+
+                  cost: 10,
+
+                }),
+
+              ),
+
+            );
+
+          }
+
+
+
+          const assistantValues = assistantRows.map((row, index) => [
+
+            row.username,
+
+            hashedPasswords[index],
+
+            row.fullName,
+
+            row.email,
+
+            "Assistant",
+
+            row.phone,
+
+          ]);
+
+
+
+          const [result]: any = await connection.query(
+
+            "INSERT INTO users (username, password_hash, full_name, email, role, phone_number) VALUES ?",
+
+            [assistantValues],
+
+          );
+
+
+
+          const firstInsertId = result.insertId;
+
+          const createdAssistants = assistantRows.map((row, index) => ({
+
+            user_id: firstInsertId + index,
+
+            username: row.username,
+
+            full_name: row.fullName,
+
+            phone_number: row.phone,
+
+            email: row.email,
+
+          }));
+
+
+
+          await connection.commit();
+
+
+
+          return c.json(
+
+            {
+
+              created: createdAssistants.length,
+
+              assistants: createdAssistants,
+
+            },
+
+            201,
+
+          );
+
+        } catch (error) {
+
+          await connection.rollback();
+
+          return handleUnexpectedError(c, error, "Failed to batch create assistants");
+
+        } finally {
+
+          connection.release();
+
+        }
+
+      } catch (error) {
+
+        return handleUnexpectedError(c, error, "Failed to batch create assistants");
+
+      } finally {
+
+        if (tempCsvPath) {
+
+          await unlink(tempCsvPath).catch((err) =>
+
+            logWarning("Failed to cleanup temp assistant CSV", {
+
+              error: err instanceof Error ? err.message : String(err),
+
+            }),
+
+          );
+
+        }
+
+      }
+
+    },
+
+  );
+
+
+
   // Get all assistants associated with a specific teacher through their classes
+
   usersApi.get(
+
     "/api/v1/teachers/:teacherId/assistants",
+
     jwt({ secret: JWT_SECRET }),
     zValidator("param", teacherIdParamSchema),
     async (c) => {
