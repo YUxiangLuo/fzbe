@@ -2,6 +2,7 @@
 # -*- coding: utf-8 -*-
 import json
 import math
+import sys
 from typing import List, Dict, Any, Tuple, Optional
 import numpy as np
 from joblib_compat import load_joblib, dump_joblib
@@ -48,6 +49,8 @@ def r2_score(y_true: List[float], y_pred: List[float]) -> float:
 def moving_average_forecast(
     series: List[float], eval_range: range, window: int, min_index: int = 0
 ) -> Tuple[List[int], List[float]]:
+    if window <= 0:
+        raise ValueError("[VALIDATION] Moving average window must be greater than 0.")
     """
     对 eval_range 中的每个 t，使用 series[t-window:t] 的真实值做一步预测。
     当预测窗口会访问 min_index 之前的数据时，该时间点会被跳过。
@@ -65,7 +68,7 @@ def moving_average_forecast(
 
 def _extract_series(arr: List[Dict[str, Any]]) -> Tuple[List[str], List[float], str]:
     if not arr:
-        raise ValueError("`--data` must not be empty.")
+        raise ValueError("[DATA] `--data` must not be empty.")
     first = arr[0]
     value_key = None
     label_key = None
@@ -76,7 +79,7 @@ def _extract_series(arr: List[Dict[str, Any]]) -> Tuple[List[str], List[float], 
         value_key = "y"
         label_key = "ts" if "ts" in first else None
     else:
-        raise ValueError("Each item must contain 'sales' or 'y' field.")
+        raise ValueError("[DATA] Each item must contain 'sales' or 'y' field.")
 
     months = [str(item[label_key]) if label_key and label_key in item else str(i) for i, item in enumerate(arr)]
     sales = [float(item[value_key]) for item in arr]
@@ -86,7 +89,7 @@ def _extract_series(arr: List[Dict[str, Any]]) -> Tuple[List[str], List[float], 
 def _load_state(model_path: str) -> Dict[str, Any]:
     state = load_joblib(model_path)
     if not isinstance(state, dict) or state.get("model_type") != MODEL_TYPE:
-        raise ValueError("Invalid MA model file.")
+        raise ValueError("[VALIDATION] Invalid MA model file.")
     return state
 
 
@@ -94,15 +97,17 @@ def _forecast_future(
     history: List[float], window: int, steps: int, future_values: Optional[List[float]] = None
 ) -> List[float]:
     if steps <= 0:
-        raise ValueError("steps must be > 0 for forecasting.")
+        raise ValueError("[VALIDATION] steps must be > 0 for forecasting.")
 
     buf = history[-window:] if window > 0 else history[:]
     if not buf:
-        raise ValueError("History is empty; cannot forecast.")
+        raise ValueError("[DATA] History is empty; cannot forecast.")
     preds: List[float] = []
     future_iter = iter(future_values) if future_values else iter([])
     for _ in range(steps):
         window_values = buf[-window:] if window > 0 else buf
+        if not window_values:
+            raise ValueError("[VALIDATION] Insufficient history to form a moving average window.")
         avg = sum(window_values) / len(window_values)
         preds.append(avg)
         try:
@@ -134,11 +139,11 @@ def predict(
     std_dev_residuals = float(state.get("std_dev_residuals", 0.0))
     train_end = int(state["train_end_index"])
     if window < 1:
-        raise ValueError("Saved MA model window must be >= 1.")
+        raise ValueError("[VALIDATION] Saved MA model window must be >= 1.")
     if not history:
-        raise ValueError("Saved MA model history is empty.")
+        raise ValueError("[DATA] Saved MA model history is empty.")
     if len(history) < window:
-        raise ValueError("Saved MA model history is shorter than window size.")
+        raise ValueError("[VALIDATION] Saved MA model history is shorter than window size.")
 
     future_values: Optional[List[float]] = None
     if data:
@@ -164,7 +169,7 @@ def train_and_evaluate(
     idxs, preds = moving_average_forecast(sales, eval_range, window, min_index=train_range.start)
     if not idxs:
         raise ValueError(
-            "no evaluation points: choose a smaller --window or increase eval_start to ensure at least `window` points within the training span."
+            "[VALIDATION] No evaluation points: choose a smaller --window or increase eval_start to ensure at least `window` points within the training span."
         )
     y_true = [sales[i] for i in idxs]
     y_pred = preds
@@ -201,22 +206,23 @@ def run(args) -> None:
         steps = None
         es = getattr(args, "eval_start", None)
         ee = getattr(args, "eval_end", None)
-        if es is not None and ee is not None:
+
+        fs = getattr(args, "forecast_steps", None)
+        if fs is not None: # 如果 forecast_steps 存在，优先使用它
+            steps = int(fs)
+            if steps <= 0:
+                raise ValueError("[VALIDATION] --forecast_steps must be > 0.")
+        elif es is not None and ee is not None: # 否则，如果 eval_start/eval_end 存在，使用它们
             try:
                 es_i, ee_i = int(es), int(ee)
                 if ee_i >= es_i:
                     steps = ee_i - es_i + 1
             except Exception:
                 steps = None
-        if steps is None:
-            fs = getattr(args, "forecast_steps", None)
-            if fs is None:
-                raise ValueError(
-                    "When using --load_model for MA, provide eval_start/eval_end or --forecast_steps."
-                )
-            steps = int(fs)
-            if steps <= 0:
-                raise ValueError("--forecast_steps must be > 0.")
+            if steps is None:
+                raise ValueError("[VALIDATION] Invalid eval_start/eval_end range for determining forecast steps.")
+        else: # 如果两者都不存在
+            raise ValueError("[VALIDATION] When using --load_model for MA, provide eval_start/eval_end or --forecast_steps.")
 
         preds, std_dev = predict(load_path, steps, getattr(args, "data", None), state=state)
         
@@ -245,8 +251,10 @@ def run(args) -> None:
                         "r2": r2_score(y_true, preds),
                     }
                     out["evaluate_months"] = months[es_i : ee_i + 1]
-            except Exception:
-                pass
+                else:
+                    out["metrics_error"] = "Length of true values and predictions do not match for evaluation."
+            except Exception as e:
+                out["metrics_error"] = f"Failed to calculate evaluation metrics: {e}"
 
         print(json.dumps(out, ensure_ascii=False, indent=2 if pretty else None))
         return
@@ -255,14 +263,14 @@ def run(args) -> None:
     try:
         arr = json.loads(args.data)
         if not isinstance(arr, list):
-            raise ValueError("`--data` must be a JSON array.")
+            raise ValueError("[DATA] `--data` must be a JSON array.")
     except Exception as e:
-        raise ValueError(f"Failed to parse --data: {e}")
+        raise ValueError(f"[DATA] Failed to parse --data: {e}")
 
     try:
         months, sales, value_key = _extract_series(arr)
     except Exception as e:
-        raise ValueError(str(e))
+        raise ValueError(f"[DATA] {e}")
 
     # 基本参数
     ts, te = int(args.train_start), int(args.train_end)
@@ -270,32 +278,32 @@ def run(args) -> None:
 
     # 窗口（必填）
     if not hasattr(args, "window") or args.window is None:
-        raise ValueError("You must specify --window to use moving average.")
+        raise ValueError("[VALIDATION] You must specify --window to use moving average.")
     w = int(args.window)
 
     # -------- 合法性检查（闭区间） --------
     n_total = len(sales)
     if not (0 <= ts <= te < n_total):
-        raise ValueError(f"Invalid training range: [{ts}, {te}] within [0, {n_total-1}]")
+        raise ValueError(f"[VALIDATION] Invalid training range: [{ts}, {te}] within [0, {n_total-1}]")
     if not (0 <= es <= ee < n_total):
         raise ValueError(
-            f"Invalid evaluation range: [{es}, {ee}] within [0, {n_total-1}]"
+            f"[VALIDATION] Invalid evaluation range: [{es}, {ee}] within [0, {n_total-1}]"
         )
     if te < ts:
-        raise ValueError("train_end must be >= train_start")
+        raise ValueError("[VALIDATION] train_end must be >= train_start")
     if ee < es:
-        raise ValueError("eval_end must be >= eval_start")
+        raise ValueError("[VALIDATION] eval_end must be >= eval_start")
     if w < 1:
-        raise ValueError("--window must be >= 1")
+        raise ValueError("[VALIDATION] --window must be >= 1")
     train_len = te - ts + 1
     if w > train_len:
         raise ValueError(
-            f"--window ({w}) cannot exceed training span length ({train_len})."
+            f"[VALIDATION] --window ({w}) cannot exceed training span length ({train_len})."
         )
     # 为确保对验证区间的首个点 es 至少在某些 t 上有足够历史，这里以 te+1 作为上限（保守做法）
     if w > te + 1:
         raise ValueError(
-            f"--window ({w}) cannot exceed available history (train_end_index+1={te+1})."
+            f"[VALIDATION] --window ({w}) cannot exceed available history (train_end_index+1={te+1})."
         )
 
     # -------- 训练与评估 --------
