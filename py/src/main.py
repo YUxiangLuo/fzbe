@@ -6,7 +6,7 @@ from models import ma, es, arima
 def main():
     parser = argparse.ArgumentParser(description="Forecasting model runner")
     # --- Common arguments ---
-    parser.add_argument("--method", choices=["ma", "es", "arima", "lstm", "weighted_average", "boosting", "stacking"], default="ma")
+    parser.add_argument("--method", choices=["ma", "es", "arima", "lstm", "weighted_average", "boosting", "stacking", "stackingv2"], default="ma")
     parser.add_argument("--data", required=False)
     parser.add_argument("--train_start", type=int, required=False)
     parser.add_argument("--train_end", type=int, required=False)
@@ -71,6 +71,7 @@ def main():
         default=0.1,
         help="L2 regularisation strength for stacking meta-model (>=0)."
     )
+    parser.add_argument("--base_models", nargs="+", required=False, help="Base models for Stacking v2.")
 
     args = parser.parse_args()
     try:
@@ -112,6 +113,12 @@ def main():
             if not args.load_ensemble and (args.models is None or args.data is None or args.eval_start is None):
                 raise ValueError("Stacking training requires --models, --data, and --eval_start/--eval_end.")
             stacking.run(args)
+
+        elif args.method == "stackingv2":
+            from models import stackingv2
+            if args.data is None or args.eval_start is None:
+                raise ValueError("Stacking v2 training requires --data and --eval_start/--eval_end.")
+            stackingv2.run(args)
 
     except ValueError as e:
         print(f"Error: {e}", file=sys.stderr)

@@ -1138,26 +1138,36 @@ export default (pool: Pool, JWT_SECRET: string) => {
           `../../py/trained_models/${studentId}_stacking_config.pkl`,
         );
 
-        const result = await runPythonMain(
-          [
-            "--method",
-            "stacking",
-            "--data",
-            dataFull,
-            "--eval_start",
-            String(body.data_window_evaluate_start_index),
-            "--eval_end",
-            String(body.data_window_evaluate_end_index),
-            "--meta_l2",
-            String(body.meta_l2 ?? 0.1),
-            "--save_ensemble",
-            ensembleSaveLoc,
-            "--models",
-            ...modelPaths,
-            "--pretty",
-          ],
-          TRAINING_TIMEOUT,
-        ); // 10-second timeout
+        let dataToSend = "";
+        let featureTypes: Record<string, "numeric" | "binary" | "categorical"> = {};
+        const args = [
+          "--method",
+          "stackingv2",
+          "--eval_start",
+          String(body.data_window_evaluate_start_index),
+          "--eval_end",
+          String(body.data_window_evaluate_end_index),
+          "--base_models",
+          ...body.ensemble_stacking_base_models,
+          "--meta_l2",
+          String(body.meta_l2 ?? 0.1),
+          "--pretty",
+        ];
+
+        if (body.ensemble_stacking_base_models.includes("lstm")) {
+          const { dataFull, featureTypes: ft, invalidFeatures } = prepareFullData(allData, body.lstm_features);
+          if (invalidFeatures.length > 0) {
+            return c.json({ error: `Invalid features for LSTM: ${invalidFeatures.join(", ")}` }, 400);
+          }
+          dataToSend = dataFull;
+          featureTypes = ft;
+          args.push("--feature_types", JSON.stringify(featureTypes));
+        } else {
+          dataToSend = prepareSimpleData(allData);
+        }
+        args.push("--data", dataToSend);
+
+        const result = await runPythonMain(args, TRAINING_TIMEOUT); // 10-second timeout
 
         return c.json({ status: "success", results: result });
       } catch (error: any) {
