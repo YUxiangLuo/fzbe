@@ -38,10 +38,10 @@ def _parse_series(data_json: str) -> Tuple[np.ndarray, List[str] | None]:
     try:
         arr = json.loads(data_json)
     except Exception as e:
-        raise ValueError(f"--data must be a JSON array of objects: {e}")
+        raise ValueError(f"[DATA] --data must be a JSON array of objects: {e}")
 
     if not isinstance(arr, list):
-        raise ValueError("--data must be a JSON array")
+        raise ValueError("[DATA] --data must be a JSON array")
 
     sales: List[float] = []
     months: List[str] = []
@@ -49,15 +49,15 @@ def _parse_series(data_json: str) -> Tuple[np.ndarray, List[str] | None]:
 
     for i, it in enumerate(arr):
         if not isinstance(it, dict):
-            raise ValueError(f"item[{i}] must be an object")
+            raise ValueError(f"[DATA] item[{i}] must be an object")
         if "sales" not in it:
-            raise ValueError(f"item[{i}] missing 'sales'")
+            raise ValueError(f"[DATA] item[{i}] missing 'sales'")
         try:
             s = float(it["sales"])
         except Exception:
-            raise ValueError(f"item[{i}].sales must be a number")
+            raise ValueError(f"[DATA] item[{i}].sales must be a number")
         if not np.isfinite(s):
-            raise ValueError(f"item[{i}].sales must be finite")
+            raise ValueError(f"[DATA] item[{i}].sales must be finite")
 
         sales.append(float(s))
         if "month" in it:
@@ -65,10 +65,10 @@ def _parse_series(data_json: str) -> Tuple[np.ndarray, List[str] | None]:
             months.append(str(it["month"]))
 
     if len(sales) == 0:
-        raise ValueError("no data points in --data")
+        raise ValueError("[DATA] no data points in --data")
 
     if has_month and len(months) != len(sales):
-        raise ValueError("length of 'months' must match 'sales'")
+        raise ValueError("[DATA] length of 'months' must match 'sales'")
 
     y = np.asarray(sales, dtype=np.float64)
     return y, (months if has_month else None)
@@ -77,15 +77,15 @@ def _parse_series(data_json: str) -> Tuple[np.ndarray, List[str] | None]:
 def _validate_ranges(n: int, ts: int, te: int, es: int, ee: int) -> None:
     """Closed-interval semantics: indices are inclusive [start, end]."""
     if not (0 <= ts <= te < n):
-        raise ValueError(f"train range invalid: ts={ts}, te={te}, n={n}")
+        raise ValueError(f"[VALIDATION] train range invalid: ts={ts}, te={te}, n={n}")
     if not (0 <= es <= ee < n):
-        raise ValueError(f"eval range invalid: es={es}, ee={ee}, n={n}")
+        raise ValueError(f"[VALIDATION] eval range invalid: es={es}, ee={ee}, n={n}")
     if es <= te:
         raise ValueError(
-            "eval_start must be > train_end for ARIMA to ensure genuine out-of-sample evaluation."
+            "[VALIDATION] eval_start must be > train_end for ARIMA to ensure genuine out-of-sample evaluation."
         )
     if (ee - es + 1) <= 0:
-        raise ValueError("empty eval range")
+        raise ValueError("[VALIDATION] empty eval range")
 
 
 def _fit_and_score(
@@ -107,7 +107,11 @@ def _fit_and_score(
         enforce_stationarity=True,
         enforce_invertibility=True,
     )
-    res = model.fit(disp=False)
+    try:
+        res = model.fit(disp=False)
+        converged = bool(getattr(res, "mle_retvals", {}).get("converged", True))
+    except Exception as e:
+        return {"p": p, "d": d, "q": q, "error": str(e)[:200], "converged": False}, None
 
     steps = int(len(y_eval_true))
     fcst = res.get_forecast(steps=steps)
@@ -124,7 +128,7 @@ def _fit_and_score(
         "mape": float(mape(y_eval_true.tolist(), y_pred.tolist())),
         "r2": float(r2(y_eval_true.tolist(), y_pred.tolist())),
         "aic": _aic,
-        "converged": bool(getattr(res, "mle_retvals", {}).get("converged", True)),
+        "converged": converged,
         "y_pred": y_pred,  # for diagnostics (not part of the original 'best' payload)
         "conf_int": np.asarray(fcst.conf_int(), dtype=np.float64),
     }
@@ -143,7 +147,7 @@ def _search_pq(
     Returns (best_result_dict, best_fitted_result, search_summary)
     """
     if len(y_train) <= d:
-        raise ValueError(f"len(train)={len(y_train)} must be > d={d}")
+        raise ValueError(f"[VALIDATION] Training data length ({len(y_train)}) must be greater than d ({d}).")
     if len(y_train) < (8 + p_max + q_max):
         warnings.warn(
             f"Training sample ({len(y_train)}) may be too small for p_max={p_max}, q_max={q_max}.",
@@ -161,20 +165,20 @@ def _search_pq(
     for p in range(p_max + 1):
         for q in range(q_max + 1):
             total += 1
-            try:
-                item, res_obj = _fit_and_score(y_train, y_eval_true, d, p, q)
+            item, res_obj = _fit_and_score(y_train, y_eval_true, d, p, q)
+            if "error" in item: # Fit failed
+                failures.append(item)
+            else: # Fit succeeded
                 results.append(item)
                 k = (item["rmse"], item["aic"], p + q, p)  # preserve previous tie-break logic
                 if best_tuple is None or k < best_tuple:
                     best_tuple = k
                     best_item = item
                     best_res_obj = res_obj
-            except Exception as e:
-                failures.append({"p": p, "q": q, "d": d, "error": str(e)[:200]})
 
     if best_item is None:
         errors_preview = ', '.join([f"(p={f['p']},q={f['q']}): {f['error']}" for f in failures[:5]])
-        raise ValueError(f"All (p,q) fits failed for d={d}. Preview: {errors_preview}")
+        raise ValueError(f"[VALIDATION] All (p,q) fits failed for d={d}. Preview: {errors_preview}")
 
     search_diag = {
         "candidates_tried": total,
@@ -203,7 +207,7 @@ def predict(model_path: str, steps: int) -> List[Dict[str, float]]:
         A list of prediction dictionaries, each containing 'prediction' and 'std_dev'.
     """
     if steps <= 0:
-        raise ValueError("steps must be > 0")
+        raise ValueError("[VALIDATION] steps must be > 0")
     res = load_joblib(model_path)
     fcst = res.get_forecast(steps=steps)
 
@@ -233,11 +237,11 @@ def run(args) -> None:
 
     # Train/search mode (expects --data and ranges)
     if args.data is None:
-        raise ValueError("ARIMA training requires --data.")
+        raise ValueError("[VALIDATION] ARIMA training requires --data.")
     req = ["train_start", "train_end", "eval_start", "eval_end", "d"]
     missing = [k for k in req if getattr(args, k, None) is None]
     if missing:
-        raise ValueError(f"ARIMA training requires {', '.join('--'+k for k in missing)}")
+        raise ValueError(f"[VALIDATION] ARIMA training requires {', '.join('--'+k for k in missing)}")
 
     y, months = _parse_series(args.data)
     n = len(y)
@@ -288,6 +292,9 @@ def run(args) -> None:
         },
         "eval_y_true": eval_y_true_list,
         "eval_predictions": eval_pred_list,
+        "predictions": [
+            {"prediction": float(p)} for p in eval_pred_list
+        ],
         # New fields below are additive and safe for old front-ends to ignore:
         "search_summary": search_summary,
         "meta": {
@@ -360,9 +367,9 @@ def _handle_prediction(args, pretty: bool) -> None:
         es = int(args.eval_start)
         ee = int(args.eval_end)
         if ee < es:
-            raise ValueError("eval_end must be >= eval_start")
+            raise ValueError("[VALIDATION] eval_end must be >= eval_start")
         if es < 0:
-            raise ValueError("eval_start must be >= 0")
+            raise ValueError("[VALIDATION] eval_start must be >= 0")
 
         eval_span = [es, ee]
 
@@ -383,7 +390,7 @@ def _handle_prediction(args, pretty: bool) -> None:
             # fully out-of-sample
             steps = ee - nobs + 1
             if steps <= 0:
-                raise ValueError("Computed steps <= 0; check eval range vs model nobs.")
+                raise ValueError("[VALIDATION] Computed steps <= 0; check eval range vs model nobs.")
             pred = res.get_forecast(steps=steps)
             yhat = np.asarray(pred.predicted_mean, dtype=np.float64)
             ci = np.asarray(pred.conf_int(alpha=alpha), dtype=np.float64)
@@ -422,10 +429,10 @@ def _handle_prediction(args, pretty: bool) -> None:
     else:
         # fallback: pure OOS forecast_steps
         if getattr(args, "forecast_steps", None) is None:
-            raise ValueError("Prediction requires either eval_start/eval_end or --forecast_steps.")
+            raise ValueError("[VALIDATION] Prediction requires either eval_start/eval_end or --forecast_steps.")
         steps = int(args.forecast_steps)
         if steps <= 0:
-            raise ValueError("--forecast_steps must be >= 1")
+            raise ValueError("[VALIDATION] --forecast_steps must be >= 1")
 
         pred = res.get_forecast(steps=steps)
         yhat = np.asarray(pred.predicted_mean, dtype=np.float64)
@@ -482,8 +489,8 @@ def _handle_prediction(args, pretty: bool) -> None:
                     "r2": float(r2(y_true.tolist(), y_pred.tolist())),
                 }
             else:
-                raise ValueError(f"Series len mismatch: y_true={len(y_true)}, pred={len(y_pred)}")
+                out["metrics_error"] = f"[VALIDATION] Series length mismatch for metrics: y_true={len(y_true)}, pred={len(y_pred)}"
         except Exception as e:
-            warnings.warn(f"Failed to compute metrics: {e}", RuntimeWarning)  # Or raise if strict
+            out["metrics_error"] = f"[DATA] Failed to compute metrics: {e}"
 
     print(json.dumps(out, ensure_ascii=False, indent=2 if pretty else None))

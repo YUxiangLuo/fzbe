@@ -677,7 +677,13 @@ export default (pool: Pool, JWT_SECRET: string) => {
         return c.json({ status: "success", results: result });
       } catch (error: any) {
         if (error.message.includes("timed out")) {
-          return c.json({ error: "Training timed out after 10 seconds" }, 504);
+          return c.json({ error: "Training timed out after 30 seconds" }, 504);
+        }
+        if (error.message.startsWith("[PYTHON_VALIDATION]")) {
+          return c.json({ error: error.message.substring(20) }, 400);
+        }
+        if (error.message.startsWith("[PYTHON_DATA]")) {
+          return c.json({ error: error.message.substring(14) }, 400);
         }
         const message =
           error instanceof Error ? error.message : "ARIMA training failed";
