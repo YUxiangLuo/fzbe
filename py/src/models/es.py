@@ -46,7 +46,7 @@ def r2_score(y_true: List[float], y_pred: List[float]) -> float:
 
 def _extract_series(arr: List[Dict[str, Any]]) -> Tuple[List[str], List[float], str]:
     if not arr:
-        raise ValueError("`--data` must not be empty.")
+        raise ValueError("[DATA] `--data` must not be empty.")
     first = arr[0]
     value_key = None
     label_key = None
@@ -57,7 +57,7 @@ def _extract_series(arr: List[Dict[str, Any]]) -> Tuple[List[str], List[float], 
         value_key = "y"
         label_key = "ts" if "ts" in first else None
     else:
-        raise ValueError("Data items must contain 'sales' or 'y' field.")
+        raise ValueError("[DATA] Data items must contain 'sales' or 'y' field.")
     months = [str(item[label_key]) if label_key and label_key in item else str(i) for i, item in enumerate(arr)]
     sales = [float(item[value_key]) for item in arr]
     return months, sales, value_key
@@ -66,7 +66,7 @@ def _extract_series(arr: List[Dict[str, Any]]) -> Tuple[List[str], List[float], 
 def _load_state(model_path: str) -> Dict[str, Any]:
     state = load_joblib(model_path)
     if not isinstance(state, dict) or state.get("model_type") != MODEL_TYPE:
-        raise ValueError("Invalid ES model file.")
+        raise ValueError("[VALIDATION] Invalid ES model file.")
     return state
 
 
@@ -82,7 +82,7 @@ def predict(
     Returns a tuple of (predictions, std_dev_residuals).
     """
     if steps <= 0:
-        raise ValueError("steps must be > 0 for forecasting.")
+        raise ValueError("[VALIDATION] steps must be > 0 for forecasting.")
     state = state or _load_state(model_path)
     alpha = float(state["alpha"])
     level = float(state["level"])
@@ -93,19 +93,19 @@ def predict(
     if data:
         try:
             arr = json.loads(data)
-            _, series, _ = _extract_series(arr)
-            start = train_end + 1
-            if start < len(series):
-                future_values = series[start : start + steps]
+            _, series_from_data, _ = _extract_series(arr)
+            # If data is provided, we assume it contains the actual future values
+            # that should be consumed to update the level.
+            future_values = series_from_data
         except Exception:
             future_values = None
 
     preds: List[float] = []
     for idx in range(steps):
-        preds.append(level)
+        preds.append(level) # 预测当前 level
         if future_values and idx < len(future_values):
             actual = future_values[idx]
-            level = alpha * actual + (1.0 - alpha) * level
+            level = alpha * actual + (1.0 - alpha) * level # 更新 level
     return preds, std_dev_residuals
 
 
@@ -130,18 +130,18 @@ def train_and_evaluate(
     # --- Phase 2: sequential evaluation (1-step ahead) ---
     idxs: List[int] = []
     preds: List[float] = []
-    current_level = float(level)
+    # For pure forecasting, the prediction for all future steps is the last known level.
+    # The level is NOT updated with evaluation data, as that would be cheating.
     for t in eval_range:
-        if t <= ts:
-            # Defensive: evaluation must have at least one prior observation
+        if t <= te: # Use train_end_index `te` for the check
+            # Defensive: evaluation must start after the training period ends.
             continue
-        preds.append(current_level)
+        preds.append(train_level) # Always predict using the final level from training
         idxs.append(t)
-        current_level = alpha * float(sales[t]) + (1.0 - alpha) * current_level
 
     if not idxs:
         raise ValueError(
-            "no evaluation points: set eval_start >= train_start + 1 to ensure at least one forecast."
+            "[VALIDATION] No evaluation points: set eval_start >= train_start + 1 to ensure at least one forecast."
         )
 
     y_true = [float(sales[i]) for i in idxs]
@@ -177,22 +177,23 @@ def run(args) -> None:
         steps = None
         es = getattr(args, "eval_start", None)
         ee = getattr(args, "eval_end", None)
-        if es is not None and ee is not None:
+
+        fs = getattr(args, "forecast_steps", None)
+        if fs is not None: # 如果 forecast_steps 存在，优先使用它
+            steps = int(fs)
+            if steps <= 0:
+                raise ValueError("[VALIDATION] --forecast_steps must be > 0.")
+        elif es is not None and ee is not None: # 否则，如果 eval_start/eval_end 存在，使用它们
             try:
                 es_i, ee_i = int(es), int(ee)
                 if ee_i >= es_i:
                     steps = ee_i - es_i + 1
             except Exception:
                 steps = None
-        if steps is None:
-            fs = getattr(args, "forecast_steps", None)
-            if fs is None:
-                raise ValueError(
-                    "When using --load_model for ES, provide eval_start/eval_end or --forecast_steps."
-                )
-            steps = int(fs)
-            if steps <= 0:
-                raise ValueError("--forecast_steps must be > 0.")
+            if steps is None:
+                raise ValueError("[VALIDATION] Invalid eval_start/eval_end range for determining forecast steps.")
+        else: # 如果两者都不存在
+            raise ValueError("[VALIDATION] When using --load_model for ES, provide eval_start/eval_end or --forecast_steps.")
 
         preds, std_dev = predict(load_path, steps, getattr(args, "data", None), state=state)
         
@@ -219,8 +220,10 @@ def run(args) -> None:
                         "r2": r2_score(y_true, preds),
                     }
                     out["evaluate_months"] = months[es_i : ee_i + 1]
-            except Exception:
-                pass
+                else:
+                    out["metrics_error"] = "Length of true values and predictions do not match for evaluation."
+            except Exception as e:
+                out["metrics_error"] = f"Failed to calculate evaluation metrics: {e}"
 
         print(json.dumps(out, ensure_ascii=False, indent=2 if pretty else None))
         return
@@ -229,10 +232,10 @@ def run(args) -> None:
     try:
         arr = json.loads(args.data)
         if not isinstance(arr, list):
-            raise ValueError("`--data` must be a JSON array.")
+            raise ValueError("[DATA] `--data` must be a JSON array.")
         months, sales, value_key = _extract_series(arr)
     except Exception as e:
-        raise ValueError(f"Failed to parse --data: {e}")
+        raise ValueError(f"[DATA] Failed to parse --data: {e}")
 
     n = len(sales)
     ts, te = int(args.train_start), int(args.train_end)  # [ts, te] 闭区间
@@ -240,28 +243,28 @@ def run(args) -> None:
 
     # alpha 校验
     if not hasattr(args, "alpha") or args.alpha is None:
-        raise ValueError("You must specify --alpha for SES.")
+        raise ValueError("[VALIDATION] You must specify --alpha for SES.")
     try:
         alpha = float(args.alpha)
     except Exception:
-        raise ValueError("--alpha must be a float in (0,1].")
+        raise ValueError("[VALIDATION] --alpha must be a float in (0,1].")
     if not (0.0 < alpha <= 1.0):
-        raise ValueError("--alpha must be in (0,1].")
+        raise ValueError("[VALIDATION] --alpha must be in (0,1].")
 
     # 范围校验（闭区间）
     if not (0 <= ts <= te < n):
-        raise ValueError(f"Invalid train range: [{ts},{te}] within [0,{n-1}]")
+        raise ValueError(f"[VALIDATION] Invalid train range: [{ts},{te}] within [0,{n-1}]")
     if not (0 <= es <= ee < n):
-        raise ValueError(f"Invalid eval range: [{es},{ee}] within [0,{n-1}]")
+        raise ValueError(f"[VALIDATION] Invalid eval range: [{es},{ee}] within [0,{n-1}]")
     if te < ts:
-        raise ValueError("train_end must be >= train_start")
+        raise ValueError("[VALIDATION] train_end must be >= train_start")
     if ee < es:
-        raise ValueError("eval_end must be >= eval_start")
+        raise ValueError("[VALIDATION] eval_end must be >= eval_start")
 
     # 需要至少有一个"历史点"来预测 eval 段的首个点：
     # 对 t=es 预测用的是 s_{es-1}，因此要求 es >= ts+1
     if es < ts + 1:
-        raise ValueError("no evaluation points: set eval_start >= train_start + 1")
+        raise ValueError("[VALIDATION] No evaluation points: set eval_start >= train_start + 1")
 
     metrics, std_dev_residuals, final_level, y_true, y_pred = train_and_evaluate(
         sales, months, range(ts, te + 1), range(es, ee + 1), alpha
