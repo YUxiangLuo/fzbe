@@ -275,7 +275,7 @@ function prepareFullData(
   lstmFeatures?: string[],
 ): {
   dataFull: string;
-  featureTypes: Record<string, "numeric" | "binary">;
+  featureTypes: Record<string, "numeric" | "binary" | "categorical">;
   invalidFeatures: string[];
 } {
   const excludeFields = [
@@ -302,7 +302,7 @@ function prepareFullData(
     featuresToUse = allColumns.filter((col) => !excludeFields.includes(col));
   }
 
-  const featureTypes: Record<string, "numeric" | "binary"> = {};
+  const featureTypes: Record<string, "numeric" | "binary" | "categorical"> = {};
   const invalidFeatures: string[] = [];
 
   for (const feature of featuresToUse) {
@@ -334,6 +334,8 @@ function prepareFullData(
 
     if (numericCount / values.length > 0.8) {
       featureTypes[feature] = "numeric";
+    } else if (uniqueValues.size <= 10) { // Heuristic for categorical
+      featureTypes[feature] = "categorical";
     } else {
       // This is an unsupported categorical feature
       invalidFeatures.push(feature);
@@ -780,7 +782,13 @@ export default (pool: Pool, JWT_SECRET: string) => {
         });
       } catch (error: any) {
         if (error.message.includes("timed out")) {
-          return c.json({ error: "Training timed out after 10 seconds" }, 504);
+          return c.json({ error: "Training timed out after 30 seconds" }, 504);
+        }
+        if (error.message.startsWith("[PYTHON_VALIDATION]")) {
+          return c.json({ error: error.message.substring(20) }, 400);
+        }
+        if (error.message.startsWith("[PYTHON_DATA]")) {
+          return c.json({ error: error.message.substring(14) }, 400);
         }
         const message =
           error instanceof Error ? error.message : "LSTM training failed";

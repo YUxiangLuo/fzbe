@@ -51,22 +51,22 @@ def _parse_feature_types(s: Optional[str]) -> Dict[str, str]:
     try:
         ft = json.loads(s)
         if not isinstance(ft, dict):
-            raise ValueError
+            raise ValueError("[DATA] --feature_types must be a JSON object")
         return {str(k): str(v).lower() for k, v in ft.items()}
     except Exception:
-        raise ValueError("--feature_types must be a JSON object")
+        raise ValueError("[DATA] --feature_types must be a JSON object")
 
 
 def _split_features(records: List[Dict[str, Any]]) -> List[str]:
     keys = None
     for r in records:
         if "x" not in r or not isinstance(r["x"], dict):
-            raise ValueError("each record must contain 'x' dict")
+            raise ValueError("[DATA] each record must contain 'x' dict")
         ks = sorted(r["x"].keys())
         if keys is None:
             keys = ks
         elif ks != keys:
-            raise ValueError("all records must share the same x keys and order")
+            raise ValueError("[DATA] all records must share the same x keys and order")
     return keys or []
 
 
@@ -91,7 +91,7 @@ def _fit_numeric_scaler(values: np.ndarray, method: str):
             lambda a: (a - mn) / (mx - mn),
             lambda a: a * (mx - mn) + mn,
         )
-    raise ValueError("--norm must be one of none|zscore|minmax")
+    raise ValueError("[VALIDATION] --norm must be one of none|zscore|minmax")
 
 
 class SeqDataset(Dataset):
@@ -153,7 +153,7 @@ def _prepare_arrays(
         elif t == "categorical":
             cat_keys.append(k)
         else:
-            raise ValueError(f"unknown feature type for '{k}': {t}")
+            raise ValueError(f"[DATA] unknown feature type for '{k}': {t}")
 
     # 构建数值/分类原始矩阵
     X_num = (
@@ -259,7 +259,7 @@ def _reconstruct_window_from_data(records: List[Dict[str, Any]], meta: Dict[str,
     input_dim = int(meta["input_dim"])
     
     if not records or len(records) < model_lookback:
-        raise ValueError(f"Not enough records to form a lookback window of size {model_lookback}")
+        raise ValueError(f"[VALIDATION] Not enough records to form a lookback window of size {model_lookback}")
 
     num_keys = meta["numeric_keys"]
     cat_keys = meta["categorical_keys"]
@@ -298,7 +298,7 @@ def _reconstruct_window_from_data(records: List[Dict[str, Any]], meta: Dict[str,
     X_all = np.concatenate([X_num_tf, X_cat_oh], axis=1) if X_cat_oh.shape[1] > 0 else X_num_tf
     
     if X_all.shape[1] != input_dim:
-        raise ValueError(f"Input dimension mismatch: provided data has {X_all.shape[1]} features, model expects {input_dim}")
+        raise ValueError(f"[VALIDATION] Input dimension mismatch: provided data has {X_all.shape[1]} features, model expects {input_dim}")
 
     return X_all[-model_lookback:, :].copy()
 
@@ -341,9 +341,9 @@ def predict(model_path: str, steps: int, data: Optional[str] = None) -> Tuple[Li
             records = arr if isinstance(arr, list) else []
             window = _reconstruct_window_from_data(records, meta)
         except Exception as e:
-            raise ValueError(f"Failed to construct window from data: {e}")
+            raise ValueError(f"[DATA] Failed to construct window from data: {e}")
     else:
-        raise ValueError("Model has no embedded last_window and no data provided")
+        raise ValueError("[VALIDATION] Model has no embedded last_window and no data provided")
 
     # 递归预测
     preds_scaled = []
@@ -387,7 +387,7 @@ def run(args) -> None:
         if fs is not None:
             steps = int(fs)
             if steps <= 0:
-                raise ValueError("--forecast_steps must be > 0")
+                raise ValueError("[VALIDATION] --forecast_steps must be > 0")
         
         if steps is None and hasattr(args, "eval_start") and hasattr(args, "eval_end") and args.eval_start is not None and args.eval_end is not None:
             try:
@@ -398,7 +398,7 @@ def run(args) -> None:
                 pass
 
         if steps is None:
-            raise ValueError("When --load_model, you must provide either --forecast_steps or both --eval_start and --eval_end.")
+            raise ValueError("[VALIDATION] When --load_model, you must provide either --forecast_steps or both --eval_start and --eval_end.")
 
 
         out = {"mode": "lstm_loaded_predict", "config": meta, "forecast_steps": steps}
@@ -414,15 +414,15 @@ def run(args) -> None:
                 if not isinstance(records, list): raise ValueError("JSON data must be an array.")
                 window = _reconstruct_window_from_data(records, meta)
             except Exception as e:
-                raise ValueError(f"Failed to construct window from --data: {e}")
+                raise ValueError(f"[DATA] Failed to construct window from --data: {e}")
 
         # 路径 B：如果不提供 --data，则使用模型中嵌入的 last_window
         if window is None:
             if "last_window" not in meta:
-                raise ValueError("Model has no embedded last_window, you must provide --data for prediction.")
+                raise ValueError("[VALIDATION] Model has no embedded last_window, you must provide --data for prediction.")
             window = np.array(meta["last_window"], dtype=float)
             if window.shape != (model_lookback, input_dim):
-                raise ValueError("Embedded last_window has an incorrect shape. You may need to provide --data.")
+                raise ValueError("[VALIDATION] Embedded last_window has an incorrect shape. You may need to provide --data.")
 
 
         # 递归预测 steps 步（特征占位：重复最后一行）
@@ -485,8 +485,7 @@ def run(args) -> None:
             raise ValueError
         records = arr
     except Exception:
-        print("Failed to parse --data as JSON array", file=sys.stderr)
-        sys.exit(2)
+        raise ValueError("[DATA] Failed to parse --data as JSON array")
 
     ft = _parse_feature_types(getattr(args, "feature_types", None))
     ts, te = int(args.train_start), int(args.train_end)  # [ts, te] 闭区间
@@ -495,17 +494,13 @@ def run(args) -> None:
     
     # 范围校验（闭区间）
     if not (0 <= ts <= te < n):
-        print(f"Invalid train range: [{ts},{te}] within [0,{n-1}]", file=sys.stderr)
-        sys.exit(2)
+        raise ValueError(f"[VALIDATION] Invalid train range: [{ts},{te}] within [0,{n-1}]")
     if not (0 <= es <= ee < n):
-        print(f"Invalid eval range: [{es},{ee}] within [0,{n-1}]", file=sys.stderr)
-        sys.exit(2)
+        raise ValueError(f"[VALIDATION] Invalid eval range: [{es},{ee}] within [0,{n-1}]")
     if ee < es:
-        print("eval_end must be >= eval_start", file=sys.stderr)
-        sys.exit(2)
+        raise ValueError("[VALIDATION] eval_end must be >= eval_start")
     if es <= te:
-        print("eval must start after train_end to avoid leakage", file=sys.stderr)
-        sys.exit(2)
+        raise ValueError("[VALIDATION] eval must start after train_end to avoid leakage")
 
     train_len = te - ts + 1  # 闭区间长度
     eval_len = ee - es + 1  # 闭区间长度
@@ -537,17 +532,13 @@ def run(args) -> None:
             "reason": f"ensure at least 1 train sample (train_len={train_len})",
         }
     if eval_len < lookback + 1:
-        print(
-            f"no evaluation samples even after auto-adjust: eval_len={eval_len}, lookback={lookback}",
-            file=sys.stderr,
+        raise ValueError(
+            f"[VALIDATION] no evaluation samples even after auto-adjust: eval_len={eval_len}, lookback={lookback}"
         )
-        sys.exit(2)
     if train_len < lookback + 1:
-        print(
-            f"train segment too short after auto-adjust: train_len={train_len}, lookback={lookback}",
-            file=sys.stderr,
+        raise ValueError(
+            f"[VALIDATION] train segment too short after auto-adjust: train_len={train_len}, lookback={lookback}"
         )
-        sys.exit(2)
 
     # 批量大小
     bs_in = getattr(args, "batch_size", None)
@@ -599,8 +590,7 @@ def run(args) -> None:
     Xtr, ytr = make_seq(ts, te)
     Xev, yev = make_seq(es, ee)
     if Xev.shape[0] == 0:
-        print("no evaluation samples; adjust lookback/eval range", file=sys.stderr)
-        sys.exit(2)
+        raise ValueError("[VALIDATION] no evaluation samples; adjust lookback/eval range")
 
     input_dim = Xtr.shape[-1]
     model = LSTMReg(
