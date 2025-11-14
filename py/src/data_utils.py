@@ -3,10 +3,11 @@
 """
 Centralized data parsing and preparation utilities for all time series models.
 """
+
 from __future__ import annotations
 
 import json
-from typing import Any, Dict, List, Tuple, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 
@@ -44,58 +45,70 @@ class TimeSeriesData:
 
         for i, record in enumerate(records):
             if self.target_key not in record:
-                raise ValueError(f"[DATA] Record {i} is missing target key '{self.target_key}'")
+                raise ValueError(
+                    f"[DATA] Record {i} is missing target key '{self.target_key}'"
+                )
             try:
                 y_val = float(record[self.target_key])
                 if not np.isfinite(y_val):
                     raise ValueError(f"must be finite, but got {y_val}")
                 y_values.append(y_val)
             except (ValueError, TypeError) as e:
-                raise ValueError(f"[DATA] Target '{self.target_key}' in record {i} is invalid: {e}")
+                raise ValueError(
+                    f"[DATA] Target '{self.target_key}' in record {i} is invalid: {e}"
+                )
 
             if has_timestamps:
                 if self.time_key not in record:
-                    raise ValueError(f"[DATA] Record {i} is missing time key '{self.time_key}'")
+                    raise ValueError(
+                        f"[DATA] Record {i} is missing time key '{self.time_key}'"
+                    )
                 timestamps.append(str(record[self.time_key]))
 
-        return np.asarray(y_values, dtype=np.float64), timestamps if has_timestamps else None
+        return np.asarray(
+            y_values, dtype=np.float64
+        ), timestamps if has_timestamps else None
 
     def _extract_features(
         self, records: List[Dict[str, Any]]
     ) -> Tuple[List[str], Optional[np.ndarray]]:
         """
         Extracts features from the 'x' dictionary in each record, if present.
+        Optimized to reduce redundant checks. Assumes consistent feature keys across records.
         Currently handles numeric features only. Categorical support can be added later.
         """
-        # Check if any record has the 'x' key for features
-        if not any("x" in r and isinstance(r.get("x"), dict) for r in records):
-            return [], None
-
-        # Determine the full, ordered set of feature names from the first record with 'x'
+        # Find the first record with 'x' to determine feature names
         feature_names: List[str] = []
         for r in records:
-            if "x" in r and isinstance(r.get("x"), dict):
+            if "x" in r and isinstance(r["x"], dict) and r["x"]:
                 feature_names = sorted(r["x"].keys())
                 break
-        
+
         if not feature_names:
             return [], None
 
         X_values: List[List[float]] = []
         for i, record in enumerate(records):
             features = record.get("x", {})
-            if sorted(features.keys()) != feature_names:
-                raise ValueError(f"[DATA] Feature keys in record {i} do not match the initial set.")
+            # Check for key consistency
+            if set(features.keys()) != set(feature_names):
+                raise ValueError(
+                    f"[DATA] Feature keys in record {i} do not match expected set {feature_names}."
+                )
 
             row: List[float] = []
             for key in feature_names:
                 try:
                     val = float(features[key])
                     if not np.isfinite(val):
-                        raise ValueError("must be finite")
+                        raise ValueError(
+                            f"Feature '{key}' in record {i} must be finite."
+                        )
                     row.append(val)
                 except (ValueError, TypeError):
-                    raise ValueError(f"[DATA] Feature '{key}' in record {i} must be a valid number.")
+                    raise ValueError(
+                        f"[DATA] Feature '{key}' in record {i} must be a valid number."
+                    )
             X_values.append(row)
 
         return feature_names, np.asarray(X_values, dtype=np.float64)
