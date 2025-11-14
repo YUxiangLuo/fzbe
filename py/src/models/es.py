@@ -189,6 +189,10 @@ def run(args) -> None:
     metrics, std_dev_residuals, final_level, y_true, y_pred = train_and_evaluate(
         sales, months, range(ts, te + 1), range(es, ee + 1), alpha
     )
+    
+    predictions_with_std = [
+        {"prediction": p, "std_dev": std_dev_residuals} for p in y_pred
+    ]
 
     out: Dict[str, Any] = {
         "mode": "ses_fixed_alpha",
@@ -198,7 +202,7 @@ def run(args) -> None:
         "evaluate_range": {"start_index": es, "end_index": ee, "months": months[es : ee + 1]},
         "metrics": metrics,
         "eval_y_true": y_true,
-        "eval_predictions": y_pred,
+        "predictions": predictions_with_std, # Use the standardized key
     }
 
     if save_path:

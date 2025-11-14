@@ -55,7 +55,7 @@ class TestESComprehensiveRefactored(unittest.TestCase):
         train_output = self.capture_run_output(train_args)
         self.assertEqual(train_output["mode"], "ses_fixed_alpha")
         self.assertTrue(os.path.exists(model_path))
-        self.assertEqual(len(train_output["eval_predictions"]), 10)
+        self.assertEqual(len(train_output["predictions"]), 10)
 
         # Predict
         predict_args = Namespace(
@@ -79,7 +79,7 @@ class TestESComprehensiveRefactored(unittest.TestCase):
         train_output = self.capture_run_output(train_args)
         self.assertEqual(train_output["mode"], "ses_fixed_alpha")
         self.assertTrue(os.path.exists(model_path))
-        self.assertEqual(len(train_output["eval_predictions"]), 0)
+        self.assertEqual(len(train_output["predictions"]), 0)
         self.assertEqual(train_output["metrics"], {})
 
     def test_03_predict_with_future_data_updates(self):

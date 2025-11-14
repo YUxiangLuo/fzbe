@@ -28,117 +28,66 @@ const evalRangeSchema = z.object({
   data_window_evaluate_end_index: z.coerce.number().int().min(0),
 });
 
-// ========== Base Model Training Schemas ==========
-const trainMovingAverageSchema = baseDataSchema
+// ========== Model Parameter Schemas ==========
+const modelParamsSchema = z.object({
+  // MA
+  maWindow: z.coerce.number().int().min(1).optional(),
+  // ES
+  esAlpha: z.coerce.number().min(0).max(1).optional(),
+  // ARIMA (for auto-search)
+  arimaD: z.coerce.number().int().min(0).optional(),
+  // ARIMA (for ensembles)
+  arimaOrder: z.string().regex(/^\d+,\d+,\d+$/).optional(),
+  // LSTM
+  lstmLookBack: z.coerce.number().int().min(1).optional(),
+  lstmEpochs: z.coerce.number().int().min(1).optional(),
+  lstmFeatureTypes: z.string().optional(), // JSON string
+  // Ensemble Models
+  models: z.string().min(1).optional(),
+  modelChain: z.string().min(1).optional(),
+});
+
+// ========== Unified Training Schema ==========
+const trainSchemaBase = baseDataSchema
   .merge(trainRangeSchema)
   .merge(evalRangeSchema)
-  .extend({
-    moving_average_window: z.coerce.number().int().min(1),
-  })
-  .refine(
-    (data) =>
-      data.data_window_train_start_index <= data.data_window_train_end_index,
-    {
-      message: "train_start_index must be <= train_end_index",
-      path: ["data_window_train_end_index"],
-    },
-  )
-  .refine(
-    (data) =>
-      data.data_window_evaluate_start_index <=
-      data.data_window_evaluate_end_index,
-    {
-      message: "evaluate_start_index must be <= evaluate_end_index",
-      path: ["data_window_evaluate_end_index"],
-    },
-  );
+  .merge(modelParamsSchema);
 
-const trainExponentialSmoothingSchema = baseDataSchema
-  .merge(trainRangeSchema)
-  .merge(evalRangeSchema)
-  .extend({
-    exponential_smoothing_alpha: z.coerce.number().min(0).max(1),
+const trainSchema = trainSchemaBase
+  .refine((data: z.infer<typeof trainSchemaBase>) => data.data_window_train_start_index <= data.data_window_train_end_index, {
+    message: "train_start_index must be <= train_end_index",
+    path: ["data_window_train_end_index"],
   })
-  .refine(
-    (data) =>
-      data.data_window_train_start_index <= data.data_window_train_end_index,
-    {
-      message: "train_start_index must be <= train_end_index",
-      path: ["data_window_train_end_index"],
-    },
-  )
-  .refine(
-    (data) =>
-      data.data_window_evaluate_start_index <=
-      data.data_window_evaluate_end_index,
-    {
-      message: "evaluate_start_index must be <= evaluate_end_index",
-      path: ["data_window_evaluate_end_index"],
-    },
-  );
+  .refine((data: z.infer<typeof trainSchemaBase>) => data.data_window_evaluate_start_index <= data.data_window_evaluate_end_index, {
+    message: "evaluate_start_index must be <= evaluate_end_index",
+    path: ["data_window_evaluate_end_index"],
+  });
 
-const trainArimaSchema = baseDataSchema
-  .merge(trainRangeSchema)
-  .merge(evalRangeSchema)
-  .extend({
-    arima_d: z.coerce.number().int().min(0),
-  })
-  .refine(
-    (data) =>
-      data.data_window_train_start_index <= data.data_window_train_end_index,
-    {
-      message: "train_start_index must be <= train_end_index",
-      path: ["data_window_train_end_index"],
-    },
-  )
-  .refine(
-    (data) =>
-      data.data_window_evaluate_start_index <=
-      data.data_window_evaluate_end_index,
-    {
-      message: "evaluate_start_index must be <= evaluate_end_index",
-      path: ["data_window_evaluate_end_index"],
-    },
-  );
-
-const trainLstmSchema = baseDataSchema
-  .merge(trainRangeSchema)
-  .merge(evalRangeSchema)
-  .extend({
-    lstm_features: z
-      .array(z.string())
-      .min(1, "At least one feature is required"),
-    lstm_target_field: z.string().min(1, "Target field is required"),
-    lstm_normalization: z.enum(["zscore", "minmax"]).default("zscore"),
-  })
-  .refine(
-    (data) =>
-      data.data_window_train_start_index <= data.data_window_train_end_index,
-    {
-      message: "train_start_index must be <= train_end_index",
-      path: ["data_window_train_end_index"],
-    },
-  )
-  .refine(
-    (data) =>
-      data.data_window_evaluate_start_index <=
-      data.data_window_evaluate_end_index,
-    {
-      message: "evaluate_start_index must be <= evaluate_end_index",
-      path: ["data_window_evaluate_end_index"],
-    },
-  );
-
-// ========== Prediction Schema ==========
+// ========== Unified Prediction Schema ==========
 const predictSchema = z.object({
-  model_type: z.enum([
-    "ma",
-    "es",
-    "arima",
-    "lstm",
-  ]),
   forecast_steps: z.coerce.number().int().min(1),
 });
+
+// ========== Model Definitions ==========
+const ALL_MODELS = [
+  "ma", "es", "arima", "lstm", 
+  "stacking", "weighted_avg", "boosting"
+] as const;
+type ModelType = (typeof ALL_MODELS)[number];
+
+const modelParameterMappings: Record<ModelType, Record<string, string>> = {
+  ma: { maWindow: "window" },
+  es: { esAlpha: "alpha" },
+  arima: { arimaD: "d" },
+  lstm: { 
+    lstmLookBack: "lookBack", 
+    lstmEpochs: "epochs", 
+    lstmFeatureTypes: "featureTypes" 
+  },
+  stacking: { models: "models" },
+  weighted_avg: { models: "models" },
+  boosting: { modelChain: "modelChain" },
+};
 
 // ========== Helper Functions ==========
 async function loadDatasetFromDb(
@@ -173,133 +122,35 @@ async function loadDatasetFromDb(
   return allData;
 }
 
-function prepareSimpleData(data: Record<string, any>[]): string {
-  // Simple format: [{"month": "2021-01", "sales": 37200}, ...]
-  // Used by MA/ES/ARIMA models
-  return JSON.stringify(
-    data.map((row) => {
-      const year = row["年份"] || row.year || "0";
-      const month = row["月份"] || row.month || "1";
-      const sales = parseFloat(
-        row["销售数量"] || row["销售总额"] || row.sales || row.y || "0",
-      );
-
-      const ts = `${year}-${String(month).padStart(2, "0")}`;
-
-      return {
-        month: ts,
-        sales: sales,
-      };
-    }),
-  );
-}
-
-function prepareFullData(
-  data: Record<string, any>[],
-  lstmFeatures?: string[],
-): {
-  dataFull: string;
-  featureTypes: Record<string, "numeric" | "binary" | "categorical">;
-  invalidFeatures: string[];
-} {
-  const excludeFields = [
-    "年份",
-    "月份",
-    "销售数量",
-    "销售总额",
-    "year",
-    "month",
-    "sales",
-    "y",
-    "行业名称",
-    "公司代码",
-    "公司名称",
-    "产品编码",
-    "产品名称",
-  ];
-
-  let featuresToUse: string[];
-  if (lstmFeatures && lstmFeatures.length > 0) {
-    featuresToUse = lstmFeatures;
-  } else {
-    const allColumns = Object.keys(data[0] || {});
-    featuresToUse = allColumns.filter((col) => !excludeFields.includes(col));
-  }
-
-  const featureTypes: Record<string, "numeric" | "binary" | "categorical"> = {};
-  const invalidFeatures: string[] = [];
-
-  for (const feature of featuresToUse) {
-    const values = data
-      .map((row) => row[feature])
-      .filter((val) => val !== null && val !== undefined && val !== "");
-
-    if (values.length === 0) {
-      featureTypes[feature] = "numeric"; // Assume numeric if no data
-      continue;
-    }
-
-    const uniqueValues = new Set(
-      values.map((v) => String(v).trim().toLowerCase()),
-    );
-
-    if (uniqueValues.size <= 2) {
-      featureTypes[feature] = "binary";
-      continue;
-    }
-
-    let numericCount = 0;
-    for (const val of values) {
-      const num = parseFloat(String(val));
-      if (!isNaN(num) && isFinite(num)) {
-        numericCount++;
-      }
-    }
-
-    if (numericCount / values.length > 0.8) {
-      featureTypes[feature] = "numeric";
-    } else if (uniqueValues.size <= 10) { // Heuristic for categorical
-      featureTypes[feature] = "categorical";
-    } else {
-      // This is an unsupported categorical feature
-      invalidFeatures.push(feature);
-    }
-  }
-
-  const dataArray = data.map((row) => {
-    const year = row["年份"] || row.year || "0";
-    const month = row["月份"] || row.month || "1";
-    const sales = parseFloat(
-      row["销售数量"] || row["销售总额"] || row.sales || row.y || "0",
-    );
-    const ts = `${year}-${String(month).padStart(2, "0")}`;
-
-    const features: Record<string, any> = {};
-    for (const feature of featuresToUse) {
-      if (row[feature] !== undefined) {
-        const numValue = parseFloat(row[feature]);
-        features[feature] = isNaN(numValue) ? row[feature] : numValue;
-      }
-    }
-
-    return { ts: ts, y: sales, x: features };
-  });
-
-  return {
-    dataFull: JSON.stringify(dataArray),
-    featureTypes: featureTypes,
-    invalidFeatures: invalidFeatures,
-  };
-}
-
-async function runPythonMain(args: string[], timeoutMs?: number): Promise<any> {
+async function runPythonModel(
+  modelType: string,
+  params: Record<string, any>,
+  timeoutMs?: number,
+): Promise<any> {
   const pyDir = path.resolve(import.meta.dir, "../../py");
   const pythonExec =
     process.platform === "win32"
       ? path.join(pyDir, "venv", "Scripts", "python.exe")
       : path.join(pyDir, "venv", "bin", "python");
 
-  const proc = Bun.spawn([pythonExec, "src/main.py", ...args], {
+  const scriptName = `run_${modelType}.py`;
+  const scriptPath = path.join(pyDir, scriptName);
+
+  if (!fs.existsSync(scriptPath)) {
+    throw new Error(`Python script not found for model type: ${modelType}`);
+  }
+
+  // Convert camelCase params to kebab-case CLI arguments
+  const args = Object.entries(params).flatMap(([key, value]) => {
+    const kebabKey = key.replace(/[A-Z]/g, (letter) => `-${letter.toLowerCase()}`);
+    const cliArg = `--${kebabKey}`;
+    if (typeof value === 'boolean') {
+      return value ? [cliArg] : [];
+    }
+    return [cliArg, String(value)];
+  });
+
+  const proc = Bun.spawn([pythonExec, scriptPath, ...args], {
     cwd: pyDir,
     stdout: "pipe",
     stderr: "pipe",
@@ -318,7 +169,7 @@ async function runPythonMain(args: string[], timeoutMs?: number): Promise<any> {
       await proc.exited;
 
       if (proc.exitCode !== 0) {
-        logger.error({ stderr }, "Python execution failed");
+        logger.error({ stderr, modelType, args }, "Python execution failed");
         const pythonErrorMessage = stderr.trim();
         if (pythonErrorMessage.startsWith("[VALIDATION]")) {
           reject(new Error(`[PYTHON_VALIDATION] ${pythonErrorMessage.substring(13).trim()}`));
@@ -331,7 +182,7 @@ async function runPythonMain(args: string[], timeoutMs?: number): Promise<any> {
         try {
           resolve(JSON.parse(stdout));
         } catch (e) {
-          logger.error({ stdout }, "Failed to parse python output");
+          logger.error({ stdout, modelType, args }, "Failed to parse python output");
           reject(new Error("Invalid output from python"));
         }
       }
@@ -358,108 +209,21 @@ async function runPythonMain(args: string[], timeoutMs?: number): Promise<any> {
   return Promise.race([executionPromise, timeoutPromise]);
 }
 
+// ========== API Endpoints ==========
 export default (pool: Pool, JWT_SECRET: string) => {
   const modelsApi = new Hono();
 
-  // ========== Base Model Training Routes ==========
-
-  // MA Training
+  // ========== Unified Model Training Route ==========
   modelsApi.post(
-    "/api/v1/models/ma/training",
+    "/api/v1/models/:model_type/training",
     jwt({ secret: JWT_SECRET }),
-    zValidator("json", trainMovingAverageSchema),
+    zValidator("json", trainSchema),
     async (c) => {
-      const payload = c.get("jwtPayload");
-      if (payload.role !== "Student") {
-        return c.json({ error: "Only students can train models" }, 403);
-      }
-      const studentId = payload.sub;
-      const body = c.req.valid("json");
-
-      const trainDataLength = body.data_window_train_end_index - body.data_window_train_start_index + 1;
-      if (body.moving_average_window > trainDataLength) {
-        return c.json(
-          {
-            error: `Moving average window (${body.moving_average_window}) cannot be greater than the training data length (${trainDataLength}).`,
-          },
-          400,
-        );
+      const modelType = c.req.param("model_type") as ModelType;
+      if (!ALL_MODELS.includes(modelType)) {
+        return c.json({ error: "Invalid model type specified" }, 400);
       }
 
-      try {
-        const allData = await loadDatasetFromDb(
-          pool,
-          body.selected_industry,
-          body.selected_company,
-          body.selected_product,
-        );
-
-        if (
-          body.data_window_train_end_index >= allData.length ||
-          body.data_window_evaluate_end_index >= allData.length
-        ) {
-          return c.json(
-            {
-              error: "Data window indices out of bounds",
-              dataset_size: allData.length,
-            },
-            400,
-          );
-        }
-
-        const dataSimple = prepareSimpleData(allData);
-        const modelSaveLoc = path.resolve(
-          import.meta.dir,
-          `../../py/trained_models/${studentId}_ma.pkl`,
-        );
-
-        const result = await runPythonMain(
-          [
-            "--method",
-            "ma",
-            "--data",
-            dataSimple,
-            "--train_start",
-            String(body.data_window_train_start_index),
-            "--train_end",
-            String(body.data_window_train_end_index),
-            "--eval_start",
-            String(body.data_window_evaluate_start_index),
-            "--eval_end",
-            String(body.data_window_evaluate_end_index),
-            "--window",
-            String(body.moving_average_window),
-            "--save_model",
-            modelSaveLoc,
-            "--pretty",
-          ],
-          TRAINING_TIMEOUT,
-        ); // 30-second timeout
-
-        return c.json({ status: "success", results: result });
-      } catch (error: any) {
-        if (error.message.includes("timed out")) {
-          return c.json({ error: "Training timed out after 30 seconds" }, 504);
-        }
-        if (error.message.startsWith("[PYTHON_VALIDATION]")) {
-          return c.json({ error: error.message.substring(20) }, 400);
-        }
-        if (error.message.startsWith("[PYTHON_DATA]")) {
-          return c.json({ error: error.message.substring(14) }, 400);
-        }
-        const message =
-          error instanceof Error ? error.message : "MA training failed";
-        return handleUnexpectedError(c, error, message);
-      }
-    },
-  );
-
-  // ES Training
-  modelsApi.post(
-    "/api/v1/models/es/training",
-    jwt({ secret: JWT_SECRET }),
-    zValidator("json", trainExponentialSmoothingSchema),
-    async (c) => {
       const payload = c.get("jwtPayload");
       if (payload.role !== "Student") {
         return c.json({ error: "Only students can train models" }, 403);
@@ -480,228 +244,97 @@ export default (pool: Pool, JWT_SECRET: string) => {
           body.data_window_evaluate_end_index >= allData.length
         ) {
           return c.json(
-            {
-              error: "Data window indices out of bounds",
-              dataset_size: allData.length,
-            },
-            400,
-          );
-        }
-
-        const dataSimple = prepareSimpleData(allData);
-        const modelSaveLoc = path.resolve(
-          import.meta.dir,
-          `../../py/trained_models/${studentId}_es.pkl`,
-        );
-
-        const result = await runPythonMain(
-          [
-            "--method",
-            "es",
-            "--data",
-            dataSimple,
-            "--train_start",
-            String(body.data_window_train_start_index),
-            "--train_end",
-            String(body.data_window_train_end_index),
-            "--eval_start",
-            String(body.data_window_evaluate_start_index),
-            "--eval_end",
-            String(body.data_window_evaluate_end_index),
-            "--alpha",
-            String(body.exponential_smoothing_alpha),
-            "--save_model",
-            modelSaveLoc,
-            "--pretty",
-          ],
-          TRAINING_TIMEOUT,
-        ); // 30-second timeout
-
-        return c.json({ status: "success", results: result });
-      } catch (error: any) {
-        if (error.message.includes("timed out")) {
-          return c.json({ error: "Training timed out after 30 seconds" }, 504);
-        }
-        if (error.message.startsWith("[PYTHON_VALIDATION]")) {
-          return c.json({ error: error.message.substring(20) }, 400);
-        }
-        if (error.message.startsWith("[PYTHON_DATA]")) {
-          return c.json({ error: error.message.substring(14) }, 400);
-        }
-        const message =
-          error instanceof Error ? error.message : "ES training failed";
-        return handleUnexpectedError(c, error, message);
-      }
-    },
-  );
-
-  // ARIMA Training
-  modelsApi.post(
-    "/api/v1/models/arima/training",
-    jwt({ secret: JWT_SECRET }),
-    zValidator("json", trainArimaSchema),
-    async (c) => {
-      const payload = c.get("jwtPayload");
-      if (payload.role !== "Student") {
-        return c.json({ error: "Only students can train models" }, 403);
-      }
-      const studentId = payload.sub;
-      const body = c.req.valid("json");
-
-      try {
-        const allData = await loadDatasetFromDb(
-          pool,
-          body.selected_industry,
-          body.selected_company,
-          body.selected_product,
-        );
-
-        if (
-          body.data_window_train_end_index >= allData.length ||
-          body.data_window_evaluate_end_index >= allData.length
-        ) {
-          return c.json(
-            {
-              error: "Data window indices out of bounds",
-              dataset_size: allData.length,
-            },
-            400,
-          );
-        }
-
-        const dataSimple = prepareSimpleData(allData);
-        const modelSaveLoc = path.resolve(
-          import.meta.dir,
-          `../../py/trained_models/${studentId}_arima.pkl`,
-        );
-
-        const result = await runPythonMain(
-          [
-            "--method",
-            "arima",
-            "--data",
-            dataSimple,
-            "--train_start",
-            String(body.data_window_train_start_index),
-            "--train_end",
-            String(body.data_window_train_end_index),
-            "--eval_start",
-            String(body.data_window_evaluate_start_index),
-            "--eval_end",
-            String(body.data_window_evaluate_end_index),
-            "--d",
-            String(body.arima_d),
-            "--save_model",
-            modelSaveLoc,
-            "--pretty",
-          ],
-          TRAINING_TIMEOUT,
-        ); // 30-second timeout
-
-        return c.json({ status: "success", results: result });
-      } catch (error: any) {
-        if (error.message.includes("timed out")) {
-          return c.json({ error: "Training timed out after 30 seconds" }, 504);
-        }
-        if (error.message.startsWith("[PYTHON_VALIDATION]")) {
-          return c.json({ error: error.message.substring(20) }, 400);
-        }
-        if (error.message.startsWith("[PYTHON_DATA]")) {
-          return c.json({ error: error.message.substring(14) }, 400);
-        }
-        const message =
-          error instanceof Error ? error.message : "ARIMA training failed";
-        return handleUnexpectedError(c, error, message);
-      }
-    },
-  );
-
-  // LSTM Training
-  modelsApi.post(
-    "/api/v1/models/lstm/training",
-    jwt({ secret: JWT_SECRET }),
-    zValidator("json", trainLstmSchema),
-    async (c) => {
-      const payload = c.get("jwtPayload");
-      if (payload.role !== "Student") {
-        return c.json({ error: "Only students can train models" }, 403);
-      }
-      const studentId = payload.sub;
-      const body = c.req.valid("json");
-
-      try {
-        const allData = await loadDatasetFromDb(
-          pool,
-          body.selected_industry,
-          body.selected_company,
-          body.selected_product,
-        );
-
-        if (
-          body.data_window_train_end_index >= allData.length ||
-          body.data_window_evaluate_end_index >= allData.length
-        ) {
-          return c.json(
-            {
-              error: "Data window indices out of bounds",
-              dataset_size: allData.length,
-            },
-            400,
-          );
-        }
-
-        const { dataFull, featureTypes, invalidFeatures } = prepareFullData(
-          allData,
-          body.lstm_features,
-        );
-
-        // Validate that all selected features are usable
-        if (invalidFeatures.length > 0) {
-          return c.json(
-            {
-              error: "Invalid feature(s) provided for LSTM training.",
-              details: `The following features could not be classified as numeric or binary: ${invalidFeatures.join(", ")}`,
-              invalid_features: invalidFeatures,
-            },
+            { error: "Data window indices out of bounds", dataset_size: allData.length },
             400,
           );
         }
 
         const modelSaveLoc = path.resolve(
           import.meta.dir,
-          `../../py/trained_models/${studentId}_lstm.pt`,
+          `../../py/trained_models/${studentId}_${modelType}.pkl`,
         );
 
-        const result = await runPythonMain(
-          [
-            "--method",
-            "lstm",
-            "--data",
-            dataFull,
-            "--feature_types",
-            JSON.stringify(featureTypes),
-            "--train_start",
-            String(body.data_window_train_start_index),
-            "--train_end",
-            String(body.data_window_train_end_index),
-            "--eval_start",
-            String(body.data_window_evaluate_start_index),
-            "--eval_end",
-            String(body.data_window_evaluate_end_index),
-            "--norm",
-            body.lstm_normalization,
-            "--save_model",
-            modelSaveLoc,
-            "--pretty",
-          ],
-          TRAINING_TIMEOUT,
-        ); // 30-second timeout
+        // Dynamically build params for the python script
+        const pythonParams: Record<string, any> = {
+          data: JSON.stringify(allData),
+          trainStart: body.data_window_train_start_index,
+          trainEnd: body.data_window_train_end_index,
+          evalStart: body.data_window_evaluate_start_index,
+          evalEnd: body.data_window_evaluate_end_index,
+          saveModel: modelSaveLoc,
+          pretty: true,
+        };
 
-        return c.json({
+        // Add model-specific params
+        const paramMapping = modelParameterMappings[modelType];
+        for (const [bodyKey, scriptKey] of Object.entries(paramMapping)) {
+          if (body[bodyKey as keyof typeof body] !== undefined) {
+            pythonParams[scriptKey] = body[bodyKey as keyof typeof body];
+          }
+        }
+        
+        // Add shared ensemble params (if any)
+        if (body.models) pythonParams.models = body.models;
+        if (body.modelChain) pythonParams.modelChain = body.modelChain;
+
+        // Add all base model params for ensembles
+        if (["stacking", "weighted_avg", "boosting"].includes(modelType)) {
+            if (body.maWindow) pythonParams.maWindow = body.maWindow;
+            if (body.esAlpha) pythonParams.esAlpha = body.esAlpha;
+            if (body.arimaOrder) pythonParams.arimaOrder = body.arimaOrder;
+            if (body.lstmLookBack) pythonParams.lstmLookBack = body.lstmLookBack;
+            if (body.lstmEpochs) pythonParams.lstmEpochs = body.lstmEpochs;
+            if (body.lstmFeatureTypes) pythonParams.lstmFeatureTypes = body.lstmFeatureTypes;
+        }
+
+        const result = await runPythonModel(modelType, pythonParams, TRAINING_TIMEOUT);
+
+        // --- Data Transformation for Frontend Compatibility (Simplified) ---
+        const transformedResult: any = {
+          metrics: result.metrics,
+          eval_y_true: result.eval_y_true,
+          eval_predictions: result.predictions 
+            ? result.predictions.map((p: { prediction: number }) => p.prediction)
+            : [],
+          notes: [], // Always include empty notes
+          saved_model: result.saved_model || null,
+        };
+
+        if (modelType === 'arima') {
+          transformedResult.best_order = result.best_order;
+          // Keep diagnostics for ARIMA as it contains conf_int
+          if (result.diagnostics) {
+            transformedResult.diagnostics = result.diagnostics;
+            transformedResult.diagnostics.y_pred_eval = transformedResult.eval_predictions;
+          }
+        }
+
+        if (modelType === 'weighted_avg') {
+          if (result.models && result.weights) {
+            const modelList = result.models;
+            transformedResult.model_names = modelList;
+            transformedResult.weights = modelList.map((name: string) => result.weights[name]);
+          }
+        }
+        
+        // For other ensembles, if model_names is desired for consistency
+        if (modelType === 'stacking' && result.models) {
+            transformedResult.model_names = result.models;
+        }
+        if (modelType === 'boosting' && result.model_chain) {
+            transformedResult.model_names = result.model_chain;
+        }
+
+        const finalResponse: { status: string; results: any; inferred_feature_types?: any } = {
           status: "success",
-          results: result,
-          inferred_feature_types: featureTypes,
-        });
+          results: transformedResult,
+        };
+
+        if (modelType === 'lstm' && result.feature_types) {
+          finalResponse.inferred_feature_types = result.feature_types;
+        }
+
+        return c.json(finalResponse);
       } catch (error: any) {
         if (error.message.includes("timed out")) {
           return c.json({ error: "Training timed out after 30 seconds" }, 504);
@@ -712,8 +345,57 @@ export default (pool: Pool, JWT_SECRET: string) => {
         if (error.message.startsWith("[PYTHON_DATA]")) {
           return c.json({ error: error.message.substring(14) }, 400);
         }
-        const message =
-          error instanceof Error ? error.message : "LSTM training failed";
+        const message = error instanceof Error ? error.message : `${modelType.toUpperCase()} training failed`;
+        return handleUnexpectedError(c, error, message);
+      }
+    },
+  );
+
+  // ========== Unified Model Prediction Route ==========
+  modelsApi.post(
+    "/api/v1/models/:model_type/predict",
+    jwt({ secret: JWT_SECRET }),
+    zValidator("json", predictSchema),
+    async (c) => {
+      const modelType = c.req.param("model_type") as ModelType;
+      if (!ALL_MODELS.includes(modelType)) {
+        return c.json({ error: "Invalid model type specified" }, 400);
+      }
+
+      const payload = c.get("jwtPayload");
+      const studentId = payload.sub;
+      const body = c.req.valid("json");
+
+      try {
+        const modelLoadPath = path.resolve(
+          import.meta.dir,
+          `../../py/trained_models/${studentId}_${modelType}.pkl`,
+        );
+
+        if (!fs.existsSync(modelLoadPath)) {
+          return c.json({ error: `No trained ${modelType.toUpperCase()} model found for this user.` }, 404);
+        }
+
+        const pythonParams = {
+          loadModel: modelLoadPath,
+          forecastSteps: body.forecast_steps,
+          pretty: true,
+        };
+
+        const result = await runPythonModel(modelType, pythonParams);
+
+        // --- Data Transformation for Frontend Compatibility ---
+        const transformedResult = { ...result };
+        if (transformedResult.predictions && Array.isArray(transformedResult.predictions)) {
+          transformedResult.forecasts = transformedResult.predictions.map(
+            (p: { prediction: number }) => p.prediction
+          );
+          delete transformedResult.predictions;
+        }
+
+        return c.json({ status: "success", results: transformedResult });
+      } catch (error: any) {
+        const message = error instanceof Error ? error.message : `${modelType.toUpperCase()} prediction failed`;
         return handleUnexpectedError(c, error, message);
       }
     },

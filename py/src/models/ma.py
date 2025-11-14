@@ -134,8 +134,8 @@ def train_and_evaluate(
     # The first possible prediction point is train_range.start + window
     first_possible_eval_point = train_range.start + window
     if eval_range.start < first_possible_eval_point and len(list(eval_range)) > 0:
-         # This condition is more specific for the error we want to catch
-         if all(t < first_possible_eval_point for t in eval_range):
+        # This condition is more specific for the error we want to catch
+        if all(t < first_possible_eval_point for t in eval_range):
             raise ValueError(f"[VALIDATION] Insufficient history for all evaluation points. First possible evaluation point is {first_possible_eval_point}.")
 
     idxs, preds = moving_average_forecast(series, eval_range, window, min_index=train_range.start)
@@ -161,7 +161,7 @@ def train_and_evaluate(
         "mape": mape(y_true, y_pred),
         "r2": r2(y_true, y_pred),
         "evaluate_indices": idxs,
-        "evaluate_months": [months[i] for i in idxs],
+        "evaluate_months": [months[i] for i in idxs] if months else [],
     }
     return metrics, std_dev_residuals, y_true, y_pred
 
@@ -215,6 +215,10 @@ def run(args) -> None:
     metrics, std_dev_residuals, y_true, y_pred = train_and_evaluate(
         sales, months, range(ts, te + 1), range(es, ee + 1), w
     )
+    
+    predictions_with_std = [
+        {"prediction": p, "std_dev": std_dev_residuals} for p in y_pred
+    ]
 
     out: Dict[str, Any] = {
         "mode": "fixed_window_only",
@@ -223,7 +227,7 @@ def run(args) -> None:
         "evaluate_range": {"start_index": es, "end_index": ee, "months": months[es : ee + 1]},
         "metrics": metrics,
         "eval_y_true": y_true.tolist(),
-        "eval_predictions": y_pred.tolist(),
+        "predictions": predictions_with_std, # Use the standardized key
     }
 
     if save_path:

@@ -914,7 +914,7 @@ export default (pool: Pool, JWT_SECRET: string) => {
               };
             },
           )
-          .sort((a, b) => a.username.localeCompare(b.username));
+          .sort((a: { username: string }, b: { username: string }) => a.username.localeCompare(b.username));
 
         return c.json(responsePayload);
       } catch (error) {

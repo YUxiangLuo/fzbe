@@ -10,40 +10,57 @@ import json
 from typing import Any, Dict, List, Optional
 
 import numpy as np
+import pandas as pd
 
 
 class ParsedData:
     """
-    A container for parsed and prepared time series data, ensuring a consistent
-    data contract across different models.
+    A container for parsed and prepared time series data, using a pandas DataFrame
+    as the underlying data structure to handle mixed data types.
     """
 
     def __init__(
         self,
-        y: np.ndarray,
+        df: pd.DataFrame,
         target_key: str,
-        timestamps: Optional[List[str]] = None,
         time_key: Optional[str] = None,
-        X: Optional[np.ndarray] = None,
         feature_keys: Optional[List[str]] = None,
     ):
-        self.y = y
+        self.df = df
         self.target_key = target_key
-        self.timestamps = timestamps
         self.time_key = time_key
-        self.X = X
-        self.feature_keys = feature_keys
+        self.feature_keys = feature_keys or []
 
     @property
     def n_obs(self) -> int:
-        return len(self.y)
+        return len(self.df)
+
+    @property
+    def y(self) -> np.ndarray:
+        """Returns the target variable as a NumPy array."""
+        return self.df[self.target_key].values
+
+    @property
+    def X(self) -> Optional[np.ndarray]:
+        """Returns the feature variables as a NumPy array, if they exist."""
+        if not self.feature_keys:
+            return None
+        return self.df[self.feature_keys].values
 
     @property
     def y_featured(self) -> np.ndarray:
         """Returns y and X combined, with y as the first column."""
-        if self.X is None:
+        if not self.feature_keys:
             return self.y.reshape(-1, 1)
-        return np.hstack([self.y.reshape(-1, 1), self.X])
+        
+        cols = [self.target_key] + self.feature_keys
+        return self.df[cols].values
+
+    @property
+    def timestamps(self) -> Optional[List[str]]:
+        if self.time_key:
+            return self.df[self.time_key].astype(str).tolist()
+        return None
 
 
 def _parse_records(
@@ -55,26 +72,28 @@ def _parse_records(
     """
     Internal helper to process a list of records into a ParsedData object.
     """
-    y_values: List[float] = []
-    timestamps: List[str] = []
-    feature_values: List[List[float]] = [] if feature_keys else None
+    df = pd.DataFrame(records)
 
-    for i, record in enumerate(records):
-        try:
-            y_values.append(float(record[target_key]))
-            if feature_keys:
-                feature_values.append([float(record[key]) for key in feature_keys])
-            if time_key:
-                timestamps.append(str(record[time_key]))
-        except (KeyError, ValueError, TypeError) as e:
-            raise ValueError(f"Error processing record {i}: {e}")
+    # Verify all necessary keys exist
+    required_keys = [target_key] + (feature_keys or [])
+    for key in required_keys:
+        if key not in df.columns:
+            raise ValueError(f"Error processing records: missing key '{key}'")
+
+    # Attempt to convert numeric columns, coercing errors
+    numeric_cols = [target_key] + (feature_keys or [])
+    for col in numeric_cols:
+        # This check is to avoid converting categorical features that are passed in feature_keys
+        if pd.api.types.is_numeric_dtype(df[col]):
+             df[col] = pd.to_numeric(df[col], errors='coerce')
+
+    if df[required_keys].isnull().values.any():
+        raise ValueError("Error processing records: contains null or non-numeric values in required columns.")
 
     return ParsedData(
-        y=np.asarray(y_values, dtype=np.float64),
+        df=df,
         target_key=target_key,
-        timestamps=timestamps if time_key else None,
         time_key=time_key,
-        X=np.asarray(feature_values, dtype=np.float64) if feature_keys else None,
         feature_keys=feature_keys,
     )
 
@@ -117,4 +136,31 @@ def load_data_from_json(
     if time_key is None and "month" in first_record:
         time_key = "month"
 
-    return _parse_records(records, target_key, time_key, feature_keys)
+    # Auto-detect feature keys if they are not provided
+    if feature_keys is None:
+        # Detect all other columns as potential features
+        all_keys = list(first_record.keys())
+        detected_features = [k for k in all_keys if k not in [target_key, time_key]]
+        feature_keys = detected_features if detected_features else None
+
+    # We can't use the old _parse_records directly as it was designed for numpy
+    # The new approach is to create the DataFrame and then the ParsedData object
+    
+    # Rigorous check for missing keys, as DataFrame creation can hide them with NaNs
+    if records:
+        first_record_keys = set(records[0].keys())
+        for i, record in enumerate(records[1:], 1):
+            record_keys = set(record.keys())
+            if record_keys != first_record_keys:
+                missing = first_record_keys - record_keys
+                extra = record_keys - first_record_keys
+                raise ValueError(f"Error processing record {i}: Key mismatch. Missing: {missing or 'None'}, Extra: {extra or 'None'}")
+
+    df = pd.DataFrame(records)
+
+    return ParsedData(
+        df=df,
+        target_key=target_key,
+        time_key=time_key,
+        feature_keys=feature_keys,
+    )

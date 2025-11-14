@@ -53,7 +53,7 @@ class TestMAComprehensiveRefactored(unittest.TestCase):
         train_output = self.capture_run_output(train_args)
         self.assertEqual(train_output["mode"], "fixed_window_only")
         self.assertTrue(os.path.exists(model_path))
-        self.assertEqual(len(train_output["eval_predictions"]), 10)
+        self.assertEqual(len(train_output["predictions"]), 10)
 
         predict_args = Namespace(
             load_model=model_path, forecast_steps=15, data=None, pretty=False
@@ -75,7 +75,7 @@ class TestMAComprehensiveRefactored(unittest.TestCase):
         train_output = self.capture_run_output(train_args)
         self.assertEqual(train_output["mode"], "fixed_window_only")
         self.assertTrue(os.path.exists(model_path))
-        self.assertEqual(len(train_output["eval_predictions"]), 0)
+        self.assertEqual(len(train_output["predictions"]), 0)
         self.assertEqual(train_output["metrics"], {})
 
     def test_03_data_with_y_key(self):

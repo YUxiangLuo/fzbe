@@ -4,3 +4,4 @@ statsmodels>=0.13
 joblib
 torch
 scikit-learn
+pandas
