@@ -1,4 +1,4 @@
-# py/test/test_stackingv2.py
+# py/test/test_stacking.py
 import unittest
 import json
 import sys
@@ -7,17 +7,17 @@ import numpy as np
 from unittest.mock import patch, MagicMock
 from io import StringIO
 
-# Add src to path to be able to import stackingv2 from models
+# Add src to path to be able to import stacking from models
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..', 'src')))
 
-from models import stackingv2
+from models import stacking
 
-class TestStackingV2(unittest.TestCase):
+class Teststacking(unittest.TestCase):
     def setUp(self):
         self.records = [{"sales": 10 + i} for i in range(20)]
         self.data_str = json.dumps(self.records)
 
-    @patch('models.stackingv2._run_base_model')
+    @patch('models.stacking._run_base_model')
     def test_run_stacking(self, mock_run_base_model):
         # Mock the base model runner to return predictable results
         def mock_runner(model_name, data_str, train_indices, test_indices, model_args):
@@ -38,7 +38,7 @@ class TestStackingV2(unittest.TestCase):
         args.pretty = False
 
         with patch('sys.stdout', new=StringIO()) as fake_out:
-            stackingv2.run(args)
+            stacking.run(args)
             output = json.loads(fake_out.getvalue())
 
         self.assertEqual(output["mode"], "stacking_v2")
