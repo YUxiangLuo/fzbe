@@ -100,6 +100,11 @@ def train_and_evaluate(
     X_train, y_train = _create_sequences(train_data, lookback)
     X_test, y_test = _create_sequences(test_data, lookback)
 
+    if len(X_train) == 0 or len(X_test) == 0:
+        raise ValueError(
+            "[VALIDATION] No sequences for training or testing. Increase data size or decrease lookback."
+        )
+
     # Model
     input_size = data.shape[1]
     model = LSTMModel(input_size=input_size, hidden_size=50)
@@ -238,6 +243,12 @@ def run(args) -> None:
 
     data_matrix = []
     for r in records:
+        # Check key existence for each record
+        missing_keys = [key for key in cols if key not in r]
+        if missing_keys:
+            raise ValueError(
+                f"[DATA] Record {records.index(r)} missing keys: {missing_keys}"
+            )
         row = [float(r[key]) for key in cols]
         data_matrix.append(row)
     data = np.array(data_matrix)
