@@ -5,7 +5,16 @@ import math
 import sys
 from typing import List, Dict, Any, Tuple, Optional
 import numpy as np
-from joblib_compat import load_joblib, dump_joblib
+import pickle
+
+def save_pickle(data, path):
+    with open(path, 'wb') as f:
+        pickle.dump(data, f)
+
+def load_pickle(path):
+    with open(path, 'rb') as f:
+        return pickle.load(f)
+from data_utils import parse_data_from_json
 
 MODEL_TYPE = "ma"
 
@@ -66,28 +75,8 @@ def moving_average_forecast(
     return idxs, preds
 
 
-def _extract_series(arr: List[Dict[str, Any]]) -> Tuple[List[str], List[float], str]:
-    if not arr:
-        raise ValueError("[DATA] `--data` must not be empty.")
-    first = arr[0]
-    value_key = None
-    label_key = None
-    if "sales" in first:
-        value_key = "sales"
-        label_key = "month" if "month" in first else None
-    elif "y" in first:
-        value_key = "y"
-        label_key = "ts" if "ts" in first else None
-    else:
-        raise ValueError("[DATA] Each item must contain 'sales' or 'y' field.")
-
-    months = [str(item[label_key]) if label_key and label_key in item else str(i) for i, item in enumerate(arr)]
-    sales = [float(item[value_key]) for item in arr]
-    return months, sales, value_key
-
-
 def _load_state(model_path: str) -> Dict[str, Any]:
-    state = load_joblib(model_path)
+    state = load_pickle(model_path)
     if not isinstance(state, dict) or state.get("model_type") != MODEL_TYPE:
         raise ValueError("[VALIDATION] Invalid MA model file.")
     return state
@@ -148,8 +137,12 @@ def predict(
     future_values: Optional[List[float]] = None
     if data:
         try:
-            arr = json.loads(data)
-            _, series, value_key = _extract_series(arr)
+            temp_data = json.loads(data)
+            target_key = "y" if isinstance(temp_data, list) and temp_data and "y" in temp_data[0] else "sales"
+            
+            parsed_data = parse_data_from_json(data, target_key=target_key)
+            series = parsed_data.y.tolist()
+            
             start = train_end + 1
             if start < len(series):
                 future_values = series[start : start + steps]
@@ -239,8 +232,14 @@ def run(args) -> None:
 
         if getattr(args, "data", None) and es is not None and ee is not None:
             try:
-                arr = json.loads(args.data)
-                months, series, _ = _extract_series(arr)
+                temp_data = json.loads(args.data)
+                target_key = "y" if isinstance(temp_data, list) and temp_data and "y" in temp_data[0] else "sales"
+                time_key = "month" if isinstance(temp_data, list) and temp_data and "month" in temp_data[0] else None
+
+                parsed_data = parse_data_from_json(args.data, target_key=target_key, time_key=time_key)
+                series = parsed_data.y.tolist()
+                months = parsed_data.timestamps if parsed_data.timestamps is not None else [str(i) for i in range(parsed_data.n_obs)]
+
                 es_i, ee_i = int(es), int(ee)
                 y_true = series[es_i : ee_i + 1]
                 if len(y_true) == len(preds):
@@ -260,17 +259,31 @@ def run(args) -> None:
         return
 
     # 解析数据
-    try:
-        arr = json.loads(args.data)
-        if not isinstance(arr, list):
-            raise ValueError("[DATA] `--data` must be a JSON array.")
-    except Exception as e:
-        raise ValueError(f"[DATA] Failed to parse --data: {e}")
+    if not hasattr(args, "data") or not args.data:
+        raise ValueError("[VALIDATION] --data is required for training.")
 
     try:
-        months, sales, value_key = _extract_series(arr)
+        temp_data = json.loads(args.data)
+        if not isinstance(temp_data, list) or not temp_data:
+            raise ValueError("[DATA] --data must be a non-empty JSON array.")
+        
+        first_record = temp_data[0]
+        if "y" in first_record:
+            target_key = "y"
+        elif "sales" in first_record:
+            target_key = "sales"
+        else:
+            raise ValueError("[DATA] Cannot determine target key. Expecting 'y' or 'sales'.")
+        
+        time_key = "month" if "month" in first_record else None
+
+        parsed_data = parse_data_from_json(args.data, target_key=target_key, time_key=time_key)
+        sales = parsed_data.y.tolist()
+        months = parsed_data.timestamps if parsed_data.timestamps is not None else [str(i) for i in range(parsed_data.n_obs)]
+        value_key = target_key
+
     except Exception as e:
-        raise ValueError(f"[DATA] {e}")
+        raise ValueError(f"[DATA] Failed to parse --data: {e}")
 
     # 基本参数
     ts, te = int(args.train_start), int(args.train_end)
@@ -337,7 +350,7 @@ def run(args) -> None:
             "value_key": value_key,
             "std_dev_residuals": std_dev_residuals,
         }
-        dump_joblib(state, save_path)
+        save_pickle(state, save_path)
         out["saved_model"] = save_path
 
     print(json.dumps(out, ensure_ascii=False, indent=2 if pretty else None))

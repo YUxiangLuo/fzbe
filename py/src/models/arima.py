@@ -18,7 +18,16 @@ import numpy as np
 from statsmodels.tsa.statespace.sarimax import SARIMAX
 from statsmodels.tools.sm_exceptions import ConvergenceWarning
 
-from joblib_compat import load_joblib, dump_joblib
+from data_utils import parse_data_from_json
+import pickle
+
+def save_pickle(data, path):
+    with open(path, 'wb') as f:
+        pickle.dump(data, f)
+
+def load_pickle(path):
+    with open(path, 'rb') as f:
+        return pickle.load(f)
 from metrics import rmse, mae, mape, r2
 
 # Previous behavior: silence warnings (we keep this default to avoid output noise)
@@ -29,51 +38,6 @@ warnings.filterwarnings("ignore", category=ConvergenceWarning)
 # -----------------------------
 # Utilities
 # -----------------------------
-def _parse_series(data_json: str) -> Tuple[np.ndarray, List[str] | None]:
-    """
-    Strictly parse the --data JSON payload.
-    Expects a JSON array of objects with at least "sales" (number). Optional "month".
-    Returns (y: float64 ndarray, months: list[str] | None)
-    """
-    try:
-        arr = json.loads(data_json)
-    except Exception as e:
-        raise ValueError(f"[DATA] --data must be a JSON array of objects: {e}")
-
-    if not isinstance(arr, list):
-        raise ValueError("[DATA] --data must be a JSON array")
-
-    sales: List[float] = []
-    months: List[str] = []
-    has_month = False
-
-    for i, it in enumerate(arr):
-        if not isinstance(it, dict):
-            raise ValueError(f"[DATA] item[{i}] must be an object")
-        if "sales" not in it:
-            raise ValueError(f"[DATA] item[{i}] missing 'sales'")
-        try:
-            s = float(it["sales"])
-        except Exception:
-            raise ValueError(f"[DATA] item[{i}].sales must be a number")
-        if not np.isfinite(s):
-            raise ValueError(f"[DATA] item[{i}].sales must be finite")
-
-        sales.append(float(s))
-        if "month" in it:
-            has_month = True
-            months.append(str(it["month"]))
-
-    if len(sales) == 0:
-        raise ValueError("[DATA] no data points in --data")
-
-    if has_month and len(months) != len(sales):
-        raise ValueError("[DATA] length of 'months' must match 'sales'")
-
-    y = np.asarray(sales, dtype=np.float64)
-    return y, (months if has_month else None)
-
-
 def _validate_ranges(n: int, ts: int, te: int, es: int, ee: int) -> None:
     """Closed-interval semantics: indices are inclusive [start, end]."""
     if not (0 <= ts <= te < n):
@@ -208,7 +172,7 @@ def predict(model_path: str, steps: int) -> List[Dict[str, float]]:
     """
     if steps <= 0:
         raise ValueError("[VALIDATION] steps must be > 0")
-    res = load_joblib(model_path)
+    res = load_pickle(model_path)
     fcst = res.get_forecast(steps=steps)
 
     predictions = fcst.predicted_mean.tolist()
@@ -243,8 +207,27 @@ def run(args) -> None:
     if missing:
         raise ValueError(f"[VALIDATION] ARIMA training requires {', '.join('--'+k for k in missing)}")
 
-    y, months = _parse_series(args.data)
-    n = len(y)
+    # Try to determine the target key ('y' is standard, 'sales' is for legacy)
+    try:
+        temp_data = json.loads(args.data)
+        if isinstance(temp_data, list) and temp_data:
+            first_record = temp_data[0]
+            if "y" in first_record:
+                target_key = "y"
+            elif "sales" in first_record:
+                target_key = "sales"
+            else:
+                raise ValueError("[DATA] Cannot determine target key. Expecting 'y' or 'sales'.")
+            
+            time_key = "month" if "month" in first_record else None
+        else:
+            raise ValueError("[DATA] --data is empty or not a list.")
+    except Exception as e:
+        raise ValueError(f"[DATA] Failed to pre-parse data to find target key: {e}")
+
+    data = parse_data_from_json(args.data, target_key=target_key, time_key=time_key)
+    y, months = data.y, data.timestamps
+    n = data.n_obs
 
     ts = int(args.train_start)
     te = int(args.train_end)
@@ -263,7 +246,7 @@ def run(args) -> None:
 
     # Optional: save the best fitted result
     if getattr(args, "save_model", None):
-        dump_joblib(best_res, args.save_model)
+        save_pickle(best_res, args.save_model)
 
     # Assemble output (keep existing keys; only add new sections)
     best_predictions = best.get("y_pred")
@@ -337,7 +320,7 @@ def _handle_prediction(args, pretty: bool) -> None:
     - Keeps original 'predictions' + 'conf_int' + 'steps' fields.
     - Adds a 'meta' section with diagnostic info (safe to ignore by old front-ends).
     """
-    res = load_joblib(args.load_model)
+    res = load_pickle(args.load_model)
     # FIXED: Extract order for output
     try:
         order = res.model.order
@@ -476,9 +459,14 @@ def _handle_prediction(args, pretty: bool) -> None:
     }
 
     # FIXED: Optional metrics if data + eval window
-    if hasattr(args, "data") and have_eval_window:
+    if hasattr(args, "data") and args.data and have_eval_window:
         try:
-            y, _ = _parse_series(args.data)
+            # Determine target key from the provided data
+            temp_data = json.loads(args.data)
+            target_key = "y" if isinstance(temp_data, list) and temp_data and "y" in temp_data[0] else "sales"
+            
+            data = parse_data_from_json(args.data, target_key=target_key)
+            y = data.y
             es, ee = int(args.eval_start), int(args.eval_end)
             y_true = y[es:ee+1]
             if len(y_true) == len(y_pred):
