@@ -29,7 +29,9 @@ MODEL_TYPE = "lstm"
 class LSTMModel(nn.Module):
     """Standard LSTM for single-variable forecasting."""
 
-    def __init__(self, input_size: int = 1, hidden_size: int = 50, num_layers: int = 1):
+    def __init__(
+        self, input_size: int = 1, hidden_size: int = 288, num_layers: int = 3
+    ):
         super(LSTMModel, self).__init__()
         self.lstm = nn.LSTM(input_size, hidden_size, num_layers, batch_first=True)
         self.fc = nn.Linear(hidden_size, 1)
@@ -74,8 +76,10 @@ def _load_state(model_path: str):
 def train_and_evaluate(
     data: np.ndarray,
     lookback: int = 10,
-    epochs: int = 50,
+    epochs: int = 20,
     normalization: str = "zscore",
+    batch_size: int = 6,
+    lr: float = 0.01,
 ):
     """Train and evaluate LSTM for multivariate data."""
     if data.shape[1] < 1:
@@ -107,15 +111,20 @@ def train_and_evaluate(
 
     # Model
     input_size = data.shape[1]
-    model = LSTMModel(input_size=input_size, hidden_size=50)
+    model = LSTMModel(input_size=input_size, hidden_size=288, num_layers=3)
     criterion = nn.MSELoss()
-    optimizer = optim.Adam(model.parameters(), lr=0.001)
+    optimizer = optim.Adam(model.parameters(), lr=lr)
+    scheduler = torch.optim.lr_scheduler.ExponentialLR(
+        optimizer, gamma=0.99
+    )  # Customer: LR decay 0.99
 
     # Training
     X_train_tensor = torch.tensor(X_train, dtype=torch.float32)
     y_train_tensor = torch.tensor(y_train, dtype=torch.float32).unsqueeze(-1)
     train_loader = DataLoader(
-        TensorDataset(X_train_tensor, y_train_tensor), batch_size=16, shuffle=True
+        TensorDataset(X_train_tensor, y_train_tensor),
+        batch_size=batch_size,
+        shuffle=True,
     )
 
     model.train()
@@ -126,6 +135,7 @@ def train_and_evaluate(
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
+        scheduler.step()  # Apply LR decay per epoch
 
     # Evaluate
     model.eval()
@@ -254,10 +264,13 @@ def run(args) -> None:
     data = np.array(data_matrix)
 
     lookback = int(getattr(args, "lookback", 10))
-    epochs = int(getattr(args, "epochs", 50))
+    epochs = int(getattr(args, "epochs", 20))  # Customer: 20 epochs
+
+    batch_size = int(getattr(args, "batch_size", 6))  # Customer: 6
+    lr = float(getattr(args, "lr", 0.01))  # Customer: 0.01
 
     model, scaler, metrics, predictions = train_and_evaluate(
-        data, lookback, epochs, normalization
+        data, lookback, epochs, normalization, batch_size=batch_size, lr=lr
     )
 
     # Save
