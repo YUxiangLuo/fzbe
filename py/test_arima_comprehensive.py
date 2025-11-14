@@ -3,23 +3,25 @@
 Comprehensive unit tests for arima.py (ARIMA model)
 Tests cover: helper functions, grid search, training, prediction, error handling, and integration scenarios
 """
-import unittest
+
 import json
-import sys
-import os
-import tempfile
-import shutil
 import math
-import numpy as np
-from unittest.mock import MagicMock, patch
+import os
+import shutil
+import sys
+import tempfile
+import unittest
 from io import StringIO
+from unittest.mock import MagicMock, patch
+
+import numpy as np
 
 # Add the src directory to the Python path
-sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), 'src')))
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "src")))
 
+from metrics import mae, mape, r2, rmse
 from models import arima
 from serialization import dump_model, load_model
-from metrics import rmse, mae, mape, r2
 
 
 class TestHelperFunctions(unittest.TestCase):
@@ -27,7 +29,9 @@ class TestHelperFunctions(unittest.TestCase):
 
     def test_determine_target_key_with_y(self):
         """Test _determine_target_key with 'y' key"""
-        data = json.dumps([{"y": 100, "month": "2023-01"}, {"y": 110, "month": "2023-02"}])
+        data = json.dumps(
+            [{"y": 100, "month": "2023-01"}, {"y": 110, "month": "2023-02"}]
+        )
         target_key, time_key = arima._determine_target_key(data)
         self.assertEqual(target_key, "y")
         self.assertEqual(time_key, "month")
@@ -112,15 +116,17 @@ class TestHelperFunctions(unittest.TestCase):
 
 
 class TestFitAndScore(unittest.TestCase):
-    """Test _fit_and_score function"""
+    """Test _fit_arima function"""
 
-    def test_fit_and_score_basic(self):
-        """Test _fit_and_score with basic data"""
+    def test_fit_arima_basic(self):
+        """Test _fit_arima with basic data"""
         np.random.seed(42)
         y_train = np.array([100, 102, 105, 107, 110, 112, 115, 117, 120])
         y_eval = np.array([122, 125])
 
-        result, fitted_res = arima._fit_and_score(y_train, y_eval, d=0, p=1, q=1)
+        result, fitted_res = arima._fit_arima(
+            y_train, d=0, p=1, q=1, y_eval_true=y_eval
+        )
 
         self.assertIn("p", result)
         self.assertIn("d", result)
@@ -136,45 +142,53 @@ class TestFitAndScore(unittest.TestCase):
         self.assertIn("converged", result)
         self.assertIsNotNone(fitted_res)
 
-    def test_fit_and_score_p0_q0(self):
-        """Test _fit_and_score with p=0, q=0 (mean model)"""
+    def test_fit_arima_p0_q0(self):
+        """Test _fit_arima with p=0, q=0 (mean model)"""
         y_train = np.array([100, 102, 105, 107, 110, 112, 115, 117, 120])
         y_eval = np.array([122, 125])
 
-        result, fitted_res = arima._fit_and_score(y_train, y_eval, d=0, p=0, q=0)
+        result, fitted_res = arima._fit_arima(
+            y_train, d=0, p=0, q=0, y_eval_true=y_eval
+        )
 
         self.assertEqual(result["p"], 0)
         self.assertEqual(result["q"], 0)
         # With d=0, p=0, q=0 and trend='c', this is just a constant mean model
         self.assertIsNotNone(fitted_res)
 
-    def test_fit_and_score_with_differencing(self):
-        """Test _fit_and_score with d=1"""
+    def test_fit_arima_with_differencing(self):
+        """Test _fit_arima with d=1"""
         y_train = np.array([100, 102, 105, 109, 114, 120, 127, 135, 144])
         y_eval = np.array([154, 165])
 
-        result, fitted_res = arima._fit_and_score(y_train, y_eval, d=1, p=1, q=1)
+        result, fitted_res = arima._fit_arima(
+            y_train, d=1, p=1, q=1, y_eval_true=y_eval
+        )
 
         self.assertEqual(result["d"], 1)
         self.assertIsNotNone(fitted_res)
 
-    def test_fit_and_score_returns_predictions(self):
-        """Test that _fit_and_score returns predictions in result"""
+    def test_fit_arima_returns_predictions(self):
+        """Test that _fit_arima returns predictions in result"""
         y_train = np.array([100, 102, 105, 107, 110, 112, 115, 117, 120])
         y_eval = np.array([122, 125])
 
-        result, fitted_res = arima._fit_and_score(y_train, y_eval, d=0, p=1, q=0)
+        result, fitted_res = arima._fit_arima(
+            y_train, d=0, p=1, q=0, y_eval_true=y_eval
+        )
 
         self.assertIn("y_pred", result)
         self.assertEqual(len(result["y_pred"]), len(y_eval))
 
-    def test_fit_and_score_with_insufficient_data(self):
-        """Test _fit_and_score with very small dataset"""
+    def test_fit_arima_with_insufficient_data(self):
+        """Test _fit_arima with very small dataset"""
         # With only 3 data points, fitting ARIMA(2,0,2) should fail or struggle
         y_train = np.array([100, 102, 105])
         y_eval = np.array([107])
 
-        result, fitted_res = arima._fit_and_score(y_train, y_eval, d=0, p=2, q=2)
+        result, fitted_res = arima._fit_arima(
+            y_train, d=0, p=2, q=2, y_eval_true=y_eval
+        )
 
         # Should either fail or succeed with warnings
         # The function catches exceptions and returns error dict
@@ -194,7 +208,9 @@ class TestSearchPQ(unittest.TestCase):
         y_train = np.array([100, 102, 105, 107, 110, 112, 115, 117, 120])
         y_eval = np.array([122, 125])
 
-        best, best_res, summary = arima._search_pq(y_train, y_eval, d=0, p_max=2, q_max=2)
+        best, best_res, summary = arima._search_pq(
+            y_train, y_eval, d=0, p_max=2, q_max=2
+        )
 
         # Check best result
         self.assertIn("p", best)
@@ -214,7 +230,9 @@ class TestSearchPQ(unittest.TestCase):
         y_train = np.array([100, 102, 105, 107, 110, 112, 115, 117, 120])
         y_eval = np.array([122, 125])
 
-        best, best_res, summary = arima._search_pq(y_train, y_eval, d=0, p_max=1, q_max=1)
+        best, best_res, summary = arima._search_pq(
+            y_train, y_eval, d=0, p_max=1, q_max=1
+        )
 
         # The best model should have p and q values
         self.assertGreaterEqual(best["p"], 0)
@@ -237,14 +255,18 @@ class TestSearchPQ(unittest.TestCase):
         y_eval = np.array([112])
 
         with self.assertWarns(RuntimeWarning):
-            best, best_res, summary = arima._search_pq(y_train, y_eval, d=0, p_max=3, q_max=3)
+            best, best_res, summary = arima._search_pq(
+                y_train, y_eval, d=0, p_max=3, q_max=3
+            )
 
     def test_search_pq_summary_structure(self):
         """Test that _search_pq summary has correct structure"""
         y_train = np.array([100, 102, 105, 107, 110, 112, 115, 117, 120])
         y_eval = np.array([122, 125])
 
-        best, best_res, summary = arima._search_pq(y_train, y_eval, d=0, p_max=1, q_max=1)
+        best, best_res, summary = arima._search_pq(
+            y_train, y_eval, d=0, p_max=1, q_max=1
+        )
 
         self.assertIn("fit_failures_preview", summary)
         self.assertIn("top_by_aic_preview", summary)
@@ -262,7 +284,9 @@ class TestPredictFunction(unittest.TestCase):
         y_train = np.array([100, 102, 105, 107, 110, 112, 115, 117, 120])
         y_eval = np.array([122, 125])
 
-        best, best_res, summary = arima._search_pq(y_train, y_eval, d=0, p_max=1, q_max=1)
+        best, best_res, summary = arima._search_pq(
+            y_train, y_eval, d=0, p_max=1, q_max=1
+        )
 
         # Save the model
         temp_dir = tempfile.mkdtemp()
@@ -306,9 +330,17 @@ class TestTrainingMode(unittest.TestCase):
     def setUp(self):
         """Set up test data"""
         self.test_data = [
-            {"y": 100}, {"y": 102}, {"y": 105}, {"y": 107},
-            {"y": 110}, {"y": 112}, {"y": 115}, {"y": 117},
-            {"y": 120}, {"y": 122}, {"y": 125}
+            {"y": 100},
+            {"y": 102},
+            {"y": 105},
+            {"y": 107},
+            {"y": 110},
+            {"y": 112},
+            {"y": 115},
+            {"y": 117},
+            {"y": 120},
+            {"y": 122},
+            {"y": 125},
         ]
         self.data_json = json.dumps(self.test_data)
 
@@ -329,7 +361,7 @@ class TestTrainingMode(unittest.TestCase):
 
         # Capture stdout
         captured_output = StringIO()
-        with patch('sys.stdout', new=captured_output):
+        with patch("sys.stdout", new=captured_output):
             arima.run(args)
 
         output = captured_output.getvalue()
@@ -361,7 +393,7 @@ class TestTrainingMode(unittest.TestCase):
             args.load_model = None
 
             captured_output = StringIO()
-            with patch('sys.stdout', new=captured_output):
+            with patch("sys.stdout", new=captured_output):
                 arima.run(args)
 
             # Check model file exists
@@ -378,9 +410,17 @@ class TestTrainingMode(unittest.TestCase):
     def test_training_with_sales_key(self):
         """Test training with 'sales' key instead of 'y'"""
         sales_data = [
-            {"sales": 100}, {"sales": 102}, {"sales": 105}, {"sales": 107},
-            {"sales": 110}, {"sales": 112}, {"sales": 115}, {"sales": 117},
-            {"sales": 120}, {"sales": 122}, {"sales": 125}
+            {"sales": 100},
+            {"sales": 102},
+            {"sales": 105},
+            {"sales": 107},
+            {"sales": 110},
+            {"sales": 112},
+            {"sales": 115},
+            {"sales": 117},
+            {"sales": 120},
+            {"sales": 122},
+            {"sales": 125},
         ]
         data_json = json.dumps(sales_data)
 
@@ -398,7 +438,7 @@ class TestTrainingMode(unittest.TestCase):
         args.load_model = None
 
         captured_output = StringIO()
-        with patch('sys.stdout', new=captured_output):
+        with patch("sys.stdout", new=captured_output):
             arima.run(args)
 
         output = captured_output.getvalue()
@@ -459,9 +499,17 @@ class TestPredictionMode(unittest.TestCase):
     def setUp(self):
         """Set up a trained model"""
         self.test_data = [
-            {"y": 100}, {"y": 102}, {"y": 105}, {"y": 107},
-            {"y": 110}, {"y": 112}, {"y": 115}, {"y": 117},
-            {"y": 120}, {"y": 122}, {"y": 125}
+            {"y": 100},
+            {"y": 102},
+            {"y": 105},
+            {"y": 107},
+            {"y": 110},
+            {"y": 112},
+            {"y": 115},
+            {"y": 117},
+            {"y": 120},
+            {"y": 122},
+            {"y": 125},
         ]
         self.data_json = json.dumps(self.test_data)
 
@@ -469,7 +517,9 @@ class TestPredictionMode(unittest.TestCase):
         np.random.seed(42)
         y_train = np.array([100, 102, 105, 107, 110, 112, 115, 117])
         y_eval = np.array([120, 122])
-        best, best_res, summary = arima._search_pq(y_train, y_eval, d=0, p_max=1, q_max=1)
+        best, best_res, summary = arima._search_pq(
+            y_train, y_eval, d=0, p_max=1, q_max=1
+        )
 
         self.temp_dir = tempfile.mkdtemp()
         self.model_path = os.path.join(self.temp_dir, "arima_test.pkl")
@@ -491,7 +541,7 @@ class TestPredictionMode(unittest.TestCase):
         args.data = None
 
         captured_output = StringIO()
-        with patch('sys.stdout', new=captured_output):
+        with patch("sys.stdout", new=captured_output):
             arima.run(args)
 
         output = captured_output.getvalue()
@@ -515,7 +565,7 @@ class TestPredictionMode(unittest.TestCase):
         args.data = None
 
         captured_output = StringIO()
-        with patch('sys.stdout', new=captured_output):
+        with patch("sys.stdout", new=captured_output):
             arima.run(args)
 
         output = captured_output.getvalue()
@@ -536,7 +586,7 @@ class TestPredictionMode(unittest.TestCase):
         args.ci_level = 0.95
 
         captured_output = StringIO()
-        with patch('sys.stdout', new=captured_output):
+        with patch("sys.stdout", new=captured_output):
             arima.run(args)
 
         output = captured_output.getvalue()
@@ -558,7 +608,10 @@ class TestPredictionMode(unittest.TestCase):
 
         with self.assertRaises(ValueError) as ctx:
             arima.run(args)
-        self.assertIn("requires either eval_start/eval_end or --forecast_steps", str(ctx.exception))
+        self.assertIn(
+            "requires either eval_start/eval_end or --forecast_steps",
+            str(ctx.exception),
+        )
 
     def test_prediction_invalid_eval_range(self):
         """Test prediction fails with invalid eval range"""
@@ -578,14 +631,16 @@ class TestPredictionMode(unittest.TestCase):
 class TestErrorHandling(unittest.TestCase):
     """Test error handling throughout arima.py"""
 
-    def test_specific_exceptions_in_fit_and_score(self):
-        """Test that _fit_and_score catches specific exceptions"""
+    def test_specific_exceptions_in_fit_arima(self):
+        """Test that _fit_arima catches specific exceptions"""
         # Create data that will cause fitting to fail - very small dataset with high order
         # This should trigger LinAlgError or ValueError during fitting
         y_train = np.array([1.0, 2.0])  # Only 2 points
         y_eval = np.array([3.0])
 
-        result, fitted_res = arima._fit_and_score(y_train, y_eval, d=0, p=5, q=5)
+        result, fitted_res = arima._fit_arima(
+            y_train, d=0, p=5, q=5, y_eval_true=y_eval
+        )
 
         # With such a small dataset and high p,q, it should fail or succeed with warnings
         # If it returns error dict, check it; otherwise, it's OK
@@ -637,9 +692,18 @@ class TestIntegration(unittest.TestCase):
     def test_full_train_predict_workflow(self):
         """Test complete train -> save -> load -> predict workflow"""
         test_data = [
-            {"y": 100}, {"y": 102}, {"y": 105}, {"y": 107},
-            {"y": 110}, {"y": 112}, {"y": 115}, {"y": 117},
-            {"y": 120}, {"y": 122}, {"y": 125}, {"y": 127}
+            {"y": 100},
+            {"y": 102},
+            {"y": 105},
+            {"y": 107},
+            {"y": 110},
+            {"y": 112},
+            {"y": 115},
+            {"y": 117},
+            {"y": 120},
+            {"y": 122},
+            {"y": 125},
+            {"y": 127},
         ]
         data_json = json.dumps(test_data)
 
@@ -662,7 +726,7 @@ class TestIntegration(unittest.TestCase):
             args_train.load_model = None
 
             captured_train = StringIO()
-            with patch('sys.stdout', new=captured_train):
+            with patch("sys.stdout", new=captured_train):
                 arima.run(args_train)
 
             train_output = json.loads(captured_train.getvalue())
@@ -679,7 +743,7 @@ class TestIntegration(unittest.TestCase):
             args_pred.data = None
 
             captured_pred = StringIO()
-            with patch('sys.stdout', new=captured_pred):
+            with patch("sys.stdout", new=captured_pred):
                 arima.run(args_pred)
 
             pred_output = json.loads(captured_pred.getvalue())
@@ -697,11 +761,16 @@ class TestIntegration(unittest.TestCase):
     def test_with_month_timestamps(self):
         """Test with month timestamps in data"""
         test_data = [
-            {"y": 100, "month": "2023-01"}, {"y": 102, "month": "2023-02"},
-            {"y": 105, "month": "2023-03"}, {"y": 107, "month": "2023-04"},
-            {"y": 110, "month": "2023-05"}, {"y": 112, "month": "2023-06"},
-            {"y": 115, "month": "2023-07"}, {"y": 117, "month": "2023-08"},
-            {"y": 120, "month": "2023-09"}, {"y": 122, "month": "2023-10"}
+            {"y": 100, "month": "2023-01"},
+            {"y": 102, "month": "2023-02"},
+            {"y": 105, "month": "2023-03"},
+            {"y": 107, "month": "2023-04"},
+            {"y": 110, "month": "2023-05"},
+            {"y": 112, "month": "2023-06"},
+            {"y": 115, "month": "2023-07"},
+            {"y": 117, "month": "2023-08"},
+            {"y": 120, "month": "2023-09"},
+            {"y": 122, "month": "2023-10"},
         ]
         data_json = json.dumps(test_data)
 
@@ -719,7 +788,7 @@ class TestIntegration(unittest.TestCase):
         args.load_model = None
 
         captured_output = StringIO()
-        with patch('sys.stdout', new=captured_output):
+        with patch("sys.stdout", new=captured_output):
             arima.run(args)
 
         output = captured_output.getvalue()
@@ -730,7 +799,7 @@ class TestIntegration(unittest.TestCase):
 
     def test_d_parameter_preserved(self):
         """Test that d parameter is never changed from caller's value"""
-        test_data = [{"y": 100 + i*2} for i in range(15)]
+        test_data = [{"y": 100 + i * 2} for i in range(15)]
         data_json = json.dumps(test_data)
 
         for d_value in [0, 1, 2]:
@@ -748,7 +817,7 @@ class TestIntegration(unittest.TestCase):
             args.load_model = None
 
             captured_output = StringIO()
-            with patch('sys.stdout', new=captured_output):
+            with patch("sys.stdout", new=captured_output):
                 arima.run(args)
 
             output = captured_output.getvalue()
@@ -759,7 +828,7 @@ class TestIntegration(unittest.TestCase):
 
     def test_metrics_computation(self):
         """Test that metrics are computed correctly"""
-        test_data = [{"y": 100 + i*2} for i in range(12)]
+        test_data = [{"y": 100 + i * 2} for i in range(12)]
         data_json = json.dumps(test_data)
 
         args = MagicMock()
@@ -776,7 +845,7 @@ class TestIntegration(unittest.TestCase):
         args.load_model = None
 
         captured_output = StringIO()
-        with patch('sys.stdout', new=captured_output):
+        with patch("sys.stdout", new=captured_output):
             arima.run(args)
 
         output = captured_output.getvalue()
@@ -819,7 +888,7 @@ def run_tests():
     result = runner.run(suite)
 
     # Print summary
-    print("\n" + "="*70)
+    print("\n" + "=" * 70)
     if result.wasSuccessful():
         print("✅ ALL TESTS PASSED!")
         print(f"Ran {result.testsRun} tests successfully")
@@ -827,10 +896,10 @@ def run_tests():
         print("❌ SOME TESTS FAILED")
         print(f"Failures: {len(result.failures)}")
         print(f"Errors: {len(result.errors)}")
-    print("="*70)
+    print("=" * 70)
 
     return 0 if result.wasSuccessful() else 1
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     sys.exit(run_tests())
