@@ -26,6 +26,13 @@ ArrayLike = Union[List[float], np.ndarray]
 
 
 # ---------- utilities ----------
+def _format_predictions(preds: List[float], std_dev: float) -> List[Dict[str, float]]:
+    """
+    Format predictions with standard deviation for JSON output.
+    """
+    return [{"prediction": float(p), "std_dev": float(std_dev)} for p in preds]
+
+
 def _load_state(model_path: str) -> Dict[str, Any]:
     """
     Load and validate a saved LSTM model state.
@@ -245,7 +252,7 @@ def run(args) -> None:
             raise ValueError("[VALIDATION] --forecast_steps must be > 0.")
 
         preds, std_dev = predict(load_path, steps, state=state)
-        predictions_with_std = [{"prediction": p, "std_dev": std_dev} for p in preds]
+        predictions_with_std = _format_predictions(preds, std_dev)
 
         out: Dict[str, Any] = {
             "mode": "lstm_loaded_predict",
@@ -305,8 +312,8 @@ def run(args) -> None:
     metrics, model, preprocessor, y_true, y_pred, std_dev_residuals, history_df = train_and_evaluate(
         parsed_data, feature_types, range(ts, te + 1), range(es, ee + 1), look_back, epochs
     )
-    
-    predictions_with_std = [{"prediction": p, "std_dev": std_dev_residuals} for p in y_pred]
+
+    predictions_with_std = _format_predictions(y_pred, std_dev_residuals)
 
     out: Dict[str, Any] = {
         "mode": "lstm_train_eval",
@@ -347,15 +354,17 @@ def run(args) -> None:
 def _validate_training_args(
     parsed_data: ParsedData, ts: int, te: int, es: int, ee: int, look_back: int
 ) -> None:
+    """
+    Validate training and evaluation parameters for LSTM.
+    """
     n = parsed_data.n_obs
     if not (0 <= ts <= te < n):
-        raise ValueError(f"Invalid train range: [{ts},{te}]")
-    if not (es == te + 1 and ee == te):
-        if not (0 <= es <= ee < n):
-            raise ValueError(f"Invalid eval range: [{es},{ee}]")
+        raise ValueError(f"[VALIDATION] Invalid train range: [{ts},{te}]")
+    if not (0 <= es <= ee < n):
+        raise ValueError(f"[VALIDATION] Invalid eval range: [{es},{ee}]")
     if es <= te:
-        raise ValueError("eval_start must be > train_end.")
+        raise ValueError("[VALIDATION] eval_start must be > train_end.")
     if look_back < 1:
-        raise ValueError("--look_back must be >= 1.")
+        raise ValueError("[VALIDATION] look_back must be >= 1.")
     if te - ts + 1 <= look_back:
-        raise ValueError("Training range must be larger than look_back.")
+        raise ValueError("[VALIDATION] Training range must be larger than look_back.")

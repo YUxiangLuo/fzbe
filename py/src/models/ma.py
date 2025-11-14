@@ -5,6 +5,7 @@ Moving Average (MA) time series forecasting model.
 """
 
 import json
+from collections import deque
 from typing import Any, Dict, List, Optional, Tuple, Union
 
 import numpy as np
@@ -41,6 +42,13 @@ def moving_average_forecast(
     return idxs, preds
 
 
+def _format_predictions(preds: List[float], std_dev: float) -> List[Dict[str, float]]:
+    """
+    Format predictions with standard deviation for JSON output.
+    """
+    return [{"prediction": p, "std_dev": std_dev} for p in preds]
+
+
 def _load_state(model_path: str) -> Dict[str, Any]:
     """
     Load and validate a saved MA model state.
@@ -59,32 +67,32 @@ def _forecast_future(
 ) -> List[float]:
     """
     Generate multi-step-ahead forecasts.
+    Uses deque for efficient sliding window operations.
     """
     if steps <= 0:
         raise ValueError("[VALIDATION] steps must be > 0 for forecasting.")
 
-    buf = list(history[-window:]) if window > 0 else list(history)
-    if not buf:
+    # Use deque with maxlen for O(1) append operations on sliding window
+    initial_history = history[-window:] if window > 0 else list(history)
+    if not initial_history:
         raise ValueError("[DATA] History is empty; cannot forecast.")
-    
+
+    buf = deque(initial_history, maxlen=window if window > 0 else None)
     preds = []
     future_iter = iter(future_values or [])
+
     for _ in range(steps):
-        window_values = buf[-window:] if window > 0 else buf
-        if not window_values:
+        if not buf:
             raise ValueError("Insufficient history for moving average window.")
-        
-        avg = sum(window_values) / len(window_values)
+
+        avg = sum(buf) / len(buf)
         preds.append(avg)
-        
+
         try:
             buf.append(next(future_iter))
         except StopIteration:
             buf.append(avg)
-            
-        if window > 0 and len(buf) > window:
-            buf.pop(0)
-            
+
     return preds
 
 
@@ -130,22 +138,25 @@ def train_and_evaluate(
     Evaluate the moving average model on a test set.
     """
     series = np.asarray(sales)
-    
-    # The first possible prediction point is train_range.start + window
-    first_possible_eval_point = train_range.start + window
-    if eval_range.start < first_possible_eval_point and len(list(eval_range)) > 0:
-        # This condition is more specific for the error we want to catch
-        if all(t < first_possible_eval_point for t in eval_range):
-            raise ValueError(f"[VALIDATION] Insufficient history for all evaluation points. First possible evaluation point is {first_possible_eval_point}.")
+
+    # Validate that evaluation range has sufficient history
+    # First possible prediction point needs at least 'window' points of history
+    eval_list = list(eval_range)
+    if eval_list:
+        first_possible_eval_point = train_range.start + window
+        if max(eval_list) < first_possible_eval_point:
+            raise ValueError(
+                f"[VALIDATION] Insufficient history for all evaluation points. "
+                f"First possible evaluation point is {first_possible_eval_point}."
+            )
 
     idxs, preds = moving_average_forecast(series, eval_range, window, min_index=train_range.start)
-    
-    if not idxs and len(list(eval_range)) > 0:
-        raise ValueError(
-            "[VALIDATION] No evaluation points could be generated."
-        )
 
-    if not idxs: # Handle empty eval range gracefully
+    if not idxs and eval_list:
+        raise ValueError("[VALIDATION] No evaluation points could be generated.")
+
+    # Handle empty eval range gracefully
+    if not idxs:
         return {}, 0.0, np.array([]), np.array([])
 
     y_true = series[idxs]
@@ -182,7 +193,7 @@ def run(args) -> None:
             raise ValueError("[VALIDATION] --forecast_steps must be > 0.")
 
         preds, std_dev = predict(load_path, steps, getattr(args, "data", None), state=state)
-        predictions_with_std = [{"prediction": p, "std_dev": std_dev} for p in preds]
+        predictions_with_std = _format_predictions(preds, std_dev)
 
         out: Dict[str, Any] = {
             "mode": "ma_loaded_predict",
@@ -215,10 +226,8 @@ def run(args) -> None:
     metrics, std_dev_residuals, y_true, y_pred = train_and_evaluate(
         sales, months, range(ts, te + 1), range(es, ee + 1), w
     )
-    
-    predictions_with_std = [
-        {"prediction": p, "std_dev": std_dev_residuals} for p in y_pred
-    ]
+
+    predictions_with_std = _format_predictions(y_pred.tolist(), std_dev_residuals)
 
     out: Dict[str, Any] = {
         "mode": "fixed_window_only",
@@ -231,6 +240,8 @@ def run(args) -> None:
     }
 
     if save_path:
+        # Save only the last 'window' points needed for future predictions
+        # This is the minimum history required to compute the moving average
         history_start = max(ts, te - w + 1)
         history = sales[history_start : te + 1]
         state = {
@@ -245,12 +256,15 @@ def run(args) -> None:
 
 
 def _validate_training_args(sales: ArrayLike, ts: int, te: int, es: int, ee: int, w: int) -> None:
+    """
+    Validate training and evaluation parameters.
+    """
     n_total = len(sales)
     if not (0 <= ts <= te < n_total):
-        raise ValueError(f"Invalid training range [{ts}, {te}]")
-    if not (es >= 0 and ee < n_total and es <= ee + 1):
-        raise ValueError(f"Invalid evaluation range [{es}, {ee}]")
+        raise ValueError(f"[VALIDATION] Invalid training range [{ts}, {te}]")
+    if not (es >= 0 and ee < n_total and es <= ee):
+        raise ValueError(f"[VALIDATION] Invalid evaluation range [{es}, {ee}]")
     if es <= te:
-        raise ValueError("Evaluation start must be after training end.")
+        raise ValueError("[VALIDATION] Evaluation start must be after training end.")
     if w < 1:
-        raise ValueError("--window must be >= 1")
+        raise ValueError("[VALIDATION] --window must be >= 1")

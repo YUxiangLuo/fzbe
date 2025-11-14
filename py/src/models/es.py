@@ -22,6 +22,13 @@ ArrayLike = Union[List[float], np.ndarray]
 
 # ---------- utilities ----------
 
+def _format_predictions(preds: List[float], std_dev: float) -> List[Dict[str, float]]:
+    """
+    Format predictions with standard deviation for JSON output.
+    """
+    return [{"prediction": p, "std_dev": std_dev} for p in preds]
+
+
 def _load_state(model_path: str) -> Dict[str, Any]:
     """
     Load and validate a saved ES model state.
@@ -42,11 +49,17 @@ def predict(
 ) -> Tuple[List[float], float]:
     """
     Forecast using a saved SES model.
+
+    For Simple Exponential Smoothing, all forecasts equal the last smoothed level.
+    If future actual values are provided, they are used to update the level for
+    subsequent predictions (online updating).
     """
     if steps <= 0:
         raise ValueError("[VALIDATION] steps must be > 0 for forecasting.")
     state = state or _load_state(model_path)
     alpha = float(state["alpha"])
+    if not (0.0 < alpha <= 1.0):
+        raise ValueError(f"[VALIDATION] Invalid alpha={alpha}, must be in (0,1].")
     level = float(state["level"])
     std_dev_residuals = float(state.get("std_dev_residuals", 0.0))
 
@@ -60,10 +73,15 @@ def predict(
 
     preds: List[float] = []
     for idx in range(steps):
-        preds.append(level)
+        # Prediction at time t is the current smoothed level
+        pred = level
+        preds.append(pred)
+
+        # If actual value is available, update level for next prediction
         if future_values and idx < len(future_values):
             actual = future_values[idx]
             level = alpha * actual + (1.0 - alpha) * level
+
     return preds, std_dev_residuals
 
 
@@ -90,6 +108,9 @@ def train_and_evaluate(
 ) -> Tuple[Dict[str, Any], float, float, List[float], List[float]]:
     """
     Trains and evaluates the SES model.
+
+    For Simple Exponential Smoothing, all future predictions equal the final
+    smoothed level from the training period.
     """
     series = np.asarray(sales, dtype=np.float64)
     train_level = _fit_level(series, train_range, alpha)
@@ -98,12 +119,14 @@ def train_and_evaluate(
     if not idxs:
         return {}, 0.0, train_level, [], []
 
+    # SES: All forecasts are the same - the final smoothed level
     preds = [train_level] * len(idxs)
     y_true = series[idxs]
     y_pred = np.array(preds, dtype=np.float64)
 
     residuals = y_true - y_pred
-    std_dev_residuals = float(np.std(residuals, ddof=0))
+    # Use sample standard deviation (ddof=1) for prediction intervals
+    std_dev_residuals = float(np.std(residuals, ddof=1)) if len(residuals) > 1 else 0.0
 
     metrics = {
         "rmse": rmse(y_true, y_pred),
@@ -145,7 +168,7 @@ def run(args) -> None:
             raise ValueError("Provide eval_start/eval_end or --forecast_steps.")
 
         preds, std_dev = predict(load_path, steps, getattr(args, "data", None), state=state)
-        predictions_with_std = [{"prediction": p, "std_dev": std_dev} for p in preds]
+        predictions_with_std = _format_predictions(preds, std_dev)
 
         out: Dict[str, Any] = {
             "mode": "es_loaded_predict",
@@ -189,10 +212,8 @@ def run(args) -> None:
     metrics, std_dev_residuals, final_level, y_true, y_pred = train_and_evaluate(
         sales, months, range(ts, te + 1), range(es, ee + 1), alpha
     )
-    
-    predictions_with_std = [
-        {"prediction": p, "std_dev": std_dev_residuals} for p in y_pred
-    ]
+
+    predictions_with_std = _format_predictions(y_pred, std_dev_residuals)
 
     out: Dict[str, Any] = {
         "mode": "ses_fixed_alpha",
@@ -218,14 +239,16 @@ def run(args) -> None:
 
 
 def _validate_training_args(sales: ArrayLike, ts: int, te: int, es: int, ee: int) -> None:
+    """
+    Validate training and evaluation parameters.
+    """
     n = len(sales)
     if not (0 <= ts <= te < n):
-        raise ValueError(f"Invalid train range: [{ts},{te}]")
-    if not (es == te + 1 and ee == te): # Allow empty eval range
-        if not (0 <= es <= ee < n):
-            raise ValueError(f"Invalid eval range: [{es},{ee}]")
+        raise ValueError(f"[VALIDATION] Invalid train range: [{ts},{te}]")
+    if not (0 <= es <= ee < n):
+        raise ValueError(f"[VALIDATION] Invalid eval range: [{es},{ee}]")
     if es <= te:
-        raise ValueError("eval_start must be > train_end.")
+        raise ValueError("[VALIDATION] eval_start must be > train_end.")
 
 def _add_metrics_to_output(out: Dict[str, Any], data: str, es: int, ee: int, preds: List[float]) -> None:
     try:
