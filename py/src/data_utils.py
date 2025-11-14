@@ -140,16 +140,3 @@ def parse_data_from_json(
         time_key=time_key,
         feature_types=feature_types,
     )
-
-# --- Legacy single-series parser for compatibility ---
-# This can be phased out as models are updated.
-def parse_sales_data(json_str):
-    """Legacy function to parse simple {"month": ..., "sales": ...} data."""
-    arr = json.loads(json_str)
-    months = [item["month"] for item in arr]
-    sales = [float(item["sales"]) for item in arr]
-    return months, sales
-
-def slice_series(series, start, end):
-    """Legacy slicing function."""
-    return series[start:end]

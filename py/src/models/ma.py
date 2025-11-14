@@ -1,70 +1,52 @@
 # src/models/ma.py
 # -*- coding: utf-8 -*-
+"""
+Moving Average (MA) time series forecasting model.
+
+Implements fixed-window moving average with support for:
+- Training and evaluation with configurable window size
+- Model persistence and loading
+- Future forecasting with optional ground truth updates
+"""
 import json
-import math
 import sys
 from typing import List, Dict, Any, Tuple, Optional
 import numpy as np
-import pickle
 
-def save_pickle(data, path):
-    with open(path, 'wb') as f:
-        pickle.dump(data, f)
-
-def load_pickle(path):
-    with open(path, 'rb') as f:
-        return pickle.load(f)
+# Import shared utilities
 from data_utils import parse_data_from_json
+from serialization import dump_model, load_model
+from metrics import rmse, mae, mape, r2
 
 MODEL_TYPE = "ma"
-
-
-# ---------- metrics ----------
-def rmse(y_true: List[float], y_pred: List[float]) -> float:
-    if not y_true:
-        return float("nan")
-    return math.sqrt(sum((a - b) ** 2 for a, b in zip(y_true, y_pred)) / len(y_true))
-
-
-def mae(y_true: List[float], y_pred: List[float]) -> float:
-    if not y_true:
-        return float("nan")
-    return sum(abs(a - b) for a, b in zip(y_true, y_pred)) / len(y_true)
-
-
-def mape(y_true: List[float], y_pred: List[float]) -> float:
-    if not y_true:
-        return float("nan")
-    eps = 1e-12
-    return (
-        100.0
-        * sum(
-            abs((a - b) / (a if abs(a) > eps else eps)) for a, b in zip(y_true, y_pred)
-        )
-        / len(y_true)
-    )
-
-
-def r2_score(y_true: List[float], y_pred: List[float]) -> float:
-    if not y_true:
-        return float("nan")
-    mean_y = sum(y_true) / len(y_true)
-    ss_res = sum((a - b) ** 2 for a, b in zip(y_true, y_pred))
-    ss_tot = sum((a - mean_y) ** 2 for a in y_true)
-    return 1.0 - ss_res / ss_tot if ss_tot != 0 else 0.0
 
 
 # ---------- core ----------
 def moving_average_forecast(
     series: List[float], eval_range: range, window: int, min_index: int = 0
 ) -> Tuple[List[int], List[float]]:
+    """
+    Generate one-step-ahead forecasts using moving average.
+
+    For each time t in eval_range, computes the mean of series[t-window:t].
+    Skips time points where the window would access data before min_index.
+
+    Args:
+        series: The full time series data
+        eval_range: Range of indices to generate predictions for
+        window: Number of past observations to average
+        min_index: Minimum index that can be accessed (default 0)
+
+    Returns:
+        Tuple of (valid_indices, predictions)
+        - valid_indices: List of indices where predictions were made
+        - predictions: List of corresponding prediction values
+
+    Raises:
+        ValueError: If window <= 0
+    """
     if window <= 0:
         raise ValueError("[VALIDATION] Moving average window must be greater than 0.")
-    """
-    对 eval_range 中的每个 t，使用 series[t-window:t] 的真实值做一步预测。
-    当预测窗口会访问 min_index 之前的数据时，该时间点会被跳过。
-    返回：有效的索引列表、对应的预测值列表。
-    """
     idxs: List[int] = []
     preds: List[float] = []
     for t in eval_range:
@@ -76,7 +58,19 @@ def moving_average_forecast(
 
 
 def _load_state(model_path: str) -> Dict[str, Any]:
-    state = load_pickle(model_path)
+    """
+    Load and validate a saved MA model state.
+
+    Args:
+        model_path: Path to the saved model file
+
+    Returns:
+        Dictionary containing model state
+
+    Raises:
+        ValueError: If the model file is invalid or not an MA model
+    """
+    state = load_model(model_path)
     if not isinstance(state, dict) or state.get("model_type") != MODEL_TYPE:
         raise ValueError("[VALIDATION] Invalid MA model file.")
     return state
@@ -85,6 +79,21 @@ def _load_state(model_path: str) -> Dict[str, Any]:
 def _forecast_future(
     history: List[float], window: int, steps: int, future_values: Optional[List[float]] = None
 ) -> List[float]:
+    """
+    Generate multi-step-ahead forecasts using moving average.
+
+    Args:
+        history: Historical values to initialize the forecast
+        window: Number of values to average (0 means use all available)
+        steps: Number of steps to forecast
+        future_values: Optional actual future values to update the window
+
+    Returns:
+        List of forecasted values
+
+    Raises:
+        ValueError: If steps <= 0 or history is empty
+    """
     if steps <= 0:
         raise ValueError("[VALIDATION] steps must be > 0 for forecasting.")
 
@@ -139,14 +148,15 @@ def predict(
         try:
             temp_data = json.loads(data)
             target_key = "y" if isinstance(temp_data, list) and temp_data and "y" in temp_data[0] else "sales"
-            
+
             parsed_data = parse_data_from_json(data, target_key=target_key)
             series = parsed_data.y.tolist()
-            
+
             start = train_end + 1
             if start < len(series):
                 future_values = series[start : start + steps]
-        except Exception:
+        except (json.JSONDecodeError, ValueError, KeyError, IndexError):
+            # If data parsing fails, proceed without future values
             future_values = None
 
     predictions = _forecast_future(history, window, steps, future_values)
@@ -157,7 +167,20 @@ def train_and_evaluate(
     sales: List[float], months: List[str], train_range: range, eval_range: range, window: int
 ) -> Tuple[Dict[str, Any], float, List[float], List[float]]:
     """
-    Trains the model (conceptually) and evaluates it, returning metrics and residual std dev.
+    Evaluate the moving average model on a test set.
+
+    Args:
+        sales: Full time series data
+        months: Corresponding time labels
+        train_range: Range of training indices (for min_index constraint)
+        eval_range: Range of evaluation indices
+        window: Moving average window size
+
+    Returns:
+        Tuple of (metrics_dict, std_dev_residuals, y_true, y_pred)
+
+    Raises:
+        ValueError: If no valid evaluation points can be generated
     """
     idxs, preds = moving_average_forecast(sales, eval_range, window, min_index=train_range.start)
     if not idxs:
@@ -176,7 +199,7 @@ def train_and_evaluate(
         "rmse": rmse(y_true, y_pred),
         "mae": mae(y_true, y_pred),
         "mape": mape(y_true, y_pred),
-        "r2": r2_score(y_true, y_pred),
+        "r2": r2(y_true, y_pred),
         "evaluate_indices": idxs,
         "evaluate_months": [months[i] for i in idxs],
     }
@@ -186,8 +209,17 @@ def train_and_evaluate(
 # ---------- public entry ----------
 def run(args) -> None:
     """
-    固定窗口移动平均法。
-    必须传入 --window；仅做合法性检查 + 单窗口评估。
+    Main entry point for MA model training and prediction.
+
+    Supports two modes:
+    1. Training mode: Requires --data, train/eval ranges, and --window
+    2. Prediction mode: Requires --load_model and forecast steps
+
+    Args:
+        args: Namespace containing command-line arguments
+
+    Raises:
+        ValueError: For invalid arguments or data
     """
     pretty: bool = bool(getattr(args, "pretty", False))
     save_path = getattr(args, "save_model", None)
@@ -247,12 +279,12 @@ def run(args) -> None:
                         "rmse": rmse(y_true, preds),
                         "mae": mae(y_true, preds),
                         "mape": mape(y_true, preds),
-                        "r2": r2_score(y_true, preds),
+                        "r2": r2(y_true, preds),
                     }
                     out["evaluate_months"] = months[es_i : ee_i + 1]
                 else:
                     out["metrics_error"] = "Length of true values and predictions do not match for evaluation."
-            except Exception as e:
+            except (json.JSONDecodeError, ValueError, KeyError, IndexError) as e:
                 out["metrics_error"] = f"Failed to calculate evaluation metrics: {e}"
 
         print(json.dumps(out, ensure_ascii=False, indent=2 if pretty else None))
@@ -341,7 +373,11 @@ def run(args) -> None:
     }
 
     if save_path:
-        history = sales[max(ts, te - w + 1) : te + 1]
+        # Save the last `window` values from training data as history
+        # Ensure we don't go before train_start
+        history_start = max(ts, te - w + 1)
+        history = sales[history_start : te + 1]
+
         state = {
             "model_type": MODEL_TYPE,
             "window": w,
@@ -350,7 +386,7 @@ def run(args) -> None:
             "value_key": value_key,
             "std_dev_residuals": std_dev_residuals,
         }
-        save_pickle(state, save_path)
+        dump_model(state, save_path)
         out["saved_model"] = save_path
 
     print(json.dumps(out, ensure_ascii=False, indent=2 if pretty else None))

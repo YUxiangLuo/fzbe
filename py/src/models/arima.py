@@ -18,16 +18,9 @@ import numpy as np
 from statsmodels.tsa.statespace.sarimax import SARIMAX
 from statsmodels.tools.sm_exceptions import ConvergenceWarning
 
+# Import shared utilities
 from data_utils import parse_data_from_json
-import pickle
-
-def save_pickle(data, path):
-    with open(path, 'wb') as f:
-        pickle.dump(data, f)
-
-def load_pickle(path):
-    with open(path, 'rb') as f:
-        return pickle.load(f)
+from serialization import dump_model, load_model
 from metrics import rmse, mae, mape, r2
 
 # Previous behavior: silence warnings (we keep this default to avoid output noise)
@@ -52,6 +45,42 @@ def _validate_ranges(n: int, ts: int, te: int, es: int, ee: int) -> None:
         raise ValueError("[VALIDATION] empty eval range")
 
 
+def _determine_target_key(data_json_str: str) -> Tuple[str, str | None]:
+    """
+    Determine the target key and time key from JSON data string.
+
+    Args:
+        data_json_str: JSON string containing the data
+
+    Returns:
+        Tuple of (target_key, time_key) where target_key is either "y" or "sales",
+        and time_key is "month" if present, else None
+
+    Raises:
+        ValueError: If data format is invalid or target key cannot be determined
+    """
+    try:
+        temp_data = json.loads(data_json_str)
+        if not isinstance(temp_data, list) or not temp_data:
+            raise ValueError("[DATA] --data must be a non-empty JSON array.")
+
+        first_record = temp_data[0]
+        if "y" in first_record:
+            target_key = "y"
+        elif "sales" in first_record:
+            target_key = "sales"
+        else:
+            raise ValueError("[DATA] Cannot determine target key. Expecting 'y' or 'sales'.")
+
+        time_key = "month" if "month" in first_record else None
+        return target_key, time_key
+
+    except json.JSONDecodeError as e:
+        raise ValueError(f"[DATA] Invalid JSON format: {e}")
+    except (KeyError, IndexError, TypeError) as e:
+        raise ValueError(f"[DATA] Failed to parse data structure: {e}")
+
+
 def _fit_and_score(
     y_train: np.ndarray,
     y_eval_true: np.ndarray,
@@ -74,8 +103,12 @@ def _fit_and_score(
     try:
         res = model.fit(disp=False)
         converged = bool(getattr(res, "mle_retvals", {}).get("converged", True))
-    except Exception as e:
+    except (ValueError, np.linalg.LinAlgError, RuntimeError) as e:
+        # Common failures during ARIMA fitting: invalid params, singular matrix, convergence issues
         return {"p": p, "d": d, "q": q, "error": str(e)[:200], "converged": False}, None
+    except Exception as e:
+        # Catch any unexpected errors during grid search (should be rare)
+        return {"p": p, "d": d, "q": q, "error": f"Unexpected: {str(e)[:180]}", "converged": False}, None
 
     steps = int(len(y_eval_true))
     fcst = res.get_forecast(steps=steps)
@@ -172,7 +205,7 @@ def predict(model_path: str, steps: int) -> List[Dict[str, float]]:
     """
     if steps <= 0:
         raise ValueError("[VALIDATION] steps must be > 0")
-    res = load_pickle(model_path)
+    res = load_model(model_path)
     fcst = res.get_forecast(steps=steps)
 
     predictions = fcst.predicted_mean.tolist()
@@ -207,24 +240,8 @@ def run(args) -> None:
     if missing:
         raise ValueError(f"[VALIDATION] ARIMA training requires {', '.join('--'+k for k in missing)}")
 
-    # Try to determine the target key ('y' is standard, 'sales' is for legacy)
-    try:
-        temp_data = json.loads(args.data)
-        if isinstance(temp_data, list) and temp_data:
-            first_record = temp_data[0]
-            if "y" in first_record:
-                target_key = "y"
-            elif "sales" in first_record:
-                target_key = "sales"
-            else:
-                raise ValueError("[DATA] Cannot determine target key. Expecting 'y' or 'sales'.")
-            
-            time_key = "month" if "month" in first_record else None
-        else:
-            raise ValueError("[DATA] --data is empty or not a list.")
-    except Exception as e:
-        raise ValueError(f"[DATA] Failed to pre-parse data to find target key: {e}")
-
+    # Determine the target key ('y' is standard, 'sales' is for legacy)
+    target_key, time_key = _determine_target_key(args.data)
     data = parse_data_from_json(args.data, target_key=target_key, time_key=time_key)
     y, months = data.y, data.timestamps
     n = data.n_obs
@@ -246,7 +263,7 @@ def run(args) -> None:
 
     # Optional: save the best fitted result
     if getattr(args, "save_model", None):
-        save_pickle(best_res, args.save_model)
+        dump_model(best_res, args.save_model)
 
     # Assemble output (keep existing keys; only add new sections)
     best_predictions = best.get("y_pred")
@@ -299,7 +316,8 @@ def run(args) -> None:
             "y_pred_eval": best["y_pred"].tolist(),
             "conf_int": best["conf_int"].astype(float).tolist(),
         }
-    except Exception:
+    except (KeyError, AttributeError, ValueError):
+        # Skip diagnostics if data is not in expected format (non-critical)
         pass
 
     print(json.dumps(out, ensure_ascii=False, indent=2 if pretty else None))
@@ -320,11 +338,12 @@ def _handle_prediction(args, pretty: bool) -> None:
     - Keeps original 'predictions' + 'conf_int' + 'steps' fields.
     - Adds a 'meta' section with diagnostic info (safe to ignore by old front-ends).
     """
-    res = load_pickle(args.load_model)
-    # FIXED: Extract order for output
+    res = load_model(args.load_model)
+    # Extract order from model for output (fallback to (0,0,0) if not available)
     try:
         order = res.model.order
-    except Exception:
+    except AttributeError:
+        # Model object may not have order attribute in some edge cases
         order = (0, 0, 0)
     nobs = int(getattr(res, "nobs", 0))
 
@@ -462,9 +481,7 @@ def _handle_prediction(args, pretty: bool) -> None:
     if hasattr(args, "data") and args.data and have_eval_window:
         try:
             # Determine target key from the provided data
-            temp_data = json.loads(args.data)
-            target_key = "y" if isinstance(temp_data, list) and temp_data and "y" in temp_data[0] else "sales"
-            
+            target_key, _ = _determine_target_key(args.data)
             data = parse_data_from_json(args.data, target_key=target_key)
             y = data.y
             es, ee = int(args.eval_start), int(args.eval_end)
@@ -478,7 +495,7 @@ def _handle_prediction(args, pretty: bool) -> None:
                 }
             else:
                 out["metrics_error"] = f"[VALIDATION] Series length mismatch for metrics: y_true={len(y_true)}, pred={len(y_pred)}"
-        except Exception as e:
+        except (json.JSONDecodeError, ValueError, KeyError, IndexError) as e:
             out["metrics_error"] = f"[DATA] Failed to compute metrics: {e}"
 
     print(json.dumps(out, ensure_ascii=False, indent=2 if pretty else None))

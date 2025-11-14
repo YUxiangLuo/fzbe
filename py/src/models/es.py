@@ -1,60 +1,39 @@
 # src/models/es.py
 # -*- coding: utf-8 -*-
+"""
+Exponential Smoothing (Simple Exponential Smoothing / SES) model.
+
+Implements level-based forecasting with:
+- Training on specified data range
+- Sequential evaluation with fixed alpha parameter
+- Model persistence for future predictions
+"""
 import json
-import math
 from typing import List, Dict, Any, Optional, Tuple
 import numpy as np
-import pickle
 
-def save_pickle(data, path):
-    with open(path, 'wb') as f:
-        pickle.dump(data, f)
-
-def load_pickle(path):
-    with open(path, 'rb') as f:
-        return pickle.load(f)
+# Import shared utilities
 from data_utils import parse_data_from_json
+from serialization import dump_model, load_model
+from metrics import rmse, mae, mape, r2
 
 MODEL_TYPE = "es"
 
 
-# ----- metrics -----
-def rmse(y_true: List[float], y_pred: List[float]) -> float:
-    if not y_true:
-        return float("nan")
-    return math.sqrt(sum((a - b) ** 2 for a, b in zip(y_true, y_pred)) / len(y_true))
-
-
-def mae(y_true: List[float], y_pred: List[float]) -> float:
-    if not y_true:
-        return float("nan")
-    return sum(abs(a - b) for a, b in zip(y_true, y_pred)) / len(y_true)
-
-
-def mape(y_true: List[float], y_pred: List[float]) -> float:
-    if not y_true:
-        return float("nan")
-    eps = 1e-12
-    return (
-        100.0
-        * sum(
-            abs((a - b) / (a if abs(a) > eps else eps)) for a, b in zip(y_true, y_pred)
-        )
-        / len(y_true)
-    )
-
-
-def r2_score(y_true: List[float], y_pred: List[float]) -> float:
-    if not y_true:
-        return float("nan")
-    mean_y = sum(y_true) / len(y_true)
-    ss_res = sum((a - b) ** 2 for a, b in zip(y_true, y_pred))
-    ss_tot = sum((a - mean_y) ** 2 for a in y_true)
-    return 1.0 - ss_res / ss_tot if ss_tot != 0 else 0.0
-
-
 def _load_state(model_path: str) -> Dict[str, Any]:
-    state = load_pickle(model_path)
+    """
+    Load and validate a saved ES model state.
+
+    Args:
+        model_path: Path to the saved model file
+
+    Returns:
+        Dictionary containing model state
+
+    Raises:
+        ValueError: If the model file is invalid or not an ES model
+    """
+    state = load_model(model_path)
     if not isinstance(state, dict) or state.get("model_type") != MODEL_TYPE:
         raise ValueError("[VALIDATION] Invalid ES model file.")
     return state
@@ -88,7 +67,8 @@ def predict(
             
             parsed_data = parse_data_from_json(data, target_key=target_key)
             future_values = parsed_data.y.tolist()
-        except Exception:
+        except (json.JSONDecodeError, ValueError, KeyError, IndexError):
+            # If data parsing fails, proceed without future values
             future_values = None
 
     preds: List[float] = []
@@ -145,7 +125,7 @@ def train_and_evaluate(
         "rmse": rmse(y_true, y_pred),
         "mae": mae(y_true, y_pred),
         "mape": mape(y_true, y_pred),
-        "r2": r2_score(y_true, y_pred),
+        "r2": r2(y_true, y_pred),
     }
 
     return metrics, float(std_dev_residuals), train_level, y_true, y_pred
@@ -179,7 +159,7 @@ def run(args) -> None:
                 es_i, ee_i = int(es), int(ee)
                 if ee_i >= es_i:
                     steps = ee_i - es_i + 1
-            except Exception:
+            except (ValueError, TypeError):
                 steps = None
             if steps is None:
                 raise ValueError("[VALIDATION] Invalid eval_start/eval_end range for determining forecast steps.")
@@ -214,12 +194,12 @@ def run(args) -> None:
                         "rmse": rmse(y_true, preds),
                         "mae": mae(y_true, preds),
                         "mape": mape(y_true, preds),
-                        "r2": r2_score(y_true, preds),
+                        "r2": r2(y_true, preds),
                     }
                     out["evaluate_months"] = months[es_i : ee_i + 1]
                 else:
                     out["metrics_error"] = "Length of true values and predictions do not match for evaluation."
-            except Exception as e:
+            except (json.JSONDecodeError, ValueError, KeyError, IndexError) as e:
                 out["metrics_error"] = f"Failed to calculate evaluation metrics: {e}"
 
         print(json.dumps(out, ensure_ascii=False, indent=2 if pretty else None))
@@ -249,7 +229,7 @@ def run(args) -> None:
         months = parsed_data.timestamps if parsed_data.timestamps is not None else [str(i) for i in range(parsed_data.n_obs)]
         value_key = target_key # Store for saving state
 
-    except Exception as e:
+    except (json.JSONDecodeError, ValueError, KeyError, IndexError) as e:
         raise ValueError(f"[DATA] Failed to parse --data: {e}")
 
     n = len(sales)
@@ -261,7 +241,7 @@ def run(args) -> None:
         raise ValueError("[VALIDATION] You must specify --alpha for SES.")
     try:
         alpha = float(args.alpha)
-    except Exception:
+    except (ValueError, TypeError):
         raise ValueError("[VALIDATION] --alpha must be a float in (0,1].")
     if not (0.0 < alpha <= 1.0):
         raise ValueError("[VALIDATION] --alpha must be in (0,1].")
@@ -318,7 +298,7 @@ def run(args) -> None:
             "value_key": value_key,
             "std_dev_residuals": std_dev_residuals,
         }
-        save_pickle(state, save_path)
+        dump_model(state, save_path)
         out["saved_model"] = save_path
 
     print(json.dumps(out, ensure_ascii=False, indent=2 if pretty else None))
