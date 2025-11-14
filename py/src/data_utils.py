@@ -119,18 +119,18 @@ class TimeSeriesData:
 
 
 def parse_data_from_json(
-    json_str: str,
+    json_str_or_records: str | List[Dict[str, Any]],
     target_key: str,
     time_key: Optional[str] = None,
     feature_types: Optional[Dict[str, str]] = None,
 ) -> TimeSeriesData:
     """
-    Parses a JSON string into a structured TimeSeriesData object.
+    Parses a JSON string or pre-parsed records into a structured TimeSeriesData object.
 
     This is the main entry point for all models to standardize data ingestion.
 
     Args:
-        json_str: The raw JSON data string.
+        json_str_or_records: Either a JSON string or already-parsed list of records.
         target_key: The dictionary key for the target variable (e.g., "sales").
         time_key: The optional dictionary key for the timestamp (e.g., "month").
         feature_types: Optional dict specifying feature types (e.g., {"promo": "binary"}).
@@ -139,10 +139,13 @@ def parse_data_from_json(
     Returns:
         A TimeSeriesData object containing y, X, timestamps, etc.
     """
-    try:
-        records = json.loads(json_str)
-    except json.JSONDecodeError as e:
-        raise ValueError(f"[DATA] Invalid JSON format: {e}")
+    if isinstance(json_str_or_records, str):
+        try:
+            records = json.loads(json_str_or_records)
+        except json.JSONDecodeError as e:
+            raise ValueError(f"[DATA] Invalid JSON format: {e}")
+    else:
+        records = json_str_or_records
 
     if not isinstance(records, list):
         raise ValueError("[DATA] JSON data must be an array of objects.")

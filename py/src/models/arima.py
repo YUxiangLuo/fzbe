@@ -22,11 +22,7 @@ from data_utils import parse_data_from_json
 from metrics import mae, mape, r2, rmse
 from serialization import dump_model, load_model
 from statsmodels.tools.sm_exceptions import ConvergenceWarning
-from statsmodels.tsa.statespace.sarimax import SARIMAX
-
-# Previous behavior: silence warnings (we keep this default to avoid output noise)
-warnings.filterwarnings("ignore", category=UserWarning)
-warnings.filterwarnings("ignore", category=ConvergenceWarning)
+from statsmodels.tsa.statespace.sarimax import SARIMAX, SARIMAXResults
 
 MODEL_TYPE = "arima"
 
@@ -50,9 +46,12 @@ def _validate_ranges(n: int, ts: int, te: int, es: int, ee: int) -> None:
 
 def _fit_arima(
     y_train: np.ndarray, d: int, p: int, q: int, y_eval_true: np.ndarray
-) -> Tuple[Dict[str, Any], Any]:
+) -> Tuple[Dict[str, Any], SARIMAXResults | None]:
     """
     Fit ARIMA model with NumPy efficiency and return result dict and fitted object.
+
+    Returns:
+        Tuple of (result_dict, fitted_model) where fitted_model is None if fitting failed.
     """
     model = SARIMAX(
         y_train,
@@ -63,16 +62,32 @@ def _fit_arima(
         enforce_invertibility=True,
     )
     try:
-        res = model.fit(disp=False)
+        # Suppress convergence and user warnings during fitting to reduce noise
+        with warnings.catch_warnings():
+            warnings.filterwarnings("ignore", category=UserWarning)
+            warnings.filterwarnings("ignore", category=ConvergenceWarning)
+            res = model.fit(disp=False)
         converged = bool(getattr(res, "mle_retvals", {}).get("converged", True))
     except (ValueError, np.linalg.LinAlgError, RuntimeError) as e:
+        # Common failures: invalid parameters, singular matrix, numerical issues
         return {"p": p, "d": d, "q": q, "error": str(e)[:200], "converged": False}, None
-    except Exception as e:
+    except (AttributeError, TypeError, KeyError) as e:
+        # Data structure issues or model specification problems
         return {
             "p": p,
             "d": d,
             "q": q,
-            "error": f"Unexpected: {str(e)[:180]}",
+            "error": f"Data/spec error: {str(e)[:180]}",
+            "converged": False,
+        }, None
+    except Exception as e:
+        # Fallback for other statsmodels exceptions (e.g., optimization failures)
+        # We catch broadly here because statsmodels can raise various internal exceptions
+        return {
+            "p": p,
+            "d": d,
+            "q": q,
+            "error": f"Unexpected: {type(e).__name__}: {str(e)[:150]}",
             "converged": False,
         }, None
 
@@ -88,10 +103,10 @@ def _fit_arima(
         "p": p,
         "d": d,
         "q": q,
-        "rmse": rmse(y_eval_true.tolist(), y_pred.tolist()),
-        "mae": mae(y_eval_true.tolist(), y_pred.tolist()),
-        "mape": mape(y_eval_true.tolist(), y_pred.tolist()),
-        "r2": r2(y_eval_true.tolist(), y_pred.tolist()),
+        "rmse": rmse(y_eval_true, y_pred),
+        "mae": mae(y_eval_true, y_pred),
+        "mape": mape(y_eval_true, y_pred),
+        "r2": r2(y_eval_true, y_pred),
         "aic": aic,
         "converged": converged,
         "y_pred": y_pred,
@@ -100,16 +115,19 @@ def _fit_arima(
     return out, res
 
 
-def _determine_target_key(data_json_str: str) -> Tuple[str, str | None]:
+def _determine_target_key(data_json_str: str) -> Tuple[str, str | None, list]:
     """
     Determine the target key and time key from JSON data string.
+    Returns parsed records to avoid duplicate JSON parsing.
 
     Args:
         data_json_str: JSON string containing the data
 
     Returns:
-        Tuple of (target_key, time_key) where target_key is either "y" or "sales",
-        and time_key is "month" if present, else None
+        Tuple of (target_key, time_key, records) where:
+        - target_key is either "y" or "sales"
+        - time_key is "month" if present, else None
+        - records is the parsed JSON list
 
     Raises:
         ValueError: If data format is invalid or target key cannot be determined
@@ -130,7 +148,7 @@ def _determine_target_key(data_json_str: str) -> Tuple[str, str | None]:
             )
 
         time_key = "month" if "month" in first_record else None
-        return target_key, time_key
+        return target_key, time_key, temp_data
 
     except json.JSONDecodeError as e:
         raise ValueError(f"[DATA] Invalid JSON format: {e}")
@@ -147,15 +165,18 @@ def _search_pq(
     d: int,
     p_max: int,
     q_max: int,
-) -> Tuple[Dict[str, Any], Any, Dict[str, Any]]:
+) -> Tuple[Dict[str, Any], SARIMAXResults, Dict[str, Any]]:
     """
     Search over p=[0..p_max], q=[0..q_max] with fixed d.
-    Returns (best_result_dict, best_fitted_result, search_summary)
+
+    Returns:
+        Tuple of (best_result_dict, best_fitted_model, search_summary)
     """
     if len(y_train) <= d:
         raise ValueError(
             f"[VALIDATION] Training data length ({len(y_train)}) must be greater than d ({d})."
         )
+    # Warning about potentially small sample size (8 is a heuristic minimum for stable estimation)
     if len(y_train) < (8 + p_max + q_max):
         warnings.warn(
             f"Training sample ({len(y_train)}) may be too small for p_max={p_max}, q_max={q_max}.",
@@ -261,8 +282,8 @@ def _handle_training(args, pretty: bool) -> None:
             f"[VALIDATION] ARIMA training requires {', '.join('--' + k for k in missing)}"
         )
 
-    target_key, time_key = _determine_target_key(args.data)
-    data = parse_data_from_json(args.data, target_key=target_key, time_key=time_key)
+    target_key, time_key, records = _determine_target_key(args.data)
+    data = parse_data_from_json(records, target_key=target_key, time_key=time_key)
     y = data.y
     months = data.timestamps
     n = data.n_obs
@@ -468,17 +489,17 @@ def _handle_prediction(args, pretty: bool) -> None:
 
     if hasattr(args, "data") and args.data and have_eval_window:
         try:
-            target_key, _ = _determine_target_key(args.data)
-            data = parse_data_from_json(args.data, target_key=target_key)
+            target_key, time_key, records = _determine_target_key(args.data)
+            data = parse_data_from_json(records, target_key=target_key, time_key=time_key)
             y = data.y
             es, ee = int(args.eval_start), int(args.eval_end)
             y_true = y[es : ee + 1]
             if len(y_true) == len(y_pred):
                 out["metrics"] = {
-                    "rmse": rmse(y_true.tolist(), y_pred.tolist()),
-                    "mae": mae(y_true.tolist(), y_pred.tolist()),
-                    "mape": mape(y_true.tolist(), y_pred.tolist()),
-                    "r2": r2(y_true.tolist(), y_pred.tolist()),
+                    "rmse": rmse(y_true, y_pred),
+                    "mae": mae(y_true, y_pred),
+                    "mape": mape(y_true, y_pred),
+                    "r2": r2(y_true, y_pred),
                 }
             else:
                 out["metrics_error"] = (
