@@ -222,8 +222,10 @@ def run(args) -> None:
     if not hasattr(args, "data") or not args.data:
         raise ValueError("[VALIDATION] --data required for training.")
 
-    target_key = getattr(args, "target_key", "y")
-    time_key = getattr(args, "time_key", "month")  # Default to "month" for timestamps
+    target_key = getattr(
+        args, "target_key", "sales"
+    )  # Unified to "sales" like other models
+    time_key = getattr(args, "time_key", "month")  # Unified to "month"
     data = parse_data_from_json(args.data, target_key=target_key, time_key=time_key)
     sales, months = data.y.tolist(), data.timestamps or []
 

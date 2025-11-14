@@ -234,7 +234,7 @@ def run(args) -> None:
         raise ValueError("[VALIDATION] --data required.")
 
     normalization = getattr(args, "lstm_normalization", "zscore")
-    target_key = getattr(args, "lstm_target_feature", "y")
+    target_key = getattr(args, "lstm_target_feature", "sales")
     features = getattr(args, "lstm_features", [])
 
     # Parse data
