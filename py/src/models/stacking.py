@@ -17,6 +17,7 @@ import json
 from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
+import torch
 
 # Import utilities
 from data_utils import parse_data_from_json
@@ -47,6 +48,7 @@ def _train_base_models(
     base_predictions = {}
     base_models_data = {}
 
+    eval_steps = len(eval_range)
     for model_name in base_models:
         print(f"Training base model: {model_name}")
         if model_name == "ma":
@@ -76,14 +78,26 @@ def _train_base_models(
             base_predictions["arima"] = result["y_pred"].tolist()
         elif model_name == "lstm":
             params = base_params.get("lstm", {})
-            data = np.array(sales).reshape(-1, 1)
-            _, _, preds, _ = lstm_train(
+            # LSTM uses full train_range and forecasts eval_steps
+            data = np.array(sales[: train_range.stop]).reshape(-1, 1)
+            model, scaler, _, _ = lstm_train(
                 data,
                 lookback=params.get("lookback", 10),
-                epochs=params.get("epochs", 10),
+                epochs=params.get("epochs", 50),
                 normalization=params.get("normalization", "zscore"),
             )
-            base_predictions["lstm"] = preds
+            # Forecast eval_steps from last train point
+            recent = data[-params.get("lookback", 10) :]
+            current = recent.copy()
+            predictions = []
+            with torch.no_grad():
+                for _ in range(eval_steps):
+                    seq = torch.tensor(current, dtype=torch.float32).unsqueeze(0)
+                    pred_scaled = model(seq).item()
+                    pred_inv = scaler.inverse_transform([[pred_scaled]])[0, 0]
+                    predictions.append(pred_inv)
+                    current = np.vstack([current, [[pred_scaled]]])
+            base_predictions["lstm"] = predictions
         else:
             raise ValueError(f"[VALIDATION] Unsupported base model: {model_name}")
 
@@ -141,6 +155,13 @@ def train_and_evaluate(
     )
 
     # Train meta-model
+    # Ensure all predictions have the same length
+    for model, preds in base_predictions.items():
+        if len(preds) != len(y_eval_true):
+            raise ValueError(
+                f"[VALIDATION] Model {model} predictions length {len(preds)} != eval length {len(y_eval_true)}"
+            )
+
     meta_data = _train_meta_model(base_predictions, y_eval_true, meta_model)
 
     # Generate ensemble predictions
@@ -202,7 +223,8 @@ def run(args) -> None:
         raise ValueError("[VALIDATION] --data required for training.")
 
     target_key = getattr(args, "target_key", "y")
-    data = parse_data_from_json(args.data, target_key=target_key)
+    time_key = getattr(args, "time_key", "month")  # Default to "month" for timestamps
+    data = parse_data_from_json(args.data, target_key=target_key, time_key=time_key)
     sales, months = data.y.tolist(), data.timestamps or []
 
     ts, te = int(args.train_start), int(args.train_end)
