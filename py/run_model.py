@@ -1,0 +1,68 @@
+import argparse
+import sys
+import os
+
+# Add src/models to path to import model modules
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), 'src')))
+
+# Import all model modules
+from models import arima, es, lstm, ma, stacking, weighted_avg, boosting
+
+MODEL_MODULES = {
+    "arima": arima,
+    "es": es,
+    "ma": ma,
+    "lstm": lstm,
+    "stacking": stacking,
+    "weighted_avg": weighted_avg,
+    "boosting": boosting,
+}
+
+def main():
+    parser = argparse.ArgumentParser(description="Run a specified time series model.")
+    parser.add_argument("model_type", type=str, help="Type of model to run (e.g., arima, lstm)")
+    
+    # Add common arguments that all models might use
+    parser.add_argument("--data", type=str, help="JSON string of input data")
+    parser.add_argument("--train-start", type=int, help="Training data start index")
+    parser.add_argument("--train-end", type=int, help="Training data end index")
+    parser.add_argument("--eval-start", type=int, help="Evaluation data start index")
+    parser.add_argument("--eval-end", type=int, help="Evaluation data end index")
+    parser.add_argument("--save-model", type=str, help="Path to save the trained model")
+    parser.add_argument("--load-model", type=str, help="Path to load a trained model")
+    parser.add_argument("--forecast-steps", type=int, help="Number of steps to forecast")
+    parser.add_argument("--pretty", action="store_true", help="Pretty print JSON output")
+
+    # Add model-specific arguments (these will be parsed by the individual model's run function)
+    # MA
+    parser.add_argument("--window", type=int, help="MA window size")
+    # ES
+    parser.add_argument("--alpha", type=float, help="Exponential smoothing alpha value")
+    # ARIMA
+    parser.add_argument("--d", type=int, help="ARIMA differencing order")
+    parser.add_argument("--max-p", type=int, help="ARIMA max p order for auto_arima")
+    parser.add_argument("--max-q", type=int, help="ARIMA max q order for auto_arima")
+    # LSTM
+    parser.add_argument("--look-back", type=int, help="LSTM look back window")
+    parser.add_argument("--epochs", type=int, help="LSTM training epochs")
+    parser.add_argument("--feature-types", type=str, help="LSTM feature types as JSON string")
+    parser.add_argument("--lstm-features", type=str, help="LSTM comma-separated feature list")
+    parser.add_argument("--lstm-target-feature", type=str, help="LSTM target feature column name")
+    parser.add_argument("--normalization", type=str, choices=['minmax', 'zscore'], help="LSTM normalization method")
+    # Ensemble Models
+    parser.add_argument("--models", type=str, help="Comma-separated list of base models for stacking/weighted_avg")
+
+    # Parse args. We need to parse unknown args because each model's run function
+    # expects a Namespace object with all its specific args, even if not defined here.
+    args, unknown = parser.parse_known_args()
+
+    if args.model_type not in MODEL_MODULES:
+        raise ValueError(f"Unknown model type: {args.model_type}")
+
+    # Pass all parsed args (including unknown ones) to the specific model's run function
+    # The individual model's run function will then parse its specific args from this Namespace
+    model_module = MODEL_MODULES[args.model_type]
+    model_module.run(args)
+
+if __name__ == "__main__":
+    main()

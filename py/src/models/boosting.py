@@ -137,7 +137,7 @@ def train_and_evaluate(
             elif model_name == "lstm":
                  _, _, _, _, y_pred, _, _ = model_module["train"](
                     parsed_data, params.get("feature_types", {}), train_range, eval_range,
-                    params["look_back"], params["epochs"]
+                    params["look_back"], params["epochs"], params.get("normalization", "minmax")
                 )
 
             # Calculate weighted error

@@ -171,7 +171,7 @@ def train_and_evaluate(
         elif model_name == "lstm":
             _, model, preprocessor, _, y_pred, std_dev, history_df = model_module["train"](
                 parsed_data, params.get("feature_types", {}), train_range, eval_range,
-                params["look_back"], params["epochs"]
+                params["look_back"], params["epochs"], params.get("normalization", "minmax")
             )
             base_model_states[model_name] = {
                 "keras_model": model, "preprocessor": preprocessor, "look_back": params["look_back"],

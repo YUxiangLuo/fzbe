@@ -12,10 +12,11 @@ import pandas as pd
 from scipy.sparse import csr_matrix
 from sklearn.compose import ColumnTransformer
 from sklearn.pipeline import Pipeline
-from sklearn.preprocessing import MinMaxScaler, OneHotEncoder
+from sklearn.preprocessing import MinMaxScaler, OneHotEncoder, StandardScaler
 
 # Import shared utilities
 from data_utils import ParsedData, load_data_from_json
+from logger import log, get_log_contents
 from metrics import mae, mape, r2, rmse
 from serialization import dump_model, load_model
 
@@ -48,6 +49,10 @@ def _load_state(model_path: str) -> Dict[str, Any]:
         raise FileNotFoundError(f"Keras model file not found at {keras_model_path}")
     state["keras_model"] = keras_load_model(keras_model_path)
     
+    # Ensure normalization is loaded for predict function
+    if "normalization" not in state:
+        state["normalization"] = 'minmax' # Default to minmax if not found (for older models)
+
     return state
 
 
@@ -93,6 +98,7 @@ def predict(
     look_back = state["look_back"]
     history_df = state["history_df"]
     std_dev_residuals = state.get("std_dev_residuals", 0.0)
+    normalization = state.get("normalization", 'minmax') # Retrieve normalization method
     
     # The preprocessor expects a DataFrame, so we work with it
     scaled_history = preprocessor.transform(history_df)
@@ -147,6 +153,7 @@ def train_and_evaluate(
     eval_range: range,
     look_back: int,
     epochs: int,
+    normalization: str = 'minmax',
 ) -> Tuple[Dict[str, Any], Any, Any, List[float], List[float], float, pd.DataFrame]:
     """
     Trains and evaluates the LSTM model with typed features.
@@ -162,9 +169,16 @@ def train_and_evaluate(
     numeric_features = [k for k, v in feature_types.items() if v == 'numeric' and k != target_key]
     categorical_features = [k for k, v in feature_types.items() if v == 'categorical']
 
+    # Choose the scaler based on the normalization parameter
+    if normalization == 'zscore':
+        scaler = StandardScaler()
+    elif normalization == 'minmax':
+        scaler = MinMaxScaler(feature_range=(0, 1))
+    else:
+        raise ValueError(f"Unknown normalization method: {normalization}")
+
     # Create the preprocessing pipelines for numeric and categorical features
-    # The target variable is always treated as the first numeric feature
-    numeric_transformer = Pipeline(steps=[('scaler', MinMaxScaler(feature_range=(0, 1)))])
+    numeric_transformer = Pipeline(steps=[('scaler', scaler)])
     categorical_transformer = Pipeline(steps=[('onehot', OneHotEncoder(handle_unknown='ignore'))])
 
     # Create a column transformer to apply different transformations to different columns
@@ -241,14 +255,18 @@ def run(args) -> None:
     import tensorflow as tf
     tf.get_logger().setLevel('ERROR')
 
+    log.info(f"LSTM run started with args: {vars(args)}")
+
     pretty: bool = bool(getattr(args, "pretty", False))
     save_path = getattr(args, "save_model", None)
     load_path = getattr(args, "load_model", None)
 
     if load_path:
+        log.info(f"Entering prediction mode with model: {load_path}")
         state = _load_state(load_path)
         steps = int(getattr(args, "forecast_steps", 0))
         if steps <= 0:
+            log.error("forecast_steps must be > 0 for prediction mode.")
             raise ValueError("[VALIDATION] --forecast_steps must be > 0.")
 
         preds, std_dev = predict(load_path, steps, state=state)
@@ -263,92 +281,119 @@ def run(args) -> None:
             "forecast_steps": steps,
             "predictions": predictions_with_std,
         }
+        log.info("Prediction finished successfully.")
+        
+        # Add captured logs to the final output
+        out["logs"] = get_log_contents()
+        
         print(json.dumps(out, ensure_ascii=False, indent=2 if pretty else None))
         return
 
     # Training Mode
+    log.info("Entering training mode.")
     if not hasattr(args, "data") or not args.data:
+        log.error("--data is required for training.")
         raise ValueError("[VALIDATION] --data is required for training.")
 
     target_key = getattr(args, "lstm_target_feature", None)
-    feature_keys_arg = getattr(args, "lstm_features", None)
-    
-    try:
-        feature_types_str = getattr(args, "feature_types", "{}")
-        feature_types = json.loads(feature_types_str)
-    except json.JSONDecodeError:
-        raise ValueError("[VALIDATION] --feature_types is not a valid JSON string.")
+    feature_keys_str = getattr(args, "lstm_features", None)
+    feature_keys_list = [k.strip() for k in feature_keys_str.split(',')] if feature_keys_str else None
+    log.debug(f"Received target_key: {target_key}, feature_keys_str: {feature_keys_str}, parsed_list: {feature_keys_list}")
 
     try:
+        feature_types_str = getattr(args, "feature_types", None) or "{}"
+        feature_types = json.loads(feature_types_str)
+        log.debug(f"Received feature_types: {feature_types}")
+
         parsed_data = load_data_from_json(
-            args.data, target_key=target_key, feature_keys=feature_keys_arg
+            args.data, target_key=target_key, feature_keys=feature_keys_list
         )
         months = parsed_data.timestamps or [str(i) for i in range(parsed_data.n_obs)]
-    except (ValueError, TypeError, json.JSONDecodeError) as e:
-        raise ValueError(f"[DATA] Failed to parse --data: {e}")
 
-    # If feature_types is empty, infer from dataframe dtypes
-    if not feature_types:
-        for col in parsed_data.df.columns:
-            if col == parsed_data.target_key or col == parsed_data.time_key:
-                continue
-            if pd.api.types.is_numeric_dtype(parsed_data.df[col]):
-                feature_types[col] = 'numeric'
-            else:
-                feature_types[col] = 'categorical'
-    
-    # Add target key to feature_types if not present
-    if parsed_data.target_key not in feature_types:
-        feature_types[parsed_data.target_key] = 'numeric'
-
-
-    ts, te = int(args.train_start), int(args.train_end)
-    es, ee = int(args.eval_start), int(args.eval_end)
-    look_back = int(getattr(args, "look_back", getattr(args, "lookback", 10)))
-    epochs = int(args.epochs)
-
-    _validate_training_args(parsed_data, ts, te, es, ee, look_back)
-
-    metrics, model, preprocessor, y_true, y_pred, std_dev_residuals, history_df = train_and_evaluate(
-        parsed_data, feature_types, range(ts, te + 1), range(es, ee + 1), look_back, epochs
-    )
-
-    predictions_with_std = _format_predictions(y_pred, std_dev_residuals)
-
-    out: Dict[str, Any] = {
-        "mode": "lstm_train_eval",
-        "data_points": parsed_data.n_obs,
-        "target_key": parsed_data.target_key,
-        "feature_types": feature_types,
-        "look_back": look_back,
-        "epochs": epochs,
-        "train_range": {"start_index": ts, "end_index": te},
-        "evaluate_range": {"start_index": es, "end_index": ee},
-        "metrics": metrics,
-        "eval_y_true": y_true,
-        "predictions": predictions_with_std,
-    }
-
-    if save_path:
-        keras_model_path = os.path.splitext(save_path)[0] + "_keras_model.h5"
-        model.save(keras_model_path)
+        # If feature_types is empty, infer from dataframe dtypes
+        if not feature_types:
+            log.info("No feature_types provided, inferring from DataFrame.")
+            for col in parsed_data.df.columns:
+                time_key = parsed_data.time_key or '' 
+                if col == parsed_data.target_key or col == time_key:
+                    continue
+                if pd.api.types.is_numeric_dtype(parsed_data.df[col]):
+                    feature_types[col] = 'numeric'
+                else:
+                    feature_types[col] = 'categorical'
+            log.info(f"Inferred feature_types: {feature_types}")
         
-        state = {
-            "model_type": MODEL_TYPE,
+        if parsed_data.target_key not in feature_types:
+            feature_types[parsed_data.target_key] = 'numeric'
+            log.debug(f"Ensured target_key '{parsed_data.target_key}' is in feature_types.")
+
+        ts, te = int(args.train_start), int(args.train_end)
+        es, ee = int(args.eval_start), int(args.eval_end)
+        
+        look_back_arg = getattr(args, "look_back", None)
+        epochs_arg = getattr(args, "epochs", None)
+        
+        look_back = int(look_back_arg) if look_back_arg is not None else 10
+        epochs = int(epochs_arg) if epochs_arg is not None else 100
+        
+        normalization = getattr(args, "normalization", 'minmax')
+        log.debug(f"Training params: look_back={look_back}, epochs={epochs}, normalization='{normalization}'")
+
+        _validate_training_args(parsed_data, ts, te, es, ee, look_back)
+
+        log.info("Starting model training and evaluation...")
+        metrics, model, preprocessor, y_true, y_pred, std_dev_residuals, history_df = train_and_evaluate(
+            parsed_data, feature_types, range(ts, te + 1), range(es, ee + 1), look_back, epochs, normalization
+        )
+        log.info(f"Training finished. Metrics: {metrics}")
+
+        predictions_with_std = _format_predictions(y_pred, std_dev_residuals)
+
+        out: Dict[str, Any] = {
+            "mode": "lstm_train_eval",
+            "data_points": parsed_data.n_obs,
+            "target_key": parsed_data.target_key,
+            "feature_types": feature_types,
             "look_back": look_back,
             "epochs": epochs,
-            "train_end_index": te,
-            "preprocessor": preprocessor,
-            "history_df": history_df,
-            "target_key": parsed_data.target_key,
-            "feature_keys": parsed_data.feature_keys,
-            "keras_model_path": keras_model_path,
-            "std_dev_residuals": std_dev_residuals,
+            "normalization": normalization,
+            "train_range": {"start_index": ts, "end_index": te},
+            "evaluate_range": {"start_index": es, "end_index": ee},
+            "metrics": metrics,
+            "eval_y_true": y_true,
+            "predictions": predictions_with_std,
         }
-        dump_model(state, save_path)
-        out["saved_model"] = save_path
 
-    print(json.dumps(out, ensure_ascii=False, indent=2 if pretty else None))
+        if save_path:
+            log.info(f"Saving model to {save_path}")
+            keras_model_path = os.path.splitext(save_path)[0] + "_keras_model.h5"
+            model.save(keras_model_path)
+            
+            state = {
+                "model_type": MODEL_TYPE,
+                "look_back": look_back,
+                "epochs": epochs,
+                "normalization": normalization,
+                "train_end_index": te,
+                "preprocessor": preprocessor,
+                "history_df": history_df,
+                "target_key": parsed_data.target_key,
+                "feature_keys": parsed_data.feature_keys,
+                "keras_model_path": keras_model_path,
+                "std_dev_residuals": std_dev_residuals,
+            }
+            dump_model(state, save_path)
+            out["saved_model"] = save_path
+
+        # Add captured logs to the final output
+        out["logs"] = get_log_contents()
+
+        log.info("Run finished successfully.")
+        print(json.dumps(out, ensure_ascii=False, indent=2 if pretty else None))
+
+    except (ValueError, TypeError, json.JSONDecodeError, KeyError, FileNotFoundError) as e:
+        log.error(f"An error occurred during data processing or training: {e}", exc_info=True)
+        raise ValueError(f"[DATA] Failed to parse or process --data: {e}")
 
 
 def _validate_training_args(

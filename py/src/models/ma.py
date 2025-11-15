@@ -5,20 +5,20 @@ Moving Average (MA) time series forecasting model.
 """
 
 import json
-from collections import deque
 from typing import Any, Dict, List, Optional, Tuple, Union
 
 import numpy as np
+import pandas as pd
 
-# Type alias for input flexibility
-ArrayLike = Union[List[float], np.ndarray]
-
-# Import shared utilities
-from data_utils import load_data_from_json
+from data_utils import ParsedData, load_data_from_json
+from logger import log, get_log_contents
 from metrics import mae, mape, r2, rmse
 from serialization import dump_model, load_model
 
 MODEL_TYPE = "ma"
+
+# Type alias for input flexibility
+ArrayLike = Union[List[float], np.ndarray]
 
 
 # ---------- core ----------
@@ -202,6 +202,8 @@ def run(args) -> None:
             "forecast_steps": steps,
             "predictions": predictions_with_std,
         }
+        out["logs"] = get_log_contents()
+        log.info("Prediction finished successfully.")
         print(json.dumps(out, ensure_ascii=False, indent=2 if pretty else None))
         return
 
@@ -211,48 +213,54 @@ def run(args) -> None:
 
     try:
         parsed_data = load_data_from_json(args.data)
-        sales = parsed_data.y
-        months = parsed_data.timestamps or [str(i) for i in range(parsed_data.n_obs)]
-        value_key = parsed_data.target_key
-    except (ValueError, TypeError, json.JSONDecodeError) as e:
-        raise ValueError(f"[DATA] Failed to parse --data: {e}")
+        y = parsed_data.y
+        timestamps = parsed_data.timestamps or [str(i) for i in range(parsed_data.n_obs)]
+        log.info(f"Data loaded successfully. Number of observations: {parsed_data.n_obs}")
 
-    ts, te = int(args.train_start), int(args.train_end)
-    es, ee = int(args.eval_start), int(args.eval_end)
-    w = int(args.window)
+        ts, te = int(args.train_start), int(args.train_end)
+        es, ee = int(args.eval_start), int(args.eval_end)
 
-    _validate_training_args(sales, ts, te, es, ee, w)
+        window_arg = getattr(args, "window", None)
+        window = int(window_arg) if window_arg is not None else 3
+        log.debug(f"Training params: window={window}")
 
-    metrics, std_dev_residuals, y_true, y_pred = train_and_evaluate(
-        sales, months, range(ts, te + 1), range(es, ee + 1), w
-    )
+        _validate_training_args(y, ts, te, es, ee, window)
 
-    predictions_with_std = _format_predictions(y_pred.tolist(), std_dev_residuals)
+        log.info("Starting model training and evaluation...")
+        metrics, std_dev_residuals, y_true, y_pred = train_and_evaluate(
+            y, timestamps, range(ts, te + 1), range(es, ee + 1), window
+        )
 
-    out: Dict[str, Any] = {
-        "mode": "fixed_window_only",
-        "data_points": len(sales),
-        "train_range": {"start_index": ts, "end_index": te, "months": months[ts : te + 1]},
-        "evaluate_range": {"start_index": es, "end_index": ee, "months": months[es : ee + 1]},
-        "metrics": metrics,
-        "eval_y_true": y_true.tolist(),
-        "predictions": predictions_with_std, # Use the standardized key
-    }
+        predictions_with_std = _format_predictions(y_pred.tolist(), std_dev_residuals)
 
-    if save_path:
-        # Save only the last 'window' points needed for future predictions
-        # This is the minimum history required to compute the moving average
-        history_start = max(ts, te - w + 1)
-        history = sales[history_start : te + 1]
-        state = {
-            "model_type": MODEL_TYPE, "window": w, "train_end_index": te,
-            "history": history.tolist(), "value_key": value_key,
-            "std_dev_residuals": std_dev_residuals,
+        out: Dict[str, Any] = {
+            "mode": "fixed_window_only",
+            "data_points": len(y),
+            "train_range": {"start_index": ts, "end_index": te, "months": timestamps[ts : te + 1]},
+            "evaluate_range": {"start_index": es, "end_index": ee, "months": timestamps[es : ee + 1]},
+            "metrics": metrics,
+            "eval_y_true": y_true.tolist(),
+            "predictions": predictions_with_std,
         }
-        dump_model(state, save_path)
-        out["saved_model"] = save_path
 
-    print(json.dumps(out, ensure_ascii=False, indent=2 if pretty else None))
+        if save_path:
+            history_start = max(ts, te - window + 1)
+            history = y[history_start : te + 1]
+            state = {
+                "model_type": MODEL_TYPE, "window": window, "train_end_index": te,
+                "history": history.tolist(),
+                "std_dev_residuals": std_dev_residuals,
+            }
+            dump_model(state, save_path)
+            out["saved_model"] = save_path
+
+        out["logs"] = get_log_contents()
+        log.info("Run finished successfully.")
+        print(json.dumps(out, ensure_ascii=False, indent=2 if pretty else None))
+
+    except Exception as e:
+        log.error(f"An unexpected error occurred during MA training: {e}", exc_info=True)
+        raise ValueError(f"[DATA] Failed to parse or process --data: {e}")
 
 
 def _validate_training_args(sales: ArrayLike, ts: int, te: int, es: int, ee: int, w: int) -> None:

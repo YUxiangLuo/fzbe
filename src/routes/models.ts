@@ -31,20 +31,20 @@ const evalRangeSchema = z.object({
 // ========== Model Parameter Schemas ==========
 const modelParamsSchema = z.object({
   // MA
-  maWindow: z.coerce.number().int().min(1).optional(),
+  moving_average_window: z.coerce.number().int().min(1).optional(),
   // ES
-  esAlpha: z.coerce.number().min(0).max(1).optional(),
+  exponential_smoothing_alpha: z.coerce.number().min(0).max(1).optional(),
   // ARIMA (for auto-search)
   arimaD: z.coerce.number().int().min(0).optional(),
-  // ARIMA (for ensembles)
-  arimaOrder: z.string().regex(/^\d+,\d+,\d+$/).optional(),
   // LSTM
   lstmLookBack: z.coerce.number().int().min(1).optional(),
   lstmEpochs: z.coerce.number().int().min(1).optional(),
+  lstmFeatures: z.string().min(1).optional(), // Comma-separated
+  lstmTargetFeature: z.string().min(1).optional(),
   lstmFeatureTypes: z.string().optional(), // JSON string
+  lstmNormalization: z.enum(['minmax', 'zscore']).optional(),
   // Ensemble Models
   models: z.string().min(1).optional(),
-  modelChain: z.string().min(1).optional(),
 });
 
 // ========== Unified Training Schema ==========
@@ -76,17 +76,51 @@ const ALL_MODELS = [
 type ModelType = (typeof ALL_MODELS)[number];
 
 const modelParameterMappings: Record<ModelType, Record<string, string>> = {
-  ma: { maWindow: "window" },
-  es: { esAlpha: "alpha" },
-  arima: { arimaD: "d" },
+  ma: { moving_average_window: "window" },
+  es: { exponential_smoothing_alpha: "alpha" },
+  arima: { arimaD: "d" }, // arimaOrder for ensembles, arimaD for auto_arima
   lstm: { 
-    lstmLookBack: "lookBack", 
+    lstmLookBack: "look-back", 
     lstmEpochs: "epochs", 
-    lstmFeatureTypes: "featureTypes" 
+    lstmFeatures: "lstm-features",
+    lstmTargetFeature: "lstm-target-feature",
+    lstmFeatureTypes: "feature-types",
+    lstmNormalization: "normalization"
   },
   stacking: { models: "models" },
   weighted_avg: { models: "models" },
-  boosting: { modelChain: "modelChain" },
+  boosting: {}, // Boosting now uses generic 'models' param, but needs an entry for type safety
+};
+
+// Define all possible parameters that any model might use
+const allPossiblePythonParams: Record<string, string> = {
+  // Common
+  data: "data",
+  trainStart: "train-start",
+  trainEnd: "train-end",
+  evalStart: "eval-start",
+  evalEnd: "eval-end",
+  saveModel: "save-model",
+  loadModel: "load-model",
+  forecastSteps: "forecast-steps",
+  pretty: "pretty",
+  // MA
+  moving_average_window: "window",
+  // ES
+  exponential_smoothing_alpha: "alpha",
+  // ARIMA
+  arimaD: "d",
+  arimaMaxP: "max-p", // For auto_arima
+  arimaMaxQ: "max-q", // For auto_arima
+  // LSTM
+  lstmLookBack: "look-back",
+  lstmEpochs: "epochs",
+  lstmFeatures: "lstm-features",
+  lstmTargetFeature: "lstm-target-feature",
+  lstmFeatureTypes: "feature-types",
+  lstmNormalization: "normalization",
+  // Ensemble Models
+  models: "models", // For stacking, weighted_avg, and boosting
 };
 
 // ========== Helper Functions ==========
@@ -133,24 +167,28 @@ async function runPythonModel(
       ? path.join(pyDir, "venv", "Scripts", "python.exe")
       : path.join(pyDir, "venv", "bin", "python");
 
-  const scriptName = `run_${modelType}.py`;
-  const scriptPath = path.join(pyDir, scriptName);
+  // Use the unified entry script
+  const scriptPath = path.join(pyDir, "run_model.py");
 
   if (!fs.existsSync(scriptPath)) {
-    throw new Error(`Python script not found for model type: ${modelType}`);
+    throw new Error(`Python entry script not found: ${scriptPath}`);
   }
 
   // Convert camelCase params to kebab-case CLI arguments
   const args = Object.entries(params).flatMap(([key, value]) => {
-    const kebabKey = key.replace(/[A-Z]/g, (letter) => `-${letter.toLowerCase()}`);
-    const cliArg = `--${kebabKey}`;
+    // Use the predefined mapping for script keys
+    const scriptKey = allPossiblePythonParams[key] || key; // Fallback to original if not mapped
+    const cliArg = `--${scriptKey}`;
     if (typeof value === 'boolean') {
       return value ? [cliArg] : [];
     }
     return [cliArg, String(value)];
   });
 
-  const proc = Bun.spawn([pythonExec, scriptPath, ...args], {
+  // Prepend model_type to args
+  const fullArgs = [modelType, ...args];
+
+  const proc = Bun.spawn([pythonExec, scriptPath, ...fullArgs], {
     cwd: pyDir,
     stdout: "pipe",
     stderr: "pipe",
@@ -169,7 +207,7 @@ async function runPythonModel(
       await proc.exited;
 
       if (proc.exitCode !== 0) {
-        logger.error({ stderr, modelType, args }, "Python execution failed");
+        logger.error({ stderr, modelType, args: fullArgs }, "Python execution failed");
         const pythonErrorMessage = stderr.trim();
         if (pythonErrorMessage.startsWith("[VALIDATION]")) {
           reject(new Error(`[PYTHON_VALIDATION] ${pythonErrorMessage.substring(13).trim()}`));
@@ -182,7 +220,7 @@ async function runPythonModel(
         try {
           resolve(JSON.parse(stdout));
         } catch (e) {
-          logger.error({ stdout, modelType, args }, "Failed to parse python output");
+          logger.error({ stdout, modelType, args: fullArgs }, "Failed to parse python output");
           reject(new Error("Invalid output from python"));
         }
       }
@@ -208,6 +246,33 @@ async function runPythonModel(
 
   return Promise.race([executionPromise, timeoutPromise]);
 }
+
+// --- Result Transformers for Frontend Compatibility ---
+const resultTransformers: Record<ModelType, (result: any) => any> = {
+  arima: (result) => ({
+    best_order: result.best_order,
+    search_summary: result.search_summary, // Add search_summary here
+    // Keep diagnostics for ARIMA as it contains conf_int
+    diagnostics: result.diagnostics ? { ...result.diagnostics, y_pred_eval: result.predictions?.map((p: any) => p.prediction) || [] } : undefined,
+  }),
+  es: (result) => ({}), // No specific extra fields for ES
+  ma: (result) => ({}), // No specific extra fields for MA
+  lstm: (result) => ({
+    feature_types: result.feature_types,
+    diagnostics: result.diagnostics ? { ...result.diagnostics, y_pred_eval: result.predictions?.map((p: any) => p.prediction) || [] } : undefined,
+  }),
+  stacking: (result) => ({
+    model_names: result.models,
+  }),
+  weighted_avg: (result) => ({
+    model_names: result.models,
+    weights: result.models?.map((name: string) => result.weights[name]),
+  }),
+  boosting: (result) => ({
+    model_names: result.best_model_chain,
+    search_summary: result.search_summary,
+  }),
+};
 
 // ========== API Endpoints ==========
 export default (pool: Pool, JWT_SECRET: string) => {
@@ -254,7 +319,6 @@ export default (pool: Pool, JWT_SECRET: string) => {
           `../../py/trained_models/${studentId}_${modelType}.pkl`,
         );
 
-        // Dynamically build params for the python script
         const pythonParams: Record<string, any> = {
           data: JSON.stringify(allData),
           trainStart: body.data_window_train_start_index,
@@ -265,71 +329,34 @@ export default (pool: Pool, JWT_SECRET: string) => {
           pretty: true,
         };
 
-        // Add model-specific params
-        const paramMapping = modelParameterMappings[modelType];
-        for (const [bodyKey, scriptKey] of Object.entries(paramMapping)) {
+        // Dynamically add all relevant parameters from the body to pythonParams
+        for (const [bodyKey, scriptKey] of Object.entries(allPossiblePythonParams)) {
           if (body[bodyKey as keyof typeof body] !== undefined) {
             pythonParams[scriptKey] = body[bodyKey as keyof typeof body];
           }
         }
-        
-        // Add shared ensemble params (if any)
-        if (body.models) pythonParams.models = body.models;
-        if (body.modelChain) pythonParams.modelChain = body.modelChain;
-
-        // Add all base model params for ensembles
-        if (["stacking", "weighted_avg", "boosting"].includes(modelType)) {
-            if (body.maWindow) pythonParams.maWindow = body.maWindow;
-            if (body.esAlpha) pythonParams.esAlpha = body.esAlpha;
-            if (body.arimaOrder) pythonParams.arimaOrder = body.arimaOrder;
-            if (body.lstmLookBack) pythonParams.lstmLookBack = body.lstmLookBack;
-            if (body.lstmEpochs) pythonParams.lstmEpochs = body.lstmEpochs;
-            if (body.lstmFeatureTypes) pythonParams.lstmFeatureTypes = body.lstmFeatureTypes;
-        }
 
         const result = await runPythonModel(modelType, pythonParams, TRAINING_TIMEOUT);
 
-        // --- Data Transformation for Frontend Compatibility (Simplified) ---
-        const transformedResult: any = {
+        // --- Data Transformation for Frontend Compatibility ---
+        const baseResults = {
           metrics: result.metrics,
           eval_y_true: result.eval_y_true,
-          eval_predictions: result.predictions 
-            ? result.predictions.map((p: { prediction: number }) => p.prediction)
-            : [],
-          notes: [], // Always include empty notes
-          saved_model: result.saved_model || null,
+          eval_predictions: result.predictions?.map((p: any) => p.prediction) || [],
+          notes: result.notes || [],
+          saved_model: result.saved_model,
+          logs: result.logs, // <-- Add logs here
         };
 
-        if (modelType === 'arima') {
-          transformedResult.best_order = result.best_order;
-          // Keep diagnostics for ARIMA as it contains conf_int
-          if (result.diagnostics) {
-            transformedResult.diagnostics = result.diagnostics;
-            transformedResult.diagnostics.y_pred_eval = transformedResult.eval_predictions;
-          }
-        }
-
-        if (modelType === 'weighted_avg') {
-          if (result.models && result.weights) {
-            const modelList = result.models;
-            transformedResult.model_names = modelList;
-            transformedResult.weights = modelList.map((name: string) => result.weights[name]);
-          }
-        }
-        
-        // For other ensembles, if model_names is desired for consistency
-        if (modelType === 'stacking' && result.models) {
-            transformedResult.model_names = result.models;
-        }
-        if (modelType === 'boosting' && result.model_chain) {
-            transformedResult.model_names = result.model_chain;
-        }
+        const modelSpecificTransformedResult = resultTransformers[modelType]?.(result) || {};
+        const finalTransformedResult = { ...baseResults, ...modelSpecificTransformedResult };
 
         const finalResponse: { status: string; results: any; inferred_feature_types?: any } = {
           status: "success",
-          results: transformedResult,
+          results: finalTransformedResult,
         };
 
+        // Special handling for LSTM inferred feature types (if present)
         if (modelType === 'lstm' && result.feature_types) {
           finalResponse.inferred_feature_types = result.feature_types;
         }

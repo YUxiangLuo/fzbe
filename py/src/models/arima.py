@@ -11,6 +11,7 @@ import numpy as np
 import pmdarima as pm
 
 from data_utils import ParsedData, load_data_from_json
+from logger import log, get_log_contents
 from metrics import mae, mape, r2, rmse
 from serialization import dump_model, load_model
 
@@ -180,14 +181,17 @@ def run(args) -> None:
     """
     Main entry point for ARIMA model training and prediction.
     """
+    log.info(f"ARIMA run started with args: {vars(args)}")
     pretty: bool = bool(getattr(args, "pretty", False))
     save_path = getattr(args, "save_model", None)
     load_path = getattr(args, "load_model", None)
 
     if load_path:
+        log.info(f"Entering prediction mode with model: {load_path}")
         state = _load_state(load_path)
         steps = int(getattr(args, "forecast_steps", 0))
         if steps <= 0:
+            log.error("forecast_steps must be > 0 for prediction mode.")
             raise ValueError("[VALIDATION] --forecast_steps must be > 0 for prediction mode.")
 
         preds, conf_int = predict(load_path, steps, state=state)
@@ -199,26 +203,35 @@ def run(args) -> None:
             "forecast_steps": steps,
             "predictions": predictions_with_std,
         }
+        out["logs"] = get_log_contents()
+        log.info("Prediction finished successfully.")
         print(json.dumps(out, ensure_ascii=False, indent=2 if pretty else None))
         return
 
     # Training Mode
+    log.info("Entering training mode.")
     if not hasattr(args, "data") or not args.data:
+        log.error("--data is required for training.")
         raise ValueError("[VALIDATION] --data is required for training.")
 
     try:
         parsed_data = load_data_from_json(args.data)
         y = parsed_data.y
         timestamps = parsed_data.timestamps or [str(i) for i in range(parsed_data.n_obs)]
+        log.info(f"Data loaded successfully. Number of observations: {parsed_data.n_obs}")
     except (ValueError, TypeError, json.JSONDecodeError) as e:
+        log.error(f"Failed to parse --data: {e}", exc_info=True)
         raise ValueError(f"[DATA] Failed to parse --data: {e}")
 
     ts, te = int(args.train_start), int(args.train_end)
     es, ee = int(args.eval_start), int(args.eval_end)
     d = int(args.d)
 
-    max_p = int(getattr(args, "max_p", 5))
-    max_q = int(getattr(args, "max_q", 5))
+    max_p_arg = getattr(args, "max_p", None)
+    max_q_arg = getattr(args, "max_q", None)
+    max_p = int(max_p_arg) if max_p_arg is not None else 5
+    max_q = int(max_q_arg) if max_q_arg is not None else 5
+    log.debug(f"Training params: d={d}, max_p={max_p}, max_q={max_q}")
 
     if not (0 <= ts <= te < len(y)):
         raise ValueError(f"[VALIDATION] Invalid train range: [{ts},{te}]")
@@ -227,9 +240,12 @@ def run(args) -> None:
     if es <= te:
         raise ValueError("[VALIDATION] eval_start must be > train_end.")
 
+    log.info("Starting model training and evaluation...")
     metrics, best_model, best_order, search_summary, y_true, y_pred, conf_int = train_and_evaluate(
         y, timestamps, range(ts, te + 1), range(es, ee + 1), d, max_p, max_q
     )
+    log.info(f"Training finished. Best order: {best_order}, Metrics: {metrics}")
+    log.debug(f"Search summary: {search_summary}")
 
     predictions_with_std = _format_predictions(y_pred, conf_int)
 
@@ -247,6 +263,7 @@ def run(args) -> None:
     }
 
     if save_path:
+        log.info(f"Saving model to {save_path}")
         state = {
             "model_type": MODEL_TYPE,
             "model": best_model,
@@ -256,4 +273,6 @@ def run(args) -> None:
         dump_model(state, save_path)
         out["saved_model"] = save_path
 
+    out["logs"] = get_log_contents()
+    log.info("Run finished successfully.")
     print(json.dumps(out, ensure_ascii=False, indent=2 if pretty else None))

@@ -224,7 +224,7 @@ def train_and_evaluate(
             # LSTM returns: (metrics, model, preprocessor, y_true, y_pred, std_dev, history_df)
             metrics, model, preprocessor, y_true, y_pred, std_dev, history_df = model_module["train"](
                 parsed_data, params["feature_types"], train_range, eval_range,
-                params["look_back"], params["epochs"]
+                params["look_back"], params["epochs"], params.get("normalization", "minmax")
             )
             # Save Keras model to a permanent location (not temp file)
             # The path will be derived from the final save_path in run()
