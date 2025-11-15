@@ -8,6 +8,7 @@ Uses subprocess to call base models for consistency with API behavior.
 """
 import json
 import os
+import sys
 import tempfile
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -190,10 +191,10 @@ def train_and_evaluate(
     level0_train_range = range(train_range.start, train_range.start + level0_split)
     level1_train_range = range(train_range.start + level0_split, train_range.stop)
 
-    print(f"[Stacking] 数据划分:")
-    print(f"  Level-0 训练集: {level0_train_range} ({len(level0_train_range)} points)")
-    print(f"  Level-1 训练集 (元模型): {level1_train_range} ({len(level1_train_range)} points)")
-    print(f"  评估集: {eval_range} ({len(eval_range)} points)")
+    print(f"[Stacking] 数据划分:", file=sys.stderr)
+    print(f"  Level-0 训练集: {level0_train_range} ({len(level0_train_range)} points)", file=sys.stderr)
+    print(f"  Level-1 训练集 (元模型): {level1_train_range} ({len(level1_train_range)} points)", file=sys.stderr)
+    print(f"  评估集: {eval_range} ({len(eval_range)} points)", file=sys.stderr)
 
     # Convert parsed_data to list of dicts for subprocess
     data_dicts = []
@@ -206,7 +207,7 @@ def train_and_evaluate(
         data_dicts.append(row)
 
     # === Step 2: Phase 1 - Train base models on level0, predict on level1 ===
-    print(f"\n[Stacking Phase 1] 训练基础模型（level0）并生成level1预测")
+    print(f"\n[Stacking Phase 1] 训练基础模型（level0）并生成level1预测", file=sys.stderr)
     level1_predictions = []
 
     for model_name in models_to_use:
@@ -216,7 +217,7 @@ def train_and_evaluate(
         params_phase1 = params.copy()
         # Don't save phase1 models
 
-        print(f"  训练 {model_name} 在 level0，预测 level1...")
+        print(f"  训练 {model_name} 在 level0，预测 level1...", file=sys.stderr)
         result = run_base_model_subprocess(
             model_type=model_name,
             data=data_dicts,
@@ -230,19 +231,19 @@ def train_and_evaluate(
 
         y_pred_level1 = extract_predictions_from_result(result)
         level1_predictions.append(y_pred_level1)
-        print(f"    ✓ 生成 {len(y_pred_level1)} 个level1预测")
+        print(f"    ✓ 生成 {len(y_pred_level1)} 个level1预测", file=sys.stderr)
 
     # === Step 3: Train meta-model on level1 predictions ===
-    print(f"\n[Stacking Phase 2] 训练元模型（在level1预测上）")
+    print(f"\n[Stacking Phase 2] 训练元模型（在level1预测上）", file=sys.stderr)
     X_meta_train = np.array(level1_predictions).T  # ✅ level1的out-of-fold预测
     y_meta_train = parsed_data.y[level1_train_range]  # ✅ level1的标签
 
     meta_model = LinearRegression()
     meta_model.fit(X_meta_train, y_meta_train)  # ✅ 在独立的level1集上训练
-    print(f"  ✓ 元模型训练完成 (输入维度: {X_meta_train.shape})")
+    print(f"  ✓ 元模型训练完成 (输入维度: {X_meta_train.shape})", file=sys.stderr)
 
     # === Step 4: Phase 2 - Retrain base models on full train_range ===
-    print(f"\n[Stacking Phase 3] 在完整训练集上重新训练基础模型")
+    print(f"\n[Stacking Phase 3] 在完整训练集上重新训练基础模型", file=sys.stderr)
     eval_predictions = []
     base_model_states = {}
 
@@ -260,7 +261,7 @@ def train_and_evaluate(
         params_with_save = params.copy()
         params_with_save["save_model"] = temp_model_file
 
-        print(f"  重新训练 {model_name} 在完整train_range，预测eval_range...")
+        print(f"  重新训练 {model_name} 在完整train_range，预测eval_range...", file=sys.stderr)
         # Run base model in subprocess on FULL train_range
         result = run_base_model_subprocess(
             model_type=model_name,
@@ -282,10 +283,10 @@ def train_and_evaluate(
             "model_file": temp_model_file,  # Will be relocated in run() if saved
             "params": params,
         }
-        print(f"    ✓ 生成 {len(y_pred_eval)} 个eval预测")
+        print(f"    ✓ 生成 {len(y_pred_eval)} 个eval预测", file=sys.stderr)
 
     # === Step 5: Final prediction and evaluation on eval_range ===
-    print(f"\n[Stacking Phase 4] 元模型最终预测和评估")
+    print(f"\n[Stacking Phase 4] 元模型最终预测和评估", file=sys.stderr)
     X_meta_eval = np.array(eval_predictions).T  # ✅ eval_range的预测
     y_pred_final = meta_model.predict(X_meta_eval)  # ✅ 元模型在独立测试集上预测
     y_true_final = parsed_data.y[eval_range]  # ✅ 真实标签
@@ -302,7 +303,7 @@ def train_and_evaluate(
         "r2": r2(y_true_final, y_pred_final),
     }
 
-    print(f"  ✓ 评估完成: RMSE={metrics['rmse']:.4f}, R²={metrics['r2']:.4f}")
+    print(f"  ✓ 评估完成: RMSE={metrics['rmse']:.4f}, R²={metrics['r2']:.4f}", file=sys.stderr)
 
     return metrics, base_model_states, meta_model, y_true_final.tolist(), y_pred_final.tolist(), std_dev_residuals
 

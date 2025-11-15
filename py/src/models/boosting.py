@@ -7,6 +7,7 @@ Uses subprocess to call base models for consistency with API behavior.
 """
 import json
 import os
+import sys
 import tempfile
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -118,10 +119,10 @@ def train_and_evaluate(
     boost_train_range = range(train_range.start, train_range.start + boost_split)
     boost_val_range = range(train_range.start + boost_split, train_range.stop)
 
-    print(f"[Boosting] 数据划分:")
-    print(f"  Boost Train Range: {boost_train_range} ({len(boost_train_range)} points)")
-    print(f"  Boost Val Range: {boost_val_range} ({len(boost_val_range)} points)")
-    print(f"  Eval Range: {eval_range} ({len(eval_range)} points)")
+    print(f"[Boosting] 数据划分:", file=sys.stderr)
+    print(f"  Boost Train Range: {boost_train_range} ({len(boost_train_range)} points)", file=sys.stderr)
+    print(f"  Boost Val Range: {boost_val_range} ({len(boost_val_range)} points)", file=sys.stderr)
+    print(f"  Eval Range: {eval_range} ({len(eval_range)} points)", file=sys.stderr)
 
     y_true_val = parsed_data.y[boost_val_range]
     sample_weights = np.ones(len(boost_val_range)) / len(boost_val_range)
@@ -144,7 +145,7 @@ def train_and_evaluate(
         data_dicts.append(row)
 
     # === Step 2: Greedy Forward Selection (using boost_train and boost_val) ===
-    print(f"\n[Boosting Phase 1] Greedy selection on boost_val")
+    print(f"\n[Boosting Phase 1] Greedy selection on boost_val", file=sys.stderr)
     for stage in range(len(models_to_use)):
         stage_results = []
 
@@ -221,7 +222,7 @@ def train_and_evaluate(
             break
 
     # === Step 3: Re-train final model chain on full train_range and evaluate on eval_range ===
-    print(f"\n[Boosting Phase 2] Retraining on full train_range and final evaluation")
+    print(f"\n[Boosting Phase 2] Retraining on full train_range and final evaluation", file=sys.stderr)
     best_states = {}
     final_eval_preds = np.zeros(len(eval_range))
     total_weight = sum(best_model_weights.values())
