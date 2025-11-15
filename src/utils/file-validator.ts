@@ -55,7 +55,7 @@ function validateExtension(fileName: string, fileType: FileType): void {
     throw new FileValidationError("File has no extension");
   }
 
-  if (!allowedExts.includes(ext as any)) {
+  if (!(allowedExts as readonly string[]).includes(ext)) {
     throw new FileValidationError(
       `Invalid file extension "${ext}". Allowed: ${allowedExts.join(", ")}`
     );
@@ -74,8 +74,9 @@ function validateMimeType(mimeType: string, fileType: FileType): void {
 
   // Check if MIME type matches any allowed pattern
   const isValid = allowedMimes.some((allowed) => {
+    const subtype = allowed.split("/")[1];
     // Exact match or contains check for flexibility
-    return mimeType === allowed || mimeType.includes(allowed.split("/")[1]);
+    return mimeType === allowed || (subtype && mimeType.includes(subtype));
   });
 
   if (!isValid) {

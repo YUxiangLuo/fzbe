@@ -165,8 +165,13 @@ function parseHTML(html: string): ParsedTag[] {
     }
 
     const fullTag = match[0];
-    const tagName = match[1].toLowerCase();
-    const attributesStr = match[2];
+    const tagName = match[1]?.toLowerCase();
+    const attributesStr = match[2] || "";
+
+    if (!tagName) {
+      lastIndex = tagRegex.lastIndex;
+      continue;
+    }
 
     // Parse tag type
     if (fullTag.startsWith("</")) {
@@ -205,7 +210,11 @@ function parseAttributes(attrStr: string): Record<string, string> {
   let match;
 
   while ((match = attrRegex.exec(attrStr)) !== null) {
-    attributes[match[1]] = match[2];
+    const key = match[1];
+    const value = match[2];
+    if (key && value !== undefined) {
+      attributes[key] = value;
+    }
   }
 
   return attributes;
