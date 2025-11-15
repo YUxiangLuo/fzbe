@@ -96,19 +96,42 @@ def train_and_evaluate(
     parsed_data: ParsedData, train_range: range, eval_range: range,
     models_to_use: List[str], model_params: Dict[str, Any]
 ) -> Tuple[Dict[str, Any], List[str], Dict[str, Any], Dict[str, float], List[float], List[float], float, Dict[str, Any]]:
-    """Trains and evaluates the AdaBoost model with Greedy Forward Selection using subprocess calls."""
+    """
+    Trains and evaluates the AdaBoost model with Greedy Forward Selection using a correct hold-out approach.
 
-    y_true_eval = parsed_data.y[eval_range]
-    sample_weights = np.ones(len(eval_range)) / len(eval_range)
+    Correct Boosting Flow:
+    1. Split train_range into boost_train (80%) and boost_val (20%).
+    2. Perform Greedy Forward Selection on boost_val:
+        - Train base models on boost_train, predict on boost_val.
+        - Select best model and calculate its weight based on boost_val error.
+        - Update sample weights based on boost_val error.
+    3. Retrain the selected model chain on the full train_range.
+    4. Evaluate the final ensemble on the independent eval_range.
+    """
+
+    # === Step 1: Split train_range into boost_train and boost_val ===
+    train_len = len(train_range)
+    if train_len < 5:
+        raise ValueError("[VALIDATION] train_range too small for boosting (需要至少5个点)")
+
+    boost_split = max(3, int(train_len * 0.8))
+    boost_train_range = range(train_range.start, train_range.start + boost_split)
+    boost_val_range = range(train_range.start + boost_split, train_range.stop)
+
+    print(f"[Boosting] 数据划分:")
+    print(f"  Boost Train Range: {boost_train_range} ({len(boost_train_range)} points)")
+    print(f"  Boost Val Range: {boost_val_range} ({len(boost_val_range)} points)")
+    print(f"  Eval Range: {eval_range} ({len(eval_range)} points)")
+
+    y_true_val = parsed_data.y[boost_val_range]
+    sample_weights = np.ones(len(boost_val_range)) / len(boost_val_range)
 
     best_chain = []
-    best_states = {}
     best_model_weights = {}
-    best_overall_preds = np.zeros(len(eval_range))
-    best_overall_rmse = float('inf')
+    best_overall_preds_val = np.zeros(len(boost_val_range))
+    best_overall_rmse_val = float('inf')
 
     search_summary = {"stages": []}
-
     available_models = list(models_to_use)
 
     # Convert parsed_data to list of dicts for subprocess
@@ -120,80 +143,67 @@ def train_and_evaluate(
                 row[feat_key] = float(parsed_data.df.iloc[i][feat_key])
         data_dicts.append(row)
 
+    # === Step 2: Greedy Forward Selection (using boost_train and boost_val) ===
+    print(f"\n[Boosting Phase 1] Greedy selection on boost_val")
     for stage in range(len(models_to_use)):
         stage_results = []
 
         for model_name in available_models:
-            # Train model using subprocess
             params = model_params[model_name]
-
             result = run_base_model_subprocess(
                 model_type=model_name,
                 data=data_dicts,
-                train_start=train_range.start,
-                train_end=train_range.stop - 1,
-                eval_start=eval_range.start,
-                eval_end=eval_range.stop - 1,
+                train_start=boost_train_range.start,
+                train_end=boost_train_range.stop - 1,
+                eval_start=boost_val_range.start,
+                eval_end=boost_val_range.stop - 1,
                 model_params=params,
                 timeout=120,
             )
-
-            # Extract predictions
-            y_pred = extract_predictions_from_result(result)
-
-            # Calculate weighted error
-            errors = np.abs(np.array(y_pred) - y_true_eval)
+            y_pred_val = extract_predictions_from_result(result)
+            errors = np.abs(np.array(y_pred_val) - y_true_val)
             weighted_error = np.sum(sample_weights * errors)
-            
-            # Clip error to prevent division by zero or log of negative
             weighted_error = min(weighted_error, 0.999)
             
             stage_results.append({
                 "model_name": model_name,
                 "weighted_error": weighted_error,
-                "predictions": y_pred
+                "predictions": y_pred_val
             })
 
-        # Find the best model for this stage
         best_model_this_stage = min(stage_results, key=lambda x: x["weighted_error"])
         winner_name = best_model_this_stage["model_name"]
         
-        # Calculate model weight (beta)
         beta = best_model_this_stage["weighted_error"] / (1 - best_model_this_stage["weighted_error"] + 1e-9)
         model_weight = np.log(1 / (beta + 1e-9))
 
-        # Update overall predictions
-        current_preds = np.array(best_model_this_stage["predictions"])
+        current_preds_val = np.array(best_model_this_stage["predictions"])
         
-        # Weighted median for aggregation
-        temp_preds = best_overall_preds.copy()
+        temp_preds_val = best_overall_preds_val.copy()
         if stage > 0:
-             temp_preds = (temp_preds * sum(best_model_weights.values()) + current_preds * model_weight) / (sum(best_model_weights.values()) + model_weight)
+             temp_preds_val = (temp_preds_val * sum(best_model_weights.values()) + current_preds_val * model_weight) / (sum(best_model_weights.values()) + model_weight)
         else:
-            temp_preds = current_preds
+            temp_preds_val = current_preds_val
 
-        temp_rmse = rmse(y_true_eval, temp_preds)
+        temp_rmse_val = rmse(y_true_val, temp_preds_val)
 
-        # Greedy selection: only add if it improves the overall model
-        if temp_rmse < best_overall_rmse:
-            best_overall_rmse = temp_rmse
-            best_overall_preds = temp_preds
+        if temp_rmse_val < best_overall_rmse_val:
+            best_overall_rmse_val = temp_rmse_val
+            best_overall_preds_val = temp_preds_val
             best_chain.append(winner_name)
             best_model_weights[winner_name] = model_weight
             
-            # Update sample weights for the next iteration
-            errors = np.abs(current_preds - y_true_eval)
+            errors = np.abs(current_preds_val - y_true_val)
             normalized_errors = errors / (np.max(errors) + 1e-9)
             sample_weights *= np.power(beta, 1 - normalized_errors)
             sample_weights /= np.sum(sample_weights)
 
-            # Log to summary
             stage_summary = {
                 "stage": stage + 1,
                 "candidates": {r["model_name"]: r["weighted_error"] for r in stage_results},
                 "winner": winner_name,
                 "model_weight": model_weight,
-                "chain_rmse": temp_rmse,
+                "chain_rmse_on_val": temp_rmse_val,
                 "action": "Model Added"
             }
         else:
@@ -201,28 +211,36 @@ def train_and_evaluate(
                 "stage": stage + 1,
                 "candidates": {r["model_name"]: r["weighted_error"] for r in stage_results},
                 "winner": winner_name,
-                "action": "Model Skipped (did not improve RMSE)"
+                "action": "Model Skipped (did not improve validation RMSE)"
             }
 
         search_summary["stages"].append(stage_summary)
-        available_models.remove(winner_name)
+        if winner_name in available_models:
+            available_models.remove(winner_name)
+        if not available_models:
+            break
 
-    # After search, re-train the winning models and save them for prediction
+    # === Step 3: Re-train final model chain on full train_range and evaluate on eval_range ===
+    print(f"\n[Boosting Phase 2] Retraining on full train_range and final evaluation")
+    best_states = {}
+    final_eval_preds = np.zeros(len(eval_range))
+    total_weight = sum(best_model_weights.values())
+
+    if not best_chain: # Handle case where no models were added
+        y_true_eval = parsed_data.y[eval_range]
+        metrics = {"rmse": float('inf'), "mae": float('inf'), "mape": float('inf'), "r2": float('-inf')}
+        return metrics, [], {}, {}, y_true_eval.tolist(), [0.0] * len(y_true_eval), 0.0, search_summary
+
     for model_name in best_chain:
         params = model_params[model_name]
-
-        # Create a temporary file for this base model
         temp_model_file = os.path.join(
             tempfile.gettempdir(),
             f"boosting_base_{model_name}_{os.getpid()}.pkl"
         )
-
-        # Add save_model to params for subprocess
         params_with_save = params.copy()
         params_with_save["save_model"] = temp_model_file
 
-        # Re-train using subprocess
-        run_base_model_subprocess(
+        result = run_base_model_subprocess(
             model_type=model_name,
             data=data_dicts,
             train_start=train_range.start,
@@ -232,23 +250,24 @@ def train_and_evaluate(
             model_params=params_with_save,
             timeout=120,
         )
+        
+        y_pred_eval = extract_predictions_from_result(result)
+        final_eval_preds += np.array(y_pred_eval) * (best_model_weights[model_name] / total_weight)
 
-        # Store the model file path
         best_states[model_name] = {
             "model_type": model_name,
             "model_file": temp_model_file,
             "params": params,
         }
 
+    y_true_eval = parsed_data.y[eval_range]
+    metrics = {"rmse": rmse(y_true_eval, final_eval_preds), "mae": mae(y_true_eval, final_eval_preds),
+               "mape": mape(y_true_eval, final_eval_preds), "r2": r2(y_true_eval, final_eval_preds)}
 
-    metrics = {"rmse": best_overall_rmse, "mae": mae(y_true_eval, best_overall_preds),
-               "mape": mape(y_true_eval, best_overall_preds), "r2": r2(y_true_eval, best_overall_preds)}
-
-    # Calculate standard deviation of the final residuals
-    final_residuals = y_true_eval - best_overall_preds
+    final_residuals = y_true_eval - final_eval_preds
     std_dev_residuals = float(np.std(final_residuals, ddof=1)) if len(final_residuals) > 1 else 0.0
 
-    return metrics, best_chain, best_states, best_model_weights, y_true_eval.tolist(), best_overall_preds.tolist(), std_dev_residuals, search_summary
+    return metrics, best_chain, best_states, best_model_weights, y_true_eval.tolist(), final_eval_preds.tolist(), std_dev_residuals, search_summary
 
 
 # ---------- public entry ----------

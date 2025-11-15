@@ -162,19 +162,38 @@ def train_and_evaluate(
     models_to_use: List[str],
     model_params: Dict[str, Any],
 ) -> Tuple[Dict[str, Any], Dict[str, Any], Any, List[float], List[float], float]:
-    """Trains and evaluates the Stacking model using subprocess calls.
+    """Trains and evaluates the Stacking model using the correct hold-out approach.
+
+    Correct Stacking Flow (教科书式):
+    1. Split train_range into level0_train (80%) and level1_train (20%)
+    2. Train base models on level0_train, predict on level1_train
+    3. Train meta-model on level1_train predictions (out-of-fold)
+    4. Retrain base models on full train_range
+    5. Evaluate on independent eval_range
 
     Returns:
         metrics: Evaluation metrics dictionary
         base_model_states: States of all base models (for saving/loading)
         meta_model: Trained meta-model (LinearRegression)
-        y_true: True values
-        y_pred: Predicted values
+        y_true: True values from eval_range
+        y_pred: Predicted values on eval_range
         std_dev_residuals: Standard deviation of residuals
     """
 
-    base_model_predictions = []
-    base_model_states = {}
+    # === Step 1: Split train_range into level0 and level1 ===
+    # This prevents data leakage: meta-model trains on "unseen" level1 predictions
+    train_len = len(train_range)
+    if train_len < 5:
+        raise ValueError("[VALIDATION] train_range too small for stacking (需要至少5个点)")
+
+    level0_split = max(3, int(train_len * 0.8))  # At least 3 points for level0
+    level0_train_range = range(train_range.start, train_range.start + level0_split)
+    level1_train_range = range(train_range.start + level0_split, train_range.stop)
+
+    print(f"[Stacking] 数据划分:")
+    print(f"  Level-0 训练集: {level0_train_range} ({len(level0_train_range)} points)")
+    print(f"  Level-1 训练集 (元模型): {level1_train_range} ({len(level1_train_range)} points)")
+    print(f"  评估集: {eval_range} ({len(eval_range)} points)")
 
     # Convert parsed_data to list of dicts for subprocess
     data_dicts = []
@@ -186,7 +205,47 @@ def train_and_evaluate(
                 row[feat_key] = float(parsed_data.df.iloc[i][feat_key])
         data_dicts.append(row)
 
-    # --- Level 0: Train base models using subprocess ---
+    # === Step 2: Phase 1 - Train base models on level0, predict on level1 ===
+    print(f"\n[Stacking Phase 1] 训练基础模型（level0）并生成level1预测")
+    level1_predictions = []
+
+    for model_name in models_to_use:
+        params = model_params[model_name]
+
+        # We don't save models from phase 1 (temporary training)
+        params_phase1 = params.copy()
+        # Don't save phase1 models
+
+        print(f"  训练 {model_name} 在 level0，预测 level1...")
+        result = run_base_model_subprocess(
+            model_type=model_name,
+            data=data_dicts,
+            train_start=level0_train_range.start,
+            train_end=level0_train_range.stop - 1,
+            eval_start=level1_train_range.start,  # ✅ 在level1上预测（out-of-fold）
+            eval_end=level1_train_range.stop - 1,
+            model_params=params_phase1,
+            timeout=120,
+        )
+
+        y_pred_level1 = extract_predictions_from_result(result)
+        level1_predictions.append(y_pred_level1)
+        print(f"    ✓ 生成 {len(y_pred_level1)} 个level1预测")
+
+    # === Step 3: Train meta-model on level1 predictions ===
+    print(f"\n[Stacking Phase 2] 训练元模型（在level1预测上）")
+    X_meta_train = np.array(level1_predictions).T  # ✅ level1的out-of-fold预测
+    y_meta_train = parsed_data.y[level1_train_range]  # ✅ level1的标签
+
+    meta_model = LinearRegression()
+    meta_model.fit(X_meta_train, y_meta_train)  # ✅ 在独立的level1集上训练
+    print(f"  ✓ 元模型训练完成 (输入维度: {X_meta_train.shape})")
+
+    # === Step 4: Phase 2 - Retrain base models on full train_range ===
+    print(f"\n[Stacking Phase 3] 在完整训练集上重新训练基础模型")
+    eval_predictions = []
+    base_model_states = {}
+
     for model_name in models_to_use:
         params = model_params[model_name]
 
@@ -201,21 +260,21 @@ def train_and_evaluate(
         params_with_save = params.copy()
         params_with_save["save_model"] = temp_model_file
 
-        # Run base model in subprocess
+        print(f"  重新训练 {model_name} 在完整train_range，预测eval_range...")
+        # Run base model in subprocess on FULL train_range
         result = run_base_model_subprocess(
             model_type=model_name,
             data=data_dicts,
-            train_start=train_range.start,
-            train_end=train_range.stop - 1,  # range.stop is exclusive, but indices are inclusive
-            eval_start=eval_range.start,
+            train_start=train_range.start,  # ✅ 完整训练集
+            train_end=train_range.stop - 1,
+            eval_start=eval_range.start,  # ✅ 独立评估集
             eval_end=eval_range.stop - 1,
             model_params=params_with_save,
-            timeout=120,  # 2 minutes per base model
+            timeout=120,
         )
 
-        # Extract predictions from subprocess result
-        y_pred = extract_predictions_from_result(result)
-        base_model_predictions.append(y_pred)
+        y_pred_eval = extract_predictions_from_result(result)
+        eval_predictions.append(y_pred_eval)
 
         # Store the model file path and parameters
         base_model_states[model_name] = {
@@ -223,27 +282,27 @@ def train_and_evaluate(
             "model_file": temp_model_file,  # Will be relocated in run() if saved
             "params": params,
         }
+        print(f"    ✓ 生成 {len(y_pred_eval)} 个eval预测")
 
-    # --- Level 1: Train meta-model ---
-    X_meta_train = np.array(base_model_predictions).T
-    y_meta_train = parsed_data.y[eval_range]
-
-    meta_model = LinearRegression()
-    meta_model.fit(X_meta_train, y_meta_train)
-
-    y_pred_final = meta_model.predict(X_meta_train)
-    y_true_final = y_meta_train
+    # === Step 5: Final prediction and evaluation on eval_range ===
+    print(f"\n[Stacking Phase 4] 元模型最终预测和评估")
+    X_meta_eval = np.array(eval_predictions).T  # ✅ eval_range的预测
+    y_pred_final = meta_model.predict(X_meta_eval)  # ✅ 元模型在独立测试集上预测
+    y_true_final = parsed_data.y[eval_range]  # ✅ 真实标签
 
     # Calculate residuals and standard deviation
     residuals = y_true_final - y_pred_final
     std_dev_residuals = float(np.std(residuals, ddof=1)) if len(residuals) > 1 else 0.0
 
+    # ✅ 在独立的eval_range上计算指标
     metrics = {
         "rmse": rmse(y_true_final, y_pred_final),
         "mae": mae(y_true_final, y_pred_final),
         "mape": mape(y_true_final, y_pred_final),
         "r2": r2(y_true_final, y_pred_final),
     }
+
+    print(f"  ✓ 评估完成: RMSE={metrics['rmse']:.4f}, R²={metrics['r2']:.4f}")
 
     return metrics, base_model_states, meta_model, y_true_final.tolist(), y_pred_final.tolist(), std_dev_residuals
 

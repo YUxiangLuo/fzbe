@@ -134,11 +134,35 @@ def train_and_evaluate(
     models_to_use: List[str],
     model_params: Dict[str, Any],
 ) -> Tuple[Dict[str, Any], Dict[str, Any], Dict[str, float], List[float], List[float], float]:
-    """Trains and evaluates the Weighted Average model using subprocess calls."""
+    """Trains and evaluates the Weighted Average model using Inverse Variance Weighting.
 
-    base_model_predictions = {}
-    base_model_states = {}
-    y_true = parsed_data.y[eval_range]
+    Correct Inverse Variance Weighting Flow (教科书式):
+    1. Split train_range into weight_train (80%) and weight_val (20%)
+    2. Train base models on weight_train, predict on weight_val
+    3. Calculate weights using weight_val residuals: w_i = 1 / (var_i + eps)
+    4. Retrain base models on full train_range
+    5. Evaluate weighted combination on independent eval_range
+
+    Algorithm: Inverse Variance Weighting
+    - weight_i = 1 / (variance_i + epsilon)
+    - normalized_weight_i = weight_i / sum(weight_j)
+    - final_prediction = sum(normalized_weight_i * prediction_i)
+    """
+
+    # === Step 1: Split train_range into weight_train and weight_val ===
+    # This prevents data leakage: weights are calculated on "unseen" weight_val predictions
+    train_len = len(train_range)
+    if train_len < 5:
+        raise ValueError("[VALIDATION] train_range too small for weighted average (需要至少5个点)")
+
+    weight_split = max(3, int(train_len * 0.8))  # At least 3 points for weight_train
+    weight_train_range = range(train_range.start, train_range.start + weight_split)
+    weight_val_range = range(train_range.start + weight_split, train_range.stop)
+
+    print(f"[Weighted Average] 数据划分:")
+    print(f"  权重训练集: {weight_train_range} ({len(weight_train_range)} points)")
+    print(f"  权重验证集 (计算权重): {weight_val_range} ({len(weight_val_range)} points)")
+    print(f"  评估集: {eval_range} ({len(eval_range)} points)")
 
     # Convert parsed_data to list of dicts for subprocess
     data_dicts = []
@@ -150,7 +174,57 @@ def train_and_evaluate(
                 row[feat_key] = float(parsed_data.df.iloc[i][feat_key])
         data_dicts.append(row)
 
-    # Train base models using subprocess
+    # === Step 2: Phase 1 - Train on weight_train, predict on weight_val ===
+    print(f"\n[Weighted Average Phase 1] 训练基础模型并生成权重验证集预测")
+    weight_val_predictions = {}
+
+    for model_name in models_to_use:
+        params = model_params[model_name]
+        params_phase1 = params.copy()  # Don't save phase1 models
+
+        print(f"  训练 {model_name} 在 weight_train，预测 weight_val...")
+        result = run_base_model_subprocess(
+            model_type=model_name,
+            data=data_dicts,
+            train_start=weight_train_range.start,
+            train_end=weight_train_range.stop - 1,
+            eval_start=weight_val_range.start,  # ✅ 在weight_val上预测（用于计算权重）
+            eval_end=weight_val_range.stop - 1,
+            model_params=params_phase1,
+            timeout=120,
+        )
+
+        y_pred_val = extract_predictions_from_result(result)
+        weight_val_predictions[model_name] = y_pred_val
+        print(f"    ✓ 生成 {len(y_pred_val)} 个weight_val预测")
+
+    # === Step 3: Calculate weights using Inverse Variance Weighting ===
+    print(f"\n[Weighted Average Phase 2] 计算权重（Inverse Variance Weighting）")
+    y_true_val = parsed_data.y[weight_val_range]  # ✅ weight_val的真实值
+    weights = {}
+    total_inverse_variance = 0.0
+
+    print(f"  方差计算 (基于weight_val残差):")
+    for name in models_to_use:
+        # ✅ 使用weight_val的残差计算方差（避免泄露）
+        residuals = y_true_val - np.array(weight_val_predictions[name])
+        variance = np.var(residuals)
+        inverse_variance = 1.0 / (variance + 1e-9)  # ✅ 保持原有算法
+        weights[name] = inverse_variance
+        total_inverse_variance += inverse_variance
+        print(f"    {name}: variance={variance:.6f}, inverse_variance={inverse_variance:.6f}")
+
+    # Normalize weights
+    print(f"  权重归一化:")
+    for name in models_to_use:
+        weights[name] /= total_inverse_variance  # ✅ 保持原有归一化算法
+        print(f"    {name}: normalized_weight={weights[name]:.6f}")
+
+    # === Step 4: Phase 2 - Retrain on full train_range, predict on eval_range ===
+    print(f"\n[Weighted Average Phase 3] 在完整训练集上重新训练基础模型")
+    eval_predictions = {}
+    base_model_states = {}
+
     for model_name in models_to_use:
         params = model_params[model_name]
 
@@ -164,21 +238,21 @@ def train_and_evaluate(
         params_with_save = params.copy()
         params_with_save["save_model"] = temp_model_file
 
-        # Run base model in subprocess
+        print(f"  重新训练 {model_name} 在完整train_range，预测eval_range...")
+        # Run base model in subprocess on FULL train_range
         result = run_base_model_subprocess(
             model_type=model_name,
             data=data_dicts,
-            train_start=train_range.start,
+            train_start=train_range.start,  # ✅ 完整训练集
             train_end=train_range.stop - 1,
-            eval_start=eval_range.start,
+            eval_start=eval_range.start,  # ✅ 独立评估集
             eval_end=eval_range.stop - 1,
             model_params=params_with_save,
             timeout=120,
         )
 
-        # Extract predictions from subprocess result
-        y_pred = extract_predictions_from_result(result)
-        base_model_predictions[model_name] = y_pred
+        y_pred_eval = extract_predictions_from_result(result)
+        eval_predictions[model_name] = y_pred_eval
 
         # Store the model file path and parameters
         base_model_states[model_name] = {
@@ -186,30 +260,27 @@ def train_and_evaluate(
             "model_file": temp_model_file,
             "params": params,
         }
+        print(f"    ✓ 生成 {len(y_pred_eval)} 个eval预测")
 
-    weights = {}
-    total_inverse_variance = 0
-    for name in models_to_use:
-        residuals = y_true - np.array(base_model_predictions[name])
-        variance = np.var(residuals)
-        inverse_variance = 1 / (variance + 1e-9)
-        weights[name] = inverse_variance
-        total_inverse_variance += inverse_variance
-        
-    for name in models_to_use:
-        weights[name] /= total_inverse_variance
-
-    X_eval = np.array([base_model_predictions[name] for name in models_to_use]).T
+    # === Step 5: Final weighted prediction and evaluation on eval_range ===
+    print(f"\n[Weighted Average Phase 4] 加权组合和最终评估")
+    X_eval = np.array([eval_predictions[name] for name in models_to_use]).T  # ✅ eval_range的预测
     model_weights = np.array([weights[name] for name in models_to_use])
-    y_pred_final = np.sum(X_eval * model_weights, axis=1)
+    y_pred_final = np.sum(X_eval * model_weights, axis=1)  # ✅ 加权组合（保持原有算法）
 
+    y_true = parsed_data.y[eval_range]  # ✅ 真实标签
     residuals_final = y_true - y_pred_final
     std_dev_residuals = float(np.std(residuals_final, ddof=1)) if len(residuals_final) > 1 else 0.0
 
+    # ✅ 在独立的eval_range上计算指标
     metrics = {
-        "rmse": rmse(y_true, y_pred_final), "mae": mae(y_true, y_pred_final),
-        "mape": mape(y_true, y_pred_final), "r2": r2(y_true, y_pred_final),
+        "rmse": rmse(y_true, y_pred_final),
+        "mae": mae(y_true, y_pred_final),
+        "mape": mape(y_true, y_pred_final),
+        "r2": r2(y_true, y_pred_final),
     }
+
+    print(f"  ✓ 评估完成: RMSE={metrics['rmse']:.4f}, R²={metrics['r2']:.4f}")
 
     return metrics, base_model_states, weights, y_true.tolist(), y_pred_final.tolist(), std_dev_residuals
 
