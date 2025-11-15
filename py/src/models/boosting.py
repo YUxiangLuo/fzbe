@@ -2,9 +2,12 @@
 # -*- coding: utf-8 -*-
 """
 AdaBoost-style ensemble with Greedy Forward Selection for automatic chain building.
+
+Uses subprocess to call base models for consistency with API behavior.
 """
 import json
 import os
+import tempfile
 from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
@@ -13,18 +16,9 @@ import numpy as np
 from data_utils import ParsedData, load_data_from_json
 from metrics import mae, mape, r2, rmse
 from serialization import dump_model, load_model
-
-# Import base model functions
-from . import arima, es, lstm, ma
+from subprocess_utils import run_base_model_subprocess, run_base_model_predict_subprocess, extract_predictions_from_result
 
 MODEL_TYPE = "boosting"
-
-MODEL_DISPATCHER = {
-    "arima": {"train": arima.train_and_evaluate, "predict": arima.predict},
-    "es": {"train": es.train_and_evaluate, "predict": es.predict},
-    "ma": {"train": ma.train_and_evaluate, "predict": ma.predict},
-    "lstm": {"train": lstm.train_and_evaluate, "predict": lstm.predict},
-}
 
 
 # ---------- utilities ----------
@@ -47,10 +41,14 @@ def _validate_training_args(
 ) -> None:
     """Validate training and evaluation parameters."""
     n = parsed_data.n_obs
+
+    # Supported base models
+    SUPPORTED_BASE_MODELS = ["ma", "es", "arima", "lstm"]
+
     if not models_to_use:
         raise ValueError("[VALIDATION] models_to_use cannot be empty.")
     for name in models_to_use:
-        if name not in MODEL_DISPATCHER:
+        if name not in SUPPORTED_BASE_MODELS:
             raise ValueError(f"[VALIDATION] Unknown model: {name}")
     if not (0 <= ts <= te < n and 0 <= es <= ee < n and es > te):
         raise ValueError("[VALIDATION] Invalid train/eval ranges.")
@@ -61,10 +59,10 @@ def _validate_training_args(
 def predict(
     model_path: str, steps: int, state: Optional[Dict[str, Any]] = None
 ) -> Tuple[List[float], float]:
-    """Forecast using a saved AdaBoost model."""
+    """Forecast using a saved AdaBoost model with subprocess calls."""
     if steps <= 0:
         raise ValueError("[VALIDATION] steps must be > 0 for forecasting.")
-    
+
     state = state or _load_state(model_path)
     model_chain = state["model_chain"]
     base_model_states = state["base_model_states"]
@@ -75,14 +73,19 @@ def predict(
     total_weight = sum(model_weights.values())
 
     for model_name in model_chain:
-        model_module = MODEL_DISPATCHER[model_name]
         model_state = base_model_states[model_name]
-        
-        if model_name == "lstm" and "keras_model" not in model_state:
-            from tensorflow.keras.models import load_model as keras_load_model
-            model_state["keras_model"] = keras_load_model(model_state["keras_model_path"])
+        model_file = model_state["model_file"]
 
-        preds, _ = model_module["predict"](model_path=None, steps=steps, state=model_state)
+        # Use subprocess to predict
+        result = run_base_model_predict_subprocess(
+            model_type=model_name,
+            model_file=model_file,
+            forecast_steps=steps,
+            timeout=60,
+        )
+
+        # Extract predictions
+        preds = extract_predictions_from_result(result)
         final_predictions += np.array(preds) * (model_weights[model_name] / total_weight)
 
     return final_predictions.tolist(), std_dev_residuals
@@ -93,52 +96,50 @@ def train_and_evaluate(
     parsed_data: ParsedData, train_range: range, eval_range: range,
     models_to_use: List[str], model_params: Dict[str, Any]
 ) -> Tuple[Dict[str, Any], List[str], Dict[str, Any], Dict[str, float], List[float], List[float], float, Dict[str, Any]]:
-    """Trains and evaluates the AdaBoost model with Greedy Forward Selection."""
-    
+    """Trains and evaluates the AdaBoost model with Greedy Forward Selection using subprocess calls."""
+
     y_true_eval = parsed_data.y[eval_range]
     sample_weights = np.ones(len(eval_range)) / len(eval_range)
-    
+
     best_chain = []
     best_states = {}
     best_model_weights = {}
     best_overall_preds = np.zeros(len(eval_range))
     best_overall_rmse = float('inf')
-    
+
     search_summary = {"stages": []}
-    
+
     available_models = list(models_to_use)
-    
+
+    # Convert parsed_data to list of dicts for subprocess
+    data_dicts = []
+    for i in range(parsed_data.n_obs):
+        row = {parsed_data.target_key: float(parsed_data.y[i])}
+        if parsed_data.feature_keys:
+            for feat_key in parsed_data.feature_keys:
+                row[feat_key] = float(parsed_data.df.iloc[i][feat_key])
+        data_dicts.append(row)
+
     for stage in range(len(models_to_use)):
         stage_results = []
-        
-        for model_name in available_models:
-            # This is a simplified AdaBoost for regression (AdaBoost.R2)
-            # We train on original data, but evaluate using sample_weights
-            
-            model_module = MODEL_DISPATCHER[model_name]
-            params = model_params[model_name]
-            y_pred = []
 
-            # Train model and get predictions on eval set
-            if model_name == "arima":
-                _, model, order, _, _, y_pred, _ = model_module["train"](
-                    parsed_data.y, parsed_data.timestamps, train_range, eval_range,
-                    params["d"], params.get("max_p", 5), params.get("max_q", 5)
-                )
-            elif model_name == "es":
-                _, _, _, _, y_pred = model_module["train"](
-                    parsed_data.y, parsed_data.timestamps, train_range, eval_range, params["alpha"]
-                )
-            elif model_name == "ma":
-                _, _, _, y_pred_arr = model_module["train"](
-                    parsed_data.y, parsed_data.timestamps, train_range, eval_range, params["window"]
-                )
-                y_pred = y_pred_arr.tolist()
-            elif model_name == "lstm":
-                 _, _, _, _, y_pred, _, _ = model_module["train"](
-                    parsed_data, params.get("feature_types", {}), train_range, eval_range,
-                    params["look_back"], params["epochs"], params.get("normalization", "minmax")
-                )
+        for model_name in available_models:
+            # Train model using subprocess
+            params = model_params[model_name]
+
+            result = run_base_model_subprocess(
+                model_type=model_name,
+                data=data_dicts,
+                train_start=train_range.start,
+                train_end=train_range.stop - 1,
+                eval_start=eval_range.start,
+                eval_end=eval_range.stop - 1,
+                model_params=params,
+                timeout=120,
+            )
+
+            # Extract predictions
+            y_pred = extract_predictions_from_result(result)
 
             # Calculate weighted error
             errors = np.abs(np.array(y_pred) - y_true_eval)
@@ -206,11 +207,38 @@ def train_and_evaluate(
         search_summary["stages"].append(stage_summary)
         available_models.remove(winner_name)
 
-    # After search, re-train the winning models to get their final states for saving
+    # After search, re-train the winning models and save them for prediction
     for model_name in best_chain:
-        # This is a simplification; in a full implementation, you'd retrain.
-        # For now, we'll just create dummy states as the logic is complex.
-        best_states[model_name] = {"params": model_params[model_name]}
+        params = model_params[model_name]
+
+        # Create a temporary file for this base model
+        temp_model_file = os.path.join(
+            tempfile.gettempdir(),
+            f"boosting_base_{model_name}_{os.getpid()}.pkl"
+        )
+
+        # Add save_model to params for subprocess
+        params_with_save = params.copy()
+        params_with_save["save_model"] = temp_model_file
+
+        # Re-train using subprocess
+        run_base_model_subprocess(
+            model_type=model_name,
+            data=data_dicts,
+            train_start=train_range.start,
+            train_end=train_range.stop - 1,
+            eval_start=eval_range.start,
+            eval_end=eval_range.stop - 1,
+            model_params=params_with_save,
+            timeout=120,
+        )
+
+        # Store the model file path
+        best_states[model_name] = {
+            "model_type": model_name,
+            "model_file": temp_model_file,
+            "params": params,
+        }
 
 
     metrics = {"rmse": best_overall_rmse, "mae": mae(y_true_eval, best_overall_preds),
@@ -243,15 +271,59 @@ def run(args) -> None:
     ts, te = int(args.train_start), int(args.train_end)
     es, ee = int(args.eval_start), int(args.eval_end)
     models_to_use = [model.strip() for model in args.models.split(',')]
-    
-    model_params = {
-        "arima": {"d": int(args.arima_d)},
-        "es": {"alpha": float(args.es_alpha)},
-        "ma": {"window": int(args.ma_window)},
-        "lstm": {"look_back": int(args.lstm_look_back), "epochs": int(args.lstm_epochs),
-                 "feature_types": json.loads(getattr(args, "lstm_feature_types", "{}"))}
-    }
-    
+
+    # Build model_params from the arguments passed by models.ts
+    # models.ts sends: --d, --alpha, --window, --look-back, --epochs, --feature-types, etc.
+    def get_arg(name, default, cast_type=None):
+        """Safely get argument with default value"""
+        val = getattr(args, name.replace("-", "_"), None)
+        if val is None:
+            return default
+        if cast_type:
+            return cast_type(val)
+        return val
+
+    model_params = {}
+
+    if "arima" in models_to_use:
+        model_params["arima"] = {
+            "d": get_arg("d", 0, int),
+            "max_p": get_arg("max_p", 5, int),
+            "max_q": get_arg("max_q", 5, int)
+        }
+
+    if "es" in models_to_use:
+        model_params["es"] = {"alpha": get_arg("alpha", 0.5, float)}
+
+    if "ma" in models_to_use:
+        model_params["ma"] = {"window": get_arg("window", 3, int)}
+
+    if "lstm" in models_to_use:
+        # Try to get feature_types from the argument
+        feature_types_str = get_arg("feature_types", None)
+        if feature_types_str:
+            feature_types = json.loads(feature_types_str)
+        else:
+            # If feature_types not provided, try to infer from lstm-features
+            lstm_features_str = get_arg("lstm_features", None)
+            target_feature = get_arg("lstm_target_feature", "y")
+
+            if lstm_features_str:
+                # Build feature_types from feature list
+                feature_names = [f.strip() for f in lstm_features_str.split(',')]
+                feature_types = {feat: "numeric" for feat in feature_names}
+                feature_types[target_feature] = "numeric"
+            else:
+                # Use auto-detection
+                feature_types = {}
+
+        model_params["lstm"] = {
+            "look_back": get_arg("look_back", 3, int),
+            "epochs": get_arg("epochs", 10, int),
+            "feature_types": feature_types,
+            "normalization": get_arg("normalization", "minmax")
+        }
+
     _validate_training_args(parsed_data, ts, te, es, ee, models_to_use, model_params)
 
     metrics, chain, states, weights, y_true, y_pred, std_dev, summary = train_and_evaluate(
@@ -269,9 +341,33 @@ def run(args) -> None:
     }
 
     if save_path:
-        # A full implementation would need to properly save/load trained model objects
-        # This is a simplified placeholder
-        state = {"model_type": MODEL_TYPE, "model_chain": chain, 
+        import shutil
+
+        # Move base model files from temp to permanent location
+        base_dir = os.path.dirname(save_path)
+        base_name = os.path.splitext(os.path.basename(save_path))[0]
+
+        for model_name, model_state in states.items():
+            temp_file = model_state["model_file"]
+
+            # Define permanent location
+            perm_file = os.path.join(base_dir, f"{base_name}_base_{model_name}.pkl")
+
+            # Move file from temp to permanent
+            if os.path.exists(temp_file):
+                shutil.move(temp_file, perm_file)
+
+                # Also move LSTM Keras model if it exists
+                if model_name == "lstm":
+                    temp_keras = os.path.splitext(temp_file)[0] + "_lstm_keras_model.h5"
+                    if os.path.exists(temp_keras):
+                        perm_keras = os.path.join(base_dir, f"{base_name}_base_{model_name}_keras.h5")
+                        shutil.move(temp_keras, perm_keras)
+
+            # Update state with permanent path
+            model_state["model_file"] = perm_file
+
+        state = {"model_type": MODEL_TYPE, "model_chain": chain,
                  "base_model_states": states, "model_weights": weights, "std_dev_residuals": std_dev}
         dump_model(state, save_path)
         out["saved_model"] = save_path

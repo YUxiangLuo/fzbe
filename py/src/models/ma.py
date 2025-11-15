@@ -5,6 +5,7 @@ Moving Average (MA) time series forecasting model.
 """
 
 import json
+from collections import deque
 from typing import Any, Dict, List, Optional, Tuple, Union
 
 import numpy as np

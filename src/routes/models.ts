@@ -10,6 +10,7 @@ import { handleUnexpectedError } from "../utils/error-handler";
 import logger from "../logger";
 
 const TRAINING_TIMEOUT = 30000;
+const ENSEMBLE_TRAINING_TIMEOUT = 120000; // 2 minutes for ensemble models
 
 // ========== Common Schemas ==========
 const baseDataSchema = z.object({
@@ -36,6 +37,8 @@ const modelParamsSchema = z.object({
   exponential_smoothing_alpha: z.coerce.number().min(0).max(1).optional(),
   // ARIMA (for auto-search)
   arimaD: z.coerce.number().int().min(0).optional(),
+  arimaMaxP: z.coerce.number().int().min(1).optional(),
+  arimaMaxQ: z.coerce.number().int().min(1).optional(),
   // LSTM
   lstmLookBack: z.coerce.number().int().min(1).optional(),
   lstmEpochs: z.coerce.number().int().min(1).optional(),
@@ -89,7 +92,7 @@ const modelParameterMappings: Record<ModelType, Record<string, string>> = {
   },
   stacking: { models: "models" },
   weighted_avg: { models: "models" },
-  boosting: {}, // Boosting now uses generic 'models' param, but needs an entry for type safety
+  boosting: { models: "models" }
 };
 
 // Define all possible parameters that any model might use
@@ -336,7 +339,10 @@ export default (pool: Pool, JWT_SECRET: string) => {
           }
         }
 
-        const result = await runPythonModel(modelType, pythonParams, TRAINING_TIMEOUT);
+        // Use longer timeout for ensemble models
+        const isEnsembleModel = ["stacking", "weighted_avg", "boosting"].includes(modelType);
+        const timeout = isEnsembleModel ? ENSEMBLE_TRAINING_TIMEOUT : TRAINING_TIMEOUT;
+        const result = await runPythonModel(modelType, pythonParams, timeout);
 
         // --- Data Transformation for Frontend Compatibility ---
         const baseResults = {
@@ -364,7 +370,9 @@ export default (pool: Pool, JWT_SECRET: string) => {
         return c.json(finalResponse);
       } catch (error: any) {
         if (error.message.includes("timed out")) {
-          return c.json({ error: "Training timed out after 30 seconds" }, 504);
+          const isEnsembleModel = ["stacking", "weighted_avg", "boosting"].includes(modelType);
+          const timeoutSeconds = isEnsembleModel ? 120 : 30;
+          return c.json({ error: `Training timed out after ${timeoutSeconds} seconds` }, 504);
         }
         if (error.message.startsWith("[PYTHON_VALIDATION]")) {
           return c.json({ error: error.message.substring(20) }, 400);
@@ -411,16 +419,13 @@ export default (pool: Pool, JWT_SECRET: string) => {
 
         const result = await runPythonModel(modelType, pythonParams);
 
-        // --- Data Transformation for Frontend Compatibility ---
-        const transformedResult = { ...result };
-        if (transformedResult.predictions && Array.isArray(transformedResult.predictions)) {
-          transformedResult.forecasts = transformedResult.predictions.map(
-            (p: { prediction: number }) => p.prediction
-          );
-          delete transformedResult.predictions;
-        }
-
-        return c.json({ status: "success", results: transformedResult });
+        // Return predictions with std_dev
+        return c.json({
+          status: "success",
+          results: {
+            predictions: result.predictions || []
+          }
+        });
       } catch (error: any) {
         const message = error instanceof Error ? error.message : `${modelType.toUpperCase()} prediction failed`;
         return handleUnexpectedError(c, error, message);
