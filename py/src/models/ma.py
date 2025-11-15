@@ -222,7 +222,13 @@ def run(args) -> None:
         es, ee = int(args.eval_start), int(args.eval_end)
 
         window_arg = getattr(args, "window", None)
-        window = int(window_arg) if window_arg is not None else 3
+        if window_arg is not None:
+            window = int(window_arg)
+        else:
+            # Auto-select window based on training data size (for educational small datasets)
+            train_size = te - ts + 1
+            window = max(2, min(3, train_size // 3))
+            log.info(f"Auto-selected window={window} based on train_size={train_size}")
         log.debug(f"Training params: window={window}")
 
         _validate_training_args(y, ts, te, es, ee, window)

@@ -329,14 +329,26 @@ def run(args) -> None:
 
         ts, te = int(args.train_start), int(args.train_end)
         es, ee = int(args.eval_start), int(args.eval_end)
-        
+
         look_back_arg = getattr(args, "look_back", None)
         epochs_arg = getattr(args, "epochs", None)
-        
-        look_back = int(look_back_arg) if look_back_arg is not None else 10
-        epochs = int(epochs_arg) if epochs_arg is not None else 100
-        
-        normalization = getattr(args, "normalization", 'minmax')
+
+        # Auto-select look_back and epochs based on training data size (for educational small datasets)
+        train_size = te - ts + 1
+        if look_back_arg is not None:
+            look_back = int(look_back_arg)
+        else:
+            look_back = max(2, min(3, train_size // 3))
+            log.info(f"Auto-selected look_back={look_back} based on train_size={train_size}")
+
+        if epochs_arg is not None:
+            epochs = int(epochs_arg)
+        else:
+            epochs = 50 if train_size <= 15 else 100
+            log.info(f"Auto-selected epochs={epochs} based on train_size={train_size}")
+
+        normalization_arg = getattr(args, "normalization", None)
+        normalization = normalization_arg if normalization_arg is not None else 'minmax'
         log.debug(f"Training params: look_back={look_back}, epochs={epochs}, normalization='{normalization}'")
 
         _validate_training_args(parsed_data, ts, te, es, ee, look_back)

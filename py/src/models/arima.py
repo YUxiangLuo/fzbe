@@ -229,8 +229,18 @@ def run(args) -> None:
 
     max_p_arg = getattr(args, "max_p", None)
     max_q_arg = getattr(args, "max_q", None)
-    max_p = int(max_p_arg) if max_p_arg is not None else 5
-    max_q = int(max_q_arg) if max_q_arg is not None else 5
+
+    if max_p_arg is not None and max_q_arg is not None:
+        max_p = int(max_p_arg)
+        max_q = int(max_q_arg)
+    else:
+        # Auto-select max_p and max_q based on training data size (for educational small datasets)
+        train_size = te - ts + 1
+        auto_max = max(1, min(3, train_size // 4))
+        max_p = int(max_p_arg) if max_p_arg is not None else auto_max
+        max_q = int(max_q_arg) if max_q_arg is not None else auto_max
+        if max_p_arg is None or max_q_arg is None:
+            log.info(f"Auto-selected max_p={max_p}, max_q={max_q} based on train_size={train_size}")
     log.debug(f"Training params: d={d}, max_p={max_p}, max_q={max_q}")
 
     if not (0 <= ts <= te < len(y)):

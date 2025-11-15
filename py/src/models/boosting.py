@@ -283,20 +283,27 @@ def run(args) -> None:
             return cast_type(val)
         return val
 
+    # Auto-select conservative defaults based on training data size (for educational small datasets)
+    train_size = te - ts + 1
+    auto_window = max(2, min(3, train_size // 3))
+    auto_max_pq = max(1, min(2, train_size // 4))
+    auto_look_back = max(2, min(3, train_size // 3))
+    auto_epochs = 20 if train_size <= 15 else 30  # Conservative for ensemble base models
+
     model_params = {}
 
     if "arima" in models_to_use:
         model_params["arima"] = {
             "d": get_arg("d", 0, int),
-            "max_p": get_arg("max_p", 5, int),
-            "max_q": get_arg("max_q", 5, int)
+            "max_p": get_arg("max_p", auto_max_pq, int),
+            "max_q": get_arg("max_q", auto_max_pq, int)
         }
 
     if "es" in models_to_use:
         model_params["es"] = {"alpha": get_arg("alpha", 0.5, float)}
 
     if "ma" in models_to_use:
-        model_params["ma"] = {"window": get_arg("window", 3, int)}
+        model_params["ma"] = {"window": get_arg("window", auto_window, int)}
 
     if "lstm" in models_to_use:
         # Try to get feature_types from the argument
@@ -318,8 +325,8 @@ def run(args) -> None:
                 feature_types = {}
 
         model_params["lstm"] = {
-            "look_back": get_arg("look_back", 3, int),
-            "epochs": get_arg("epochs", 10, int),
+            "look_back": get_arg("look_back", auto_look_back, int),
+            "epochs": get_arg("epochs", auto_epochs, int),
             "feature_types": feature_types,
             "normalization": get_arg("normalization", "minmax")
         }
