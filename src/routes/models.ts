@@ -32,20 +32,17 @@ const evalRangeSchema = z.object({
 // ========== Model Parameter Schemas ==========
 const modelParamsSchema = z.object({
   // MA
-  moving_average_window: z.coerce.number().int().min(1).optional(),
+  moving_average_window: z.coerce.number().int().min(2).optional(),
   // ES
   exponential_smoothing_alpha: z.coerce.number().min(0).max(1).optional(),
   // ARIMA (for auto-search)
   arimaD: z.coerce.number().int().min(0).optional(),
-  arimaMaxP: z.coerce.number().int().min(1).optional(),
-  arimaMaxQ: z.coerce.number().int().min(1).optional(),
-  // LSTM
-  lstmLookBack: z.coerce.number().int().min(1).optional(),
-  lstmEpochs: z.coerce.number().int().min(1).optional(),
-  lstmFeatures: z.string().min(1).optional(), // Comma-separated
+
+  // lstm
+  lstmFeatures: z.string().min(1).optional(),
   lstmTargetFeature: z.string().min(1).optional(),
-  lstmFeatureTypes: z.string().optional(), // JSON string
   lstmNormalization: z.enum(['minmax', 'zscore']).optional(),
+
   // Ensemble Models
   models: z.string().min(1).optional(),
 });
