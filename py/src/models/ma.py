@@ -29,17 +29,28 @@ def moving_average_forecast(
     """
     Generate one-step-ahead forecasts using moving average.
     """
+    log.debug(f"moving_average_forecast called with window={window}, eval_range={eval_range}, min_index={min_index}")
     if window <= 0:
         raise ValueError("[VALIDATION] Moving average window must be greater than 0.")
     idxs, preds = [], []
     series = np.asarray(series)
+    log.debug(f"Series length: {len(series)}")
 
+    skipped_points = 0
     for t in eval_range:
         start = t - window
         if start < min_index:
+            skipped_points += 1
             continue
-        preds.append(float(np.mean(series[start:t])))
+        avg_value = float(np.mean(series[start:t]))
+        preds.append(avg_value)
         idxs.append(t)
+        log.debug(f"  t={t}: averaging series[{start}:{t}] = {avg_value:.4f}")
+
+    if skipped_points > 0:
+        log.warning(f"Skipped {skipped_points} evaluation points due to insufficient history (window={window})")
+    log.info(f"Generated {len(preds)} predictions out of {len(list(eval_range))} requested evaluation points")
+
     return idxs, preds
 
 
@@ -138,13 +149,18 @@ def train_and_evaluate(
     """
     Evaluate the moving average model on a test set.
     """
+    log.info(f"Starting MA train_and_evaluate: window={window}, train_range={train_range}, eval_range={eval_range}")
     series = np.asarray(sales)
+    log.debug(f"Total series length: {len(series)}")
+    log.debug(f"Training data range: [{train_range.start}, {train_range.stop-1}], count={train_range.stop - train_range.start}")
+    log.debug(f"Evaluation data range: [{eval_range.start}, {eval_range.stop-1}], count={eval_range.stop - eval_range.start}")
 
     # Validate that evaluation range has sufficient history
     # First possible prediction point needs at least 'window' points of history
     eval_list = list(eval_range)
     if eval_list:
         first_possible_eval_point = train_range.start + window
+        log.debug(f"First possible evaluation point (requires {window} history): {first_possible_eval_point}")
         if max(eval_list) < first_possible_eval_point:
             raise ValueError(
                 f"[VALIDATION] Insufficient history for all evaluation points. "
@@ -158,12 +174,15 @@ def train_and_evaluate(
 
     # Handle empty eval range gracefully
     if not idxs:
+        log.warning("Empty evaluation range, returning empty metrics")
         return {}, 0.0, np.array([]), np.array([])
 
     y_true = series[idxs]
     y_pred = np.array(preds)
     residuals = y_true - y_pred
     std_dev_residuals = float(np.std(residuals))
+
+    log.info(f"Calculated residuals: mean={np.mean(residuals):.4f}, std_dev={std_dev_residuals:.4f}")
 
     metrics: Dict[str, Any] = {
         "window": window,
@@ -175,6 +194,8 @@ def train_and_evaluate(
         "evaluate_indices": idxs,
         "evaluate_months": [months[i] for i in idxs] if months else [],
     }
+    log.info(f"Evaluation metrics computed: RMSE={metrics['rmse']:.4f}, MAE={metrics['mae']:.4f}, MAPE={metrics['mape']:.4f}, R²={metrics['r2']:.4f}")
+
     return metrics, std_dev_residuals, y_true, y_pred
 
 
@@ -193,7 +214,9 @@ def run(args) -> None:
         if steps <= 0:
             raise ValueError("[VALIDATION] --forecast_steps must be > 0.")
 
+        log.info(f"Starting prediction with {steps} forecast steps")
         preds, std_dev = predict(load_path, steps, getattr(args, "data", None), state=state)
+        log.info(f"Generated {len(preds)} predictions")
         predictions_with_std = _format_predictions(preds, std_dev)
 
         out: Dict[str, Any] = {
@@ -203,8 +226,8 @@ def run(args) -> None:
             "forecast_steps": steps,
             "predictions": predictions_with_std,
         }
+        log.info("Prediction finished successfully")
         out["logs"] = get_log_contents()
-        log.info("Prediction finished successfully.")
         print(json.dumps(out, ensure_ascii=False, indent=2 if pretty else None))
         return
 
@@ -251,14 +274,17 @@ def run(args) -> None:
         }
 
         if save_path:
+            log.info(f"Saving model to {save_path}")
             history_start = max(ts, te - window + 1)
             history = y[history_start : te + 1]
+            log.debug(f"Saving history from index {history_start} to {te}, length={len(history)}")
             state = {
                 "model_type": MODEL_TYPE, "window": window, "train_end_index": te,
                 "history": history.tolist(),
                 "std_dev_residuals": std_dev_residuals,
             }
             dump_model(state, save_path)
+            log.info(f"Model saved successfully to {save_path}")
             out["saved_model"] = save_path
 
         out["logs"] = get_log_contents()
@@ -274,12 +300,24 @@ def _validate_training_args(sales: ArrayLike, ts: int, te: int, es: int, ee: int
     """
     Validate training and evaluation parameters.
     """
+    log.debug(f"Validating training arguments: ts={ts}, te={te}, es={es}, ee={ee}, window={w}")
     n_total = len(sales)
+    log.debug(f"Total data points: {n_total}")
+
     if not (0 <= ts <= te < n_total):
-        raise ValueError(f"[VALIDATION] Invalid training range [{ts}, {te}]")
+        log.error(f"Invalid training range: [{ts}, {te}], data size: {n_total}")
+        raise ValueError(f"[VALIDATION] Invalid training range [{ts}, {te}], must be within [0, {n_total-1}]")
     if not (es >= 0 and ee < n_total and es <= ee):
-        raise ValueError(f"[VALIDATION] Invalid evaluation range [{es}, {ee}]")
+        log.error(f"Invalid evaluation range: [{es}, {ee}], data size: {n_total}")
+        raise ValueError(f"[VALIDATION] Invalid evaluation range [{es}, {ee}], must be within [0, {n_total-1}]")
     if es <= te:
-        raise ValueError("[VALIDATION] Evaluation start must be after training end.")
+        log.error(f"Evaluation start {es} must be after training end {te}")
+        raise ValueError(f"[VALIDATION] Evaluation start ({es}) must be after training end ({te}).")
     if w < 1:
-        raise ValueError("[VALIDATION] --window must be >= 1")
+        log.error(f"Window {w} must be >= 1")
+        raise ValueError(f"[VALIDATION] Window must be >= 1, got {w}")
+
+    # Additional helpful validations
+    train_size = te - ts + 1
+    eval_size = ee - es + 1
+    log.info(f"Validation passed: train_size={train_size}, eval_size={eval_size}, window={w}")

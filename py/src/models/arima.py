@@ -51,13 +51,17 @@ def predict(
         predictions: List of forecasted values
         conf_int: List of [lower, upper] confidence interval bounds
     """
+    log.debug(f"ARIMA predict called with steps={steps}, model_path={model_path}")
     if steps <= 0:
         raise ValueError("[VALIDATION] steps must be > 0 for forecasting.")
 
     state = state or _load_state(model_path)
     model = state["model"]
+    order = state.get("order", {})
 
+    log.info(f"Generating {steps}-step forecast with order (p={order.get('p')}, d={order.get('d')}, q={order.get('q')})")
     y_pred, conf_int = model.predict(n_periods=steps, return_conf_int=True)
+    log.info(f"Generated {len(y_pred)} predictions with confidence intervals")
 
     return y_pred.tolist(), conf_int.tolist()
 
@@ -94,6 +98,8 @@ def train_and_evaluate(
         y_pred: Predicted evaluation values
         conf_int: Confidence intervals
     """
+    log.info(f"Starting ARIMA train_and_evaluate: d={d}, max_p={max_p}, max_q={max_q}, train_range={train_range}, eval_range={eval_range}")
+
     if d < 0:
         raise ValueError(f"[VALIDATION] d must be >= 0, got {d}")
     if max_p < 0 or max_q < 0:
@@ -102,23 +108,32 @@ def train_and_evaluate(
     y_train = y[train_range]
     y_eval = y[eval_range]
 
+    log.debug(f"Total series length: {len(y)}")
+    log.debug(f"Training data range: [{train_range.start}, {train_range.stop-1}], count={len(y_train)}")
+    log.debug(f"Evaluation data range: [{eval_range.start}, {eval_range.stop-1}], count={len(y_eval)}")
+    log.debug(f"Training data: min={np.min(y_train):.4f}, max={np.max(y_train):.4f}, mean={np.mean(y_train):.4f}")
+
     if len(y_train) == 0:
         raise ValueError("[VALIDATION] Training range is empty")
     if len(y_eval) == 0:
         raise ValueError("[VALIDATION] Evaluation range is empty")
 
     # --- Run auto_arima for both AIC and BIC ---
+    log.info(f"Running auto_arima with AIC criterion: searching p in [0, {max_p}], q in [0, {max_q}], d={d}")
     aic_model = pm.auto_arima(
         y_train, d=d, start_p=0, start_q=0, max_p=max_p, max_q=max_q,
         seasonal=False, stepwise=True, suppress_warnings=True,
         error_action="ignore", information_criterion="aic", trace=False,
     )
+    log.debug(f"AIC-optimized model found: order={aic_model.order}")
 
+    log.info(f"Running auto_arima with BIC criterion: searching p in [0, {max_p}], q in [0, {max_q}], d={d}")
     bic_model = pm.auto_arima(
         y_train, d=d, start_p=0, start_q=0, max_p=max_p, max_q=max_q,
         seasonal=False, stepwise=True, suppress_warnings=True,
         error_action="ignore", information_criterion="bic", trace=False,
     )
+    log.debug(f"BIC-optimized model found: order={bic_model.order}")
 
     # --- Compare and select the best model ---
     aic_order = aic_model.order
@@ -129,6 +144,9 @@ def train_and_evaluate(
     bic_aic = bic_model.aic()
     bic_bic = bic_model.bic()
 
+    log.debug(f"AIC model: order={aic_order}, AIC={aic_aic:.4f}, BIC={aic_bic:.4f}")
+    log.debug(f"BIC model: order={bic_order}, AIC={bic_aic:.4f}, BIC={bic_bic:.4f}")
+
     # Selection strategy: compare AIC values first, use BIC as tiebreaker
     selection_criterion = "aic_optimized"
     best_model = aic_model
@@ -136,11 +154,16 @@ def train_and_evaluate(
     if bic_aic < aic_aic:
         best_model = bic_model
         selection_criterion = "bic_optimized_better_aic"
+        log.info(f"Selected BIC-optimized model (better AIC): order={bic_order}")
     elif bic_aic == aic_aic and bic_bic < aic_bic:
         best_model = bic_model
         selection_criterion = "bic_optimized_tie_aic_better_bic"
+        log.info(f"Selected BIC-optimized model (tie AIC, better BIC): order={bic_order}")
+    else:
+        log.info(f"Selected AIC-optimized model: order={aic_order}")
 
     best_order = {"p": best_model.order[0], "d": best_model.order[1], "q": best_model.order[2]}
+    log.info(f"Final selected order: (p={best_order['p']}, d={best_order['d']}, q={best_order['q']})")
 
     # Search summary for transparency
     search_summary = {
@@ -159,8 +182,19 @@ def train_and_evaluate(
     }
 
     # --- Evaluate the best model ---
+    log.info(f"Forecasting {len(eval_range)} steps for evaluation")
     y_pred, conf_int = best_model.predict(n_periods=len(eval_range), return_conf_int=True)
     y_true = y_eval.tolist()
+
+    # Check convergence
+    converged = bool(best_model.arima_res_.mle_retvals.get("converged", False))
+    if converged:
+        log.info("Model converged successfully")
+    else:
+        log.warning("Model did not converge properly")
+
+    residuals = np.array(y_true) - y_pred
+    log.info(f"Calculated residuals: mean={np.mean(residuals):.4f}, std_dev={np.std(residuals):.4f}")
 
     metrics = {
         "rmse": rmse(y_eval, y_pred),
@@ -169,9 +203,11 @@ def train_and_evaluate(
         "r2": r2(y_eval, y_pred),
         "aic": float(best_model.aic()),
         "bic": float(best_model.bic()),
-        "converged": bool(best_model.arima_res_.mle_retvals.get("converged", False)),
+        "converged": converged,
         "evaluated_points": len(y_eval),
     }
+
+    log.info(f"Evaluation metrics computed: RMSE={metrics['rmse']:.4f}, MAE={metrics['mae']:.4f}, MAPE={metrics['mape']:.4f}, R²={metrics['r2']:.4f}, AIC={metrics['aic']:.4f}, BIC={metrics['bic']:.4f}")
 
     return metrics, best_model, best_order, search_summary, y_true, y_pred.tolist(), conf_int.tolist()
 
@@ -194,6 +230,7 @@ def run(args) -> None:
             log.error("forecast_steps must be > 0 for prediction mode.")
             raise ValueError("[VALIDATION] --forecast_steps must be > 0 for prediction mode.")
 
+        log.info(f"Starting prediction with {steps} forecast steps")
         preds, conf_int = predict(load_path, steps, state=state)
         predictions_with_std = _format_predictions(preds, conf_int)
 
@@ -203,8 +240,8 @@ def run(args) -> None:
             "forecast_steps": steps,
             "predictions": predictions_with_std,
         }
+        log.info("Prediction finished successfully")
         out["logs"] = get_log_contents()
-        log.info("Prediction finished successfully.")
         print(json.dumps(out, ensure_ascii=False, indent=2 if pretty else None))
         return
 
@@ -233,6 +270,7 @@ def run(args) -> None:
     if max_p_arg is not None and max_q_arg is not None:
         max_p = int(max_p_arg)
         max_q = int(max_q_arg)
+        log.debug(f"Using user-specified max_p={max_p}, max_q={max_q}")
     else:
         # Auto-select max_p and max_q based on training data size (for educational small datasets)
         train_size = te - ts + 1
@@ -244,11 +282,19 @@ def run(args) -> None:
     log.debug(f"Training params: d={d}, max_p={max_p}, max_q={max_q}")
 
     if not (0 <= ts <= te < len(y)):
-        raise ValueError(f"[VALIDATION] Invalid train range: [{ts},{te}]")
+        log.error(f"Invalid training range: [{ts}, {te}], data size: {len(y)}")
+        raise ValueError(f"[VALIDATION] Invalid train range: [{ts},{te}], must be within [0, {len(y)-1}]")
     if not (0 <= es <= ee < len(y)):
-        raise ValueError(f"[VALIDATION] Invalid eval range: [{es},{ee}]")
+        log.error(f"Invalid evaluation range: [{es}, {ee}], data size: {len(y)}")
+        raise ValueError(f"[VALIDATION] Invalid eval range: [{es},{ee}], must be within [0, {len(y)-1}]")
     if es <= te:
-        raise ValueError("[VALIDATION] eval_start must be > train_end.")
+        log.error(f"Evaluation start {es} must be after training end {te}")
+        raise ValueError(f"[VALIDATION] Evaluation start ({es}) must be after training end ({te}).")
+
+    # Additional helpful validations
+    train_size = te - ts + 1
+    eval_size = ee - es + 1
+    log.info(f"Validation passed: train_size={train_size}, eval_size={eval_size}, d={d}, max_p={max_p}, max_q={max_q}")
 
     log.info("Starting model training and evaluation...")
     metrics, best_model, best_order, search_summary, y_true, y_pred, conf_int = train_and_evaluate(
@@ -274,6 +320,7 @@ def run(args) -> None:
 
     if save_path:
         log.info(f"Saving model to {save_path}")
+        log.debug(f"Saving model with order (p={best_order['p']}, d={best_order['d']}, q={best_order['q']})")
         state = {
             "model_type": MODEL_TYPE,
             "model": best_model,
@@ -281,6 +328,7 @@ def run(args) -> None:
             "d": d,
         }
         dump_model(state, save_path)
+        log.info(f"Model saved successfully to {save_path}")
         out["saved_model"] = save_path
 
     out["logs"] = get_log_contents()

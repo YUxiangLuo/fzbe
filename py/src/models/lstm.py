@@ -81,10 +81,11 @@ def predict(
     """
     Forecast using a saved LSTM model.
     """
+    log.debug(f"LSTM predict called with steps={steps}, model_path={model_path}")
     if steps <= 0:
         raise ValueError("[VALIDATION] steps must be > 0 for forecasting.")
     state = state or _load_state(model_path)
-    
+
     # If state is passed directly, the keras model might not be loaded yet
     if "keras_model" not in state:
         from tensorflow.keras.models import load_model as keras_load_model
@@ -92,6 +93,7 @@ def predict(
         if not keras_model_path or not os.path.exists(keras_model_path):
             raise FileNotFoundError(f"Keras model file not found at {keras_model_path}")
         state["keras_model"] = keras_load_model(keras_model_path)
+        log.debug(f"Loaded Keras model from {keras_model_path}")
 
     keras_model = state["keras_model"]
     preprocessor = state["preprocessor"]
@@ -99,10 +101,13 @@ def predict(
     history_df = state["history_df"]
     std_dev_residuals = state.get("std_dev_residuals", 0.0)
     normalization = state.get("normalization", 'minmax') # Retrieve normalization method
-    
+
+    log.info(f"Generating {steps}-step forecast with look_back={look_back}, normalization='{normalization}'")
+
     # The preprocessor expects a DataFrame, so we work with it
     scaled_history = preprocessor.transform(history_df)
     n_features_out = scaled_history.shape[1]
+    log.debug(f"Preprocessed history: {len(history_df)} rows, {n_features_out} features after transformation")
 
     # Use the last part of the history as the initial input
     input_seq = scaled_history[-look_back:].reshape(1, look_back, n_features_out)
@@ -117,31 +122,34 @@ def predict(
 
 
     predictions_scaled = []
-    for _ in range(steps):
+    for step_idx in range(steps):
         pred_scaled = keras_model.predict(input_seq, verbose=0)
         predictions_scaled.append(pred_scaled[0, 0])
-        
+        log.debug(f"  Step {step_idx+1}/{steps}: predicted scaled value = {pred_scaled[0, 0]:.4f}")
+
         # Create the next input step (as a scaled vector)
         next_input_step_scaled = np.zeros((1, 1, n_features_out))
         next_input_step_scaled[0, 0, target_column_index] = pred_scaled[0, 0]
-        
+
         # For other features, assume they stay constant at the last known value
         last_known_scaled_features = input_seq[0, -1, :]
         for i in range(n_features_out):
             if i != target_column_index:
                 next_input_step_scaled[0, 0, i] = last_known_scaled_features[i]
-            
+
         # Update the input sequence for the next prediction
         input_seq = np.append(input_seq[:, 1:, :], next_input_step_scaled, axis=1)
 
     # Inverse transform the predictions
     # Create a dummy array with the same shape as the scaler expects
     n_numeric_features = target_scaler.n_features_in_
-    
+
     dummy_array = np.zeros((len(predictions_scaled), n_numeric_features))
     dummy_array[:, 0] = predictions_scaled
     unscaled_predictions = target_scaler.inverse_transform(dummy_array)[:, 0]
-    
+
+    log.info(f"Generated {len(unscaled_predictions)} predictions after inverse transform")
+
     return unscaled_predictions.flatten().tolist(), std_dev_residuals
 
 
@@ -158,22 +166,32 @@ def train_and_evaluate(
     """
     Trains and evaluates the LSTM model with typed features.
     """
+    log.info(f"Starting LSTM train_and_evaluate: look_back={look_back}, epochs={epochs}, normalization='{normalization}', train_range={train_range}, eval_range={eval_range}")
+
     from tensorflow.keras.layers import LSTM as KerasLSTM
     from tensorflow.keras.layers import Dense
     from tensorflow.keras.models import Sequential
 
     df = parsed_data.df
     target_key = parsed_data.target_key
-    
+
+    log.debug(f"Total series length: {len(df)}")
+    log.debug(f"Training data range: [{train_range.start}, {train_range.stop-1}], count={train_range.stop - train_range.start}")
+    log.debug(f"Evaluation data range: [{eval_range.start}, {eval_range.stop-1}], count={eval_range.stop - eval_range.start}")
+
     # Separate features by type
     numeric_features = [k for k, v in feature_types.items() if v == 'numeric' and k != target_key]
     categorical_features = [k for k, v in feature_types.items() if v == 'categorical']
 
+    log.debug(f"Target: '{target_key}', Numeric features: {numeric_features}, Categorical features: {categorical_features}")
+
     # Choose the scaler based on the normalization parameter
     if normalization == 'zscore':
         scaler = StandardScaler()
+        log.info("Using StandardScaler (z-score normalization)")
     elif normalization == 'minmax':
         scaler = MinMaxScaler(feature_range=(0, 1))
+        log.info("Using MinMaxScaler (0-1 normalization)")
     else:
         raise ValueError(f"Unknown normalization method: {normalization}")
 
@@ -191,58 +209,78 @@ def train_and_evaluate(
     )
 
     # Fit the preprocessor and transform the data
+    log.info("Fitting preprocessor and transforming data...")
     scaled_series = preprocessor.fit_transform(df)
     if isinstance(scaled_series, csr_matrix): # OneHotEncoder can return sparse matrix
         scaled_series = scaled_series.toarray()
 
     n_features_out = scaled_series.shape[1]
+    log.info(f"Preprocessed data shape: {scaled_series.shape} (features after encoding: {n_features_out})")
 
     # Split into train and test sets
     train_data = scaled_series[train_range]
-    
+
     # Create dataset for training
+    log.info(f"Creating LSTM dataset with look_back={look_back}...")
     trainX, trainY = _create_dataset(train_data, look_back)
-    
+    log.info(f"Training dataset created: X shape={trainX.shape}, Y shape={trainY.shape}")
+
     # Build and train the LSTM model
+    log.info(f"Building LSTM model: 4 units, input_shape=({look_back}, {n_features_out})")
     model = Sequential()
     model.add(KerasLSTM(4, input_shape=(look_back, n_features_out)))
     model.add(Dense(1))
     model.compile(loss="mean_squared_error", optimizer="adam")
+
+    log.info(f"Training LSTM model for {epochs} epochs...")
     model.fit(trainX, trainY, epochs=epochs, batch_size=1, verbose=0)
+    log.info("Model training completed")
 
     # Make predictions for evaluation
     if not list(eval_range):
+        log.warning("Empty evaluation range, returning empty metrics")
         return {}, model, preprocessor, [], [], 0.0, pd.DataFrame()
 
     eval_input_start = eval_range.start - look_back
     if eval_input_start < 0:
         raise ValueError("Not enough data before evaluation range to form input.")
-        
+
+    log.info(f"Generating predictions for evaluation range...")
     eval_input_data = scaled_series[eval_input_start : eval_range.stop]
     evalX, _ = _create_dataset(eval_input_data, look_back)
+    log.debug(f"Evaluation dataset created: X shape={evalX.shape}")
 
     preds_scaled = model.predict(evalX, verbose=0)
-    
+    log.debug(f"Generated {len(preds_scaled)} scaled predictions")
+
     # Inverse transform predictions
     target_scaler = preprocessor.named_transformers_['numeric'].named_steps['scaler']
     dummy_preds = np.zeros((len(preds_scaled), len(numeric_features) + 1))
     dummy_preds[:, 0] = preds_scaled.flatten()
     y_pred = target_scaler.inverse_transform(dummy_preds)[:, 0]
-    
+
     y_true = df[target_key].values[eval_range]
+    log.info(f"Generated {len(y_pred)} predictions after inverse transform")
 
     residuals = y_true - y_pred
     std_dev_residuals = float(np.std(residuals))
+    log.info(f"Calculated residuals: mean={np.mean(residuals):.4f}, std_dev={std_dev_residuals:.4f}")
 
     metrics = {
         "rmse": rmse(y_true, y_pred),
         "mae": mae(y_true, y_pred),
         "mape": mape(y_true, y_pred),
         "r2": r2(y_true, y_pred),
+        "look_back": look_back,
+        "epochs": epochs,
+        "evaluated_points": len(y_true),
     }
-    
+
+    log.info(f"Evaluation metrics computed: RMSE={metrics['rmse']:.4f}, MAE={metrics['mae']:.4f}, MAPE={metrics['mape']:.4f}, R²={metrics['r2']:.4f}")
+
     history_df_for_saving = df.iloc[train_range.stop - look_back : train_range.stop]
-    
+    log.debug(f"Saved history for future predictions: {len(history_df_for_saving)} rows")
+
     return metrics, model, preprocessor, y_true.tolist(), y_pred.tolist(), std_dev_residuals, history_df_for_saving
 
 
@@ -269,6 +307,7 @@ def run(args) -> None:
             log.error("forecast_steps must be > 0 for prediction mode.")
             raise ValueError("[VALIDATION] --forecast_steps must be > 0.")
 
+        log.info(f"Starting prediction with {steps} forecast steps")
         preds, std_dev = predict(load_path, steps, state=state)
         predictions_with_std = _format_predictions(preds, std_dev)
 
@@ -281,11 +320,11 @@ def run(args) -> None:
             "forecast_steps": steps,
             "predictions": predictions_with_std,
         }
-        log.info("Prediction finished successfully.")
-        
+        log.info("Prediction finished successfully")
+
         # Add captured logs to the final output
         out["logs"] = get_log_contents()
-        
+
         print(json.dumps(out, ensure_ascii=False, indent=2 if pretty else None))
         return
 
@@ -379,8 +418,9 @@ def run(args) -> None:
         if save_path:
             log.info(f"Saving model to {save_path}")
             keras_model_path = os.path.splitext(save_path)[0] + "_keras_model.h5"
+            log.debug(f"Saving Keras model to {keras_model_path}")
             model.save(keras_model_path)
-            
+
             state = {
                 "model_type": MODEL_TYPE,
                 "look_back": look_back,
@@ -395,6 +435,7 @@ def run(args) -> None:
                 "std_dev_residuals": std_dev_residuals,
             }
             dump_model(state, save_path)
+            log.info(f"Model saved successfully to {save_path} (Keras: {keras_model_path})")
             out["saved_model"] = save_path
 
         # Add captured logs to the final output
@@ -414,14 +455,27 @@ def _validate_training_args(
     """
     Validate training and evaluation parameters for LSTM.
     """
+    log.debug(f"Validating training arguments: ts={ts}, te={te}, es={es}, ee={ee}, look_back={look_back}")
     n = parsed_data.n_obs
+    log.debug(f"Total data points: {n}")
+
     if not (0 <= ts <= te < n):
-        raise ValueError(f"[VALIDATION] Invalid train range: [{ts},{te}]")
+        log.error(f"Invalid training range: [{ts}, {te}], data size: {n}")
+        raise ValueError(f"[VALIDATION] Invalid train range: [{ts},{te}], must be within [0, {n-1}]")
     if not (0 <= es <= ee < n):
-        raise ValueError(f"[VALIDATION] Invalid eval range: [{es},{ee}]")
+        log.error(f"Invalid evaluation range: [{es}, {ee}], data size: {n}")
+        raise ValueError(f"[VALIDATION] Invalid eval range: [{es},{ee}], must be within [0, {n-1}]")
     if es <= te:
-        raise ValueError("[VALIDATION] eval_start must be > train_end.")
+        log.error(f"Evaluation start {es} must be after training end {te}")
+        raise ValueError(f"[VALIDATION] Evaluation start ({es}) must be after training end ({te}).")
     if look_back < 1:
+        log.error(f"look_back {look_back} must be >= 1")
         raise ValueError("[VALIDATION] look_back must be >= 1.")
     if te - ts + 1 <= look_back:
+        log.error(f"Training range size {te - ts + 1} must be larger than look_back {look_back}")
         raise ValueError("[VALIDATION] Training range must be larger than look_back.")
+
+    # Additional helpful validations
+    train_size = te - ts + 1
+    eval_size = ee - es + 1
+    log.info(f"Validation passed: train_size={train_size}, eval_size={eval_size}, look_back={look_back}")

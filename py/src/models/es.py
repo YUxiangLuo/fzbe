@@ -39,11 +39,16 @@ def predict(
     state: Optional[Dict[str, Any]] = None,
 ) -> Tuple[List[float], float]:
     """Forecast future values using a saved ES model."""
+    log.debug(f"ES predict called with steps={steps}, model_path={model_path}")
     state = state or _load_state(model_path)
     model = state["model"]
     std_dev_residuals = float(state.get("std_dev_residuals", 0.0))
-    
+    alpha = float(state.get("alpha", 0.5))
+
+    log.info(f"Generating {steps}-step forecast with alpha={alpha}")
     predictions = model.forecast(steps)
+    log.info(f"Generated {len(predictions)} predictions")
+
     return predictions.tolist(), std_dev_residuals
 
 
@@ -55,19 +60,30 @@ def train_and_evaluate(
     alpha: float,
 ) -> Tuple[Dict[str, Any], Any, List[float], List[float], float]:
     """Train and evaluate the Exponential Smoothing model."""
+    log.info(f"Starting ES train_and_evaluate: alpha={alpha}, train_range={train_range}, eval_range={eval_range}")
     series = np.asarray(y)
     y_train = series[train_range]
     y_eval = series[eval_range]
 
+    log.debug(f"Total series length: {len(series)}")
+    log.debug(f"Training data range: [{train_range.start}, {train_range.stop-1}], count={len(y_train)}")
+    log.debug(f"Evaluation data range: [{eval_range.start}, {eval_range.stop-1}], count={len(y_eval)}")
+    log.debug(f"Training data: min={np.min(y_train):.4f}, max={np.max(y_train):.4f}, mean={np.mean(y_train):.4f}")
+
+    log.info(f"Fitting SimpleExpSmoothing with alpha={alpha}")
     model = SimpleExpSmoothing(y_train, initialization_method="estimated").fit(
         smoothing_level=alpha, optimized=False
     )
-    
+    log.debug(f"Model fitted successfully")
+
+    log.info(f"Forecasting {len(eval_range)} steps for evaluation")
     y_pred = model.forecast(len(eval_range))
     y_true = y_eval.tolist()
 
     residuals = np.array(y_true) - np.array(y_pred)
     std_dev_residuals = float(np.std(residuals))
+
+    log.info(f"Calculated residuals: mean={np.mean(residuals):.4f}, std_dev={std_dev_residuals:.4f}")
 
     metrics = {
         "alpha": alpha,
@@ -77,20 +93,35 @@ def train_and_evaluate(
         "mape": mape(y_true, y_pred),
         "r2": r2(y_true, y_pred),
     }
+
+    log.info(f"Evaluation metrics computed: RMSE={metrics['rmse']:.4f}, MAE={metrics['mae']:.4f}, MAPE={metrics['mape']:.4f}, R²={metrics['r2']:.4f}")
+
     return metrics, model, y_true, y_pred.tolist(), std_dev_residuals
 
 
 def _validate_training_args(y: ArrayLike, ts: int, te: int, es: int, ee: int, alpha: float) -> None:
     """Validate training and evaluation parameters."""
+    log.debug(f"Validating training arguments: ts={ts}, te={te}, es={es}, ee={ee}, alpha={alpha}")
     n_total = len(y)
+    log.debug(f"Total data points: {n_total}")
+
     if not (0 <= ts <= te < n_total):
-        raise ValueError(f"[VALIDATION] Invalid training range [{ts}, {te}]")
+        log.error(f"Invalid training range: [{ts}, {te}], data size: {n_total}")
+        raise ValueError(f"[VALIDATION] Invalid training range [{ts}, {te}], must be within [0, {n_total-1}]")
     if not (es >= 0 and ee < n_total and es <= ee):
-        raise ValueError(f"[VALIDATION] Invalid evaluation range [{es}, {ee}]")
+        log.error(f"Invalid evaluation range: [{es}, {ee}], data size: {n_total}")
+        raise ValueError(f"[VALIDATION] Invalid evaluation range [{es}, {ee}], must be within [0, {n_total-1}]")
     if es <= te:
-        raise ValueError("[VALIDATION] Evaluation start must be after training end.")
-    if not (0.0 <= alpha <= 1.0):
-        raise ValueError("[VALIDATION] Alpha must be between 0 and 1.")
+        log.error(f"Evaluation start {es} must be after training end {te}")
+        raise ValueError(f"[VALIDATION] Evaluation start ({es}) must be after training end ({te}).")
+    if not (0.0 < alpha <= 1.0):
+        log.error(f"Alpha {alpha} must be in (0, 1]")
+        raise ValueError(f"[VALIDATION] Alpha must be in (0, 1], got {alpha}")
+
+    # Additional helpful validations
+    train_size = te - ts + 1
+    eval_size = ee - es + 1
+    log.info(f"Validation passed: train_size={train_size}, eval_size={eval_size}, alpha={alpha}")
 
 
 def run(args) -> None:
@@ -108,6 +139,7 @@ def run(args) -> None:
             if steps <= 0:
                 raise ValueError("[VALIDATION] --forecast_steps must be > 0.")
 
+            log.info(f"Starting prediction with {steps} forecast steps")
             preds, std_dev = predict(load_path, steps, state=state)
             predictions_with_std = _format_predictions(preds, std_dev)
 
@@ -118,8 +150,8 @@ def run(args) -> None:
                 "forecast_steps": steps,
                 "predictions": predictions_with_std,
             }
+            log.info("Prediction finished successfully")
             out["logs"] = get_log_contents()
-            log.info("Prediction finished successfully.")
             print(json.dumps(out, ensure_ascii=False, indent=2 if pretty else None))
             return
         except Exception as e:
@@ -173,6 +205,7 @@ def run(args) -> None:
                 "model": model, "std_dev_residuals": std_dev_residuals,
             }
             dump_model(state, save_path)
+            log.info(f"Model saved successfully to {save_path}")
             out["saved_model"] = save_path
 
         out["logs"] = get_log_contents()
