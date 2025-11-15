@@ -5,3 +5,5 @@ joblib
 torch
 scikit-learn
 pandas
+pmdarima
+tensorflow
