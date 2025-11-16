@@ -302,8 +302,8 @@ def main():
             expected_logs=[
                 "Validation passed",
                 "Auto-selected look_back=2 based on train_size=6",
-                "Auto-selected epochs=50 based on train_size=6",
-                "Training LSTM model for 50 epochs",
+                "Using default epochs=20",
+                "Training LSTM model for 20 epochs",
                 "Model training completed",
                 "metrics computed"
             ]

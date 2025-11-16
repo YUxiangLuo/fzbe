@@ -208,9 +208,13 @@ def train_and_evaluate(
         remainder='drop'
     )
 
-    # Fit the preprocessor and transform the data
-    log.info("Fitting preprocessor and transforming data...")
-    scaled_series = preprocessor.fit_transform(df)
+    # Fit the preprocessor ONLY on training data to avoid data leakage
+    log.info("Fitting preprocessor on TRAINING data only...")
+    train_df = df.iloc[train_range]
+    preprocessor.fit(train_df)
+
+    # Transform the entire dataset
+    scaled_series = preprocessor.transform(df)
     if isinstance(scaled_series, csr_matrix): # OneHotEncoder can return sparse matrix
         scaled_series = scaled_series.toarray()
 
@@ -225,15 +229,40 @@ def train_and_evaluate(
     trainX, trainY = _create_dataset(train_data, look_back)
     log.info(f"Training dataset created: X shape={trainX.shape}, Y shape={trainY.shape}")
 
-    # Build and train the LSTM model
-    log.info(f"Building LSTM model: 4 units, input_shape=({look_back}, {n_features_out})")
+    # Build and train the LSTM model (3 layers, 288 units each)
+    log.info(f"Building LSTM model: 3 layers, 288 units each, input_shape=({look_back}, {n_features_out})")
     model = Sequential()
-    model.add(KerasLSTM(4, input_shape=(look_back, n_features_out)))
+    # First LSTM layer (returns sequences for next LSTM layer)
+    model.add(KerasLSTM(288, input_shape=(look_back, n_features_out), return_sequences=True))
+    # Second LSTM layer (returns sequences for next LSTM layer)
+    model.add(KerasLSTM(288, return_sequences=True))
+    # Third LSTM layer (returns only last output)
+    model.add(KerasLSTM(288))
+    # Fully connected layer for final prediction
     model.add(Dense(1))
-    model.compile(loss="mean_squared_error", optimizer="adam")
 
-    log.info(f"Training LSTM model for {epochs} epochs...")
-    model.fit(trainX, trainY, epochs=epochs, batch_size=1, verbose=0)
+    # Configure Adam optimizer with custom learning rate and decay
+    from tensorflow.keras.optimizers import Adam
+    from tensorflow.keras.callbacks import LearningRateScheduler
+
+    initial_learning_rate = 0.01
+    decay_rate = 0.99
+
+    optimizer = Adam(learning_rate=initial_learning_rate)
+    model.compile(loss="mean_squared_error", optimizer=optimizer)
+
+    # Learning rate decay scheduler
+    def lr_schedule(epoch):
+        """
+        Learning rate decay schedule: lr = initial_lr * (decay_rate ^ epoch)
+        """
+        return initial_learning_rate * (decay_rate ** epoch)
+
+    lr_scheduler = LearningRateScheduler(lr_schedule, verbose=0)
+
+    log.info(f"Training LSTM model for {epochs} epochs with batch_size=6...")
+    log.info(f"Initial learning rate: {initial_learning_rate}, decay rate: {decay_rate}")
+    model.fit(trainX, trainY, epochs=epochs, batch_size=6, verbose=0, callbacks=[lr_scheduler])
     log.info("Model training completed")
 
     # Make predictions for evaluation
@@ -383,8 +412,8 @@ def run(args) -> None:
         if epochs_arg is not None:
             epochs = int(epochs_arg)
         else:
-            epochs = 50 if train_size <= 15 else 100
-            log.info(f"Auto-selected epochs={epochs} based on train_size={train_size}")
+            epochs = 20  # Default as per client requirements
+            log.info(f"Using default epochs={epochs}")
 
         normalization_arg = getattr(args, "normalization", None)
         normalization = normalization_arg if normalization_arg is not None else 'minmax'
