@@ -118,6 +118,17 @@ def train_and_evaluate(
     if len(y_eval) == 0:
         raise ValueError("[VALIDATION] Evaluation range is empty")
 
+    # Warn about effective sample size reduction due to differencing
+    if d > 0:
+        effective_train_size = len(y_train) - d
+        log.info(f"After d={d} differencing, effective training size: {len(y_train)} → {effective_train_size}")
+        if effective_train_size < 10:
+            log.warning(f"Very small effective sample size ({effective_train_size}) after differencing. "
+                       f"Consider using d=0 or collecting more data for reliable parameter estimation.")
+        elif effective_train_size < 20:
+            log.warning(f"Small effective sample size ({effective_train_size}) after differencing. "
+                       f"Model may have limited predictive power. Consider simpler models.")
+
     # --- Run auto_arima for both AIC and BIC ---
     log.info(f"Running auto_arima with AIC criterion: searching p in [0, {max_p}], q in [0, {max_q}], d={d}")
     aic_model = pm.auto_arima(
@@ -147,23 +158,51 @@ def train_and_evaluate(
     log.debug(f"AIC model: order={aic_order}, AIC={aic_aic:.4f}, BIC={aic_bic:.4f}")
     log.debug(f"BIC model: order={bic_order}, AIC={bic_aic:.4f}, BIC={bic_bic:.4f}")
 
-    # Selection strategy: compare AIC values first, use BIC as tiebreaker
+    # Selection strategy: for small samples, prioritize BIC to prevent overfitting
+    train_size = len(y_train)
     selection_criterion = "aic_optimized"
     best_model = aic_model
 
-    if bic_aic < aic_aic:
-        best_model = bic_model
-        selection_criterion = "bic_optimized_better_aic"
-        log.info(f"Selected BIC-optimized model (better AIC): order={bic_order}")
-    elif bic_aic == aic_aic and bic_bic < aic_bic:
-        best_model = bic_model
-        selection_criterion = "bic_optimized_tie_aic_better_bic"
-        log.info(f"Selected BIC-optimized model (tie AIC, better BIC): order={bic_order}")
+    if train_size < 30:
+        # Small sample: prioritize BIC (stronger penalty against complexity)
+        log.info(f"Using BIC-priority selection for small sample (n={train_size})")
+        if bic_bic < aic_bic:
+            best_model = bic_model
+            selection_criterion = "bic_preferred_small_sample"
+            log.info(f"Selected BIC-optimized model (better BIC, small sample): order={bic_order}")
+        elif bic_bic == aic_bic and bic_aic <= aic_aic:
+            best_model = bic_model
+            selection_criterion = "bic_tie_better_or_equal_aic"
+            log.info(f"Selected BIC-optimized model (tie BIC, AIC not worse): order={bic_order}")
+        else:
+            log.info(f"Selected AIC-optimized model (better BIC even in small sample): order={aic_order}")
     else:
-        log.info(f"Selected AIC-optimized model: order={aic_order}")
+        # Large sample: prioritize AIC (asymptotically efficient)
+        log.info(f"Using AIC-priority selection for larger sample (n={train_size})")
+        if bic_aic < aic_aic:
+            best_model = bic_model
+            selection_criterion = "bic_optimized_better_aic"
+            log.info(f"Selected BIC-optimized model (better AIC): order={bic_order}")
+        elif bic_aic == aic_aic and bic_bic < aic_bic:
+            best_model = bic_model
+            selection_criterion = "bic_tie_aic_better_bic"
+            log.info(f"Selected BIC-optimized model (tie AIC, better BIC): order={bic_order}")
+        else:
+            log.info(f"Selected AIC-optimized model: order={aic_order}")
 
     best_order = {"p": best_model.order[0], "d": best_model.order[1], "q": best_model.order[2]}
-    log.info(f"Final selected order: (p={best_order['p']}, d={best_order['d']}, q={best_order['q']})")
+
+    # Calculate and log parameter-to-data ratio for diagnostic purposes
+    n_params = best_order['p'] + best_order['q']  # Number of AR and MA parameters
+    effective_sample_size = len(y_train) - d
+    if n_params > 0:
+        param_ratio = (n_params / effective_sample_size) * 100
+        log.info(f"Final selected order: (p={best_order['p']}, d={best_order['d']}, q={best_order['q']})")
+        log.info(f"Model complexity: {n_params} parameters / {effective_sample_size} effective samples = {param_ratio:.1f}%")
+        if param_ratio > 30:
+            log.warning(f"High parameter-to-sample ratio ({param_ratio:.1f}%). Model may be at risk of overfitting.")
+    else:
+        log.info(f"Final selected order: (p={best_order['p']}, d={best_order['d']}, q={best_order['q']}) - Random walk model")
 
     # Search summary for transparency
     search_summary = {
@@ -272,13 +311,23 @@ def run(args) -> None:
         max_q = int(max_q_arg)
         log.debug(f"Using user-specified max_p={max_p}, max_q={max_q}")
     else:
-        # Auto-select max_p and max_q based on training data size (for educational small datasets)
+        # Auto-select max_p and max_q based on training data size
+        # For small datasets, use conservative limits to prevent overfitting
         train_size = te - ts + 1
-        auto_max = max(1, min(3, train_size // 4))
+        if train_size <= 12:
+            auto_max = 1  # ARIMA(1,d,1): max 2 parameters, avoid overfitting
+            log.info(f"Small dataset detected (train_size={train_size}), using conservative max_p=max_q={auto_max}")
+        elif train_size <= 20:
+            auto_max = 2  # ARIMA(2,d,2): max 4 parameters
+            log.info(f"Medium-small dataset detected (train_size={train_size}), using moderate max_p=max_q={auto_max}")
+        else:
+            auto_max = max(1, min(5, train_size // 6))  # Rule of thumb: params < train_size/6
+            log.info(f"Using calculated max_p=max_q={auto_max} based on train_size={train_size}")
+
         max_p = int(max_p_arg) if max_p_arg is not None else auto_max
         max_q = int(max_q_arg) if max_q_arg is not None else auto_max
         if max_p_arg is None or max_q_arg is None:
-            log.info(f"Auto-selected max_p={max_p}, max_q={max_q} based on train_size={train_size}")
+            log.info(f"Auto-selected max_p={max_p}, max_q={max_q} for preventing overfitting")
     log.debug(f"Training params: d={d}, max_p={max_p}, max_q={max_q}")
 
     if not (0 <= ts <= te < len(y)):
