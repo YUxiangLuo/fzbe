@@ -184,10 +184,16 @@ def train_and_evaluate(
     # === Step 1: Split train_range into level0 and level1 ===
     # This prevents data leakage: meta-model trains on "unseen" level1 predictions
     train_len = len(train_range)
-    if train_len < 5:
-        raise ValueError("[VALIDATION] train_range too small for stacking (需要至少5个点)")
+    if train_len < 8:
+        raise ValueError("[VALIDATION] train_range too small for stacking (需要至少8个点，推荐≥12点)")
 
-    level0_split = max(3, int(train_len * 0.8))  # At least 3 points for level0
+    # For small datasets, use 85% for level0 to ensure sufficient training data
+    # For larger datasets, use standard 80% split
+    if train_len <= 15:
+        level0_split = max(train_len - 3, int(train_len * 0.85))  # Leave at least 3 points for level1
+    else:
+        level0_split = max(3, int(train_len * 0.8))  # At least 3 points for level0
+
     level0_train_range = range(train_range.start, train_range.start + level0_split)
     level1_train_range = range(train_range.start + level0_split, train_range.stop)
 
@@ -210,6 +216,12 @@ def train_and_evaluate(
     print(f"\n[Stacking Phase 1] 训练基础模型（level0）并生成level1预测", file=sys.stderr)
     level1_predictions = []
 
+    # Calculate dynamic timeout for LSTM models
+    base_timeout = 120
+    if "lstm" in models_to_use:
+        lstm_epochs = model_params["lstm"].get("epochs", 20)
+        base_timeout = max(120, lstm_epochs * 10)  # 10 seconds per epoch
+
     for model_name in models_to_use:
         params = model_params[model_name]
 
@@ -226,7 +238,7 @@ def train_and_evaluate(
             eval_start=level1_train_range.start,  # ✅ 在level1上预测（out-of-fold）
             eval_end=level1_train_range.stop - 1,
             model_params=params_phase1,
-            timeout=120,
+            timeout=base_timeout,
         )
 
         y_pred_level1 = extract_predictions_from_result(result)
@@ -271,7 +283,7 @@ def train_and_evaluate(
             eval_start=eval_range.start,  # ✅ 独立评估集
             eval_end=eval_range.stop - 1,
             model_params=params_with_save,
-            timeout=120,
+            timeout=base_timeout,  # Use dynamic timeout
         )
 
         y_pred_eval = extract_predictions_from_result(result)
@@ -351,11 +363,15 @@ def run(args) -> None:
             return cast_type(val)
         return val
 
-    # Auto-select conservative defaults based on training data size (for educational small datasets)
+    # Auto-select conservative defaults based on level0 training data size
+    # (base models will be trained on level0 in Phase 1, which is ~80-85% of train_range)
     train_size = te - ts + 1
-    auto_window = max(2, min(3, train_size // 3))
-    auto_max_pq = max(1, min(2, train_size // 4))
-    auto_look_back = max(2, min(3, train_size // 3))
+    level0_size = max(3, int(train_size * 0.85)) if train_size <= 15 else int(train_size * 0.8)
+
+    # Use level0_size for parameter calculation to avoid phase 1 failures
+    auto_window = max(2, min(3, level0_size // 4))  # More conservative
+    auto_max_pq = max(1, min(2, level0_size // 6))  # More conservative
+    auto_look_back = max(2, min(3, level0_size // 4))  # More conservative
     auto_epochs = 20 if train_size <= 15 else 30  # Conservative for ensemble base models
 
     model_params = {}
