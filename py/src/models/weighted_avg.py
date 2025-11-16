@@ -55,6 +55,9 @@ def _validate_training_args(
     if not models_to_use:
         raise ValueError("[VALIDATION] models_to_use cannot be empty.")
 
+    if len(models_to_use) < 2:
+        raise ValueError("[VALIDATION] Weighted Average requires at least 2 base models.")
+
     for model_name in models_to_use:
         if model_name not in SUPPORTED_BASE_MODELS:
             raise ValueError(f"[VALIDATION] Unknown model: {model_name}")
@@ -153,10 +156,16 @@ def train_and_evaluate(
     # === Step 1: Split train_range into weight_train and weight_val ===
     # This prevents data leakage: weights are calculated on "unseen" weight_val predictions
     train_len = len(train_range)
-    if train_len < 5:
-        raise ValueError("[VALIDATION] train_range too small for weighted average (需要至少5个点)")
+    if train_len < 8:
+        raise ValueError("[VALIDATION] train_range too small for weighted average (需要至少8个点，推荐≥12点)")
 
-    weight_split = max(3, int(train_len * 0.8))  # At least 3 points for weight_train
+    # For small datasets, use 85% for weight_train to ensure sufficient training data
+    # For larger datasets, use standard 80% split
+    if train_len <= 15:
+        weight_split = max(train_len - 3, int(train_len * 0.85))  # Leave at least 3 points for weight_val
+    else:
+        weight_split = max(3, int(train_len * 0.8))  # At least 3 points for weight_train
+
     weight_train_range = range(train_range.start, train_range.start + weight_split)
     weight_val_range = range(train_range.start + weight_split, train_range.stop)
 
@@ -179,6 +188,12 @@ def train_and_evaluate(
     print(f"\n[Weighted Average Phase 1] 训练基础模型并生成权重验证集预测", file=sys.stderr)
     weight_val_predictions = {}
 
+    # Calculate dynamic timeout for LSTM models
+    base_timeout = 120
+    if "lstm" in models_to_use:
+        lstm_epochs = model_params["lstm"].get("epochs", 20)
+        base_timeout = max(120, lstm_epochs * 10)  # 10 seconds per epoch
+
     for model_name in models_to_use:
         params = model_params[model_name]
         params_phase1 = params.copy()  # Don't save phase1 models
@@ -192,7 +207,7 @@ def train_and_evaluate(
             eval_start=weight_val_range.start,  # ✅ 在weight_val上预测（用于计算权重）
             eval_end=weight_val_range.stop - 1,
             model_params=params_phase1,
-            timeout=120,
+            timeout=base_timeout,
         )
 
         y_pred_val = extract_predictions_from_result(result)
@@ -249,7 +264,7 @@ def train_and_evaluate(
             eval_start=eval_range.start,  # ✅ 独立评估集
             eval_end=eval_range.stop - 1,
             model_params=params_with_save,
-            timeout=120,
+            timeout=base_timeout,  # Use dynamic timeout
         )
 
         y_pred_eval = extract_predictions_from_result(result)
@@ -321,11 +336,15 @@ def run(args) -> None:
             return cast_type(val)
         return val
 
-    # Auto-select conservative defaults based on training data size (for educational small datasets)
+    # Auto-select conservative defaults based on weight_train size
+    # (base models will be trained on weight_train in Phase 1, which is ~80-85% of train_range)
     train_size = te - ts + 1
-    auto_window = max(2, min(3, train_size // 3))
-    auto_max_pq = max(1, min(2, train_size // 4))
-    auto_look_back = max(2, min(3, train_size // 3))
+    weight_train_size = max(3, int(train_size * 0.85)) if train_size <= 15 else int(train_size * 0.8)
+
+    # Use weight_train_size for parameter calculation to avoid phase 1 failures
+    auto_window = max(2, min(3, weight_train_size // 4))  # More conservative
+    auto_max_pq = max(1, min(2, weight_train_size // 6))  # More conservative
+    auto_look_back = max(2, min(3, weight_train_size // 4))  # More conservative
     auto_epochs = 20 if train_size <= 15 else 30  # Conservative for ensemble base models
 
     model_params = {}
