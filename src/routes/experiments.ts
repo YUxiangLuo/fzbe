@@ -97,7 +97,7 @@ const datetimeFields = new Set<string>([
 
 const experimentIdParamSchema = z.object({
   experimentId: z.string().regex(/^\d+$/, {
-    message: "experimentId must be a number",
+    message: "experimentId 必须是数字",
   }),
 });
 
@@ -312,7 +312,7 @@ const updateExperimentSchema = z
   })
   .refine(
     (data) => Object.keys(data).length > 0,
-    "At least one field must be provided",
+    "至少需要提供一个字段",
   );
 
 const sanitizeForDb = (data: Record<string, unknown>) => {
@@ -493,18 +493,18 @@ export default (pool: Pool, JWT_SECRET: string) => {
   experimentsApi.get("/api/v1/students/me/experiment-runs/active", jwt({ secret: JWT_SECRET }), async (c) => {
     const payload = c.get("jwtPayload");
     if (payload.role !== "Student") {
-      return c.json({ error: "Forbidden" }, 403);
+      return c.json({ error: "权限不足" }, 403);
     }
     const studentId = payload.sub;
 
     try {
       const row = await fetchLatestNotCompletedExperimentForStudent(pool, studentId);
       if (!row) {
-        return c.json({ error: "Experiment status not found" }, 404);
+        return c.json({ error: "未找到实验状态" }, 404);
       }
       return c.json(normalizeExperimentRow(row));
     } catch (error) {
-      return handleUnexpectedError(c, error, "Failed to fetch experiment status");
+      return handleUnexpectedError(c, error, "获取实验状态失败");
     }
   });
 
@@ -516,7 +516,7 @@ export default (pool: Pool, JWT_SECRET: string) => {
     async (c) => {
       const payload = c.get("jwtPayload");
       if (payload.role !== "Student") {
-        return c.json({ error: "Forbidden" }, 403);
+        return c.json({ error: "权限不足" }, 403);
       }
       const studentId = Number.parseInt(payload.sub, 10);
       const data = c.req.valid("json");
@@ -553,7 +553,7 @@ export default (pool: Pool, JWT_SECRET: string) => {
         if (transactionStarted) {
           await connection.rollback();
         }
-        return handleUnexpectedError(c, error, "Failed to create experiment status");
+        return handleUnexpectedError(c, error, "创建实验状态失败");
       } finally {
         connection.release();
       }
@@ -567,7 +567,7 @@ export default (pool: Pool, JWT_SECRET: string) => {
     async (c) => {
       const payload = c.get("jwtPayload");
       if (payload.role !== "Student") {
-        return c.json({ error: "Forbidden" }, 403);
+        return c.json({ error: "权限不足" }, 403);
       }
       const studentId = Number.parseInt(payload.sub, 10);
 
@@ -585,7 +585,7 @@ export default (pool: Pool, JWT_SECRET: string) => {
         );
         return c.json(normalized);
       } catch (error) {
-        return handleUnexpectedError(c, error, "Failed to load experiments");
+        return handleUnexpectedError(c, error, "加载实验列表失败");
       }
     },
   );
@@ -598,7 +598,7 @@ export default (pool: Pool, JWT_SECRET: string) => {
     async (c) => {
       const payload = c.get("jwtPayload");
       if (payload.role !== "Student") {
-        return c.json({ error: "Forbidden" }, 403);
+        return c.json({ error: "权限不足" }, 403);
       }
       const studentId = Number.parseInt(payload.sub, 10);
       const { experimentId } = c.req.valid("param");
@@ -613,11 +613,11 @@ export default (pool: Pool, JWT_SECRET: string) => {
         );
 
         if (!experimentRow || Number(experimentRow.student_id) !== studentId) {
-          return c.json({ error: "Experiment not found" }, 404);
+          return c.json({ error: "实验不存在" }, 404);
         }
 
         if (experimentRow.status === "Completed") {
-          return c.json({ error: "Completed experiments cannot be deleted" }, 400);
+          return c.json({ error: "已完成的实验无法删除" }, 400);
         }
 
         await pool.query(
@@ -625,9 +625,9 @@ export default (pool: Pool, JWT_SECRET: string) => {
           [experimentIdNumber],
         );
 
-        return c.json({ message: "Experiment deleted successfully" });
+        return c.json({ message: "实验删除成功" });
       } catch (error) {
-        return handleUnexpectedError(c, error, "Failed to delete experiment");
+        return handleUnexpectedError(c, error, "删除实验失败");
       }
     },
   );
@@ -641,7 +641,7 @@ export default (pool: Pool, JWT_SECRET: string) => {
     async (c) => {
       const payload = c.get("jwtPayload");
       if (payload.role !== "Student") {
-        return c.json({ error: "Forbidden" }, 403);
+        return c.json({ error: "权限不足" }, 403);
       }
 
       const { experimentId } = c.req.valid("param");
@@ -653,24 +653,24 @@ export default (pool: Pool, JWT_SECRET: string) => {
       delete sanitized.total_active_duration_seconds;
 
       if (Object.keys(sanitized).length === 0) {
-        return c.json({ error: "No fields provided to update" }, 400);
+        return c.json({ error: "未提供更新字段" }, 400);
       }
 
       if (sanitized["current_step"] === null) {
-        return c.json({ error: "current_step cannot be null" }, 400);
+        return c.json({ error: "current_step 不能为空" }, 400);
       }
       if (sanitized["highest_completed_step"] === null) {
-        return c.json({ error: "highest_completed_step cannot be null" }, 400);
+        return c.json({ error: "highest_completed_step 不能为空" }, 400);
       }
 
       try {
         const row = await fetchExperimentById(pool, experimentIdNumber);
         if (!row) {
-          return c.json({ error: "Experiment status not found" }, 404);
+          return c.json({ error: "未找到实验状态" }, 404);
         }
 
         if (row.student_id !== studentId) {
-          return c.json({ error: "Forbidden" }, 403);
+          return c.json({ error: "权限不足" }, 403);
         }
 
         if (Object.prototype.hasOwnProperty.call(sanitized, "last_activity_at")) {
@@ -721,7 +721,7 @@ export default (pool: Pool, JWT_SECRET: string) => {
         const updatedRow = await fetchExperimentById(pool, experimentIdNumber);
         return c.json(normalizeExperimentRow(updatedRow!));
       } catch (error) {
-        return handleUnexpectedError(c, error, "Failed to update experiment status");
+        return handleUnexpectedError(c, error, "更新实验状态失败");
       }
     },
   );
@@ -740,7 +740,7 @@ export default (pool: Pool, JWT_SECRET: string) => {
     async (c) => {
       const payload = c.get("jwtPayload");
       if (payload.role !== "Student") {
-        return c.json({ error: "Forbidden" }, 403);
+        return c.json({ error: "权限不足" }, 403);
       }
       const studentId = Number.parseInt(payload.sub, 10);
       const { experimentId } = c.req.valid("param");
@@ -757,10 +757,10 @@ export default (pool: Pool, JWT_SECRET: string) => {
         );
 
         if (experimentRows.length === 0) {
-          return c.json({ error: "Experiment not found" }, 404);
+          return c.json({ error: "实验不存在" }, 404);
         }
         if ((experimentRows[0] as { student_id: number }).student_id !== studentId) {
-          return c.json({ error: "Forbidden: You do not own this experiment" }, 403);
+          return c.json({ error: "权限不足：您不是该实验的所有者" }, 403);
         }
 
         // --- 新的优化逻辑开始 ---
@@ -808,7 +808,7 @@ export default (pool: Pool, JWT_SECRET: string) => {
         }
 
         return c.json({
-          message: "Event created successfully",
+          message: "事件创建成功",
           event_id: result.insertId,
         }, 201);
 
@@ -816,7 +816,7 @@ export default (pool: Pool, JWT_SECRET: string) => {
         if (transactionStarted) {
           await connection.rollback();
         }
-        return handleUnexpectedError(c, error, "Failed to create experiment step event");
+        return handleUnexpectedError(c, error, "创建实验步骤事件失败");
       } finally {
         connection.release();
       }

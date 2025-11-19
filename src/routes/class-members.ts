@@ -10,23 +10,23 @@ const DEFAULT_PASSWORD_HASH = getDefaultPasswordHash();
 
 // Zod Schemas for Validation
 const classIdParamSchema = z.object({
-  classId: z.string().regex(/^\d+$/, "classId must be a number"),
+  classId: z.string().regex(/^\d+$/, "classId 必须是数字"),
 });
 
 const classAssistantParamSchema = z.object({
-  classId: z.string().regex(/^\d+$/, "classId must be a number"),
-  assistantId: z.string().regex(/^\d+$/, "assistantId must be a number"),
+  classId: z.string().regex(/^\d+$/, "classId 必须是数字"),
+  assistantId: z.string().regex(/^\d+$/, "assistantId 必须是数字"),
 });
 
 const classStudentParamSchema = z.object({
-  classId: z.string().regex(/^\d+$/, "classId must be a number"),
-  studentId: z.string().regex(/^\d+$/, "studentId must be a number"),
+  classId: z.string().regex(/^\d+$/, "classId 必须是数字"),
+  studentId: z.string().regex(/^\d+$/, "studentId 必须是数字"),
 });
 
 const createStudentSchema = z.object({
-  username: z.string().min(1, "学号 is required"),
-  full_name: z.string().min(1, "姓名 is required"),
-  email: z.string().regex(/^[^\s@]+@[^\s@]+\.[^\s@]+$/, "Invalid email format").optional(),
+  username: z.string().min(1, "学号不能为空"),
+  full_name: z.string().min(1, "姓名不能为空"),
+  email: z.string().regex(/^[^\s@]+@[^\s@]+\.[^\s@]+$/, "无效的邮箱格式").optional(),
   phone_number: z.string().optional(),
   password: z
     .string()
@@ -43,7 +43,7 @@ const joinClassSchema = z.object({
 });
 
 const enrollStudentSchema = z.object({
-  student_id: z.number().int().positive("Student ID must be a positive integer"),
+  student_id: z.number().int().positive("学生 ID 必须是正整数"),
 });
 
 export default (pool: Pool, JWT_SECRET: string) => {
@@ -109,7 +109,7 @@ export default (pool: Pool, JWT_SECRET: string) => {
         payload.role !== "Teacher" &&
         payload.role !== "Assistant"
       ) {
-        return c.json({ error: "Forbidden" }, 403);
+        return c.json({ error: "权限不足" }, 403);
       }
 
       const connection = await pool.getConnection();
@@ -125,12 +125,12 @@ export default (pool: Pool, JWT_SECRET: string) => {
 
         if (teacherId === null) {
           await connection.rollback();
-          return c.json({ error: "Class not found" }, 404);
+          return c.json({ error: "班级不存在" }, 404);
         }
 
         if (!allowed) {
           await connection.rollback();
-          return c.json({ error: "Forbidden" }, 403);
+          return c.json({ error: "权限不足" }, 403);
         }
 
         // Use provided password or default
@@ -179,7 +179,7 @@ export default (pool: Pool, JWT_SECRET: string) => {
         );
 
         if (studentRows.length === 0) {
-          throw new Error("Failed to load created student record");
+          throw new Error("加载创建的学生记录失败");
         }
 
         await connection.commit();
@@ -203,7 +203,7 @@ export default (pool: Pool, JWT_SECRET: string) => {
         return handleUnexpectedError(
           c,
           error,
-          "Failed to create student and enroll in class",
+          "创建学生并加入班级失败",
         );
       } finally {
         connection.release();
@@ -237,7 +237,7 @@ export default (pool: Pool, JWT_SECRET: string) => {
             payload.role !== "Admin"
           ) {
             await connection.rollback();
-            return c.json({ error: "Forbidden" }, 403);
+            return c.json({ error: "权限不足" }, 403);
           }
 
           const { allowed, teacherId } = await checkClassAccess(
@@ -249,12 +249,12 @@ export default (pool: Pool, JWT_SECRET: string) => {
 
           if (teacherId === null) {
             await connection.rollback();
-            return c.json({ error: "Class not found" }, 404);
+            return c.json({ error: "班级不存在" }, 404);
           }
 
           if (!allowed) {
             await connection.rollback();
-            return c.json({ error: "Forbidden: You can only enroll students to your own classes" }, 403);
+            return c.json({ error: "权限不足：您只能将学生添加到您自己的班级" }, 403);
           }
 
           const [[studentLock]]: any[] = await connection.query(
@@ -264,12 +264,12 @@ export default (pool: Pool, JWT_SECRET: string) => {
 
           if (!studentLock) {
             await connection.rollback();
-            return c.json({ error: "Student not found" }, 404);
+            return c.json({ error: "学生不存在" }, 404);
           }
 
           if (studentLock.role !== "Student") {
             await connection.rollback();
-            return c.json({ error: "User is not a student" }, 400);
+            return c.json({ error: "用户不是学生" }, 400);
           }
 
           const [existingEnrollments]: any[] = await connection.query(
@@ -286,8 +286,8 @@ export default (pool: Pool, JWT_SECRET: string) => {
             await connection.rollback();
             return c.json(
               {
-                error: "Student already enrolled in a class",
-                message: "This student is already enrolled in another class",
+                error: "学生已加入班级",
+                message: "该学生已加入其他班级",
                 current_class: {
                   class_id: currentClass.class_id,
                   class_name: currentClass.class_name,
@@ -320,14 +320,14 @@ export default (pool: Pool, JWT_SECRET: string) => {
             await connection.rollback();
           }
           if (error?.code === "ER_DUP_ENTRY") {
-            return c.json({ error: "Student already enrolled in this class" }, 409);
+            return c.json({ error: "学生已加入该班级" }, 409);
           }
-          return handleUnexpectedError(c, error, "Failed to enroll student");
+          return handleUnexpectedError(c, error, "添加学生失败");
         } finally {
           connection.release();
         }
       } catch (error: any) {
-        return handleUnexpectedError(c, error, "Failed to enroll student");
+        return handleUnexpectedError(c, error, "添加学生失败");
       }
     },
   );
@@ -351,11 +351,11 @@ export default (pool: Pool, JWT_SECRET: string) => {
         );
 
         if (teacherId === null) {
-          return c.json({ error: "Class not found" }, 404);
+          return c.json({ error: "班级不存在" }, 404);
         }
 
         if (!allowed) {
-          return c.json({ error: "Forbidden" }, 403);
+          return c.json({ error: "权限不足" }, 403);
         }
 
         const [students] = await pool.query(
@@ -369,7 +369,7 @@ export default (pool: Pool, JWT_SECRET: string) => {
 
         return c.json(students);
       } catch (error) {
-        return handleUnexpectedError(c, error, "Failed to fetch class students");
+        return handleUnexpectedError(c, error, "获取班级学生失败");
       }
     },
   );
@@ -394,11 +394,11 @@ export default (pool: Pool, JWT_SECRET: string) => {
         );
 
         if (teacherId === null) {
-          return c.json({ error: "Class not found" }, 404);
+          return c.json({ error: "班级不存在" }, 404);
         }
 
         if (!allowed) {
-          return c.json({ error: "Forbidden" }, 403);
+          return c.json({ error: "权限不足" }, 403);
         }
 
         // Verify that the user is actually a student
@@ -408,11 +408,11 @@ export default (pool: Pool, JWT_SECRET: string) => {
         );
 
         if (userRows.length === 0) {
-          return c.json({ error: "User not found" }, 404);
+          return c.json({ error: "用户不存在" }, 404);
         }
 
         if (userRows[0].role !== "Student") {
-          return c.json({ error: "User is not a student" }, 400);
+          return c.json({ error: "用户不是学生" }, 400);
         }
 
         const [result]: any = await pool.query(
@@ -421,12 +421,12 @@ export default (pool: Pool, JWT_SECRET: string) => {
         );
 
         if (result.affectedRows === 0) {
-          return c.json({ error: "Enrollment not found" }, 404);
+          return c.json({ error: "未找到加入记录" }, 404);
         }
 
-        return c.json({ message: "Student removed from class" });
+        return c.json({ message: "学生已从班级移除" });
       } catch (error) {
-        return handleUnexpectedError(c, error, "Failed to remove student from class");
+        return handleUnexpectedError(c, error, "从班级移除学生失败");
       }
     },
   );
@@ -446,7 +446,7 @@ export default (pool: Pool, JWT_SECRET: string) => {
 
         // Verify user is a student
         if (payload.role !== "Student") {
-          return c.json({ error: "Only students can join classes" }, 403);
+          return c.json({ error: "只有学生可以加入班级" }, 403);
         }
 
         const studentId = payload.sub;
@@ -476,8 +476,8 @@ export default (pool: Pool, JWT_SECRET: string) => {
             await connection.rollback();
             return c.json(
               {
-                error: "Already enrolled in a class",
-                message: "You are already enrolled in another class. Please leave your current class before joining a new one.",
+                error: "已加入班级",
+                message: "您已加入其他班级。请先退出当前班级再加入新班级。",
                 current_class: {
                   class_id: currentClass.class_id,
                   class_name: currentClass.class_name,
@@ -494,7 +494,7 @@ export default (pool: Pool, JWT_SECRET: string) => {
 
           if (classRows.length === 0) {
             await connection.rollback();
-            return c.json({ error: "Class not found" }, 404);
+            return c.json({ error: "班级不存在" }, 404);
           }
 
           const classInfo = classRows[0];
@@ -502,11 +502,11 @@ export default (pool: Pool, JWT_SECRET: string) => {
           if (classInfo.class_code) {
             if (!class_code) {
               await connection.rollback();
-              return c.json({ error: "Class code is required for this class" }, 400);
+              return c.json({ error: "该班级需要班级代码" }, 400);
             }
             if (class_code !== classInfo.class_code) {
               await connection.rollback();
-              return c.json({ error: "Invalid class code" }, 403);
+              return c.json({ error: "班级代码无效" }, 403);
             }
           }
 
@@ -519,7 +519,7 @@ export default (pool: Pool, JWT_SECRET: string) => {
 
           return c.json(
             {
-              message: "Successfully joined class",
+              message: "成功加入班级",
               class: {
                 class_id: classInfo.class_id,
                 class_name: classInfo.class_name,
@@ -532,12 +532,12 @@ export default (pool: Pool, JWT_SECRET: string) => {
           if (transactionStarted) {
             await connection.rollback();
           }
-          return handleUnexpectedError(c, error, "Failed to join class");
+          return handleUnexpectedError(c, error, "加入班级失败");
         } finally {
           connection.release();
         }
       } catch (error) {
-        return handleUnexpectedError(c, error, "Failed to join class");
+        return handleUnexpectedError(c, error, "加入班级失败");
       }
     },
   );
@@ -550,7 +550,7 @@ export default (pool: Pool, JWT_SECRET: string) => {
       try {
         const payload = c.get("jwtPayload");
         if (payload.role !== "Student") {
-          return c.json({ error: "Only students can view joinable classes" }, 403);
+          return c.json({ error: "只有学生可以查看可加入的班级" }, 403);
         }
 
         const studentId = Number(payload.sub);
@@ -566,8 +566,8 @@ export default (pool: Pool, JWT_SECRET: string) => {
         if (existingEnrollment) {
           return c.json(
             {
-              error: "Already enrolled in a class",
-              message: "You are already enrolled in a class. Please leave it before joining a new one.",
+              error: "已加入班级",
+              message: "您已加入班级。请先退出再加入新班级。",
               current_class_id: existingEnrollment.class_id,
             },
             409,
@@ -590,7 +590,7 @@ export default (pool: Pool, JWT_SECRET: string) => {
 
         return c.json(rows);
       } catch (error) {
-        return handleUnexpectedError(c, error, "Failed to load joinable classes");
+        return handleUnexpectedError(c, error, "加载可加入班级列表失败");
       }
     },
   );
@@ -616,11 +616,11 @@ export default (pool: Pool, JWT_SECRET: string) => {
         );
 
         if (teacherId === null) {
-          return c.json({ error: "Class not found" }, 404);
+          return c.json({ error: "班级不存在" }, 404);
         }
 
         if (!allowed) {
-          return c.json({ error: "Forbidden" }, 403);
+          return c.json({ error: "权限不足" }, 403);
         }
 
         const [userRows]: any[] = await pool.query(
@@ -628,7 +628,7 @@ export default (pool: Pool, JWT_SECRET: string) => {
           [assistant_id],
         );
         if (userRows.length === 0 || userRows[0].role !== "Assistant") {
-          return c.json({ error: "User is not an assistant" }, 400);
+          return c.json({ error: "用户不是助教" }, 400);
         }
 
         await pool.query(
@@ -636,12 +636,12 @@ export default (pool: Pool, JWT_SECRET: string) => {
           [classIdNumber, assistant_id],
         );
 
-        return c.json({ message: "Assistant added successfully" }, 201);
+        return c.json({ message: "助教添加成功" }, 201);
       } catch (error: any) {
         if (error.code === "ER_DUP_ENTRY") {
-          return c.json({ error: "Assistant already assigned to this class" }, 409);
+          return c.json({ error: "助教已分配给该班级" }, 409);
         }
-        return handleUnexpectedError(c, error, "Failed to add assistant to class");
+        return handleUnexpectedError(c, error, "添加助教失败");
       }
     },
   );
@@ -665,11 +665,11 @@ export default (pool: Pool, JWT_SECRET: string) => {
         );
 
         if (teacherId === null) {
-          return c.json({ error: "Class not found" }, 404);
+          return c.json({ error: "班级不存在" }, 404);
         }
 
         if (!allowed) {
-          return c.json({ error: "Forbidden" }, 403);
+          return c.json({ error: "权限不足" }, 403);
         }
 
         const [rows] = await pool.query(
@@ -682,7 +682,7 @@ export default (pool: Pool, JWT_SECRET: string) => {
 
         return c.json(rows);
       } catch (error) {
-        return handleUnexpectedError(c, error, "Failed to fetch class assistants");
+        return handleUnexpectedError(c, error, "获取班级助教失败");
       }
     },
   );
@@ -707,11 +707,11 @@ export default (pool: Pool, JWT_SECRET: string) => {
         );
 
         if (teacherId === null) {
-          return c.json({ error: "Class not found" }, 404);
+          return c.json({ error: "班级不存在" }, 404);
         }
 
         if (!allowed) {
-          return c.json({ error: "Forbidden" }, 403);
+          return c.json({ error: "权限不足" }, 403);
         }
 
         const [result]: any = await pool.query(
@@ -720,12 +720,12 @@ export default (pool: Pool, JWT_SECRET: string) => {
         );
 
         if (result.affectedRows === 0) {
-          return c.json({ error: "Assignment not found" }, 404);
+          return c.json({ error: "未找到分配记录" }, 404);
         }
 
-        return c.json({ message: "Assistant removed successfully" });
+        return c.json({ message: "助教移除成功" });
       } catch (error) {
-        return handleUnexpectedError(c, error, "Failed to remove assistant from class");
+        return handleUnexpectedError(c, error, "移除助教失败");
       }
     },
   );

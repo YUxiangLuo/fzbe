@@ -43,7 +43,7 @@ const industryCompanyProductParamSchema = z.object({
 const datasetIdParamSchema = z.object({
   datasetId: z
     .string()
-    .regex(/^\d+$/, { message: "datasetId must be a number" }),
+    .regex(/^\d+$/, { message: "datasetId 必须是数字" }),
 });
 
 const updateDatasetSchema = z.object({
@@ -124,7 +124,7 @@ export default (pool: Pool, JWT_SECRET: string) => {
     try {
       const payload = c.get("jwtPayload");
       if (payload.role !== "Admin") {
-        return c.json({ error: "Forbidden" }, 403);
+        return c.json({ error: "权限不足" }, 403);
       }
 
       const body = await c.req.parseBody();
@@ -133,11 +133,11 @@ export default (pool: Pool, JWT_SECRET: string) => {
       const description = body["description"];
 
       if (!(file instanceof File)) {
-        return c.json({ error: "CSV file is required" }, 400);
+        return c.json({ error: "需要 CSV 文件" }, 400);
       }
 
       if (!dataName || typeof dataName !== "string") {
-        return c.json({ error: "data_name is required" }, 400);
+        return c.json({ error: "数据集名称不能为空" }, 400);
       }
 
       // Comprehensive file validation
@@ -302,12 +302,12 @@ export default (pool: Pool, JWT_SECRET: string) => {
           );
         }
 
-        return handleUnexpectedError(c, dbError, "Failed to upload dataset");
+        return handleUnexpectedError(c, dbError, "上传数据集失败");
       } finally {
         connection.release();
       }
     } catch (error) {
-      return handleUnexpectedError(c, error, "Failed to upload dataset");
+      return handleUnexpectedError(c, error, "上传数据集失败");
     } finally {
       // Always cleanup the temporary file
       if (!uploadSucceeded && datasetDirectory) {
@@ -338,7 +338,7 @@ export default (pool: Pool, JWT_SECRET: string) => {
       const normalized = (rows as any[]).map((row) => normalizeDatasetRow(row));
       return c.json(normalized);
     } catch (error) {
-      return handleUnexpectedError(c, error, "Failed to fetch datasets");
+      return handleUnexpectedError(c, error, "获取数据集列表失败");
     }
   });
 
@@ -350,7 +350,7 @@ export default (pool: Pool, JWT_SECRET: string) => {
       );
       return c.json(rows.map((row) => row.industry_name));
     } catch (error) {
-      return handleUnexpectedError(c, error, "Failed to fetch industries");
+      return handleUnexpectedError(c, error, "获取行业列表失败");
     }
   });
 
@@ -367,7 +367,7 @@ export default (pool: Pool, JWT_SECRET: string) => {
         );
         return c.json(rows.map((row) => row.company_name));
       } catch (error) {
-        return handleUnexpectedError(c, error, "Failed to fetch companies");
+        return handleUnexpectedError(c, error, "获取公司列表失败");
       }
     },
   );
@@ -388,7 +388,7 @@ export default (pool: Pool, JWT_SECRET: string) => {
         );
         return c.json(rows.map((row) => row.product_name));
       } catch (error) {
-        return handleUnexpectedError(c, error, "Failed to fetch products");
+        return handleUnexpectedError(c, error, "获取产品列表失败");
       }
     },
   );
@@ -411,14 +411,14 @@ export default (pool: Pool, JWT_SECRET: string) => {
 
         const segment = segments[0];
         if (!segment) {
-          return c.json({ error: "Product segment not found" }, 404);
+          return c.json({ error: "未找到产品分段" }, 404);
         }
 
         const { file_path: filePath } = segment;
         const fileExists = await Bun.file(filePath).exists();
         if (!fileExists) {
           logWarning("Product segment file missing on disk", { filePath });
-          return c.json({ error: "Product segment file is missing" }, 404);
+          return c.json({ error: "产品分段文件丢失" }, 404);
         }
 
         const fields = await new Promise<string[]>((resolve, reject) => {
@@ -456,7 +456,7 @@ export default (pool: Pool, JWT_SECRET: string) => {
 
         return c.json({ fields });
       } catch (error) {
-        return handleUnexpectedError(c, error, "Failed to fetch product fields");
+        return handleUnexpectedError(c, error, "获取产品字段失败");
       }
     },
   );
@@ -479,7 +479,7 @@ export default (pool: Pool, JWT_SECRET: string) => {
 
         const segment = segments[0];
         if (!segment) {
-          return c.json({ error: "Product segment not found" }, 404);
+          return c.json({ error: "未找到产品分段" }, 404);
         }
 
         const { file_path: filePath } = segment;
@@ -488,7 +488,7 @@ export default (pool: Pool, JWT_SECRET: string) => {
         const fileExists = await Bun.file(filePath).exists();
         if (!fileExists) {
           logWarning("Product sales data file missing on disk", { filePath });
-          return c.json({ error: "Product sales data file is missing" }, 404);
+          return c.json({ error: "产品销售数据文件丢失" }, 404);
         }
 
         const monthlySales: Array<{ month: string; sales: number }> = [];
@@ -584,7 +584,7 @@ export default (pool: Pool, JWT_SECRET: string) => {
           csvData,
         });
       } catch (error) {
-        return handleUnexpectedError(c, error, "Failed to fetch product sales data");
+        return handleUnexpectedError(c, error, "获取产品销售数据失败");
       }
     },
   );
@@ -602,11 +602,11 @@ export default (pool: Pool, JWT_SECRET: string) => {
           [datasetId],
         );
         if (rows.length === 0) {
-          return c.json({ error: "Dataset not found" }, 404);
+          return c.json({ error: "数据集不存在" }, 404);
         }
         return c.json(normalizeDatasetRow(rows[0]));
       } catch (error) {
-        return handleUnexpectedError(c, error, "Failed to fetch dataset");
+        return handleUnexpectedError(c, error, "获取数据集失败");
       }
     },
   );
@@ -621,7 +621,7 @@ export default (pool: Pool, JWT_SECRET: string) => {
       try {
         const payload = c.get("jwtPayload");
         if (payload.role !== "Admin") {
-          return c.json({ error: "Forbidden" }, 403);
+          return c.json({ error: "权限不足" }, 403);
         }
 
         const { datasetId } = c.req.valid("param");
@@ -639,7 +639,7 @@ export default (pool: Pool, JWT_SECRET: string) => {
         }
 
         if (fields.length === 0) {
-          return c.json({ error: "No fields to update" }, 400);
+          return c.json({ error: "没有需要更新的字段" }, 400);
         }
 
         values.push(datasetId);
@@ -647,7 +647,7 @@ export default (pool: Pool, JWT_SECRET: string) => {
         const [result] = await pool.query<ResultSetHeader>(sql, values);
 
         if (result.affectedRows === 0) {
-          return c.json({ error: "Dataset not found" }, 404);
+          return c.json({ error: "数据集不存在" }, 404);
         }
 
         const [rows] = await pool.query<DatasetRow[]>(
@@ -656,7 +656,7 @@ export default (pool: Pool, JWT_SECRET: string) => {
         );
         return c.json(normalizeDatasetRow(rows[0]));
       } catch (error) {
-        return handleUnexpectedError(c, error, "Failed to update dataset");
+        return handleUnexpectedError(c, error, "更新数据集失败");
       }
     },
   );
@@ -670,7 +670,7 @@ export default (pool: Pool, JWT_SECRET: string) => {
       try {
         const payload = c.get("jwtPayload");
         if (payload.role !== "Admin") {
-          return c.json({ error: "Forbidden" }, 403);
+          return c.json({ error: "权限不足" }, 403);
         }
 
         const { datasetId } = c.req.valid("param");
@@ -682,7 +682,7 @@ export default (pool: Pool, JWT_SECRET: string) => {
         const dataset = rows[0];
 
         if (!dataset) {
-          return c.json({ error: "Dataset not found" }, 404);
+          return c.json({ error: "数据集不存在" }, 404);
         }
 
         // Delete the original file itself
@@ -715,12 +715,12 @@ export default (pool: Pool, JWT_SECRET: string) => {
 
         if (result.affectedRows === 0) {
           // This case should ideally not be reached if the directory was found
-          return c.json({ error: "Dataset not found in database" }, 404);
+          return c.json({ error: "数据库中未找到数据集" }, 404);
         }
 
-        return c.json({ message: "Dataset and all associated files deleted successfully" });
+        return c.json({ message: "数据集及所有相关文件删除成功" });
       } catch (error) {
-        return handleUnexpectedError(c, error, "Failed to delete dataset");
+        return handleUnexpectedError(c, error, "删除数据集失败");
       }
     },
   );

@@ -4,7 +4,7 @@ import logger from "../logger";
 export const handleUnexpectedError = (
   c: Context,
   error: unknown,
-  message = "Internal server error",
+  message = "服务器内部错误",
 ) => {
   logger.error(
     {

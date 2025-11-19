@@ -52,12 +52,12 @@ function validateExtension(fileName: string, fileType: FileType): void {
   const allowedExts = ALLOWED_EXTENSIONS[fileType];
 
   if (!ext) {
-    throw new FileValidationError("File has no extension");
+    throw new FileValidationError("文件没有扩展名");
   }
 
   if (!(allowedExts as readonly string[]).includes(ext)) {
     throw new FileValidationError(
-      `Invalid file extension "${ext}". Allowed: ${allowedExts.join(", ")}`
+      `无效的文件扩展名 "${ext}"。允许的扩展名: ${allowedExts.join(", ")}`
     );
   }
 }
@@ -69,7 +69,7 @@ function validateMimeType(mimeType: string, fileType: FileType): void {
   const allowedMimes = ALLOWED_MIME_TYPES[fileType];
 
   if (!mimeType) {
-    throw new FileValidationError("File MIME type is missing");
+    throw new FileValidationError("文件 MIME 类型缺失");
   }
 
   // Check if MIME type matches any allowed pattern
@@ -81,7 +81,7 @@ function validateMimeType(mimeType: string, fileType: FileType): void {
 
   if (!isValid) {
     throw new FileValidationError(
-      `Invalid MIME type "${mimeType}". Allowed: ${allowedMimes.join(", ")}`
+      `无效的 MIME 类型 "${mimeType}"。允许的类型: ${allowedMimes.join(", ")}`
     );
   }
 }
@@ -114,7 +114,7 @@ async function validateMagicBytes(
 
   if (!isValid) {
     throw new FileValidationError(
-      `File signature does not match expected ${fileType.toUpperCase()} format`
+      `文件签名不符合预期的 ${fileType.toUpperCase()} 格式`
     );
   }
 }
@@ -127,12 +127,12 @@ function validateSize(fileSize: number, maxSize?: number): void {
     const maxSizeMB = (maxSize / (1024 * 1024)).toFixed(2);
     const fileSizeMB = (fileSize / (1024 * 1024)).toFixed(2);
     throw new FileValidationError(
-      `File size ${fileSizeMB}MB exceeds maximum allowed size of ${maxSizeMB}MB`
+      `文件大小 ${fileSizeMB}MB 超过了允许的最大值 ${maxSizeMB}MB`
     );
   }
 
   if (fileSize === 0) {
-    throw new FileValidationError("File is empty");
+    throw new FileValidationError("文件为空");
   }
 }
 

@@ -11,11 +11,11 @@ const adfPointSchema = z.object({
   month: z
     .string()
     .trim()
-    .min(1, { message: "month is required" }),
+    .min(1, { message: "月份不能为空" }),
   sales: z
     .coerce.number()
     .refine((value) => Number.isFinite(value), {
-      message: "sales must be a finite number",
+      message: "销售额必须是有限数字",
     }),
 });
 

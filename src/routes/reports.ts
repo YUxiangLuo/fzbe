@@ -11,7 +11,7 @@ import { handleUnexpectedError } from "../utils/error-handler";
 import { sanitizeHTML, HTMLSanitizationError } from "../utils/html-sanitizer";
 
 const experimentIdParamSchema = z.object({
-  experimentId: z.string().regex(/^\d+$/, { message: "experimentId must be a number" }),
+  experimentId: z.string().regex(/^\d+$/, { message: "experimentId 必须是数字" }),
 });
 
 const submitReportSchema = z.object({
@@ -22,7 +22,7 @@ async function markdownToSanitizedHtml(markdown: string): Promise<string> {
   const parsed = await marked.parse(markdown);
 
   if (typeof parsed !== "string") {
-    throw new HTMLSanitizationError("Failed to convert Markdown to HTML");
+    throw new HTMLSanitizationError("Markdown 转换为 HTML 失败");
   }
 
   return sanitizeHTML(parsed);
@@ -119,7 +119,7 @@ export default (pool: Pool, JWT_SECRET: string) => {
       try {
         const payload = c.get("jwtPayload");
         if (payload.role !== "Student") {
-          return c.json({ error: "Forbidden" }, 403);
+          return c.json({ error: "权限不足" }, 403);
         }
         const studentId = Number.parseInt(payload.sub, 10);
 
@@ -136,12 +136,12 @@ export default (pool: Pool, JWT_SECRET: string) => {
         );
 
         if (!ownership) {
-          return c.json({ error: "Experiment not found" }, 404);
+          return c.json({ error: "实验不存在" }, 404);
         }
 
         if (Number.parseInt(String(ownership.student_id), 10) !== studentId) {
           return c.json(
-            { error: "Forbidden: Experiment does not belong to the current user" },
+            { error: "权限不足：该实验不属于当前用户" },
             403,
           );
         }
@@ -153,7 +153,7 @@ export default (pool: Pool, JWT_SECRET: string) => {
         } catch (error) {
           if (error instanceof HTMLSanitizationError) {
             return c.json(
-              { error: "Invalid report content: " + error.message },
+              { error: "无效的报告内容： " + error.message },
               400
             );
           }
@@ -256,7 +256,7 @@ export default (pool: Pool, JWT_SECRET: string) => {
             if (rows.length > 0) {
               reportId = rows[0].report_id;
               return c.json({
-                message: "Report updated successfully",
+                message: "报告更新成功",
                 report_id: reportId,
                 pdf_path: pdfPath,
               });
@@ -265,7 +265,7 @@ export default (pool: Pool, JWT_SECRET: string) => {
 
           return c.json(
             {
-              message: "Report submitted successfully",
+              message: "报告提交成功",
               report_id: reportId,
               pdf_path: pdfPath,
             },
@@ -276,7 +276,7 @@ export default (pool: Pool, JWT_SECRET: string) => {
           return handleUnexpectedError(
             c,
             dbError,
-            "An internal server error occurred while processing the report.",
+            "处理报告时发生内部服务器错误。",
           );
         } finally {
           connection.release();
@@ -285,7 +285,7 @@ export default (pool: Pool, JWT_SECRET: string) => {
         return handleUnexpectedError(
           c,
           error,
-          "An internal server error occurred while processing the report.",
+          "处理报告时发生内部服务器错误。",
         );
       } finally {
         if (browser) {

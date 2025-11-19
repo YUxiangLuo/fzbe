@@ -46,7 +46,7 @@ const singleAnswerSchema = z.object({
 
 const batchSubmitAnswersSchema = z.object({
   experiment_id: z.number().int().positive(),
-  answers: z.array(singleAnswerSchema).min(1, "At least one answer must be provided"),
+  answers: z.array(singleAnswerSchema).min(1, "至少需要提供一个答案"),
 });
 
 export default (pool: Pool, JWT_SECRET: string) => {
@@ -57,7 +57,7 @@ export default (pool: Pool, JWT_SECRET: string) => {
     try {
       const payload = c.get("jwtPayload");
       if (payload.role !== "Student") {
-        return c.json({ error: "Forbidden" }, 403);
+        return c.json({ error: "权限不足" }, 403);
       }
 
       // Step 1: Get all question IDs matching the criteria (uses index)
@@ -66,7 +66,7 @@ export default (pool: Pool, JWT_SECRET: string) => {
       );
 
       if (idRows.length === 0) {
-        return c.json({ error: "No model-related questions available" }, 404);
+        return c.json({ error: "没有可用的模型相关题目" }, 404);
       }
 
       // Step 2: Randomly select up to 4 question IDs in application layer
@@ -102,7 +102,7 @@ export default (pool: Pool, JWT_SECRET: string) => {
       return c.json(normalized);
 
     } catch (error) {
-      return handleUnexpectedError(c, error, "Failed to fetch model quiz questions");
+      return handleUnexpectedError(c, error, "获取模型测试题目失败");
     }
   });
 
@@ -111,7 +111,7 @@ export default (pool: Pool, JWT_SECRET: string) => {
     try {
       const payload = c.get("jwtPayload");
       if (payload.role !== "Student") {
-        return c.json({ error: "Forbidden" }, 403);
+        return c.json({ error: "权限不足" }, 403);
       }
 
       // Step 1: Get all question IDs matching the criteria (uses index)
@@ -120,7 +120,7 @@ export default (pool: Pool, JWT_SECRET: string) => {
       );
 
       if (idRows.length === 0) {
-        return c.json({ error: "No plan-related questions available" }, 404);
+        return c.json({ error: "没有可用的生产计划相关题目" }, 404);
       }
 
       // Step 2: Randomly select up to 4 question IDs in application layer
@@ -156,7 +156,7 @@ export default (pool: Pool, JWT_SECRET: string) => {
       return c.json(normalized);
 
     } catch (error) {
-      return handleUnexpectedError(c, error, "Failed to fetch plan quiz questions");
+      return handleUnexpectedError(c, error, "获取生产计划测试题目失败");
     }
   });
 
@@ -169,7 +169,7 @@ export default (pool: Pool, JWT_SECRET: string) => {
       try {
         const payload = c.get("jwtPayload");
         if (payload.role !== "Student") {
-          return c.json({ error: "Forbidden" }, 403);
+          return c.json({ error: "权限不足" }, 403);
         }
         const studentId = Number.parseInt(payload.sub, 10);
 
@@ -177,7 +177,7 @@ export default (pool: Pool, JWT_SECRET: string) => {
 
         const questionIds = submittedAnswers.map((a) => a.question_id);
         if (questionIds.length === 0) {
-          return c.json({ error: "No answers provided" }, 400);
+          return c.json({ error: "未提供答案" }, 400);
         }
 
         const connection = await pool.getConnection();
@@ -200,7 +200,7 @@ export default (pool: Pool, JWT_SECRET: string) => {
 
           if (!experimentOwnership) {
             releaseConnection();
-            return c.json({ error: "Experiment not found" }, 404);
+            return c.json({ error: "实验不存在" }, 404);
           }
 
           if (
@@ -208,7 +208,7 @@ export default (pool: Pool, JWT_SECRET: string) => {
           ) {
             releaseConnection();
             return c.json(
-              { error: "Forbidden: Experiment does not belong to the current user" },
+              { error: "权限不足：该实验不属于当前用户" },
               403,
             );
           }
@@ -316,11 +316,11 @@ export default (pool: Pool, JWT_SECRET: string) => {
             await connection.rollback();
           }
           releaseConnection();
-          return handleUnexpectedError(c, error, "Failed to submit quiz answers");
+          return handleUnexpectedError(c, error, "提交测试答案失败");
         }
 
       } catch (error) {
-        return handleUnexpectedError(c, error, "Failed to submit quiz answers");
+        return handleUnexpectedError(c, error, "提交测试答案失败");
       }
     },
   );

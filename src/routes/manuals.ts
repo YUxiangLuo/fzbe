@@ -10,7 +10,7 @@ import { validateFile, generateUniqueFilename, FileValidationError } from "../ut
 
 // Zod Schemas for Validation
 const manualIdParamSchema = z.object({
-  manualId: z.string().regex(/^\d+$/, { message: "manualId must be a number" }),
+  manualId: z.string().regex(/^\d+$/, { message: "manualId 必须是数字" }),
 });
 
 const updateManualSchema = z.object({
@@ -50,7 +50,7 @@ export default (pool: Pool, JWT_SECRET: string) => {
     try {
       const payload = c.get("jwtPayload");
       if (payload.role !== "Admin") {
-        return c.json({ error: "Forbidden" }, 403);
+        return c.json({ error: "权限不足" }, 403);
       }
 
       const body = await c.req.parseBody();
@@ -60,11 +60,11 @@ export default (pool: Pool, JWT_SECRET: string) => {
       const uploaderId = payload.sub;
 
       if (!(file instanceof File)) {
-        return c.json({ error: "file is required" }, 400);
+        return c.json({ error: "必须上传文件" }, 400);
       }
 
       if (!fileName || typeof fileName !== "string") {
-        return c.json({ error: "file_name is required" }, 400);
+        return c.json({ error: "必须提供文件名" }, 400);
       }
 
       // Comprehensive file validation
@@ -105,7 +105,7 @@ export default (pool: Pool, JWT_SECRET: string) => {
 
       return c.json(normalizeManualRow(rows[0]), 201);
     } catch (error) {
-      return handleUnexpectedError(c, error, "Failed to upload manual");
+      return handleUnexpectedError(c, error, "上传手册失败");
     }
   });
 
@@ -114,7 +114,7 @@ export default (pool: Pool, JWT_SECRET: string) => {
     try {
       const payload = c.get("jwtPayload");
       if (payload.role !== "Admin") {
-        return c.json({ error: "Forbidden" }, 403);
+        return c.json({ error: "权限不足" }, 403);
       }
       const [rows] = await pool.query(`
           SELECT m.*, u.full_name as uploader_name
@@ -125,7 +125,7 @@ export default (pool: Pool, JWT_SECRET: string) => {
       const normalized = (rows as any[]).map((row) => normalizeManualRow(row));
       return c.json(normalized);
     } catch (error) {
-      return handleUnexpectedError(c, error, "Failed to fetch manuals");
+      return handleUnexpectedError(c, error, "获取手册列表失败");
     }
   });
 
@@ -141,11 +141,11 @@ export default (pool: Pool, JWT_SECRET: string) => {
       `);
       const manual = rows[0];
       if (!manual) {
-        return c.json({ error: "No active manual found" }, 404);
+        return c.json({ error: "未找到激活的手册" }, 404);
       }
       return c.json(normalizeManualRow(manual));
     } catch (error) {
-      return handleUnexpectedError(c, error, "Failed to fetch active manual");
+      return handleUnexpectedError(c, error, "获取激活手册失败");
     }
   });
 
@@ -158,7 +158,7 @@ export default (pool: Pool, JWT_SECRET: string) => {
     async (c) => {
       const payload = c.get("jwtPayload");
       if (payload.role !== "Admin") {
-        return c.json({ error: "Forbidden" }, 403);
+        return c.json({ error: "权限不足" }, 403);
       }
 
       const { manualId } = c.req.valid("param");
@@ -193,7 +193,7 @@ export default (pool: Pool, JWT_SECRET: string) => {
 
         if (fields.length === 0) {
           await connection.rollback();
-          return c.json({ error: "No fields to update" }, 400);
+          return c.json({ error: "没有需要更新的字段" }, 400);
         }
 
         values.push(manualIdNumber);
@@ -202,7 +202,7 @@ export default (pool: Pool, JWT_SECRET: string) => {
 
         if (result.affectedRows === 0) {
           await connection.rollback();
-          return c.json({ error: "Manual not found" }, 404);
+          return c.json({ error: "手册不存在" }, 404);
         }
 
         await connection.commit();
@@ -217,7 +217,7 @@ export default (pool: Pool, JWT_SECRET: string) => {
         return c.json(normalizeManualRow(rows[0]));
       } catch (error) {
         await connection.rollback();
-        return handleUnexpectedError(c, error, "Failed to update manual");
+        return handleUnexpectedError(c, error, "更新手册失败");
       } finally {
         connection.release();
       }
@@ -233,7 +233,7 @@ export default (pool: Pool, JWT_SECRET: string) => {
       try {
         const payload = c.get("jwtPayload");
         if (payload.role !== "Admin") {
-          return c.json({ error: "Forbidden" }, 403);
+          return c.json({ error: "权限不足" }, 403);
         }
 
         const { manualId } = c.req.valid("param");
@@ -246,7 +246,7 @@ export default (pool: Pool, JWT_SECRET: string) => {
         const manual = rows[0];
 
         if (!manual) {
-          return c.json({ error: "Manual not found" }, 404);
+          return c.json({ error: "手册不存在" }, 404);
         }
 
         // Use rm with force: true to avoid crashing if the file is already deleted
@@ -256,9 +256,9 @@ export default (pool: Pool, JWT_SECRET: string) => {
           manualIdNumber,
         ]);
 
-        return c.json({ message: "Manual deleted successfully" });
+        return c.json({ message: "手册删除成功" });
       } catch (error) {
-        return handleUnexpectedError(c, error, "Failed to delete manual");
+        return handleUnexpectedError(c, error, "删除手册失败");
       }
     },
   );

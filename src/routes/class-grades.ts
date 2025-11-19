@@ -10,11 +10,11 @@ import { handleUnexpectedError } from "../utils/error-handler";
 
 // Zod Schemas for Validation
 const classIdParamSchema = z.object({
-  classId: z.string().regex(/^\d+$/, { message: "classId must be a number" }),
+  classId: z.string().regex(/^\d+$/, { message: "classId 必须是数字" }),
 });
 
 const reportIdParamSchema = z.object({
-  reportId: z.string().regex(/^\d+$/, { message: "reportId must be a number" }),
+  reportId: z.string().regex(/^\d+$/, { message: "reportId 必须是数字" }),
 });
 
 const EXP_FLOW_FIELDS = [
@@ -47,8 +47,8 @@ const EXPERIMENT_GRADE_FIELDS = [
 
 const EXPERIMENT_GRADE_SELECT_FRAGMENT = EXPERIMENT_GRADE_FIELDS.length
   ? `,\n             ${EXPERIMENT_GRADE_FIELDS.map(
-      (column) => `eg.${column} AS grade_${column}`,
-    ).join(",\n             ")}`
+    (column) => `eg.${column} AS grade_${column}`,
+  ).join(",\n             ")}`
   : "";
 
 const EXPERIMENT_GRADE_MUTABLE_FIELDS = [...EXPERIMENT_GRADE_FIELDS] as const;
@@ -153,8 +153,8 @@ const computeExperimentScores = (
   );
   const finalScore = hasExperiment
     ? Object.values(finalScoreComponents).some(
-        (component) => component.weighted_score !== null,
-      )
+      (component) => component.weighted_score !== null,
+    )
       ? finalScoreRaw
       : null
     : null;
@@ -349,8 +349,8 @@ const LATEST_GRADE_SELECTION_SQL = `
 const createOptionalGradeValue = () =>
   z
     .number()
-    .min(0, { message: "grade must be between 0 and 100" })
-    .max(100, { message: "grade must be between 0 and 100" })
+    .min(0, { message: "分数必须在 0 到 100 之间" })
+    .max(100, { message: "分数必须在 0 到 100 之间" })
     .optional();
 
 const optionalGradeValue = createOptionalGradeValue();
@@ -383,7 +383,7 @@ const experimentGradeUpdateSchema = z
     if (!hasValue) {
       ctx.addIssue({
         code: z.ZodIssueCode.custom,
-        message: "At least one experiment_grade field must be provided",
+        message: "至少需要提供一个实验成绩字段",
       });
     }
   })
@@ -398,7 +398,7 @@ const updateGradeWeightsSchema = z.object({
   // At least one field must be provided
   return Object.values(data).some(v => v !== undefined);
 }, {
-  message: "At least one weight field must be provided",
+  message: "至少需要提供一个权重字段",
 });
 
 const gradeReportSchema = z
@@ -413,7 +413,7 @@ const gradeReportSchema = z
       data.feedback !== undefined ||
       data.experiment_grade !== undefined,
     {
-      message: "At least one of grade, feedback, or experiment_grade must be provided",
+      message: "至少需要提供分数、反馈或实验成绩中的一项",
     },
   );
 
@@ -483,7 +483,7 @@ export default (pool: Pool, JWT_SECRET: string) => {
         );
 
         if (classRows.length === 0) {
-          return c.json({ error: "Class not found" }, 404);
+          return c.json({ error: "班级不存在" }, 404);
         }
 
         let isAllowed = false;
@@ -501,7 +501,7 @@ export default (pool: Pool, JWT_SECRET: string) => {
         }
 
         if (!isAllowed) {
-          return c.json({ error: "Forbidden" }, 403);
+          return c.json({ error: "权限不足" }, 403);
         }
 
         const [reportRows]: any[] = await pool.query(
@@ -571,7 +571,7 @@ export default (pool: Pool, JWT_SECRET: string) => {
 
         return c.json(reports);
       } catch (error) {
-        return handleUnexpectedError(c, error, "Failed to fetch class reports");
+        return handleUnexpectedError(c, error, "获取班级报告失败");
       }
     },
   );
@@ -590,7 +590,7 @@ export default (pool: Pool, JWT_SECRET: string) => {
           payload.role !== "Admin" &&
           payload.role !== "Assistant"
         ) {
-          return c.json({ error: "Forbidden" }, 403);
+          return c.json({ error: "权限不足" }, 403);
         }
 
         const { reportId } = c.req.valid("param");
@@ -613,7 +613,7 @@ export default (pool: Pool, JWT_SECRET: string) => {
 
           if (reportRows.length === 0) {
             await connection.rollback();
-            return c.json({ error: "Report not found" }, 404);
+            return c.json({ error: "报告不存在" }, 404);
           }
 
           const { experiment_id, student_id } = reportRows[0];
@@ -643,7 +643,7 @@ export default (pool: Pool, JWT_SECRET: string) => {
 
           if (!authorized) {
             await connection.rollback();
-            return c.json({ error: "Forbidden" }, 403);
+            return c.json({ error: "权限不足" }, 403);
           }
 
           const experimentGradeUpdateFields: string[] = [];
@@ -676,7 +676,7 @@ export default (pool: Pool, JWT_SECRET: string) => {
 
             if (gradeResult.affectedRows === 0) {
               await connection.rollback();
-              return c.json({ error: "Grade record not found" }, 404);
+              return c.json({ error: "成绩记录不存在" }, 404);
             }
           }
 
@@ -743,41 +743,41 @@ export default (pool: Pool, JWT_SECRET: string) => {
 
           const experimentGradeResponse = updatedExperimentGrade
             ? EXPERIMENT_GRADE_FIELDS.reduce<Record<string, number | null>>(
-                (acc, field) => {
-                  const value = updatedExperimentGrade[field];
-                  acc[field] =
-                    value === null || value === undefined ? null : Number(value);
-                  return acc;
-                },
-                {},
-              )
+              (acc, field) => {
+                const value = updatedExperimentGrade[field];
+                acc[field] =
+                  value === null || value === undefined ? null : Number(value);
+                return acc;
+              },
+              {},
+            )
             : null;
 
           return c.json(
             updatedReport
               ? {
-                  user_id: updatedReport.user_id,
-                  username: updatedReport.username ?? null,
-                  full_name: updatedReport.full_name ?? null,
-                  report_id: updatedReport.report_id,
-                  experiment_id: updatedReport.experiment_id,
-                  submitted_at: updatedReport.submitted_at ?? null,
-                  pdf_file_path: updatedReport.pdf_file_path ?? null,
-                  grade: updatedReport.grade ?? null,
-                  feedback: updatedReport.feedback ?? null,
-                  grader_name: updatedReport.grader_name ?? null,
-                  experiment_grade: experimentGradeResponse,
-                }
+                user_id: updatedReport.user_id,
+                username: updatedReport.username ?? null,
+                full_name: updatedReport.full_name ?? null,
+                report_id: updatedReport.report_id,
+                experiment_id: updatedReport.experiment_id,
+                submitted_at: updatedReport.submitted_at ?? null,
+                pdf_file_path: updatedReport.pdf_file_path ?? null,
+                grade: updatedReport.grade ?? null,
+                feedback: updatedReport.feedback ?? null,
+                grader_name: updatedReport.grader_name ?? null,
+                experiment_grade: experimentGradeResponse,
+              }
               : null,
           );
         } catch (error) {
           await connection.rollback();
-          return handleUnexpectedError(c, error, "Failed to grade report");
+          return handleUnexpectedError(c, error, "批改报告失败");
         } finally {
           connection.release();
         }
       } catch (error) {
-        return handleUnexpectedError(c, error, "Failed to grade report");
+        return handleUnexpectedError(c, error, "批改报告失败");
       }
     },
   );
@@ -800,7 +800,7 @@ export default (pool: Pool, JWT_SECRET: string) => {
         );
 
         if (classRows.length === 0) {
-          return c.json({ error: "Class not found" }, 404);
+          return c.json({ error: "班级不存在" }, 404);
         }
 
         let isAllowed = false;
@@ -826,7 +826,7 @@ export default (pool: Pool, JWT_SECRET: string) => {
         }
 
         if (!isAllowed) {
-          return c.json({ error: "Forbidden" }, 403);
+          return c.json({ error: "权限不足" }, 403);
         }
 
         const [studentRows]: any[] = await pool.query(
@@ -918,7 +918,7 @@ export default (pool: Pool, JWT_SECRET: string) => {
 
         return c.json(responsePayload);
       } catch (error) {
-        return handleUnexpectedError(c, error, "Failed to fetch experiment status");
+        return handleUnexpectedError(c, error, "获取实验状态失败");
       }
     },
   );
@@ -941,7 +941,7 @@ export default (pool: Pool, JWT_SECRET: string) => {
         );
 
         if (classRows.length === 0) {
-          return c.json({ error: "Class not found" }, 404);
+          return c.json({ error: "班级不存在" }, 404);
         }
 
         let isAllowed = false;
@@ -959,7 +959,7 @@ export default (pool: Pool, JWT_SECRET: string) => {
         }
 
         if (!isAllowed) {
-          return c.json({ error: "Forbidden" }, 403);
+          return c.json({ error: "权限不足" }, 403);
         }
 
         const [weights]: any[] = await pool.query(
@@ -968,12 +968,12 @@ export default (pool: Pool, JWT_SECRET: string) => {
         );
 
         if (weights.length === 0) {
-          return c.json({ error: "Grade weights not found for this class" }, 404);
+          return c.json({ error: "未找到该班级的成绩权重" }, 404);
         }
 
         return c.json(weights[0]);
       } catch (error) {
-        return handleUnexpectedError(c, error, "Failed to fetch grade weights");
+        return handleUnexpectedError(c, error, "获取成绩权重失败");
       }
     },
   );
@@ -994,7 +994,7 @@ export default (pool: Pool, JWT_SECRET: string) => {
       );
 
       if (classRows.length === 0) {
-        return c.json({ error: "Class not found" }, 404);
+        return c.json({ error: "班级不存在" }, 404);
       }
 
       let isAllowed = false;
@@ -1012,7 +1012,7 @@ export default (pool: Pool, JWT_SECRET: string) => {
       }
 
       if (!isAllowed) {
-        return c.json({ error: "Forbidden" }, 403);
+        return c.json({ error: "权限不足" }, 403);
       }
 
       const [reports]: any[] = await pool.query(
@@ -1040,7 +1040,7 @@ export default (pool: Pool, JWT_SECRET: string) => {
       );
 
       if (reports.length === 0) {
-        return c.json({ error: "No reports found for this class" }, 404);
+        return c.json({ error: "未找到该班级的报告" }, 404);
       }
 
       const tempDir = await mkdtemp(path.join(os.tmpdir(), "class-report-export-"));
@@ -1082,7 +1082,7 @@ export default (pool: Pool, JWT_SECRET: string) => {
         }
 
         if (copiedFiles.length === 0) {
-          return c.json({ error: "No report files available for download" }, 404);
+          return c.json({ error: "没有可下载的报告文件" }, 404);
         }
 
         const zipFileName = `class-${classIdNumber}-reports.zip`;
@@ -1103,14 +1103,14 @@ export default (pool: Pool, JWT_SECRET: string) => {
           });
         } catch (spawnError) {
           throw new Error(
-            `Failed to start zip command. Ensure 'zip' is installed on the server: ${spawnError}`,
+            `启动 zip 命令失败。请确保服务器已安装 'zip': ${spawnError}`,
           );
         }
 
         const exitCode = await zipProcess.exited;
         if (exitCode !== 0) {
           const errorText = await new Response(zipProcess.stderr).text();
-          throw new Error(`zip command failed: ${errorText}`);
+          throw new Error(`zip 命令执行失败: ${errorText}`);
         }
 
         await mkdir(EXPORTS_DIR, { recursive: true });
@@ -1144,7 +1144,7 @@ export default (pool: Pool, JWT_SECRET: string) => {
       );
 
       if (classRows.length === 0) {
-        return c.json({ error: "Class not found" }, 404);
+        return c.json({ error: "班级不存在" }, 404);
       }
 
       let isAllowed = false;
@@ -1162,7 +1162,7 @@ export default (pool: Pool, JWT_SECRET: string) => {
       }
 
       if (!isAllowed) {
-        return c.json({ error: "Forbidden" }, 403);
+        return c.json({ error: "权限不足" }, 403);
       }
 
       const [weightRows]: any[] = await pool.query(
@@ -1171,7 +1171,7 @@ export default (pool: Pool, JWT_SECRET: string) => {
       );
 
       if (weightRows.length === 0) {
-        return c.json({ error: "Grade weights not configured for this class" }, 404);
+        return c.json({ error: "该班级未配置成绩权重" }, 404);
       }
 
       const weights = weightRows[0] as Record<string, number>;
@@ -1182,7 +1182,7 @@ export default (pool: Pool, JWT_SECRET: string) => {
       );
 
       if (gradeRows.length === 0) {
-        return c.json({ error: "No enrolled students found for this class" }, 404);
+        return c.json({ error: "该班级未找到已加入的学生" }, 404);
       }
 
       const toCsvValue = (value: unknown) => {
@@ -1290,7 +1290,7 @@ export default (pool: Pool, JWT_SECRET: string) => {
           payload.role !== "Admin" &&
           payload.role !== "Assistant"
         ) {
-          return c.json({ error: "Forbidden" }, 403);
+          return c.json({ error: "权限不足" }, 403);
         }
 
         const { classId } = c.req.valid("param");
@@ -1304,7 +1304,7 @@ export default (pool: Pool, JWT_SECRET: string) => {
         );
 
         if (classRows.length === 0) {
-          return c.json({ error: "Class not found" }, 404);
+          return c.json({ error: "班级不存在" }, 404);
         }
 
         let isAllowed = false;
@@ -1322,7 +1322,7 @@ export default (pool: Pool, JWT_SECRET: string) => {
         }
 
         if (!isAllowed) {
-          return c.json({ error: "Forbidden" }, 403);
+          return c.json({ error: "权限不足" }, 403);
         }
 
         // Check if weights exist
@@ -1332,7 +1332,7 @@ export default (pool: Pool, JWT_SECRET: string) => {
         );
 
         if (existing.length === 0) {
-          return c.json({ error: "Grade weights not found for this class" }, 404);
+          return c.json({ error: "未找到该班级的成绩权重" }, 404);
         }
 
         const fields: string[] = [];
@@ -1372,7 +1372,7 @@ export default (pool: Pool, JWT_SECRET: string) => {
 
         return c.json(updatedWeights[0]);
       } catch (error) {
-        return handleUnexpectedError(c, error, "Failed to update grade weights");
+        return handleUnexpectedError(c, error, "更新成绩权重失败");
       }
     },
   );
@@ -1395,7 +1395,7 @@ export default (pool: Pool, JWT_SECRET: string) => {
         );
 
         if (classRows.length === 0) {
-          return c.json({ error: "Class not found" }, 404);
+          return c.json({ error: "班级不存在" }, 404);
         }
 
         let isAllowed = false;
@@ -1421,7 +1421,7 @@ export default (pool: Pool, JWT_SECRET: string) => {
         }
 
         if (!isAllowed) {
-          return c.json({ error: "Forbidden" }, 403);
+          return c.json({ error: "权限不足" }, 403);
         }
 
         const [weightRows]: any[] = await pool.query(
@@ -1430,7 +1430,7 @@ export default (pool: Pool, JWT_SECRET: string) => {
         );
 
         if (weightRows.length === 0) {
-          return c.json({ error: "Grade weights not configured for this class" }, 404);
+          return c.json({ error: "该班级未配置成绩权重" }, 404);
         }
 
         const weights = weightRows[0] as Record<string, number>;
@@ -1497,7 +1497,7 @@ export default (pool: Pool, JWT_SECRET: string) => {
 
         return c.json(latestGrades);
       } catch (error) {
-        return handleUnexpectedError(c, error, "Failed to fetch latest grades");
+        return handleUnexpectedError(c, error, "获取最新成绩失败");
       }
     },
   );
@@ -1520,7 +1520,7 @@ export default (pool: Pool, JWT_SECRET: string) => {
         );
 
         if (classRows.length === 0) {
-          return c.json({ error: "Class not found" }, 404);
+          return c.json({ error: "班级不存在" }, 404);
         }
 
         let isAllowed = false;
@@ -1546,7 +1546,7 @@ export default (pool: Pool, JWT_SECRET: string) => {
         }
 
         if (!isAllowed) {
-          return c.json({ error: "Forbidden" }, 403);
+          return c.json({ error: "权限不足" }, 403);
         }
 
         const [studentExperimentRows]: any[] = await pool.query(
@@ -1656,7 +1656,7 @@ export default (pool: Pool, JWT_SECRET: string) => {
 
         return c.json(responsePayload);
       } catch (error) {
-        return handleUnexpectedError(c, error, "Failed to fetch experiment step events");
+        return handleUnexpectedError(c, error, "获取实验步骤事件失败");
       }
     },
   );

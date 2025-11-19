@@ -55,11 +55,11 @@ const trainSchemaBase = baseDataSchema
 
 const trainSchema = trainSchemaBase
   .refine((data: z.infer<typeof trainSchemaBase>) => data.data_window_train_start_index <= data.data_window_train_end_index, {
-    message: "train_start_index must be <= train_end_index",
+    message: "训练起始索引必须小于等于训练结束索引",
     path: ["data_window_train_end_index"],
   })
   .refine((data: z.infer<typeof trainSchemaBase>) => data.data_window_evaluate_start_index <= data.data_window_evaluate_end_index, {
-    message: "evaluate_start_index must be <= evaluate_end_index",
+    message: "评估起始索引必须小于等于评估结束索引",
     path: ["data_window_evaluate_end_index"],
   });
 
@@ -70,7 +70,7 @@ const predictSchema = z.object({
 
 // ========== Model Definitions ==========
 const ALL_MODELS = [
-  "ma", "es", "arima", "lstm", 
+  "ma", "es", "arima", "lstm",
   "stacking", "weighted_avg", "boosting"
 ] as const;
 type ModelType = (typeof ALL_MODELS)[number];
@@ -79,9 +79,9 @@ const modelParameterMappings: Record<ModelType, Record<string, string>> = {
   ma: { moving_average_window: "window" },
   es: { exponential_smoothing_alpha: "alpha" },
   arima: { arimaD: "d" }, // arimaOrder for ensembles, arimaD for auto_arima
-  lstm: { 
-    lstmLookBack: "look-back", 
-    lstmEpochs: "epochs", 
+  lstm: {
+    lstmLookBack: "look-back",
+    lstmEpochs: "epochs",
     lstmFeatures: "lstm-features",
     lstmTargetFeature: "lstm-target-feature",
     lstmFeatureTypes: "feature-types",
@@ -136,7 +136,7 @@ async function loadDatasetFromDb(
   );
 
   if (segmentRows.length === 0) {
-    throw new Error("Dataset segment file not found");
+    throw new Error("未找到数据集分段文件");
   }
 
   const allData: Record<string, any>[] = [];
@@ -171,7 +171,7 @@ async function runPythonModel(
   const scriptPath = path.join(pyDir, "run_model.py");
 
   if (!fs.existsSync(scriptPath)) {
-    throw new Error(`Python entry script not found: ${scriptPath}`);
+    throw new Error(`未找到 Python 入口脚本: ${scriptPath}`);
   }
 
   // Convert camelCase params to kebab-case CLI arguments
@@ -207,21 +207,21 @@ async function runPythonModel(
       await proc.exited;
 
       if (proc.exitCode !== 0) {
-        logger.error({ stderr, modelType, args: fullArgs }, "Python execution failed");
+        logger.error({ stderr, modelType, args: fullArgs }, "Python 执行失败");
         const pythonErrorMessage = stderr.trim();
         if (pythonErrorMessage.startsWith("[VALIDATION]")) {
           reject(new Error(`[PYTHON_VALIDATION] ${pythonErrorMessage.substring(13).trim()}`));
         } else if (pythonErrorMessage.startsWith("[DATA]")) {
           reject(new Error(`[PYTHON_DATA] ${pythonErrorMessage.substring(7).trim()}`));
         } else {
-          reject(new Error(`Python execution failed: ${stderr}`));
+          reject(new Error(`Python 执行失败: ${stderr}`));
         }
       } else {
         try {
           resolve(JSON.parse(stdout));
         } catch (e) {
-          logger.error({ stdout, modelType, args: fullArgs }, "Failed to parse python output");
-          reject(new Error("Invalid output from python"));
+          logger.error({ stdout, modelType, args: fullArgs }, "解析 Python 输出失败");
+          reject(new Error("Python 输出无效"));
         }
       }
     } catch (err) {
@@ -240,7 +240,7 @@ async function runPythonModel(
   const timeoutPromise = new Promise<any>((_, reject) => {
     timeoutId = setTimeout(() => {
       proc.kill();
-      reject(new Error(`Python execution timed out after ${timeoutMs}ms`));
+      reject(new Error(`Python 执行超时 (${timeoutMs}ms)`));
     }, timeoutMs);
   });
 
@@ -286,12 +286,12 @@ export default (pool: Pool, JWT_SECRET: string) => {
     async (c) => {
       const modelType = c.req.param("model_type") as ModelType;
       if (!ALL_MODELS.includes(modelType)) {
-        return c.json({ error: "Invalid model type specified" }, 400);
+        return c.json({ error: "指定的模型类型无效" }, 400);
       }
 
       const payload = c.get("jwtPayload");
       if (payload.role !== "Student") {
-        return c.json({ error: "Only students can train models" }, 403);
+        return c.json({ error: "只有学生可以训练模型" }, 403);
       }
       const studentId = payload.sub;
       const body = c.req.valid("json");
@@ -309,7 +309,7 @@ export default (pool: Pool, JWT_SECRET: string) => {
           body.data_window_evaluate_end_index >= allData.length
         ) {
           return c.json(
-            { error: "Data window indices out of bounds", dataset_size: allData.length },
+            { error: "数据窗口索引超出范围", dataset_size: allData.length },
             400,
           );
         }
@@ -369,7 +369,7 @@ export default (pool: Pool, JWT_SECRET: string) => {
         if (error.message.includes("timed out")) {
           const isEnsembleModel = ["stacking", "weighted_avg", "boosting"].includes(modelType);
           const timeoutSeconds = isEnsembleModel ? 120 : 30;
-          return c.json({ error: `Training timed out after ${timeoutSeconds} seconds` }, 504);
+          return c.json({ error: `训练超时（${timeoutSeconds}秒）` }, 504);
         }
         if (error.message.startsWith("[PYTHON_VALIDATION]")) {
           return c.json({ error: error.message.substring(20) }, 400);
@@ -377,7 +377,7 @@ export default (pool: Pool, JWT_SECRET: string) => {
         if (error.message.startsWith("[PYTHON_DATA]")) {
           return c.json({ error: error.message.substring(14) }, 400);
         }
-        const message = error instanceof Error ? error.message : `${modelType.toUpperCase()} training failed`;
+        const message = error instanceof Error ? error.message : `${modelType.toUpperCase()} 训练失败`;
         return handleUnexpectedError(c, error, message);
       }
     },
@@ -391,7 +391,7 @@ export default (pool: Pool, JWT_SECRET: string) => {
     async (c) => {
       const modelType = c.req.param("model_type") as ModelType;
       if (!ALL_MODELS.includes(modelType)) {
-        return c.json({ error: "Invalid model type specified" }, 400);
+        return c.json({ error: "指定的模型类型无效" }, 400);
       }
 
       const payload = c.get("jwtPayload");
@@ -405,7 +405,7 @@ export default (pool: Pool, JWT_SECRET: string) => {
         );
 
         if (!fs.existsSync(modelLoadPath)) {
-          return c.json({ error: `No trained ${modelType.toUpperCase()} model found for this user.` }, 404);
+          return c.json({ error: `未找到该用户的已训练 ${modelType.toUpperCase()} 模型` }, 404);
         }
 
         const pythonParams = {
@@ -424,7 +424,7 @@ export default (pool: Pool, JWT_SECRET: string) => {
           }
         });
       } catch (error: any) {
-        const message = error instanceof Error ? error.message : `${modelType.toUpperCase()} prediction failed`;
+        const message = error instanceof Error ? error.message : `${modelType.toUpperCase()} 预测失败`;
         return handleUnexpectedError(c, error, message);
       }
     },

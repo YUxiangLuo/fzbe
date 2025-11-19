@@ -15,7 +15,7 @@ const registerSchema = z.object({
   username: z.string().min(3),
   password: z
     .string()
-    .min(6, { message: "Password must be at least 6 characters long" }),
+    .min(6, { message: "密码长度至少为6位" }),
   full_name: z.string().min(1),
   email: z.string().email(),
   role: z.enum(["Student", "Teacher", "Assistant", "Admin"]).default("Student"),
@@ -51,43 +51,43 @@ const updateUserSchema = z
   })
   .refine((data) => data.full_name || data.phone_number || data.email, {
     message:
-      "At least one field (full_name, phone_number, or email) must be provided",
+      "至少需要提供一个字段 (full_name, phone_number, 或 email)",
   });
 
 const changePasswordSchema = z.object({
   currentPassword: z
     .string()
-    .min(1, { message: "Current password is required" }),
+    .min(1, { message: "当前密码不能为空" }),
   newPassword: z
     .string()
-    .min(6, { message: "New password must be at least 6 characters long" }),
+    .min(6, { message: "新密码长度至少为6位" }),
 });
 
 const adminChangePasswordSchema = z.object({
   newPassword: z
     .string()
-    .min(6, { message: "New password must be at least 6 characters long" }),
+    .min(6, { message: "新密码长度至少为6位" }),
 });
 
 const resetPasswordSchema = z.object({
   newPassword: z
     .string()
-    .min(6, { message: "New password must be at least 6 characters long" })
+    .min(6, { message: "新密码长度至少为6位" })
     .optional(),
 });
 
 const userSearchQuerySchema = z.object({
-  q: z.string().trim().min(1, { message: "Search term is required" }),
+  q: z.string().trim().min(1, { message: "搜索关键词不能为空" }),
   page: z.coerce.number().int().min(1).optional().default(1),
   limit: z.coerce.number().int().min(1).max(100).optional().default(10),
 });
 
 const userIdParamSchema = z.object({
-  userId: z.string().regex(/^\d+$/, { message: "userId must be a number" }),
+  userId: z.string().regex(/^\d+$/, { message: "userId 必须是数字" }),
 });
 
 const teacherIdParamSchema = z.object({
-  teacherId: z.string().regex(/^\d+$/, { message: "teacherId must be a number" }),
+  teacherId: z.string().regex(/^\d+$/, { message: "teacherId 必须是数字" }),
 });
 
 const paginationQuerySchema = z.object({
@@ -99,47 +99,47 @@ const createAssistantSchema = registerSchema
   .extend({
     class_ids: z
       .array(z.number().int().min(1))
-      .min(1, "At least one class ID is required"),
+      .min(1, "至少需要一个班级 ID"),
   })
   .omit({ role: true }); // Role is fixed to 'Assistant', so we don't need it from the input.
 
 // Self-registration schemas for different roles
 const roleParamSchema = z.object({
-  role: z.enum(["Student", "Teacher", "Assistant"], "Invalid role. Must be Student, Teacher, or Assistant"),
+  role: z.enum(["Student", "Teacher", "Assistant"], "无效的角色。必须是 Student, Teacher, 或 Assistant"),
 });
 
 const studentSelfRegisterSchema = z.object({
   username: z
     .string()
-    .min(8, "Student username must be at least 8 digits")
-    .regex(/^\d+$/, "Student username must contain only digits"),
+    .min(8, "学生用户名至少为8位数字")
+    .regex(/^\d+$/, "学生用户名只能包含数字"),
   password: z
     .string()
-    .min(6, "Password must be at least 6 characters long"),
+    .min(6, "密码长度至少为6位"),
   name: z
     .string()
-    .min(1, "Name is required")
-    .regex(/^[\u4e00-\u9fa5a-zA-Z\s]+$/, "Name can only contain Chinese characters, English letters, and spaces"),
-  email: z.string().regex(/^[^\s@]+@[^\s@]+\.[^\s@]+$/, "Invalid email format"),
+    .min(1, "姓名不能为空")
+    .regex(/^[\u4e00-\u9fa5a-zA-Z\s]+$/, "姓名只能包含中文字符、英文字母和空格"),
+  email: z.string().regex(/^[^\s@]+@[^\s@]+\.[^\s@]+$/, "无效的邮箱格式"),
 });
 
 const teacherAssistantSelfRegisterSchema = z.object({
   username: z
     .string()
-    .min(3, "Username must be at least 3 characters long")
-    .regex(/^[a-zA-Z0-9]+$/, "Username can only contain letters and numbers"),
+    .min(3, "用户名至少为3个字符")
+    .regex(/^[a-zA-Z0-9]+$/, "用户名只能包含字母和数字"),
   password: z
     .string()
-    .min(6, "Password must be at least 6 characters long"),
+    .min(6, "密码长度至少为6位"),
   name: z
     .string()
-    .min(1, "Name is required")
-    .regex(/^[\u4e00-\u9fa5a-zA-Z\s]+$/, "Name can only contain Chinese characters, English letters, and spaces"),
-  email: z.string().regex(/^[^\s@]+@[^\s@]+\.[^\s@]+$/, "Invalid email format"),
+    .min(1, "姓名不能为空")
+    .regex(/^[\u4e00-\u9fa5a-zA-Z\s]+$/, "姓名只能包含中文字符、英文字母和空格"),
+  email: z.string().regex(/^[^\s@]+@[^\s@]+\.[^\s@]+$/, "无效的邮箱格式"),
   phone: z
     .string()
-    .length(11, "Phone number must be exactly 11 digits")
-    .regex(/^\d{11}$/, "Phone number must contain only digits"),
+    .length(11, "手机号必须是11位数字")
+    .regex(/^\d{11}$/, "手机号只能包含数字"),
 });
 
 // Teacher-centric grade weights have been removed. All grade weights are now class-centric
@@ -216,7 +216,7 @@ export default (pool: Pool, JWT_SECRET: string) => {
 
             return c.json(
 
-              { error: "Validation failed", details: result.error.issues },
+              { error: "验证失败", details: result.error.issues },
 
               400
 
@@ -234,7 +234,7 @@ export default (pool: Pool, JWT_SECRET: string) => {
 
             return c.json(
 
-              { error: "Validation failed", details: result.error.issues },
+              { error: "验证失败", details: result.error.issues },
 
               400
 
@@ -246,7 +246,7 @@ export default (pool: Pool, JWT_SECRET: string) => {
 
         } else {
 
-          return c.json({ error: "Invalid role" }, 400);
+          return c.json({ error: "无效的角色" }, 400);
 
         }
 
@@ -320,31 +320,31 @@ export default (pool: Pool, JWT_SECRET: string) => {
 
             if (error.message.includes("users.username")) {
 
-              return c.json({ error: "Username already exists" }, 409);
+              return c.json({ error: "用户名已存在" }, 409);
 
             }
 
             if (error.message.includes("users.email")) {
 
-              return c.json({ error: "Email already exists" }, 409);
+              return c.json({ error: "邮箱已存在" }, 409);
 
             }
 
             if (error.message.includes("users.phone_number")) {
 
-              return c.json({ error: "Phone number already exists" }, 409);
+              return c.json({ error: "手机号已存在" }, 409);
 
             }
 
           }
 
-          return handleUnexpectedError(c, error, "Registration failed");
+          return handleUnexpectedError(c, error, "注册失败");
 
         }
 
       } catch (error) {
 
-        return handleUnexpectedError(c, error, "Registration failed");
+        return handleUnexpectedError(c, error, "注册失败");
 
       }
 
@@ -372,7 +372,7 @@ export default (pool: Pool, JWT_SECRET: string) => {
 
         if (payload.role !== "Admin") {
 
-          return c.json({ error: "Forbidden" }, 403);
+          return c.json({ error: "权限不足" }, 403);
 
         }
 
@@ -442,25 +442,25 @@ export default (pool: Pool, JWT_SECRET: string) => {
 
           if (error.message.includes("users.username")) {
 
-            return c.json({ error: "Username already exists" }, 409);
+            return c.json({ error: "用户名已存在" }, 409);
 
           }
 
           if (error.message.includes("users.email")) {
 
-            return c.json({ error: "Email already exists" }, 409);
+            return c.json({ error: "邮箱已存在" }, 409);
 
           }
 
           if (error.message.includes("users.phone_number")) {
 
-            return c.json({ error: "Phone number already exists" }, 409);
+            return c.json({ error: "手机号已存在" }, 409);
 
           }
 
         }
 
-        return handleUnexpectedError(c, error, "Failed to create assistant");
+        return handleUnexpectedError(c, error, "创建助教失败");
 
       }
 
@@ -488,7 +488,7 @@ export default (pool: Pool, JWT_SECRET: string) => {
 
         if (payload.role !== "Admin") {
 
-          return c.json({ error: "Forbidden" }, 403);
+          return c.json({ error: "权限不足" }, 403);
 
         }
 
@@ -500,7 +500,7 @@ export default (pool: Pool, JWT_SECRET: string) => {
 
         if (!term) {
 
-          return c.json({ error: "Search term is required" }, 400);
+          return c.json({ error: "搜索关键词不能为空" }, 400);
 
         }
 
@@ -706,7 +706,7 @@ export default (pool: Pool, JWT_SECRET: string) => {
 
       } catch (error) {
 
-        return handleUnexpectedError(c, error, "Failed to search users");
+        return handleUnexpectedError(c, error, "搜索用户失败");
 
       }
 
@@ -732,7 +732,7 @@ export default (pool: Pool, JWT_SECRET: string) => {
 
       if (payload.role !== "Admin" && payload.role !== "Teacher") {
 
-        return c.json({ error: "Forbidden" }, 403);
+        return c.json({ error: "权限不足" }, 403);
 
       }
 
@@ -768,7 +768,7 @@ export default (pool: Pool, JWT_SECRET: string) => {
 
           await connection.rollback();
 
-          return c.json({ error: "One or more class IDs are invalid" }, 400);
+          return c.json({ error: "一个或多个班级 ID 无效" }, 400);
 
         }
 
@@ -790,7 +790,7 @@ export default (pool: Pool, JWT_SECRET: string) => {
 
                 {
 
-                  error: `Forbidden to assign assistant to class ID ${row.class_id} which you do not own.`,
+                  error: `禁止将助教分配给您不拥有的班级 (ID: ${row.class_id})`,
 
                 },
 
@@ -880,19 +880,19 @@ export default (pool: Pool, JWT_SECRET: string) => {
 
           if (error.message.includes("users.username")) {
 
-            return c.json({ error: "Username already exists" }, 409);
+            return c.json({ error: "用户名已存在" }, 409);
 
           }
 
           if (error.message.includes("users.email")) {
 
-            return c.json({ error: "Email already exists" }, 409);
+            return c.json({ error: "邮箱已存在" }, 409);
 
           }
 
         }
 
-        return handleUnexpectedError(c, error, "Failed to create assistant");
+        return handleUnexpectedError(c, error, "创建助教失败");
 
       } finally {
 
@@ -924,7 +924,7 @@ export default (pool: Pool, JWT_SECRET: string) => {
 
         if (payload.role !== "Admin") {
 
-          return c.json({ error: "Forbidden" }, 403);
+          return c.json({ error: "权限不足" }, 403);
 
         }
 
@@ -996,25 +996,25 @@ export default (pool: Pool, JWT_SECRET: string) => {
 
           if (error.message.includes("users.username")) {
 
-            return c.json({ error: "Username already exists" }, 409);
+            return c.json({ error: "用户名已存在" }, 409);
 
           }
 
           if (error.message.includes("users.email")) {
 
-            return c.json({ error: "Email already exists" }, 409);
+            return c.json({ error: "邮箱已存在" }, 409);
 
           }
 
           if (error.message.includes("users.phone_number")) {
 
-            return c.json({ error: "Phone number already exists" }, 409);
+            return c.json({ error: "手机号已存在" }, 409);
 
           }
 
         }
 
-        return handleUnexpectedError(c, error, "Failed to create teacher");
+        return handleUnexpectedError(c, error, "创建教师失败");
 
       }
 
@@ -1042,7 +1042,7 @@ export default (pool: Pool, JWT_SECRET: string) => {
 
         if (payload.role !== "Admin") {
 
-          return c.json({ error: "Forbidden" }, 403);
+          return c.json({ error: "权限不足" }, 403);
 
         }
 
@@ -1504,7 +1504,7 @@ export default (pool: Pool, JWT_SECRET: string) => {
 
           await connection.rollback();
 
-          return handleUnexpectedError(c, error, "Failed to batch create teachers");
+          return handleUnexpectedError(c, error, "批量创建教师失败");
 
         } finally {
 
@@ -1514,7 +1514,7 @@ export default (pool: Pool, JWT_SECRET: string) => {
 
       } catch (error) {
 
-        return handleUnexpectedError(c, error, "Failed to batch create teachers");
+        return handleUnexpectedError(c, error, "批量创建教师失败");
 
       } finally {
 
@@ -1558,7 +1558,7 @@ export default (pool: Pool, JWT_SECRET: string) => {
 
         if (payload.role !== "Admin") {
 
-          return c.json({ error: "Forbidden" }, 403);
+          return c.json({ error: "权限不足" }, 403);
 
         }
 
@@ -2010,7 +2010,7 @@ export default (pool: Pool, JWT_SECRET: string) => {
 
           await connection.rollback();
 
-          return handleUnexpectedError(c, error, "Failed to batch create assistants");
+          return handleUnexpectedError(c, error, "批量创建助教失败");
 
         } finally {
 
@@ -2020,7 +2020,7 @@ export default (pool: Pool, JWT_SECRET: string) => {
 
       } catch (error) {
 
-        return handleUnexpectedError(c, error, "Failed to batch create assistants");
+        return handleUnexpectedError(c, error, "批量创建助教失败");
 
       } finally {
 
@@ -2062,7 +2062,7 @@ export default (pool: Pool, JWT_SECRET: string) => {
 
         // Authorization: Admin can see anyone's, teachers can only see their own.
         if (payload.role !== "Admin" && payload.sub !== teacherIdNumber) {
-          return c.json({ error: "Forbidden" }, 403);
+          return c.json({ error: "权限不足" }, 403);
         }
 
         const sql = `
@@ -2082,7 +2082,7 @@ export default (pool: Pool, JWT_SECRET: string) => {
 
         return c.json(assistantRows);
       } catch (error) {
-        return handleUnexpectedError(c, error, "Failed to fetch assistants for teacher");
+        return handleUnexpectedError(c, error, "获取教师的助教失败");
       }
     },
   );
@@ -2096,7 +2096,7 @@ export default (pool: Pool, JWT_SECRET: string) => {
       try {
         const payload = c.get("jwtPayload");
         if (payload.role !== "Admin") {
-          return c.json({ error: "Forbidden" }, 403);
+          return c.json({ error: "权限不足" }, 403);
         }
 
         const { page, limit } = c.req.valid("query");
@@ -2124,7 +2124,7 @@ export default (pool: Pool, JWT_SECRET: string) => {
           },
         });
       } catch (error) {
-        return handleUnexpectedError(c, error, "Failed to fetch users");
+        return handleUnexpectedError(c, error, "获取用户列表失败");
       }
     },
   );
@@ -2134,14 +2134,14 @@ export default (pool: Pool, JWT_SECRET: string) => {
     try {
       const payload = c.get("jwtPayload");
       if (payload.role !== "Admin" && payload.role !== "Teacher") {
-        return c.json({ error: "Forbidden" }, 403);
+        return c.json({ error: "权限不足" }, 403);
       }
       const [rows] = await pool.query(
         "SELECT user_id, username, full_name, email, phone_number, role, created_at FROM users WHERE role = 'Assistant'",
       );
       return c.json(rows);
     } catch (error) {
-      return handleUnexpectedError(c, error, "Failed to fetch assistants");
+      return handleUnexpectedError(c, error, "获取助教列表失败");
     }
   });
 
@@ -2155,7 +2155,7 @@ export default (pool: Pool, JWT_SECRET: string) => {
         payload.role !== "Teacher" &&
         payload.role !== "Assistant"
       ) {
-        return c.json({ error: "Forbidden" }, 403);
+        return c.json({ error: "权限不足" }, 403);
       }
 
       const [rows] = await pool.query(
@@ -2170,7 +2170,7 @@ export default (pool: Pool, JWT_SECRET: string) => {
 
       return c.json(rows);
     } catch (error) {
-      return handleUnexpectedError(c, error, "Failed to fetch unenrolled students");
+      return handleUnexpectedError(c, error, "获取未选课学生失败");
     }
   });
 
@@ -2197,7 +2197,7 @@ export default (pool: Pool, JWT_SECRET: string) => {
       const user = rows[0];
 
       if (!user) {
-        return c.json({ error: "User not found" }, 404);
+        return c.json({ error: "用户不存在" }, 404);
       }
 
       const passwordHash: string | null = user.password_hash ?? null;
@@ -2258,7 +2258,7 @@ export default (pool: Pool, JWT_SECRET: string) => {
 
       return c.json(user);
     } catch (error) {
-      return handleUnexpectedError(c, error, "Failed to fetch current user");
+      return handleUnexpectedError(c, error, "获取当前用户信息失败");
     }
   });
 
@@ -2308,9 +2308,9 @@ export default (pool: Pool, JWT_SECRET: string) => {
         return c.json(rows[0]);
       } catch (error: any) {
         if (error.code === "ER_DUP_ENTRY") {
-          return c.json({ error: "Email already exists" }, 409);
+          return c.json({ error: "邮箱已存在" }, 409);
         }
-        return handleUnexpectedError(c, error, "Failed to update user");
+        return handleUnexpectedError(c, error, "更新用户信息失败");
       }
     },
   );
@@ -2335,7 +2335,7 @@ export default (pool: Pool, JWT_SECRET: string) => {
 
         if (!user) {
           // This case should ideally not be reached if JWT is valid
-          return c.json({ error: "User not found" }, 404);
+          return c.json({ error: "用户不存在" }, 404);
         }
 
         // 2. Verify current password
@@ -2345,7 +2345,7 @@ export default (pool: Pool, JWT_SECRET: string) => {
         );
 
         if (!passwordMatch) {
-          return c.json({ error: "Invalid current password" }, 401);
+          return c.json({ error: "当前密码错误" }, 401);
         }
 
         // 3. Hash new password and update database
@@ -2358,9 +2358,9 @@ export default (pool: Pool, JWT_SECRET: string) => {
           [newPasswordHash, userId],
         );
 
-        return c.json({ message: "Password updated successfully" });
+        return c.json({ message: "密码更新成功" });
       } catch (error) {
-        return handleUnexpectedError(c, error, "Failed to change password");
+        return handleUnexpectedError(c, error, "修改密码失败");
       }
     },
   );
@@ -2380,7 +2380,7 @@ export default (pool: Pool, JWT_SECRET: string) => {
           requesterPayload.role !== "Admin" &&
           requesterPayload.sub !== targetUserId
         ) {
-          return c.json({ error: "Forbidden" }, 403);
+          return c.json({ error: "权限不足" }, 403);
         }
 
         const [rows]: any[] = await pool.query(
@@ -2397,15 +2397,15 @@ export default (pool: Pool, JWT_SECRET: string) => {
         );
         const user = rows[0];
 
-      if (!user) {
-        return c.json({ error: "User not found" }, 404);
+        if (!user) {
+          return c.json({ error: "用户不存在" }, 404);
+        }
+        return c.json(user);
+      } catch (error) {
+        return handleUnexpectedError(c, error, "获取用户信息失败");
       }
-      return c.json(user);
-    } catch (error) {
-      return handleUnexpectedError(c, error, "Failed to fetch user");
-    }
-  },
-);
+    },
+  );
 
   // Admin: Force change user's password
   usersApi.put(
@@ -2417,7 +2417,7 @@ export default (pool: Pool, JWT_SECRET: string) => {
       try {
         const requesterPayload = c.get("jwtPayload");
         if (requesterPayload.role !== "Admin") {
-          return c.json({ error: "Forbidden" }, 403);
+          return c.json({ error: "权限不足" }, 403);
         }
 
         const { userId } = c.req.valid("param");
@@ -2428,7 +2428,7 @@ export default (pool: Pool, JWT_SECRET: string) => {
           return c.json(
             {
               error:
-                "Admins should use the /users/me/password route to change their own password.",
+                "管理员应使用 /users/me/password 路由修改自己的密码",
             },
             400,
           );
@@ -2445,12 +2445,12 @@ export default (pool: Pool, JWT_SECRET: string) => {
         );
 
         if (result.affectedRows === 0) {
-          return c.json({ error: "User not found" }, 404);
+          return c.json({ error: "用户不存在" }, 404);
         }
 
-        return c.json({ message: "Password updated successfully for user" });
+        return c.json({ message: "用户密码更新成功" });
       } catch (error) {
-        return handleUnexpectedError(c, error, "Failed to force change password");
+        return handleUnexpectedError(c, error, "强制修改密码失败");
       }
     },
   );
@@ -2473,7 +2473,7 @@ export default (pool: Pool, JWT_SECRET: string) => {
           payload.role !== "Teacher" &&
           payload.role !== "Assistant"
         ) {
-          return c.json({ error: "Forbidden" }, 403);
+          return c.json({ error: "权限不足" }, 403);
         }
 
         // 1. Fetch target user's role
@@ -2484,11 +2484,11 @@ export default (pool: Pool, JWT_SECRET: string) => {
         const targetUser = userRows[0];
 
         if (!targetUser) {
-          return c.json({ error: "User not found" }, 404);
+          return c.json({ error: "用户不存在" }, 404);
         }
 
         if (targetUser.role !== "Student") {
-          return c.json({ error: "Can only reset passwords for students" }, 400);
+          return c.json({ error: "只能重置学生的密码" }, 400);
         }
 
         // 2. Authorization check for teachers
@@ -2504,7 +2504,7 @@ export default (pool: Pool, JWT_SECRET: string) => {
           );
 
           if (enrollmentRows.length === 0) {
-            return c.json({ error: "Forbidden: Student is not in one of your classes" }, 403);
+            return c.json({ error: "权限不足：该学生不在您的班级中" }, 403);
           }
         } else if (payload.role === "Assistant") {
           const assistantId = Number(payload.sub);
@@ -2519,7 +2519,7 @@ export default (pool: Pool, JWT_SECRET: string) => {
 
           if (assignmentRows.length === 0) {
             return c.json({
-              error: "Forbidden: Student is not assigned to one of your classes",
+              error: "权限不足：该学生未分配给您的班级",
             }, 403);
           }
         }
@@ -2546,16 +2546,16 @@ export default (pool: Pool, JWT_SECRET: string) => {
 
         if (result.affectedRows === 0) {
           // This case should be rare given the check above, but good for safety
-          return c.json({ error: "User not found" }, 404);
+          return c.json({ error: "用户不存在" }, 404);
         }
 
         const message = newPassword
-          ? "Password updated successfully"
-          : "Password reset to default successfully";
+          ? "密码更新成功"
+          : "密码已成功重置为默认密码";
 
         return c.json({ message });
       } catch (error) {
-        return handleUnexpectedError(c, error, "Failed to reset password");
+        return handleUnexpectedError(c, error, "重置密码失败");
       }
     },
   );
@@ -2572,11 +2572,11 @@ export default (pool: Pool, JWT_SECRET: string) => {
         const targetUserId = parseInt(userId, 10);
 
         if (requesterPayload.role !== "Admin") {
-          return c.json({ error: "Forbidden" }, 403);
+          return c.json({ error: "权限不足" }, 403);
         }
 
         if (requesterPayload.sub === targetUserId) {
-          return c.json({ error: "Admin cannot delete themselves" }, 400);
+          return c.json({ error: "管理员不能删除自己" }, 400);
         }
 
         const connection = await pool.getConnection();
@@ -2591,7 +2591,7 @@ export default (pool: Pool, JWT_SECRET: string) => {
           const userRecord = userRows[0];
           if (!userRecord) {
             await connection.rollback();
-            return c.json({ error: "User not found" }, 404);
+            return c.json({ error: "用户不存在" }, 404);
           }
 
           const cleanupSummary: { deletedClasses?: number; removedAssistantAssignments?: number; removedEnrollments?: number } = {};
@@ -2647,17 +2647,17 @@ export default (pool: Pool, JWT_SECRET: string) => {
           await connection.commit();
 
           return c.json({
-            message: "User deleted successfully",
+            message: "用户删除成功",
             cleanup: cleanupSummary,
           });
         } catch (error) {
           await connection.rollback();
-          return handleUnexpectedError(c, error, "Failed to delete user");
+          return handleUnexpectedError(c, error, "删除用户失败");
         } finally {
           connection.release();
         }
       } catch (error) {
-        return handleUnexpectedError(c, error, "Failed to delete user");
+        return handleUnexpectedError(c, error, "删除用户失败");
       }
     },
   );

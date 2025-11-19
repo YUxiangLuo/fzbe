@@ -12,15 +12,15 @@ import { validateFile, generateUniqueFilename, FileValidationError } from "../ut
 
 // Zod Schemas for Validation
 const classIdParamSchema = z.object({
-  classId: z.string().regex(/^\d+$/, { message: "classId must be a number" }),
+  classId: z.string().regex(/^\d+$/, { message: "classId 必须是数字" }),
 });
 
 const teacherIdParamSchema = z.object({
-  teacherId: z.string().regex(/^\d+$/, { message: "teacherId must be a number" }),
+  teacherId: z.string().regex(/^\d+$/, { message: "teacherId 必须是数字" }),
 });
 
 const assistantIdParamSchema = z.object({
-  assistantId: z.string().regex(/^\d+$/, { message: "assistantId must be a number" }),
+  assistantId: z.string().regex(/^\d+$/, { message: "assistantId 必须是数字" }),
 });
 
 const createClassSchema = z.object({
@@ -34,7 +34,7 @@ const updateClassSchema = z
     class_code: z.string().optional(),
   })
   .refine((data) => data.class_name !== undefined || data.class_code !== undefined, {
-    message: "At least one field (class_name or class_code) must be provided",
+    message: "至少需要提供一个字段 (class_name 或 class_code)",
   });
 
 const STUDENT_ID_REGEX = /^[A-Za-z0-9_-]{3,32}$/;
@@ -68,7 +68,7 @@ export default (pool: Pool, JWT_SECRET: string) => {
       try {
         const payload = c.get("jwtPayload");
         if (payload.role !== "Teacher" && payload.role !== "Admin") {
-          return c.json({ error: "Forbidden" }, 403);
+          return c.json({ error: "权限不足" }, 403);
         }
 
         const body = await c.req.parseBody();
@@ -77,7 +77,7 @@ export default (pool: Pool, JWT_SECRET: string) => {
         const studentListFile = body["student_list"];
 
         if (!class_name || typeof class_name !== "string") {
-          return c.json({ error: "class_name is required" }, 400);
+          return c.json({ error: "班级名称不能为空" }, 400);
         }
 
         // Validate student list CSV if provided
@@ -200,7 +200,7 @@ export default (pool: Pool, JWT_SECRET: string) => {
                 const existingUsernames = existingUsers.map((u: any) => u.username);
                 await connection.rollback();
                 return c.json({
-                  error: "Transaction failed. The following students already exist in the database.",
+                  error: "事务失败。以下学生已存在于数据库中。",
                   existing_students: existingUsernames
                 }, 409);
               }
@@ -272,15 +272,15 @@ export default (pool: Pool, JWT_SECRET: string) => {
 
         } catch (error) {
           await connection.rollback();
-          return handleUnexpectedError(c, error, "Failed to create class");
+          return handleUnexpectedError(c, error, "创建班级失败");
         } finally {
           connection.release();
         }
       } catch (error: any) {
         if (error.code === "ER_DUP_ENTRY") {
-          return c.json({ error: "Class code already exists" }, 409);
+          return c.json({ error: "班级代码已存在" }, 409);
         }
-        return handleUnexpectedError(c, error, "Failed to create class");
+        return handleUnexpectedError(c, error, "创建班级失败");
       } finally {
         if (tempCsvPath) {
           await unlink(tempCsvPath).catch((err) =>
@@ -298,7 +298,7 @@ export default (pool: Pool, JWT_SECRET: string) => {
     try {
       const payload = c.get("jwtPayload");
       if (payload.role !== "Admin") {
-        return c.json({ error: "Forbidden" }, 403);
+        return c.json({ error: "权限不足" }, 403);
       }
 
       const [rows] = await pool.query(
@@ -306,7 +306,7 @@ export default (pool: Pool, JWT_SECRET: string) => {
       );
       return c.json(rows);
     } catch (error) {
-      return handleUnexpectedError(c, error, "Failed to fetch classes");
+      return handleUnexpectedError(c, error, "获取班级列表失败");
     }
   });
 
@@ -328,7 +328,7 @@ export default (pool: Pool, JWT_SECRET: string) => {
         const classInfo = classRows[0];
 
         if (!classInfo) {
-          return c.json({ error: "Class not found" }, 404);
+          return c.json({ error: "班级不存在" }, 404);
         }
 
         let isAllowed = false;
@@ -353,7 +353,7 @@ export default (pool: Pool, JWT_SECRET: string) => {
         }
 
         if (!isAllowed) {
-          return c.json({ error: "Forbidden" }, 403);
+          return c.json({ error: "权限不足" }, 403);
         }
 
         const [studentRows] = await pool.query(
@@ -372,7 +372,7 @@ export default (pool: Pool, JWT_SECRET: string) => {
         const response = { ...classInfo, students: studentRows, assistants: assistantRows };
         return c.json(response);
       } catch (error) {
-        return handleUnexpectedError(c, error, "Failed to fetch class details");
+        return handleUnexpectedError(c, error, "获取班级详情失败");
       }
     },
   );
@@ -395,7 +395,7 @@ export default (pool: Pool, JWT_SECRET: string) => {
           [classIdNumber],
         );
         if (classRows.length === 0) {
-          return c.json({ error: "Class not found" }, 404);
+          return c.json({ error: "班级不存在" }, 404);
         }
 
         const classOwner = classRows[0].teacher_id;
@@ -413,7 +413,7 @@ export default (pool: Pool, JWT_SECRET: string) => {
         }
 
         if (!isAllowed) {
-          return c.json({ error: "Forbidden" }, 403);
+          return c.json({ error: "权限不足" }, 403);
         }
 
         const fields: string[] = [];
@@ -428,7 +428,7 @@ export default (pool: Pool, JWT_SECRET: string) => {
         }
 
         if (fields.length === 0) {
-          return c.json({ error: "No fields to update" }, 400);
+          return c.json({ error: "没有需要更新的字段" }, 400);
         }
 
         values.push(classIdNumber);
@@ -438,9 +438,9 @@ export default (pool: Pool, JWT_SECRET: string) => {
           await pool.query(sql, values);
         } catch (error: any) {
           if (error.code === "ER_DUP_ENTRY") {
-            return c.json({ error: "Class code already exists" }, 409);
+            return c.json({ error: "班级代码已存在" }, 409);
           }
-          return handleUnexpectedError(c, error, "Failed to update class");
+          return handleUnexpectedError(c, error, "更新班级失败");
         }
 
         const [updatedRows]: any[] = await pool.query(
@@ -450,7 +450,7 @@ export default (pool: Pool, JWT_SECRET: string) => {
 
         return c.json(updatedRows[0]);
       } catch (error) {
-        return handleUnexpectedError(c, error, "Failed to update class");
+        return handleUnexpectedError(c, error, "更新班级失败");
       }
     },
   );
@@ -476,13 +476,13 @@ export default (pool: Pool, JWT_SECRET: string) => {
 
         if (classRows.length === 0) {
           await connection.rollback();
-          return c.json({ error: "Class not found" }, 404);
+          return c.json({ error: "班级不存在" }, 404);
         }
 
         const classOwner = classRows[0].teacher_id;
         if (payload.role !== "Admin" && payload.sub !== classOwner) {
           await connection.rollback();
-          return c.json({ error: "Forbidden" }, 403);
+          return c.json({ error: "权限不足" }, 403);
         }
 
         const [[assistantCountRow]]: any[] = await connection.query(
@@ -504,13 +504,13 @@ export default (pool: Pool, JWT_SECRET: string) => {
 
         if (deleteResult.affectedRows === 0) {
           await connection.rollback();
-          return c.json({ error: "Class not found" }, 404);
+          return c.json({ error: "班级不存在" }, 404);
         }
 
         await connection.commit();
 
         return c.json({
-          message: "Class deleted successfully",
+          message: "班级删除成功",
           cleanup: {
             removedAssistants: assistantCountRow.count,
             removedEnrollments: enrollmentCountRow.count,
@@ -519,7 +519,7 @@ export default (pool: Pool, JWT_SECRET: string) => {
         });
       } catch (error) {
         await connection.rollback();
-        return handleUnexpectedError(c, error, "Failed to delete class");
+        return handleUnexpectedError(c, error, "删除班级失败");
       } finally {
         connection.release();
       }
@@ -538,7 +538,7 @@ export default (pool: Pool, JWT_SECRET: string) => {
         const teacherIdNumber = Number.parseInt(teacherId, 10);
 
         if (payload.role !== "Admin" && payload.sub !== teacherIdNumber) {
-          return c.json({ error: "Forbidden" }, 403);
+          return c.json({ error: "权限不足" }, 403);
         }
 
         const [teacherRows]: any[] = await pool.query(
@@ -547,7 +547,7 @@ export default (pool: Pool, JWT_SECRET: string) => {
         );
 
         if (teacherRows.length === 0 && payload.role !== "Admin") {
-          return c.json({ error: "Target user is not a teacher" }, 404);
+          return c.json({ error: "目标用户不是教师" }, 404);
         }
 
         const [classRows] = await pool.query(
@@ -557,7 +557,7 @@ export default (pool: Pool, JWT_SECRET: string) => {
 
         return c.json(classRows);
       } catch (error) {
-        return handleUnexpectedError(c, error, "Failed to fetch classes for teacher");
+        return handleUnexpectedError(c, error, "获取教师班级失败");
       }
     },
   );
@@ -574,7 +574,7 @@ export default (pool: Pool, JWT_SECRET: string) => {
         const assistantIdNumber = Number.parseInt(assistantId, 10);
 
         if (payload.role !== "Admin" && payload.sub !== assistantIdNumber) {
-          return c.json({ error: "Forbidden" }, 403);
+          return c.json({ error: "权限不足" }, 403);
         }
 
         const [assistantRows]: any[] = await pool.query(
@@ -583,7 +583,7 @@ export default (pool: Pool, JWT_SECRET: string) => {
         );
 
         if (assistantRows.length === 0 && payload.role !== "Admin") {
-          return c.json({ error: "Target user is not an assistant" }, 404);
+          return c.json({ error: "目标用户不是助教" }, 404);
         }
 
         const [classRows] = await pool.query(
@@ -597,7 +597,7 @@ export default (pool: Pool, JWT_SECRET: string) => {
 
         return c.json(classRows);
       } catch (error) {
-        return handleUnexpectedError(c, error, "Failed to fetch classes for assistant");
+        return handleUnexpectedError(c, error, "获取助教班级失败");
       }
     },
   );

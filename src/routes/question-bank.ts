@@ -24,7 +24,7 @@ const createQuestionSchema = z
     }
     return true;
   }, {
-    message: "Single Choice questions must have exactly one correct answer",
+    message: "单选题必须有且仅有一个正确答案",
     path: ["correct_answers"],
   })
   .refine((data) => {
@@ -42,7 +42,7 @@ const createQuestionSchema = z
     }
     return true;
   }, {
-    message: "Choice questions must include options",
+    message: "选择题必须包含选项",
     path: ["options"],
   });
 
@@ -62,7 +62,7 @@ const updateQuestionSchema = z
       data.options !== undefined ||
       data.correct_answers !== undefined,
     {
-      message: "At least one field must be provided",
+      message: "至少需要提供一个字段",
     },
   )
   .refine(
@@ -73,7 +73,7 @@ const updateQuestionSchema = z
       return true;
     },
     {
-      message: "Single Choice questions must have exactly one correct answer",
+      message: "单选题必须有且仅有一个正确答案",
       path: ["correct_answers"],
     },
   )
@@ -94,7 +94,7 @@ const updateQuestionSchema = z
   );
 
 const questionIdParamSchema = z.object({
-  questionId: z.string().regex(/^\d+$/, { message: "questionId must be a number" }),
+  questionId: z.string().regex(/^\d+$/, { message: "questionId 必须是数字" }),
 });
 
 const parseJsonField = (value: unknown) => {
@@ -144,7 +144,7 @@ export default (pool: Pool, JWT_SECRET: string) => {
         payload.role !== "Teacher" &&
         payload.role !== "Assistant"
       ) {
-        return c.json({ error: "Forbidden" }, 403);
+        return c.json({ error: "权限不足" }, 403);
       }
 
       const [questions] = await pool.query(
@@ -164,7 +164,7 @@ export default (pool: Pool, JWT_SECRET: string) => {
       const normalized = (questions as any[]).map((row) => normalizeQuestionRow(row, true));
       return c.json(normalized);
     } catch (error) {
-      return handleUnexpectedError(c, error, "Failed to fetch question bank");
+      return handleUnexpectedError(c, error, "获取题库失败");
     }
   });
 
@@ -181,7 +181,7 @@ export default (pool: Pool, JWT_SECRET: string) => {
           payload.role !== "Teacher" &&
           payload.role !== "Assistant"
         ) {
-          return c.json({ error: "Forbidden" }, 403);
+          return c.json({ error: "权限不足" }, 403);
         }
 
         const { knowledge_point, question_type, question_text, options, correct_answers } =
@@ -227,7 +227,7 @@ export default (pool: Pool, JWT_SECRET: string) => {
         const createdQuestion = (rows as any[])[0];
         return c.json(normalizeQuestionRow(createdQuestion, true), 201);
       } catch (error) {
-        return handleUnexpectedError(c, error, "Failed to create question");
+        return handleUnexpectedError(c, error, "创建题目失败");
       }
     },
   );
@@ -246,7 +246,7 @@ export default (pool: Pool, JWT_SECRET: string) => {
           payload.role !== "Teacher" &&
           payload.role !== "Assistant"
         ) {
-          return c.json({ error: "Forbidden" }, 403);
+          return c.json({ error: "权限不足" }, 403);
         }
 
         const { questionId } = c.req.valid("param");
@@ -281,7 +281,7 @@ export default (pool: Pool, JWT_SECRET: string) => {
         }
 
         if (fields.length === 0) {
-          return c.json({ error: "No fields to update" }, 400);
+          return c.json({ error: "没有需要更新的字段" }, 400);
         }
 
         values.push(questionIdNumber);
@@ -290,7 +290,7 @@ export default (pool: Pool, JWT_SECRET: string) => {
         const [result]: any = await pool.query(sql, values);
 
         if (result.affectedRows === 0) {
-          return c.json({ error: "Question not found" }, 404);
+          return c.json({ error: "题目不存在" }, 404);
         }
 
         const [rows] = await pool.query(
@@ -310,12 +310,12 @@ export default (pool: Pool, JWT_SECRET: string) => {
         );
 
         if ((rows as any[]).length === 0) {
-          return c.json({ error: "Question not found" }, 404);
+          return c.json({ error: "题目不存在" }, 404);
         }
 
         return c.json(normalizeQuestionRow((rows as any[])[0], true));
       } catch (error) {
-        return handleUnexpectedError(c, error, "Failed to update question");
+        return handleUnexpectedError(c, error, "更新题目失败");
       }
     },
   );
@@ -333,7 +333,7 @@ export default (pool: Pool, JWT_SECRET: string) => {
           payload.role !== "Teacher" &&
           payload.role !== "Assistant"
         ) {
-          return c.json({ error: "Forbidden" }, 403);
+          return c.json({ error: "权限不足" }, 403);
         }
 
         const { questionId } = c.req.valid("param");
@@ -345,12 +345,12 @@ export default (pool: Pool, JWT_SECRET: string) => {
         );
 
         if (result.affectedRows === 0) {
-          return c.json({ error: "Question not found" }, 404);
+          return c.json({ error: "题目不存在" }, 404);
         }
 
         return c.json({ message: "Question deleted successfully" });
       } catch (error) {
-        return handleUnexpectedError(c, error, "Failed to delete question");
+        return handleUnexpectedError(c, error, "删除题目失败");
       }
     },
   );

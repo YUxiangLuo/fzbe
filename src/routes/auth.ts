@@ -7,8 +7,8 @@ import { handleUnexpectedError } from "../utils/error-handler";
 
 // Zod Schema for Validation
 const loginSchema = z.object({
-  username: z.string().min(1, { message: "Username is required" }),
-  password: z.string().min(1, { message: "Password is required" }),
+  username: z.string().min(1, { message: "用户名不能为空" }),
+  password: z.string().min(1, { message: "密码不能为空" }),
   role: z.enum(["Student", "Teacher", "Assistant", "Admin"]).optional(),
 });
 
@@ -27,7 +27,7 @@ export default (pool: Pool, JWT_SECRET: string) => {
       const user = rows[0];
 
       if (!user) {
-        return c.json({ error: "Invalid credentials" }, 401);
+        return c.json({ error: "用户名或密码错误" }, 401);
       }
 
       const passwordMatch = await Bun.password.verify(
@@ -36,7 +36,7 @@ export default (pool: Pool, JWT_SECRET: string) => {
       );
 
       if (!passwordMatch) {
-        return c.json({ error: "Invalid credentials" }, 401);
+        return c.json({ error: "用户名或密码错误" }, 401);
       }
 
       // Validate role if provided
@@ -63,7 +63,7 @@ export default (pool: Pool, JWT_SECRET: string) => {
       const token = await sign(payload, JWT_SECRET);
       return c.json({ token, user: { role: user.role } });
     } catch (error) {
-      return handleUnexpectedError(c, error, "Login failed");
+      return handleUnexpectedError(c, error, "登录失败");
     }
   });
 
