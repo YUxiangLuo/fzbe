@@ -176,6 +176,79 @@ export default (pool: Pool, JWT_SECRET: string) => {
       // 2. Parse file in memory to get segments
       const segmentsMap = await parseCsvSegments(tempUploadPath);
 
+      // 2.5 Robustness Check: Validate data consistency for each segment
+      for (const [key, segment] of segmentsMap.entries()) {
+        const timePoints = new Set<string>();
+        let previousTime = "";
+
+        for (let i = 0; i < segment.rows.length; i++) {
+          const row = segment.rows[i];
+          const yearRaw = row["年份"]?.trim();
+          const monthRaw = row["月份"]?.trim();
+
+          // Check 1: Valid numeric year/month
+          if (!yearRaw || !/^\d{4}$/.test(yearRaw)) {
+            return c.json({
+              error: "数据格式错误",
+              details: `产品 "${segment.productName}" 第 ${i + 1} 行年份格式错误: "${yearRaw}" (需为4位数字)`,
+            }, 400);
+          }
+          // Simple month validation: allows 1-12, 01-12
+          if (!monthRaw || !/^(0?[1-9]|1[0-2])$/.test(monthRaw)) {
+            return c.json({
+              error: "数据格式错误",
+              details: `产品 "${segment.productName}" 第 ${i + 1} 行月份格式错误: "${monthRaw}" (需为1-12)`,
+            }, 400);
+          }
+
+        const normalizedMonth = monthRaw.padStart(2, "0");
+          const currentTime = `${yearRaw}-${normalizedMonth}`;
+
+          // Check 2: Duplicate time points
+          if (timePoints.has(currentTime)) {
+             return c.json({
+              error: "数据重复",
+              details: `产品 "${segment.productName}" 存在重复的时间点: ${currentTime}`,
+            }, 400);
+          }
+          timePoints.add(currentTime);
+
+          // Check 3: Time reversal (strictly increasing check, though skipping months is allowed)
+          if (previousTime && currentTime < previousTime) {
+             return c.json({
+              error: "时间顺序错误",
+              details: `产品 "${segment.productName}" 时间顺序颠倒: ${currentTime} 出现在 ${previousTime} 之后`,
+            }, 400);
+          }
+          previousTime = currentTime;
+
+          // Check 4: Valid Sales Quantity
+          const salesRaw = row["销售数量"];
+          // Remove commas for validation (e.g. "1,200" -> "1200")
+          const salesCleaned = salesRaw ? salesRaw.replace(/,/g, "").trim() : "";
+          const salesNum = Number(salesCleaned);
+          
+          if (salesCleaned === "" || Number.isNaN(salesNum) || salesNum < 0) {
+            return c.json({
+              error: "数据格式错误",
+              details: `产品 "${segment.productName}" 第 ${i + 1} 行销售数量无效: "${salesRaw}" (需为非负数字)`,
+            }, 400);
+          }
+
+          // Check 5: Unit Consistency
+          const unitRaw = (row["数量单位"] ?? "").trim();
+          // Use the unit from the first row as the standard
+          const expectedUnit = (segment.rows[0]["数量单位"] ?? "").trim();
+          
+          if (unitRaw !== expectedUnit) {
+             return c.json({
+              error: "数据不一致",
+              details: `产品 "${segment.productName}" 第 ${i + 1} 行数量单位 "${unitRaw}" 与首行单位 "${expectedUnit}" 不一致`,
+            }, 400);
+          }
+        }
+      }
+
       const connection = await pool.getConnection();
       try {
         await connection.beginTransaction();
