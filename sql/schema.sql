@@ -262,6 +262,8 @@ CREATE TABLE IF NOT EXISTS `experiment_reports` (
   -- Absolute path on Linux that ends with .pdf
   `pdf_file_path` VARCHAR(255),
 
+  `status` ENUM('submitted', 'graded', 'rejected') NOT NULL DEFAULT 'submitted',
+
   `submitted_at` TIMESTAMP NULL,
   -- 0-100
   `grade` FLOAT,

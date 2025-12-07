@@ -322,7 +322,8 @@ const LATEST_GRADE_SELECTION_SQL = `
     grade.exp_flow_report_submission,
     grade.knowledge_test,
     grade.model_quality,
-    grade.report_quality
+    grade.report_quality,
+    er.status AS report_status
   FROM enrollments e
   JOIN users u ON e.student_id = u.user_id
   LEFT JOIN (
@@ -342,6 +343,9 @@ const LATEST_GRADE_SELECTION_SQL = `
   LEFT JOIN experiment_grade grade
     ON grade.student_id = latest.student_id
    AND grade.experiment_id = latest.experiment_id
+  LEFT JOIN experiment_reports er
+    ON er.student_id = latest.student_id
+   AND er.experiment_id = latest.experiment_id
   WHERE e.class_id = ?
   ORDER BY u.username ASC
 `;
@@ -401,19 +405,23 @@ const updateGradeWeightsSchema = z.object({
   message: "至少需要提供一个权重字段",
 });
 
+const optionalStatusValue = z.enum(["graded", "rejected"]).optional();
+
 const gradeReportSchema = z
   .object({
     grade: optionalGradeValue,
     feedback: optionalFeedbackValue,
+    status: optionalStatusValue,
     experiment_grade: experimentGradeUpdateSchema,
   })
   .refine(
     (data) =>
       data.grade !== undefined ||
       data.feedback !== undefined ||
+      data.status !== undefined ||
       data.experiment_grade !== undefined,
     {
-      message: "至少需要提供分数、反馈或实验成绩中的一项",
+      message: "至少需要提供分数、反馈、状态或实验成绩中的一项",
     },
   );
 
@@ -511,6 +519,7 @@ export default (pool: Pool, JWT_SECRET: string) => {
              u.full_name,
              er.report_id,
              latest.experiment_id,
+             er.status,
              er.submitted_at,
              er.pdf_file_path,
              er.grade,
@@ -598,6 +607,7 @@ export default (pool: Pool, JWT_SECRET: string) => {
         const {
           grade,
           feedback,
+          status,
           experiment_grade: experimentGradeInput,
         } = c.req.valid("json");
 
@@ -691,6 +701,10 @@ export default (pool: Pool, JWT_SECRET: string) => {
             reportUpdateFields.push("feedback = ?");
             reportUpdateValues.push(feedback);
           }
+          if (status !== undefined) {
+            reportUpdateFields.push("status = ?");
+            reportUpdateValues.push(status);
+          }
 
           if (reportUpdateFields.length > 0) {
             const graderId = Number.parseInt(String(payload.sub), 10);
@@ -717,6 +731,7 @@ export default (pool: Pool, JWT_SECRET: string) => {
                 u.full_name,
                 er.report_id,
                 er.experiment_id,
+                er.status,
                 er.submitted_at,
                 er.pdf_file_path,
                 er.grade,
@@ -761,6 +776,7 @@ export default (pool: Pool, JWT_SECRET: string) => {
                 full_name: updatedReport.full_name ?? null,
                 report_id: updatedReport.report_id,
                 experiment_id: updatedReport.experiment_id,
+                status: updatedReport.status ?? null,
                 submitted_at: updatedReport.submitted_at ?? null,
                 pdf_file_path: updatedReport.pdf_file_path ?? null,
                 grade: updatedReport.grade ?? null,
@@ -1035,12 +1051,13 @@ export default (pool: Pool, JWT_SECRET: string) => {
            ON er.student_id = latest.student_id
           AND er.experiment_id = latest.latest_experiment_id
          JOIN users u ON u.user_id = latest.student_id
-        WHERE er.pdf_file_path IS NOT NULL`,
+        WHERE er.pdf_file_path IS NOT NULL
+          AND er.status != 'rejected'`,
         [classIdNumber],
       );
 
       if (reports.length === 0) {
-        return c.json({ error: "未找到该班级的报告" }, 404);
+        return c.json({ error: "未找到该班级的有效报告（可能是因为学生尚未提交或报告已被驳回）" }, 404);
       }
 
       const tempDir = await mkdtemp(path.join(os.tmpdir(), "class-report-export-"));
@@ -1230,6 +1247,7 @@ export default (pool: Pool, JWT_SECRET: string) => {
         "知识点测试",
         "模型选择",
         "实验报告",
+        "报告状态",
         "实验流程",
         "最终得分",
       ];
@@ -1238,6 +1256,7 @@ export default (pool: Pool, JWT_SECRET: string) => {
 
       for (const row of gradeRows) {
         const studentId = row.user_id;
+        const isRejected = row.report_status === "rejected";
 
         const { expFlowScore, finalScore } = computeExperimentScores(row, weights);
         const expFlowScoreStr =
@@ -1245,18 +1264,27 @@ export default (pool: Pool, JWT_SECRET: string) => {
         const finalScoreStr =
           finalScore === null ? "" : Number(finalScore).toFixed(2);
 
+        // Helper to conditionally return value or empty string based on rejection status
+        const val = (v: string) => (isRejected ? "" : v);
+
+        let statusText = "未提交";
+        if (row.report_status === "submitted") statusText = "已提交";
+        else if (row.report_status === "graded") statusText = "已评分";
+        else if (row.report_status === "rejected") statusText = "已驳回";
+
         const rowValues: string[] = [
           toCsvValue(studentId),
           toCsvValue(row.username),
           toCsvValue(row.full_name),
           toCsvValue(row.email),
           toCsvValue(row.experiment_id),
-          ...EXP_FLOW_FIELDS.map((field) => formatNumeric(row[field])),
-          formatNumeric(row.knowledge_test),
-          formatNumeric(row.model_quality),
-          formatNumeric(row.report_quality),
-          toCsvValue(expFlowScoreStr),
-          toCsvValue(finalScoreStr),
+          ...EXP_FLOW_FIELDS.map((field) => val(formatNumeric(row[field]))),
+          val(formatNumeric(row.knowledge_test)),
+          val(formatNumeric(row.model_quality)),
+          val(formatNumeric(row.report_quality)),
+          toCsvValue(statusText),
+          val(toCsvValue(expFlowScoreStr)),
+          val(toCsvValue(finalScoreStr)),
         ];
 
         csvLines.push(rowValues.join(","));
@@ -1489,6 +1517,7 @@ export default (pool: Pool, JWT_SECRET: string) => {
             model_quality: toNumberOrNull(row.model_quality),
             knowledge_test: toNumberOrNull(row.knowledge_test),
             report_quality: toNumberOrNull(row.report_quality),
+            report_status: row.report_status ?? null,
             final_score: finalScore === null ? null : Number(finalScore.toFixed(2)),
             exp_flow_breakdown: expFlowBreakdown,
             final_score_breakdown: finalScoreBreakdown,

@@ -207,11 +207,12 @@ export default (pool: Pool, JWT_SECRET: string) => {
           await connection.beginTransaction();
 
           const reportSql = `
-            INSERT INTO experiment_reports (experiment_id, student_id, report_content, pdf_file_path, submitted_at)
-            VALUES (?, ?, ?, ?, NOW())
+            INSERT INTO experiment_reports (experiment_id, student_id, report_content, pdf_file_path, status, submitted_at)
+            VALUES (?, ?, ?, ?, 'submitted', NOW())
             ON DUPLICATE KEY UPDATE
               report_content = VALUES(report_content),
               pdf_file_path = VALUES(pdf_file_path),
+              status = 'submitted',
               submitted_at = NOW()
           `;
 
@@ -293,6 +294,58 @@ export default (pool: Pool, JWT_SECRET: string) => {
         }
       }
     },
+  );
+
+  // GET /api/v1/my-latest-report-status - 检查最新报告状态（用于驳回提示）
+  reportsApi.get(
+    "/api/v1/my-latest-report-status",
+    authMiddleware,
+    async (c) => {
+      try {
+        const payload = c.get("jwtPayload");
+        if (payload.role !== "Student") {
+          return c.json({ error: "权限不足" }, 403);
+        }
+        const studentId = Number.parseInt(payload.sub, 10);
+
+        // Find the latest experiment for this student
+        const [[latestExperiment]]: any[] = await pool.query(
+          `SELECT experiment_id, student_id, status, current_step, start_time, last_activity_at, completion_time
+             FROM experiment_status
+            WHERE student_id = ?
+            ORDER BY experiment_id DESC
+            LIMIT 1`,
+          [studentId]
+        );
+
+        if (!latestExperiment) {
+          return c.json({ is_rejected: false });
+        }
+
+        const experimentId = latestExperiment.experiment_id;
+
+        // Check report status for this experiment
+        const [[report]]: any[] = await pool.query(
+          `SELECT *
+             FROM experiment_reports
+            WHERE experiment_id = ? AND student_id = ?`,
+          [experimentId, studentId]
+        );
+
+        if (report && report.status === "rejected") {
+          return c.json({
+            is_rejected: true,
+            experiment: latestExperiment,
+            report: report
+          });
+        }
+
+        return c.json({ is_rejected: false });
+
+      } catch (error) {
+        return handleUnexpectedError(c, error, "获取报告状态失败");
+      }
+    }
   );
 
   return reportsApi;
