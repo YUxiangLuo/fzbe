@@ -37,7 +37,7 @@ const updateClassSchema = z
     message: "至少需要提供一个字段 (class_name 或 class_code)",
   });
 
-const STUDENT_ID_REGEX = /^[A-Za-z0-9_-]{3,32}$/;
+const STUDENT_ID_REGEX = /^\d{8,32}$/;
 const MIN_FULL_NAME_LENGTH = 2;
 const MAX_FULL_NAME_LENGTH = 64;
 
@@ -149,7 +149,7 @@ export default (pool: Pool, JWT_SECRET: string) => {
                   if (!isValidStudentId(studentId)) {
                     invalidRecords.push({
                       row: rowNumber,
-                      reason: `学号 ${studentId} 不符合格式要求`,
+                      reason: `学号 ${studentId} 不符合格式要求（需为8位及以上数字）`,
                     });
                     return;
                   }
