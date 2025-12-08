@@ -75,44 +75,31 @@ def _forecast_future(
     history: List[float],
     window: int,
     steps: int,
-    future_values: Optional[List[float]] = None,
 ) -> List[float]:
     """
     Generate multi-step-ahead forecasts.
-    Uses deque for efficient sliding window operations.
+    Returns a constant forecast based on the mean of the last 'window' historical points.
+    MA models assume the future mean is the same as the current moving average.
     """
     if steps <= 0:
         raise ValueError("[VALIDATION] steps must be > 0 for forecasting.")
 
-    # Use deque with maxlen for O(1) append operations on sliding window
+    # Use the last 'window' points to calculate the projected level
     initial_history = history[-window:] if window > 0 else list(history)
     if not initial_history:
         raise ValueError("[DATA] History is empty; cannot forecast.")
 
-    buf = deque(initial_history, maxlen=window if window > 0 else None)
-    preds = []
-    future_iter = iter(future_values or [])
+    # Calculate the moving average once (the "Level")
+    avg = float(np.mean(initial_history))
 
-    for _ in range(steps):
-        if not buf:
-            raise ValueError("Insufficient history for moving average window.")
-
-        avg = sum(buf) / len(buf)
-        preds.append(avg)
-
-        try:
-            buf.append(next(future_iter))
-        except StopIteration:
-            buf.append(avg)
-
-    return preds
+    # Return this constant level for all future steps
+    return [avg] * steps
 
 
 # ---------- predict (for ensemble / CLI load) ----------
 def predict(
     model_path: str,
     steps: int,
-    data: Optional[str] = None,
     state: Optional[Dict[str, Any]] = None,
 ) -> Tuple[List[float], float]:
     """
@@ -122,20 +109,8 @@ def predict(
     window = int(state["window"])
     history = list(state["history"])
     std_dev_residuals = float(state.get("std_dev_residuals", 0.0))
-    train_end = int(state["train_end_index"])
 
-    future_values: Optional[List[float]] = None
-    if data:
-        try:
-            parsed_data = load_data_from_json(data)
-            series = parsed_data.y
-            start = train_end + 1
-            if start < len(series):
-                future_values = series[start : start + steps].tolist()
-        except (ValueError, TypeError):
-            future_values = None
-
-    predictions = _forecast_future(history, window, steps, future_values)
+    predictions = _forecast_future(history, window, steps)
     return predictions, std_dev_residuals
 
 
@@ -215,7 +190,7 @@ def run(args) -> None:
             raise ValueError("[VALIDATION] --forecast_steps must be > 0.")
 
         log.info(f"Starting prediction with {steps} forecast steps")
-        preds, std_dev = predict(load_path, steps, getattr(args, "data", None), state=state)
+        preds, std_dev = predict(load_path, steps, state=state)
         log.info(f"Generated {len(preds)} predictions")
         predictions_with_std = _format_predictions(preds, std_dev)
 
@@ -250,7 +225,7 @@ def run(args) -> None:
         else:
             # Auto-select window based on training data size (for educational small datasets)
             train_size = te - ts + 1
-            window = max(2, min(3, train_size // 3))
+            window = max(3, min(12, train_size // 4))
             log.info(f"Auto-selected window={window} based on train_size={train_size}")
         log.debug(f"Training params: window={window}")
 

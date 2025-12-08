@@ -406,7 +406,7 @@ def run(args) -> None:
         if look_back_arg is not None:
             look_back = int(look_back_arg)
         else:
-            look_back = max(2, min(3, train_size // 3))
+            look_back = max(3, min(12, train_size // 4))
             log.info(f"Auto-selected look_back={look_back} based on train_size={train_size}")
 
         if epochs_arg is not None:

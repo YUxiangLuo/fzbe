@@ -301,7 +301,7 @@ def main():
             epochs=None,  # Test auto-selection
             expected_logs=[
                 "Validation passed",
-                "Auto-selected look_back=2 based on train_size=6",
+                "Auto-selected look_back=3 based on train_size=6",
                 "Using default epochs=20",
                 "Training LSTM model for 20 epochs",
                 "Model training completed",
@@ -392,6 +392,19 @@ def main():
                 "Saving model to",
                 "Model saved successfully"
             ]
+        ),
+
+        # Test 7: Invalid look_back (zero)
+        TestCase(
+            name="Invalid Look-back (Zero)",
+            description="look_back=0 should fail validation",
+            data=generate_linear_data(100, 5, 15),
+            train_start=0, train_end=10,
+            eval_start=11, eval_end=14,
+            look_back=0,
+            epochs=10,
+            should_succeed=False,
+            expected_logs=["look_back must be >= 1"]
         ),
     ]
 

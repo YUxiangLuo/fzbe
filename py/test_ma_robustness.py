@@ -237,6 +237,68 @@ def run_ma_predict_test(model_file: str, forecast_steps: int, expected_logs: Lis
         return {"success": False, "error": str(e)}
 
 
+def run_ma_leakage_test(model_file: str, forecast_steps: int) -> bool:
+    """
+    Test 7: Verify that providing future data does NOT affect predictions (Anti-Leakage).
+    """
+    print(f"\n\n{'#'*80}")
+    print(f"# Test 7/7: Anti-Leakage Verification")
+    print(f"{'#'*80}")
+    print("Goal: Ensure predictions are identical whether future data is provided or not.")
+
+    # 1. Predict WITHOUT data
+    print("\n--- Run 1: Predict WITHOUT data ---")
+    cmd_no_data = [
+        venv_python, run_model_script, "ma",
+        "--load-model", model_file,
+        "--forecast-steps", str(forecast_steps),
+    ]
+    res1 = subprocess.run(cmd_no_data, cwd=py_dir, capture_output=True, text=True)
+    if res1.returncode != 0:
+        print(f"❌ Run 1 failed: {res1.stderr}")
+        return False
+    try:
+        out1 = json.loads(res1.stdout[res1.stdout.find('{'):])
+        preds1 = [p['prediction'] for p in out1['predictions']]
+        print(f"Predictions 1: {preds1}")
+    except Exception as e:
+        print(f"❌ Run 1 parsing failed: {e}")
+        return False
+
+    # 2. Predict WITH dummy data (simulating leakage attempt)
+    # Even if we provide completely different "future" data, the model should ignore it.
+    print("\n--- Run 2: Predict WITH future data (Leakage Attempt) ---")
+    dummy_data = [{"y": 9999.0} for _ in range(forecast_steps)] # Obvious outlier data
+    data_json = json.dumps(dummy_data)
+    cmd_with_data = [
+        venv_python, run_model_script, "ma",
+        "--load-model", model_file,
+        "--forecast-steps", str(forecast_steps),
+        "--data", data_json 
+    ]
+    res2 = subprocess.run(cmd_with_data, cwd=py_dir, capture_output=True, text=True)
+    if res2.returncode != 0:
+        print(f"❌ Run 2 failed: {res2.stderr}")
+        return False
+    try:
+        out2 = json.loads(res2.stdout[res2.stdout.find('{'):])
+        preds2 = [p['prediction'] for p in out2['predictions']]
+        print(f"Predictions 2: {preds2}")
+    except Exception as e:
+        print(f"❌ Run 2 parsing failed: {e}")
+        return False
+
+    # 3. Compare
+    print("\n--- Comparison ---")
+    if preds1 == preds2:
+        print("✅ PASSED: Predictions are identical. No leakage detected.")
+        return True
+    else:
+        print("❌ FAILED: Predictions differ! The model is using the provided data.")
+        print(f"Diff: {[p1 - p2 for p1, p2 in zip(preds1, preds2)]}")
+        return False
+
+
 def main():
     """Run comprehensive MA model tests."""
     print("🧪 MA Model Robustness Test Suite")
@@ -256,7 +318,7 @@ def main():
             eval_start=6, eval_end=7,
             window=None,
             expected_logs=[
-                "Auto-selected window=2",
+                "Auto-selected window=3",
                 "Validation passed",
                 "Generated 2 predictions",
                 "metrics computed"
@@ -287,7 +349,7 @@ def main():
             eval_start=30, eval_end=39,
             window=None,
             expected_logs=[
-                "Auto-selected window=3",
+                "Auto-selected window=7",
                 "Generated 10 predictions"
             ]
         ),
@@ -319,6 +381,30 @@ def main():
                 "Saving model to"
             ]
         ),
+
+        # Test 6: Invalid window (zero)
+        TestCase(
+            name="Invalid Window (Zero)",
+            description="window=0 should fail validation",
+            data=generate_linear_data(100, 5, 10),
+            train_start=0, train_end=6,
+            eval_start=7, eval_end=9,
+            window=0,
+            should_succeed=False,
+            expected_logs=["Window must be >= 1"]
+        ),
+
+        # Test 7: Invalid window (negative)
+        TestCase(
+            name="Invalid Window (Negative)",
+            description="window=-1 should fail validation",
+            data=generate_linear_data(100, 5, 10),
+            train_start=0, train_end=6,
+            eval_start=7, eval_end=9,
+            window=-1,
+            should_succeed=False,
+            expected_logs=["Window must be >= 1"]
+        ),
     ]
 
     # Set model file for save test
@@ -328,22 +414,39 @@ def main():
     results = []
     for i, test_case in enumerate(test_cases, 1):
         print(f"\n\n{'#'*80}")
-        print(f"# Test {i}/{len(test_cases)}")
+        print(f"# Test {i}/{len(test_cases) + 1}")  # Adjusted count
         print(f"{'#'*80}")
         result = run_ma_test(test_case)
         results.append((test_case.name, result["success"]))
 
-    # Test 6: Prediction with saved model
+    # Test 6: Prediction with saved model AND Constant Forecast Check
     if test_cases[4].model_file and os.path.exists(test_cases[4].model_file):
         print(f"\n\n{'#'*80}")
-        print(f"# Test {len(test_cases)+1}/{len(test_cases)+1}")
+        print(f"# Test {len(test_cases)+1}/{len(test_cases)+2}")
         print(f"{'#'*80}")
         pred_result = run_ma_predict_test(
             model_file=test_cases[4].model_file,
             forecast_steps=5,
             expected_logs=["Prediction finished successfully"]
         )
-        results.append(("MA Prediction", pred_result["success"]))
+        
+        # Verify Constant Forecast (All predictions should be equal)
+        is_constant = False
+        if pred_result["success"]:
+            preds = [p['prediction'] for p in pred_result["output"]['predictions']]
+            # Check if all elements are equal to the first element
+            if len(set(preds)) <= 1:
+                print("✅ Constant Forecast Verified: All predicted values are identical.")
+                is_constant = True
+            else:
+                print(f"❌ FAILED: Predictions are NOT constant! {preds}")
+                is_constant = False
+        
+        results.append(("MA Prediction & Constant Check", pred_result["success"] and is_constant))
+
+        # Test 7: Anti-Leakage
+        leakage_success = run_ma_leakage_test(test_cases[4].model_file, forecast_steps=5)
+        results.append(("Anti-Leakage Verification", leakage_success))
 
     # Summary
     print(f"\n\n{'='*80}")

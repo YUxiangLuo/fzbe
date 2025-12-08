@@ -393,6 +393,18 @@ def main():
                 "Model saved successfully"
             ]
         ),
+
+        # Test 7: Invalid d (negative)
+        TestCase(
+            name="Invalid d (Negative)",
+            description="d=-1 should fail validation",
+            data=generate_linear_data(100, 5, 20),
+            train_start=0, train_end=14,
+            eval_start=15, eval_end=19,
+            d=-1,
+            should_succeed=False,
+            expected_logs=["d must be >= 0"]
+        ),
     ]
 
     # Set model file for save test
