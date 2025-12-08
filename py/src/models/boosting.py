@@ -164,7 +164,8 @@ def predict(
     # Subsequent models predict residuals
     for i in range(1, len(model_chain)):
         model_name = model_chain[i]
-        model_state = base_model_states[model_name]["models"][i]
+        # Each model is only selected once, so models list has only one element at index 0
+        model_state = base_model_states[model_name]["models"][0]
         model_file = model_state["model_file"]
 
         result = run_base_model_predict_subprocess(
