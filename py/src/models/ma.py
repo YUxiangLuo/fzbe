@@ -155,7 +155,7 @@ def train_and_evaluate(
     y_true = series[idxs]
     y_pred = np.array(preds)
     residuals = y_true - y_pred
-    std_dev_residuals = float(np.std(residuals))
+    std_dev_residuals = float(np.std(residuals, ddof=1)) if len(residuals) > 1 else 0.0
 
     log.info(f"Calculated residuals: mean={np.mean(residuals):.4f}, std_dev={std_dev_residuals:.4f}")
 
