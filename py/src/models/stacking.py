@@ -250,8 +250,10 @@ def train_and_evaluate(
     X_meta_train = np.array(level1_predictions).T  # ✅ level1的out-of-fold预测
     y_meta_train = parsed_data.y[level1_train_range]  # ✅ level1的标签
 
-    meta_model = LinearRegression()
+    # Use positive=True to prevent negative weights and instability due to multicollinearity
+    meta_model = LinearRegression(positive=True)
     meta_model.fit(X_meta_train, y_meta_train)  # ✅ 在独立的level1集上训练
+    
     print(f"  ✓ 元模型训练完成 (输入维度: {X_meta_train.shape})", file=sys.stderr)
 
     # === Step 4: Phase 2 - Retrain base models on full train_range ===
