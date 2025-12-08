@@ -50,7 +50,10 @@ def main():
     parser.add_argument("--lstm-target-feature", type=str, help="LSTM target feature column name")
     parser.add_argument("--normalization", type=str, choices=['minmax', 'zscore'], help="LSTM normalization method")
     # Ensemble Models
-    parser.add_argument("--models", type=str, help="Comma-separated list of base models for stacking/weighted_avg")
+    parser.add_argument("--models", type=str, help="Comma-separated list of base models for stacking/weighted_avg/boosting")
+    # Boosting-specific
+    parser.add_argument("--learning-rate", type=float, help="Boosting learning rate (shrinkage parameter)")
+    parser.add_argument("--max-rounds", type=int, help="Boosting maximum number of rounds")
 
     # Parse args. We need to parse unknown args because each model's run function
     # expects a Namespace object with all its specific args, even if not defined here.

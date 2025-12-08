@@ -269,8 +269,7 @@ def main():
                 "window": 3,
                 "alpha": 0.7,
                 "d": 1,
-                "look_back": 3,
-                "epochs": 10,  # Reduced for testing speed
+                # look_back and epochs are auto-selected by backend
             },
             expected_logs=[
                 "训练 lstm 在 level0",

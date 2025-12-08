@@ -336,15 +336,24 @@ def run(args) -> None:
             return cast_type(val)
         return val
 
-    # Auto-select conservative defaults based on weight_train size
+    # Auto-select defaults based on weight_train size
     # (base models will be trained on weight_train in Phase 1, which is ~80-85% of train_range)
     train_size = te - ts + 1
     weight_train_size = max(3, int(train_size * 0.85)) if train_size <= 15 else int(train_size * 0.8)
 
     # Use weight_train_size for parameter calculation to avoid phase 1 failures
-    auto_window = max(2, min(3, weight_train_size // 4))  # More conservative
-    auto_max_pq = max(1, min(2, weight_train_size // 6))  # More conservative
-    auto_look_back = max(2, min(3, weight_train_size // 4))  # More conservative
+    # Aligned with individual model auto-selection logic
+    auto_window = max(3, min(12, weight_train_size // 4))
+    auto_look_back = max(3, min(12, weight_train_size // 4))
+
+    # ARIMA: use tiered approach like in arima.py
+    if weight_train_size <= 12:
+        auto_max_pq = 1
+    elif weight_train_size <= 20:
+        auto_max_pq = 2
+    else:
+        auto_max_pq = max(1, min(5, weight_train_size // 6))
+
     auto_epochs = 20 if train_size <= 15 else 30  # Conservative for ensemble base models
 
     model_params = {}

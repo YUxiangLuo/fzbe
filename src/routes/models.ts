@@ -269,7 +269,7 @@ const resultTransformers: Record<ModelType, (result: any) => any> = {
     weights: result.models?.map((name: string) => result.weights[name]),
   }),
   boosting: (result) => ({
-    model_names: result.best_model_chain,
+    model_names: result.model_chain,
     search_summary: result.search_summary,
   }),
 };

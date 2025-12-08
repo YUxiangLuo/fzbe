@@ -543,12 +543,21 @@ def run(args) -> None:
         raise ValueError("[VALIDATION] max_rounds must be >= 1")
 
     # Auto-select conservative defaults based on boost_train size
+    # Align with individual model auto-selection logic
     train_size = te - ts + 1
     boost_train_size = max(3, int(train_size * 0.85)) if train_size <= 15 else int(train_size * 0.8)
 
-    auto_window = max(2, min(3, boost_train_size // 4))
-    auto_max_pq = max(1, min(2, boost_train_size // 6))
-    auto_look_back = max(2, min(3, boost_train_size // 4))
+    auto_window = max(3, min(12, boost_train_size // 4))
+    auto_look_back = max(3, min(12, boost_train_size // 4))
+
+    # ARIMA: use tiered approach like in arima.py
+    if boost_train_size <= 12:
+        auto_max_pq = 1
+    elif boost_train_size <= 20:
+        auto_max_pq = 2
+    else:
+        auto_max_pq = max(1, min(5, boost_train_size // 6))
+
     auto_epochs = 20 if train_size <= 15 else 30
 
     model_params = {}

@@ -369,9 +369,18 @@ def run(args) -> None:
     level0_size = max(3, int(train_size * 0.85)) if train_size <= 15 else int(train_size * 0.8)
 
     # Use level0_size for parameter calculation to avoid phase 1 failures
-    auto_window = max(2, min(3, level0_size // 4))  # More conservative
-    auto_max_pq = max(1, min(2, level0_size // 6))  # More conservative
-    auto_look_back = max(2, min(3, level0_size // 4))  # More conservative
+    # Align with individual model auto-selection logic
+    auto_window = max(3, min(12, level0_size // 4))
+    auto_look_back = max(3, min(12, level0_size // 4))
+
+    # ARIMA: use tiered approach like in arima.py
+    if level0_size <= 12:
+        auto_max_pq = 1
+    elif level0_size <= 20:
+        auto_max_pq = 2
+    else:
+        auto_max_pq = max(1, min(5, level0_size // 6))
+
     auto_epochs = 20 if train_size <= 15 else 30  # Conservative for ensemble base models
 
     model_params = {}

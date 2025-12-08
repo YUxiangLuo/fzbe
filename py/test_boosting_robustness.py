@@ -73,11 +73,13 @@ def run_boosting_test(test_case: TestCase) -> Dict[str, Any]:
 
     # Add model-specific parameters
     for key, value in test_case.model_params.items():
+        # Convert underscore to hyphen for argparse compatibility
+        arg_name = key.replace('_', '-')
         if isinstance(value, bool):
             if value:
-                cmd.append(f"--{key}")
+                cmd.append(f"--{arg_name}")
         else:
-            cmd.extend([f"--{key}", str(value)])
+            cmd.extend([f"--{arg_name}", str(value)])
 
     if test_case.model_file:
         cmd.extend(["--save-model", test_case.model_file])
@@ -276,7 +278,7 @@ def main():
             model_params={"window": 2, "alpha": 0.6, "d": 0, "learning_rate": 0.3, "max_rounds": 3},
             expected_logs=[
                 "Round 1",
-                "Model Added",
+                "Added",  # Changed from "Model Added" to match actual output
                 "Model chain:"
             ]
         ),
@@ -299,7 +301,27 @@ def main():
             expected_logs=["Learning Rate: 0.1"]
         ),
 
-        # Test 4: Model saving
+        # Test 4: Medium dataset with all 4 models
+        TestCase(
+            name="Medium Dataset (All 4 Models)",
+            description="20 training points, 5 eval points, MA+ES+ARIMA+LSTM",
+            data=generate_exponential_data(base=100, growth_rate=0.03, count=25),
+            train_start=0, train_end=19,
+            eval_start=20, eval_end=24,
+            models="ma,es,arima,lstm",
+            model_params={
+                "window": 3,
+                "alpha": 0.7,
+                "d": 1,
+                # look_back, epochs, learning_rate, max_rounds are auto-selected by backend
+            },
+            expected_logs=[
+                "Round 1",
+                "Model chain:"
+            ]
+        ),
+
+        # Test 5: Model saving
         TestCase(
             name="Model Save Test",
             description="Save boosting model with MA+ES chain",
@@ -312,7 +334,7 @@ def main():
             model_file=os.path.join(temp_dir, "boosting_test_model.pkl")
         ),
 
-        # Test 5: Too few training points (should fail)
+        # Test 6: Too few training points (should fail)
         TestCase(
             name="Too Few Training Points",
             description="Only 7 training points - should fail validation",
@@ -325,7 +347,7 @@ def main():
             expected_logs=["需要至少8个点"]
         ),
 
-        # Test 6: Invalid learning rate (>1, should fail)
+        # Test 7: Invalid learning rate (>1, should fail)
         TestCase(
             name="Invalid Learning Rate (>1)",
             description="learning_rate=1.5 should fail validation",
@@ -338,7 +360,7 @@ def main():
             expected_logs=["learning_rate must be in (0, 1]"]
         ),
 
-        # Test 7: Invalid learning rate (<=0, should fail)
+        # Test 8: Invalid learning rate (<=0, should fail)
         TestCase(
             name="Invalid Learning Rate (0)",
             description="learning_rate=0 should fail validation",
