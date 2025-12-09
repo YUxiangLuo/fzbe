@@ -9,8 +9,8 @@ import csv from "csv-parser";
 import { handleUnexpectedError } from "../utils/error-handler";
 import logger from "../logger";
 
-const TRAINING_TIMEOUT = 60000;
-const ENSEMBLE_TRAINING_TIMEOUT = 120000; // 2 minutes for ensemble models
+const TRAINING_TIMEOUT = 300000; // 5 minutes for all models
+const ENSEMBLE_TRAINING_TIMEOUT = 300000; // 5 minutes for all models
 
 // ========== Common Schemas ==========
 const baseDataSchema = z.object({
