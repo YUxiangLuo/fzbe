@@ -1230,10 +1230,8 @@ export default (pool: Pool, JWT_SECRET: string) => {
       };
 
       const header = [
-        "学生ID",
         "学号",
         "姓名",
-        "邮箱",
         "实验ID",
         "数据准备",
         "描述性统计",
@@ -1244,11 +1242,11 @@ export default (pool: Pool, JWT_SECRET: string) => {
         "生产变量参数计算",
         "制定生产计划",
         "提交实验报告",
+        "实验流程",
         "知识点测试",
         "模型选择",
         "实验报告",
         "报告状态",
-        "实验流程",
         "最终得分",
       ];
 
@@ -1273,17 +1271,15 @@ export default (pool: Pool, JWT_SECRET: string) => {
         else if (row.report_status === "rejected") statusText = "已驳回";
 
         const rowValues: string[] = [
-          toCsvValue(studentId),
           toCsvValue(row.username),
           toCsvValue(row.full_name),
-          toCsvValue(row.email),
           toCsvValue(row.experiment_id),
           ...EXP_FLOW_FIELDS.map((field) => val(formatNumeric(row[field]))),
+          val(toCsvValue(expFlowScoreStr)),
           val(formatNumeric(row.knowledge_test)),
           val(formatNumeric(row.model_quality)),
           val(formatNumeric(row.report_quality)),
           toCsvValue(statusText),
-          val(toCsvValue(expFlowScoreStr)),
           val(toCsvValue(finalScoreStr)),
         ];
 
