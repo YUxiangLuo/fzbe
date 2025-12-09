@@ -147,7 +147,7 @@ def load_data_from_json(
                 # Ensure year and month are clean strings before combining
                 year_str = df["年份"].astype(str)
                 month_str = pd.to_numeric(df["月份"], errors='coerce').apply(lambda x: f"{int(x):02d}")
-                
+
                 if month_str.isnull().any():
                     log.warning("Could not create composite timestamp due to non-numeric '月份' values. Falling back.")
                     raise ValueError("Non-numeric month values")
@@ -155,6 +155,11 @@ def load_data_from_json(
                 df["timestamp"] = year_str + "-" + month_str
                 time_key = "timestamp"
                 log.info(f"Created composite time_key: '{time_key}'")
+
+                # Convert 年份 and 月份 to numeric for use as features
+                df["年份"] = pd.to_numeric(df["年份"], errors='coerce')
+                df["月份"] = pd.to_numeric(df["月份"], errors='coerce')
+                log.info("Converted '年份' and '月份' to numeric types for use as features")
             except Exception as e:
                 log.warning(f"Could not create composite timestamp: {e}. Falling back to simpler time key.")
                 if "月份" in df.columns: time_key = "月份"
@@ -164,14 +169,15 @@ def load_data_from_json(
             time_key = "month"
         elif "date" in df.columns:
             time_key = "date"
-        
+
         if time_key and time_key not in ["timestamp"]:
              log.info(f"Auto-detected time_key: '{time_key}'")
 
     # Auto-detect feature keys if they are not provided
     if feature_keys is None:
         all_keys = df.columns.tolist()
-        keys_to_exclude = [target_key, time_key, "年份", "月份"]
+        # Only exclude target_key and time_key, keep 年份 and 月份 as numeric features
+        keys_to_exclude = [target_key, time_key]
         detected_features = [k for k in all_keys if k not in keys_to_exclude]
         feature_keys = detected_features if detected_features else []
         log.info(f"Auto-detected feature_keys: {feature_keys}")
@@ -203,10 +209,9 @@ def load_data_from_json(
         
     df_filtered = df[columns_to_keep]
     log.info(f"Final columns after filtering: {df_filtered.columns.tolist()}")
-    
-    if time_key == "timestamp" and "年份" in df_filtered.columns and "月份" in df_filtered.columns:
-        df_filtered = df_filtered.drop(columns=["年份", "月份"])
-        log.info("Dropped original '年份' and '月份' columns.")
+
+    # Keep 年份 and 月份 as numeric features (no longer dropping them)
+    # This allows models like LSTM to use month for seasonality
 
     return ParsedData(
         df=df_filtered,
