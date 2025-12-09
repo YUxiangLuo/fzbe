@@ -1300,6 +1300,184 @@ export default (pool: Pool, JWT_SECRET: string) => {
     },
   );
 
+  // GET /api/v1/classes/:classId/report-export.csv - 导出班级实验报告CSV
+  classGradesApi.get(
+    "/api/v1/classes/:classId/report-export.csv",
+    jwt({ secret: JWT_SECRET }),
+    zValidator("param", classIdParamSchema),
+    async (c) => {
+      const payload = c.get("jwtPayload");
+      const { classId } = c.req.valid("param");
+      const classIdNumber = Number.parseInt(classId, 10);
+
+      const [classRows]: any[] = await pool.query(
+        "SELECT teacher_id FROM classes WHERE class_id = ?",
+        [classIdNumber],
+      );
+
+      if (classRows.length === 0) {
+        return c.json({ error: "班级不存在" }, 404);
+      }
+
+      let isAllowed = false;
+      if (payload.role === "Admin" || payload.sub === classRows[0].teacher_id) {
+        isAllowed = true;
+      } else if (payload.role === "Assistant") {
+        const assigned = await isAssistantAssignedToClass(
+          pool,
+          classIdNumber,
+          payload.sub,
+        );
+        if (assigned) {
+          isAllowed = true;
+        }
+      }
+
+      if (!isAllowed) {
+        return c.json({ error: "权限不足" }, 403);
+      }
+
+      const [reportRows]: any[] = await pool.query(
+        `SELECT
+           u.user_id,
+           u.username,
+           u.full_name,
+           er.report_id,
+           latest.experiment_id,
+           er.status,
+           er.submitted_at,
+           er.pdf_file_path,
+           er.grade,
+           er.feedback,
+           grader.full_name AS grader_name
+         FROM enrollments e
+         JOIN users u ON e.student_id = u.user_id
+         LEFT JOIN (
+           SELECT
+             ranked.student_id,
+             ranked.experiment_id
+           FROM (
+             SELECT
+               es.student_id,
+               es.experiment_id,
+               ROW_NUMBER() OVER (
+                 PARTITION BY es.student_id
+                 ORDER BY es.experiment_id DESC
+               ) AS rn
+             FROM experiment_status es
+             JOIN enrollments e2 ON e2.student_id = es.student_id
+             WHERE e2.class_id = ?
+           ) ranked
+           WHERE ranked.rn = 1
+         ) latest ON latest.student_id = e.student_id
+         LEFT JOIN experiment_reports er
+           ON er.student_id = latest.student_id
+          AND er.experiment_id = latest.experiment_id
+         LEFT JOIN users grader ON er.graded_by = grader.user_id
+         WHERE e.class_id = ?
+         ORDER BY u.username ASC`,
+        [classIdNumber, classIdNumber],
+      );
+
+      if (reportRows.length === 0) {
+        return c.json({ error: "该班级未找到已加入的学生" }, 404);
+      }
+
+      const toCsvValue = (value: unknown) => {
+        if (value === null || value === undefined) {
+          return "";
+        }
+        let str: string;
+        if (value instanceof Date) {
+          str = value.toISOString();
+        } else {
+          str = String(value);
+        }
+        if (/[",\n]/.test(str)) {
+          return `"${str.replace(/"/g, '""')}"`;
+        }
+        return str;
+      };
+
+      const formatNumeric = (value: unknown) => {
+        if (value === null || value === undefined) {
+          return "";
+        }
+        const num = Number(value);
+        if (!Number.isFinite(num)) {
+          return "";
+        }
+        return num.toFixed(2);
+      };
+
+      const formatDateTime = (value: unknown) => {
+        if (value === null || value === undefined) {
+          return "";
+        }
+        if (value instanceof Date) {
+          return value.toISOString().replace('T', ' ').substring(0, 19);
+        }
+        const dateStr = String(value);
+        try {
+          const date = new Date(dateStr);
+          if (!isNaN(date.getTime())) {
+            return date.toISOString().replace('T', ' ').substring(0, 19);
+          }
+        } catch (e) {
+          // ignore
+        }
+        return dateStr;
+      };
+
+      const header = [
+        "学号",
+        "姓名",
+        "实验ID",
+        "报告ID",
+        "报告状态",
+        "提交时间",
+        "报告分数",
+        "批改教师",
+        "批改反馈",
+      ];
+
+      const csvLines: string[] = [header.join(",")];
+
+      for (const row of reportRows) {
+        let statusText = "未提交";
+        if (row.status === "submitted") statusText = "已提交";
+        else if (row.status === "graded") statusText = "已评分";
+        else if (row.status === "rejected") statusText = "已驳回";
+
+        const rowValues: string[] = [
+          toCsvValue(row.username),
+          toCsvValue(row.full_name),
+          toCsvValue(row.experiment_id),
+          toCsvValue(row.report_id),
+          toCsvValue(statusText),
+          toCsvValue(formatDateTime(row.submitted_at)),
+          formatNumeric(row.grade),
+          toCsvValue(row.grader_name),
+          toCsvValue(row.feedback),
+        ];
+
+        csvLines.push(rowValues.join(","));
+      }
+
+      const csvContent = "\uFEFF" + csvLines.join("\n");
+
+      await mkdir(EXPORTS_DIR, { recursive: true });
+      const exportFileName = `class-${classIdNumber}-reports-${Date.now()}.csv`;
+      const exportFilePath = path.join(EXPORTS_DIR, exportFileName);
+      await Bun.write(exportFilePath, csvContent);
+      const relativePath = `uploads/exports/${exportFileName}`;
+
+      return c.json({
+        file_path: relativePath,
+      });
+    },
+  );
+
   // PUT /api/v1/classes/:classId/grading-policy - 更新成绩权重
   classGradesApi.put(
     "/api/v1/classes/:classId/grading-policy",
