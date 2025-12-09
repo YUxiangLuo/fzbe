@@ -10,6 +10,70 @@ import { mkdir } from "node:fs/promises";
 import { handleUnexpectedError } from "../utils/error-handler";
 import { sanitizeHTML, HTMLSanitizationError } from "../utils/html-sanitizer";
 
+const MODEL_TYPES = [
+  "ma",
+  "exp",
+  "arima",
+  "lstm",
+  "ensemble_weighted",
+  "ensemble_boosting",
+  "ensemble_stacking",
+] as const;
+
+type ModelType = typeof MODEL_TYPES[number];
+
+interface ModelMetric {
+  type: ModelType;
+  rmse: number;
+  mae: number;
+  r2: number;
+}
+
+function getBestModel(experiment: any): ModelType | null {
+  const models: ModelMetric[] = [];
+
+  const addModel = (type: ModelType, prefix: string) => {
+    // Check if completed
+    if (!experiment[`${prefix}_completed`]) return;
+
+    const rmse = Number(experiment[`${prefix}_metrics_rmse`]);
+    const mae = Number(experiment[`${prefix}_metrics_mae`]);
+    const r2 = Number(experiment[`${prefix}_metrics_r2`]);
+
+    if (!isNaN(rmse) && !isNaN(mae) && !isNaN(r2)) {
+      models.push({ type, rmse, mae, r2 });
+    }
+  };
+
+  addModel("ma", "moving_average");
+  addModel("exp", "exponential_smoothing");
+  addModel("arima", "arima");
+  addModel("lstm", "lstm");
+  addModel("ensemble_weighted", "ensemble_weighted");
+  addModel("ensemble_boosting", "ensemble_boosting");
+  addModel("ensemble_stacking", "ensemble_stacking");
+
+  // Calculate combined error score for all models
+  const modelsWithScore = models.map(m => ({
+    ...m,
+    score: m.rmse + m.mae
+  }));
+
+  // 1. Find the minimum error score (best accuracy)
+  const minScore = Math.min(...modelsWithScore.map(m => m.score));
+
+  // 2. Filter models that are within 1% range of the minimum score (The "First Tier")
+  // If minScore is 0, only models with 0 score are kept.
+  const threshold = minScore === 0 ? 0 : minScore * 1.01;
+  
+  const candidates = modelsWithScore.filter(m => m.score <= threshold);
+
+  // 3. Among the candidates, pick the one with the highest R2 (best fit)
+  candidates.sort((a, b) => b.r2 - a.r2);
+
+  return candidates[0]!.type;
+}
+
 const experimentIdParamSchema = z.object({
   experimentId: z.string().regex(/^\d+$/, { message: "experimentId 必须是数字" }),
 });
@@ -127,19 +191,19 @@ export default (pool: Pool, JWT_SECRET: string) => {
         const experiment_id = Number.parseInt(experimentId, 10);
         const { report_content: markdownContent } = c.req.valid("json");
 
-        const [[ownership]]: any[] = await pool.query(
-          `SELECT student_id
+        const [[experiment]]: any[] = await pool.query(
+          `SELECT *
              FROM experiment_status
             WHERE experiment_id = ?
             LIMIT 1`,
           [experiment_id],
         );
 
-        if (!ownership) {
+        if (!experiment) {
           return c.json({ error: "实验不存在" }, 404);
         }
 
-        if (Number.parseInt(String(ownership.student_id), 10) !== studentId) {
+        if (Number.parseInt(String(experiment.student_id), 10) !== studentId) {
           return c.json(
             { error: "权限不足：该实验不属于当前用户" },
             403,
@@ -225,7 +289,17 @@ export default (pool: Pool, JWT_SECRET: string) => {
 
 
 
-          // 提交报告成功则实验流程所有步骤都100分
+          // Calculate Model Quality Score
+          const calculatedBest = getBestModel(experiment);
+          const selectedBest = experiment.selected_best_model;
+          let modelQualityScore = 0;
+          if (calculatedBest && selectedBest === calculatedBest) {
+            modelQualityScore = 100;
+          } else if (calculatedBest && selectedBest !== calculatedBest) {
+            modelQualityScore = 50; // Set to 50 if a best model was calculated but not selected
+          }
+
+          // 提交报告成功则实验流程所有步骤都100分，并更新模型质量分
           const EXP_FLOW_GRADE_COLUMNS = [
             "exp_flow_demand_data_preparation",
             "exp_flow_demand_descriptive_stats",
@@ -237,13 +311,14 @@ export default (pool: Pool, JWT_SECRET: string) => {
             "exp_flow_production_plan_creation",
             "exp_flow_report_submission",
           ] as const;
-          const EXP_FLOW_GRADE_UPDATE_SET = EXP_FLOW_GRADE_COLUMNS.map(
-            (col) => `${col} = ?`,
-          ).join(", ");
-          const fullValues = EXP_FLOW_GRADE_COLUMNS.map(() => 100);
+
+          const GRADE_COLUMNS = [...EXP_FLOW_GRADE_COLUMNS, "model_quality"];
+          const GRADE_UPDATE_SET = GRADE_COLUMNS.map((col) => `${col} = ?`).join(", ");
+          const gradeValues = [...EXP_FLOW_GRADE_COLUMNS.map(() => 100), modelQualityScore];
+
           await connection.query(
-            `UPDATE experiment_grade SET ${EXP_FLOW_GRADE_UPDATE_SET} WHERE experiment_id = ? AND student_id = ?`,
-            [...fullValues, experiment_id, studentId],
+            `UPDATE experiment_grade SET ${GRADE_UPDATE_SET} WHERE experiment_id = ? AND student_id = ?`,
+            [...gradeValues, experiment_id, studentId],
           );
 
           await connection.commit();
