@@ -322,7 +322,7 @@ export default (pool: Pool, JWT_SECRET: string) => {
         if (segmentsMap.size > 0) {
           const segmentValues = [];
           for (const segment of segmentsMap.values()) {
-            const segmentFileName = `${segment.productName.replace(/[\/\\?%*:|"<>]/g, "-")}.csv`;
+            const segmentFileName = `${segment.companyName.replace(/[\/\\?%*:|"<>]/g, "-")}_${segment.productName.replace(/[\/\\?%*:|"<>]/g, "-")}.csv`;
             const segmentFilePath = path.join(segmentsDir, segmentFileName);
             const csvContent = toCsvString(segment.rows);
             await Bun.write(segmentFilePath, csvContent);
