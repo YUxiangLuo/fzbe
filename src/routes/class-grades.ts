@@ -1436,9 +1436,9 @@ export default (pool: Pool, JWT_SECRET: string) => {
         "报告ID",
         "报告状态",
         "提交时间",
-        "报告分数",
-        "批改教师",
-        "批改反馈",
+        "报告得分",
+        "评阅人",
+        "评语",
       ];
 
       const csvLines: string[] = [header.join(",")];
