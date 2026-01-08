@@ -1,9 +1,14 @@
+# Core scientific stack
 numpy
 scipy
+pandas
+scikit-learn
 statsmodels>=0.13
 joblib
-torch
-scikit-learn
-pandas
 pmdarima
+
+# Deep learning (CPU only)
+torch
+
+# TensorFlow (CPU by default on Linux)
 tensorflow
