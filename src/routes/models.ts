@@ -11,6 +11,22 @@ import logger from "../logger";
 
 const TRAINING_TIMEOUT = 300000; // 5 minutes for all models
 const ENSEMBLE_TRAINING_TIMEOUT = 300000; // 5 minutes for all models
+const MAX_CONCURRENT_MODEL_JOBS = 16;
+let activeModelJobs = 0;
+
+const tryAcquireModelSlot = (): boolean => {
+  if (activeModelJobs >= MAX_CONCURRENT_MODEL_JOBS) {
+    return false;
+  }
+  activeModelJobs += 1;
+  return true;
+};
+
+const releaseModelSlot = () => {
+  if (activeModelJobs > 0) {
+    activeModelJobs -= 1;
+  }
+};
 
 // ========== Common Schemas ==========
 const baseDataSchema = z.object({
@@ -295,6 +311,9 @@ export default (pool: Pool, JWT_SECRET: string) => {
       }
       const studentId = payload.sub;
       const body = c.req.valid("json");
+      if (!tryAcquireModelSlot()) {
+        return c.json({ error: "模型服务繁忙，请稍后再试" }, 429);
+      }
 
       try {
         const allData = await loadDatasetFromDb(
@@ -379,6 +398,8 @@ export default (pool: Pool, JWT_SECRET: string) => {
         }
         const message = error instanceof Error ? error.message : `${modelType.toUpperCase()} 训练失败`;
         return handleUnexpectedError(c, error, message);
+      } finally {
+        releaseModelSlot();
       }
     },
   );
@@ -397,6 +418,9 @@ export default (pool: Pool, JWT_SECRET: string) => {
       const payload = c.get("jwtPayload");
       const studentId = payload.sub;
       const body = c.req.valid("json");
+      if (!tryAcquireModelSlot()) {
+        return c.json({ error: "模型服务繁忙，请稍后再试" }, 429);
+      }
 
       try {
         const modelLoadPath = path.resolve(
@@ -426,6 +450,8 @@ export default (pool: Pool, JWT_SECRET: string) => {
       } catch (error: any) {
         const message = error instanceof Error ? error.message : `${modelType.toUpperCase()} 预测失败`;
         return handleUnexpectedError(c, error, message);
+      } finally {
+        releaseModelSlot();
       }
     },
   );

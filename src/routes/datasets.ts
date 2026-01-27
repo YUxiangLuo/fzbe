@@ -180,9 +180,18 @@ export default (pool: Pool, JWT_SECRET: string) => {
       for (const [key, segment] of segmentsMap.entries()) {
         const timePoints = new Set<string>();
         let previousTime = "";
+        const firstRow = segment.rows[0];
 
-        for (let i = 0; i < segment.rows.length; i++) {
-          const row = segment.rows[i];
+        if (!firstRow) {
+          return c.json({
+            error: "数据格式错误",
+            details: `产品 "${segment.productName}" 无有效数据`,
+          }, 400);
+        }
+
+        const expectedUnit = (firstRow["数量单位"] ?? "").trim();
+
+        for (const [i, row] of segment.rows.entries()) {
           const yearRaw = row["年份"]?.trim();
           const monthRaw = row["月份"]?.trim();
 
@@ -237,11 +246,9 @@ export default (pool: Pool, JWT_SECRET: string) => {
 
           // Check 5: Unit Consistency
           const unitRaw = (row["数量单位"] ?? "").trim();
-          // Use the unit from the first row as the standard
-          const expectedUnit = (segment.rows[0]["数量单位"] ?? "").trim();
           
           if (unitRaw !== expectedUnit) {
-             return c.json({
+              return c.json({
               error: "数据不一致",
               details: `产品 "${segment.productName}" 第 ${i + 1} 行数量单位 "${unitRaw}" 与首行单位 "${expectedUnit}" 不一致`,
             }, 400);

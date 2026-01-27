@@ -40,6 +40,31 @@ async function executeSqlFile(connection: mysql.Connection, filePath: string) {
 }
 
 /**
+ * 删除指定数据库中的所有表
+ * @param connection 数据库连接实例
+ * @param database 数据库名称
+ */
+async function dropAllTables(connection: mysql.Connection, database: string) {
+  const [rows] = await connection.query<mysql.RowDataPacket[]>(
+    'SELECT TABLE_NAME FROM information_schema.tables WHERE table_schema = ? AND table_type = "BASE TABLE"',
+    [database]
+  );
+  if (rows.length === 0) {
+    console.log('No existing tables to drop.');
+    return;
+  }
+
+  const tableNames = rows.map(row => row.TABLE_NAME as string);
+  console.log(`Dropping ${tableNames.length} tables...`);
+  await connection.query('SET FOREIGN_KEY_CHECKS = 0;');
+  await connection.query(
+    `DROP TABLE IF EXISTS ${tableNames.map(name => `\`${name}\``).join(', ')};`
+  );
+  await connection.query('SET FOREIGN_KEY_CHECKS = 1;');
+  console.log('✅ All existing tables dropped.');
+}
+
+/**
  * 主函数：设置数据库
  */
 async function setupDatabase() {
@@ -65,11 +90,14 @@ async function setupDatabase() {
     await connection.changeUser({ database: DB_DATABASE });
     console.log(`Switched to database '${DB_DATABASE}'.`);
 
-    // 4. 执行 schema.sql 来创建表结构
+    // 4. 删除已有表
+    await dropAllTables(connection, DB_DATABASE!);
+
+    // 5. 执行 schema.sql 来创建表结构
     console.log('Executing schema.sql...');
     await executeSqlFile(connection, SCHEMA_FILE);
 
-    // 5. 执行 seed.sql 来填充数据
+    // 6. 执行 seed.sql 来填充数据
     console.log('Executing seed.sql...');
     await executeSqlFile(connection, SEED_FILE);
 
