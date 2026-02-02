@@ -10,6 +10,8 @@
   "private": true,
   "scripts": {
     "start": "bun run src/index.ts",
+    "test": "bun test",
+    "test:unit": "bun test tests/unit/",
     "db:setup": "bun run scripts/db-setup.ts",
     "hash-password": "bun run scripts/hash-password.ts"
   },
