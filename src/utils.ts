@@ -2,12 +2,10 @@ import fs from "fs";
 import csv from "csv-parser";
 import path from "path";
 
+import { env } from "./config";
+
 export const getDefaultPasswordHash = (): string => {
-  const hash = Bun.env.DEFAULT_PASSWORD_HASH;
-  if (!hash) {
-    throw new Error("DEFAULT_PASSWORD_HASH environment variable not set");
-  }
-  return hash;
+  return env.DEFAULT_PASSWORD_HASH;
 };
 
 // Represents a segment of data for a specific product, including its metadata and all its data rows.

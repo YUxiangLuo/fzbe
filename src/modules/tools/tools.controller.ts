@@ -1,0 +1,27 @@
+import { Hono } from "hono";
+import { zValidator } from "@hono/zod-validator";
+import { jwtAuth } from "../../middleware";
+import { adfRequestSchema } from "./tools.schema";
+import { performAdfTest } from "./tools.service";
+import { handleUnexpectedError } from "../../utils/error-handler";
+import type { AdfInputPoint } from "../../utils";
+
+const toolsController = new Hono();
+
+toolsController.post(
+  "/api/v1/tools/adf",
+  jwtAuth,
+  zValidator("json", adfRequestSchema),
+  async (c) => {
+    const { series } = c.req.valid("json") as { series: AdfInputPoint[] };
+
+    try {
+      const result = await performAdfTest(series);
+      return c.json({ result });
+    } catch (error) {
+      return handleUnexpectedError(c, error, "ADF 检测失败");
+    }
+  },
+);
+
+export default toolsController;
