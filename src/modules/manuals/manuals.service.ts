@@ -4,6 +4,7 @@ import type { RowDataPacket, ResultSetHeader } from "mysql2";
 import { pool } from "../../config";
 import type { ExperimentManual } from "../../types";
 import { validateFile, generateUniqueFilename, FileValidationError } from "../../utils/file-validator";
+import { FILE_SIZE_LIMITS } from "../../utils/constants";
 import type { UpdateManualInput } from "./manuals.schema";
 
 type ManualRow = ExperimentManual & RowDataPacket & { uploader_name?: string };
@@ -34,7 +35,7 @@ export async function uploadManual(input: UploadManualInput) {
   const { file, fileName, description, uploaderId } = input;
 
   await validateFile(file, "pdf", {
-    maxSize: 50 * 1024 * 1024,
+    maxSize: FILE_SIZE_LIMITS.PDF_MAX_SIZE,
     checkMagicBytes: true,
   });
 

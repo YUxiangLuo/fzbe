@@ -1,6 +1,6 @@
 import type { RowDataPacket, ResultSetHeader, Pool, PoolConnection } from "mysql2/promise";
 import { pool } from "../../config";
-import { getDefaultPasswordHash } from "../../utils";
+import { getDefaultPasswordHash, hashPassword } from "../../utils/password";
 import type { CreateStudentInput } from "./class-members.schema";
 
 const DEFAULT_PASSWORD_HASH = getDefaultPasswordHash();
@@ -78,7 +78,7 @@ export async function createStudentInClass(classId: number, userId: number, user
 
     let password_hash: string;
     if (input.password) {
-      password_hash = await Bun.password.hash(input.password, { algorithm: "bcrypt", cost: 10 });
+      password_hash = await hashPassword(input.password);
     } else {
       password_hash = DEFAULT_PASSWORD_HASH;
     }

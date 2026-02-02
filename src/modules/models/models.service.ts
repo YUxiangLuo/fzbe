@@ -5,9 +5,10 @@ import csv from "csv-parser";
 import { pool } from "../../config";
 import logger from "../../logger";
 import type { ModelType, TrainInput } from "./models.schema";
+import { TIMEOUTS, CONCURRENCY_LIMITS } from "../../utils/constants";
 
-const TRAINING_TIMEOUT = 300000;
-const MAX_CONCURRENT_MODEL_JOBS = 16;
+const TRAINING_TIMEOUT = TIMEOUTS.MODEL_TRAINING;
+const MAX_CONCURRENT_MODEL_JOBS = CONCURRENCY_LIMITS.MAX_CONCURRENT_MODEL_JOBS;
 let activeModelJobs = 0;
 
 export const tryAcquireModelSlot = (): boolean => {
@@ -117,7 +118,11 @@ export async function runPythonModel(
       await proc.exited;
 
       if (proc.exitCode !== 0) {
-        logger.error({ stderr, modelType, args: fullArgs }, "Python 执行失败");
+        // 截断日志，避免泄露完整数据
+        const truncatedArgs = fullArgs.map((arg) =>
+          typeof arg === "string" && arg.length > 200 ? `${arg.slice(0, 200)}...[truncated]` : arg,
+        );
+        logger.error({ stderr: stderr.slice(0, 2000), modelType, args: truncatedArgs }, "Python 执行失败");
         const pythonErrorMessage = stderr.trim();
         if (pythonErrorMessage.startsWith("[VALIDATION]")) {
           reject(new Error(`[PYTHON_VALIDATION] ${pythonErrorMessage.substring(13).trim()}`));
@@ -130,7 +135,10 @@ export async function runPythonModel(
         try {
           resolve(JSON.parse(stdout));
         } catch {
-          logger.error({ stdout, modelType, args: fullArgs }, "解析 Python 输出失败");
+          const truncatedArgs = fullArgs.map((arg) =>
+            typeof arg === "string" && arg.length > 200 ? `${arg.slice(0, 200)}...[truncated]` : arg,
+          );
+          logger.error({ stdout: stdout.slice(0, 2000), modelType, args: truncatedArgs }, "解析 Python 输出失败");
           reject(new Error("Python 输出无效"));
         }
       }

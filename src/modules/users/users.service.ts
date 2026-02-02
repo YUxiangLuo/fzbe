@@ -4,15 +4,13 @@ import { createReadStream } from "node:fs";
 import csv from "csv-parser";
 import type { RowDataPacket, ResultSetHeader } from "mysql2/promise";
 import { pool } from "../../config";
-import { getDefaultPasswordHash } from "../../utils";
+import { hashPassword, getDefaultPasswordHash, shouldChangePassword, verifyPassword } from "../../utils/password";
 import { logWarning } from "../../utils/error-handler";
+import { USER_CONSTANTS, FILE_SIZE_LIMITS, CSV_LIMITS } from "../../utils/constants";
 import type { CreateTeacherInput, CreateAssistantSingleInput, CreateAssistantInput, UpdateUserInput, ResetPasswordInput, UserSearchQuery, PaginationQuery } from "./users.schema";
 import { studentSelfRegisterSchema, teacherAssistantSelfRegisterSchema } from "./users.schema";
 
-const TEACHER_EMAIL_DOMAIN = "teacher.edu";
-const ASSISTANT_EMAIL_DOMAIN = "assistant.edu";
-const PHONE_REGEX = /^\d{6,15}$/;
-const MIN_TEACHER_NAME_LENGTH = 2;
+const { TEACHER_EMAIL_DOMAIN, ASSISTANT_EMAIL_DOMAIN, PHONE_REGEX, MIN_NAME_LENGTH } = USER_CONSTANTS;
 const DEFAULT_PASSWORD_HASH = getDefaultPasswordHash();
 
 interface UserRow extends RowDataPacket { user_id: number; username: string; full_name: string; email: string; role: string; phone_number: string | null; password_hash: string; created_at: Date; }
@@ -27,7 +25,7 @@ export async function registerSelfUser(role: "Student" | "Teacher" | "Assistant"
 
   const { username, password, name, email } = result.data;
   const phone = (result.data as { phone?: string }).phone || null;
-  const password_hash = await Bun.password.hash(password, { algorithm: "bcrypt", cost: 10 });
+  const password_hash = await hashPassword(password);
 
   try {
     const [insertResult] = await pool.query<ResultSetHeader>("INSERT INTO users (username, password_hash, full_name, email, phone_number, role) VALUES (?, ?, ?, ?, ?, ?)", [username, password_hash, name, email, phone, role]);
@@ -46,7 +44,7 @@ export async function registerSelfUser(role: "Student" | "Teacher" | "Assistant"
 export async function createAssistantSingle(input: CreateAssistantSingleInput) {
   const { username, full_name, email, phone, password } = input;
   const assistantEmail = email ?? `${username}@${ASSISTANT_EMAIL_DOMAIN}`;
-  const password_hash = password ? await Bun.password.hash(password, { algorithm: "bcrypt", cost: 10 }) : DEFAULT_PASSWORD_HASH;
+  const password_hash = password ? await hashPassword(password) : DEFAULT_PASSWORD_HASH;
 
   try {
     const [result] = await pool.query<ResultSetHeader>("INSERT INTO users (username, password_hash, full_name, email, phone_number, role) VALUES (?, ?, ?, ?, ?, 'Assistant')", [username, password_hash, full_name, assistantEmail, phone || null]);
@@ -109,7 +107,7 @@ export async function createAssistantWithClasses(input: CreateAssistantInput, re
       }
     }
 
-    const password_hash = await Bun.password.hash(password, { algorithm: "bcrypt", cost: 10 });
+    const password_hash = await hashPassword(password);
     const [userResult] = await connection.query<ResultSetHeader>("INSERT INTO users (username, password_hash, full_name, email, role, phone_number) VALUES (?, ?, ?, ?, 'Assistant', ?)", [username, password_hash, full_name, email, phone_number || null]);
     const newAssistantId = userResult.insertId;
     const assignmentValues = class_ids.map((classId) => [classId, newAssistantId]);
@@ -130,7 +128,7 @@ export async function createAssistantWithClasses(input: CreateAssistantInput, re
 export async function createTeacher(input: CreateTeacherInput) {
   const { username, full_name, email, phone, password } = input;
   const teacherEmail = email ?? `${username}@${TEACHER_EMAIL_DOMAIN}`;
-  const password_hash = password ? await Bun.password.hash(password, { algorithm: "bcrypt", cost: 10 }) : DEFAULT_PASSWORD_HASH;
+  const password_hash = password ? await hashPassword(password) : DEFAULT_PASSWORD_HASH;
 
   try {
     const [result] = await pool.query<ResultSetHeader>("INSERT INTO users (username, password_hash, full_name, email, phone_number, role) VALUES (?, ?, ?, ?, ?, 'Teacher')", [username, password_hash, full_name, teacherEmail, phone || null]);
@@ -151,12 +149,12 @@ export async function batchCreateTeachers(file: File, password: unknown) {
   if (password !== undefined && password !== null && password !== "") {
     if (typeof password !== "string") return { error: "invalid_password_type" as const };
     const trimmed = password.trim();
-    if (trimmed.length < 6) return { error: "password_too_short" as const };
+    if (trimmed.length < USER_CONSTANTS.MIN_PASSWORD_LENGTH) return { error: "password_too_short" as const };
     normalizedPassword = trimmed;
   }
 
   if (file.type && file.type !== "text/csv" && !file.type.includes("csv")) return { error: "invalid_file_type" as const };
-  if (file.size > 5 * 1024 * 1024) return { error: "file_too_large" as const };
+  if (file.size > FILE_SIZE_LIMITS.CSV_MAX_SIZE) return { error: "file_too_large" as const };
 
   const tempDir = path.resolve(import.meta.dir, "../../../uploads", "temp");
   await mkdir(tempDir, { recursive: true });
@@ -174,10 +172,15 @@ export async function batchCreateTeachers(file: File, password: unknown) {
         .pipe(csv({ mapHeaders: ({ header }) => header.replace(/^\uFEFF/, "").trim() }))
         .on("data", (row: Record<string, string>) => {
           rowNumber += 1;
+          // 检查行数限制
+          if (rowNumber > CSV_LIMITS.BATCH_IMPORT_MAX_ROWS) {
+            invalidRows.push({ row: rowNumber, reason: `超过最大行数限制 ${CSV_LIMITS.BATCH_IMPORT_MAX_ROWS}` });
+            return;
+          }
           const fullName = row["姓名"]?.trim() ?? "";
           const phone = row["手机号"]?.trim() ?? "";
           if (!fullName || !phone) { invalidRows.push({ row: rowNumber, reason: "姓名或手机号缺失" }); return; }
-          if (fullName.length < MIN_TEACHER_NAME_LENGTH) { invalidRows.push({ row: rowNumber, reason: `姓名长度需至少 ${MIN_TEACHER_NAME_LENGTH} 个字符` }); return; }
+          if (fullName.length < MIN_NAME_LENGTH) { invalidRows.push({ row: rowNumber, reason: `姓名长度需至少 ${MIN_NAME_LENGTH} 个字符` }); return; }
           if (!PHONE_REGEX.test(phone)) { invalidRows.push({ row: rowNumber, reason: `手机号 ${phone} 格式不正确，应为 6-15 位数字` }); return; }
           if (seenPhones.has(phone)) { invalidRows.push({ row: rowNumber, reason: `CSV 内存在重复手机号 ${phone}` }); return; }
           seenPhones.add(phone);
@@ -210,10 +213,10 @@ export async function batchCreateTeachers(file: File, password: unknown) {
 
       let hashedPasswords: string[];
       if (normalizedPassword) {
-        const hashed = await Bun.password.hash(normalizedPassword, { algorithm: "bcrypt", cost: 10 });
+        const hashed = await hashPassword(normalizedPassword);
         hashedPasswords = teacherRows.map(() => hashed);
       } else {
-        hashedPasswords = await Promise.all(teacherRows.map((r) => Bun.password.hash(r.phone, { algorithm: "bcrypt", cost: 10 })));
+        hashedPasswords = await Promise.all(teacherRows.map((r) => hashPassword(r.phone)));
       }
 
       const teacherValues = teacherRows.map((r, i) => [r.username, hashedPasswords[i], r.fullName, r.email, "Teacher", r.phone]);
@@ -233,12 +236,12 @@ export async function batchCreateAssistants(file: File, password: unknown) {
   if (password !== undefined && password !== null && password !== "") {
     if (typeof password !== "string") return { error: "invalid_password_type" as const };
     const trimmed = password.trim();
-    if (trimmed.length < 6) return { error: "password_too_short" as const };
+    if (trimmed.length < USER_CONSTANTS.MIN_PASSWORD_LENGTH) return { error: "password_too_short" as const };
     normalizedPassword = trimmed;
   }
 
   if (file.type && file.type !== "text/csv" && !file.type.includes("csv")) return { error: "invalid_file_type" as const };
-  if (file.size > 5 * 1024 * 1024) return { error: "file_too_large" as const };
+  if (file.size > FILE_SIZE_LIMITS.CSV_MAX_SIZE) return { error: "file_too_large" as const };
 
   const tempDir = path.resolve(import.meta.dir, "../../../uploads", "temp");
   await mkdir(tempDir, { recursive: true });
@@ -256,14 +259,19 @@ export async function batchCreateAssistants(file: File, password: unknown) {
         .pipe(csv({ mapHeaders: ({ header }) => header.replace(/^\uFEFF/, "").trim() }))
         .on("data", (row: Record<string, string>) => {
           rowNumber += 1;
+          // 检查行数限制
+          if (rowNumber > CSV_LIMITS.BATCH_IMPORT_MAX_ROWS) {
+            invalidRows.push({ row: rowNumber, reason: `超过最大行数限制 ${CSV_LIMITS.BATCH_IMPORT_MAX_ROWS}` });
+            return;
+          }
           const fullName = row["姓名"]?.trim() ?? "";
           const phone = row["手机号"]?.trim() ?? "";
           if (!fullName || !phone) { invalidRows.push({ row: rowNumber, reason: "姓名或手机号缺失" }); return; }
-          if (fullName.length < MIN_TEACHER_NAME_LENGTH) { invalidRows.push({ row: rowNumber, reason: `姓名长度需至少 ${MIN_TEACHER_NAME_LENGTH} 个字符` }); return; }
+          if (fullName.length < MIN_NAME_LENGTH) { invalidRows.push({ row: rowNumber, reason: `姓名长度需至少 ${MIN_NAME_LENGTH} 个字符` }); return; }
           if (!PHONE_REGEX.test(phone)) { invalidRows.push({ row: rowNumber, reason: `手机号 ${phone} 格式不正确，应为 6-15 位数字` }); return; }
           if (seenPhones.has(phone)) { invalidRows.push({ row: rowNumber, reason: `CSV 内存在重复手机号 ${phone}` }); return; }
           seenPhones.add(phone);
-          assistantRows.push({ row: rowNumber, fullName, phone, username: `ta_${phone}`, email: `ta_${phone}@assistant.edu` });
+          assistantRows.push({ row: rowNumber, fullName, phone, username: `ta_${phone}`, email: `ta_${phone}@${ASSISTANT_EMAIL_DOMAIN}` });
         })
         .on("end", resolve)
         .on("error", reject);
@@ -292,10 +300,10 @@ export async function batchCreateAssistants(file: File, password: unknown) {
 
       let hashedPasswords: string[];
       if (normalizedPassword) {
-        const hashed = await Bun.password.hash(normalizedPassword, { algorithm: "bcrypt", cost: 10 });
+        const hashed = await hashPassword(normalizedPassword);
         hashedPasswords = assistantRows.map(() => hashed);
       } else {
-        hashedPasswords = await Promise.all(assistantRows.map((r) => Bun.password.hash(r.phone, { algorithm: "bcrypt", cost: 10 })));
+        hashedPasswords = await Promise.all(assistantRows.map((r) => hashPassword(r.phone)));
       }
 
       const assistantValues = assistantRows.map((r, i) => [r.username, hashedPasswords[i], r.fullName, r.email, "Assistant", r.phone]);
@@ -346,11 +354,9 @@ export async function getCurrentUser(userId: number) {
 
   const shouldAuditPassword = ["Student", "Teacher", "Assistant"].includes(user.role);
   if (shouldAuditPassword && passwordHash) {
-    const matchesDefault = passwordHash === DEFAULT_PASSWORD_HASH;
-    let matchesIdentifier = false;
-    if (user.role === "Student") matchesIdentifier = await Bun.password.verify(user.username, passwordHash).catch(() => false);
-    else if ((user.role === "Teacher" || user.role === "Assistant") && user.phone_number) matchesIdentifier = await Bun.password.verify(user.phone_number, passwordHash).catch(() => false);
-    result.must_change_password = Boolean(matchesDefault || matchesIdentifier);
+    // 获取用于检查的标识符：学生用学号，教师/助教用手机号
+    const identifier = user.role === "Student" ? user.username : user.phone_number;
+    result.must_change_password = await shouldChangePassword(passwordHash, identifier);
   }
 
   if (user.role === "Student") {
@@ -386,10 +392,10 @@ export async function changePassword(userId: number, currentPassword: string, ne
   const [[user]] = await pool.query<UserRow[]>("SELECT password_hash FROM users WHERE user_id = ?", [userId]);
   if (!user) return { error: "not_found" as const };
 
-  const passwordMatch = await Bun.password.verify(currentPassword, user.password_hash);
+  const passwordMatch = await verifyPassword(currentPassword, user.password_hash);
   if (!passwordMatch) return { error: "wrong_password" as const };
 
-  const newPasswordHash = await Bun.password.hash(newPassword, { algorithm: "bcrypt", cost: 10 });
+  const newPasswordHash = await hashPassword(newPassword);
   await pool.query("UPDATE users SET password_hash = ? WHERE user_id = ?", [newPasswordHash, userId]);
   return { success: true };
 }
@@ -401,7 +407,7 @@ export async function getUserById(userId: number) {
 }
 
 export async function adminChangePassword(targetUserId: number, newPassword: string) {
-  const newPasswordHash = await Bun.password.hash(newPassword, { algorithm: "bcrypt", cost: 10 });
+  const newPasswordHash = await hashPassword(newPassword);
   const [result] = await pool.query<ResultSetHeader>("UPDATE users SET password_hash = ? WHERE user_id = ?", [newPasswordHash, targetUserId]);
   if (result.affectedRows === 0) return { error: "not_found" as const };
   return { success: true };
@@ -420,7 +426,7 @@ export async function resetStudentPassword(targetUserId: number, requesterId: nu
     if (!row) return { error: "not_assigned_student" as const };
   }
 
-  const password_hash = input.newPassword ? await Bun.password.hash(input.newPassword, { algorithm: "bcrypt", cost: 10 }) : DEFAULT_PASSWORD_HASH;
+  const password_hash = input.newPassword ? await hashPassword(input.newPassword) : DEFAULT_PASSWORD_HASH;
   const [result] = await pool.query<ResultSetHeader>("UPDATE users SET password_hash = ? WHERE user_id = ?", [password_hash, targetUserId]);
   if (result.affectedRows === 0) return { error: "not_found" as const };
   return { success: true, isCustomPassword: Boolean(input.newPassword) };

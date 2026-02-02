@@ -6,6 +6,8 @@ import csv from "csv-parser";
 import { pool } from "../../config";
 import { validateFile, generateUniqueFilename, FileValidationError } from "../../utils/file-validator";
 import { logWarning } from "../../utils/error-handler";
+import { hashPassword } from "../../utils/password";
+import { USER_CONSTANTS, CSV_LIMITS } from "../../utils/constants";
 import type { UpdateClassInput } from "./classes.schema";
 
 interface ClassRow extends RowDataPacket {
@@ -34,13 +36,11 @@ interface AssignmentRow extends RowDataPacket {
   enrollment_id?: number;
 }
 
-const STUDENT_ID_REGEX = /^\d{8,32}$/;
-const MIN_FULL_NAME_LENGTH = 2;
-const MAX_FULL_NAME_LENGTH = 64;
+const { STUDENT_ID_REGEX, MIN_NAME_LENGTH, MAX_NAME_LENGTH } = USER_CONSTANTS;
 
 const isValidStudentId = (value: string) => STUDENT_ID_REGEX.test(value);
 const isValidFullName = (value: string) =>
-  value.length >= MIN_FULL_NAME_LENGTH && value.length <= MAX_FULL_NAME_LENGTH;
+  value.length >= MIN_NAME_LENGTH && value.length <= MAX_NAME_LENGTH;
 
 export async function isAssistantAssignedToClass(classId: number, assistantId: number): Promise<boolean> {
   const [[assignment]] = await pool.query<AssignmentRow[]>(
@@ -108,6 +108,11 @@ export async function createClass(
           .pipe(csv({ mapHeaders: ({ header }) => header.replace(/^\uFEFF/, "").trim() }))
           .on("data", (row: Record<string, string>) => {
             rowNumber += 1;
+            // 检查行数限制
+            if (rowNumber > CSV_LIMITS.BATCH_IMPORT_MAX_ROWS) {
+              invalidRecords.push({ row: rowNumber, reason: `超过最大行数限制 ${CSV_LIMITS.BATCH_IMPORT_MAX_ROWS}` });
+              return;
+            }
             const studentId = row["学号"]?.trim() ?? "";
             const fullName = row["姓名"]?.trim() ?? "";
 
@@ -120,7 +125,7 @@ export async function createClass(
               return;
             }
             if (!isValidFullName(fullName)) {
-              invalidRecords.push({ row: rowNumber, reason: `姓名长度需在 ${MIN_FULL_NAME_LENGTH}-${MAX_FULL_NAME_LENGTH} 个字符之间` });
+              invalidRecords.push({ row: rowNumber, reason: `姓名长度需在 ${MIN_NAME_LENGTH}-${MAX_NAME_LENGTH} 个字符之间` });
               return;
             }
             if (seenStudentIds.has(studentId)) {
@@ -152,7 +157,7 @@ export async function createClass(
         }
 
         const hashedPasswords = await Promise.all(
-          studentRecords.map((r) => Bun.password.hash(r.studentId, { algorithm: "bcrypt", cost: 10 })),
+          studentRecords.map((r) => hashPassword(r.studentId)),
         );
 
         const studentValues = studentRecords.map((r, i) => [r.studentId, hashedPasswords[i], r.fullName, r.email, "Student"]);

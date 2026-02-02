@@ -5,6 +5,7 @@ import { marked } from "marked";
 import puppeteer from "puppeteer-core";
 import { pool } from "../../config";
 import { sanitizeHTML, HTMLSanitizationError } from "../../utils/html-sanitizer";
+import { CONTENT_LIMITS, PATHS, TIMEOUTS } from "../../utils/constants";
 
 const MODEL_TYPES = [
   "ma", "exp", "arima", "lstm",
@@ -150,7 +151,15 @@ export async function submitReport(
   experimentId: number,
   studentId: number,
   markdownContent: string,
-): Promise<{ error: string; status: 403 | 404 } | { data: SubmitReportResult; isUpdate: boolean }> {
+): Promise<{ error: string; status: 400 | 403 | 404 } | { data: SubmitReportResult; isUpdate: boolean }> {
+  // 输入长度限制
+  if (markdownContent.length > CONTENT_LIMITS.MARKDOWN_MAX_LENGTH) {
+    return {
+      error: `报告内容过长，最大允许 ${CONTENT_LIMITS.MARKDOWN_MAX_LENGTH} 字符`,
+      status: 400,
+    };
+  }
+
   const [[experiment]] = await pool.query<ExperimentRow[]>(
     `SELECT * FROM experiment_status WHERE experiment_id = ? LIMIT 1`,
     [experimentId],
@@ -174,7 +183,7 @@ export async function submitReport(
   const pdfPath = path.join(reportsDir, uniqueFilename);
 
   const browser = await puppeteer.launch({
-    executablePath: "/usr/bin/chromium",
+    executablePath: PATHS.CHROMIUM_PATH,
     headless: true,
     args: ["--no-sandbox", "--disable-setuid-sandbox", "--disable-web-security", "--disable-features=IsolateOrigins,site-per-process"],
   });

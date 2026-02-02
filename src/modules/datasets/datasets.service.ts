@@ -7,6 +7,7 @@ import { pool } from "../../config";
 import { parseCsvSegments, getCsvHeaders } from "../../utils";
 import { validateFile, generateUniqueFilename, FileValidationError } from "../../utils/file-validator";
 import { logWarning } from "../../utils/error-handler";
+import { FILE_SIZE_LIMITS } from "../../utils/constants";
 import type { UpdateDatasetInput } from "./datasets.schema";
 
 interface DatasetRow extends RowDataPacket {
@@ -52,7 +53,7 @@ export async function uploadDataset(file: File, dataName: string, description?: 
   let datasetDirectory: string | null = null;
 
   try {
-    await validateFile(file, "csv", { maxSize: 50 * 1024 * 1024, checkMagicBytes: false });
+    await validateFile(file, "csv", { maxSize: FILE_SIZE_LIMITS.DATASET_CSV_MAX_SIZE, checkMagicBytes: false });
   } catch (error) {
     if (error instanceof FileValidationError) return { error: error.message, status: 400 as const };
     throw error;

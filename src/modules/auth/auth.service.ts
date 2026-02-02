@@ -2,6 +2,7 @@ import { sign } from "hono/jwt";
 import type { RowDataPacket } from "mysql2";
 import { pool } from "../../config";
 import { env } from "../../config";
+import { verifyPassword } from "../../utils/password";
 import type { User, UserRole } from "../../types";
 import type { LoginInput } from "./auth.schema";
 
@@ -40,7 +41,7 @@ export async function login(input: LoginInput): Promise<LoginResult | LoginError
     return { success: false, error: "用户名或密码错误", status: 401 };
   }
 
-  const passwordMatch = await Bun.password.verify(password, user.password_hash);
+  const passwordMatch = await verifyPassword(password, user.password_hash);
   if (!passwordMatch) {
     return { success: false, error: "用户名或密码错误", status: 401 };
   }
