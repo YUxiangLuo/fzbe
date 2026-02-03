@@ -4,7 +4,7 @@ import { createReadStream } from "node:fs";
 import type { RowDataPacket, ResultSetHeader } from "mysql2/promise";
 import csv from "csv-parser";
 import { pool } from "../../config";
-import { parseCsvSegments, getCsvHeaders } from "../../utils";
+import { parseCsvSegments, getCsvHeaders } from "../../utils/csv-processor";
 import { validateFile, generateUniqueFilename, FileValidationError } from "../../utils/file-validator";
 import { logWarning } from "../../utils/error-handler";
 import { FILE_SIZE_LIMITS } from "../../utils/constants";

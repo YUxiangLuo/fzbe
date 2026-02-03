@@ -4,7 +4,7 @@ import { jwtAuth } from "../../middleware";
 import { adfRequestSchema } from "./tools.schema";
 import { performAdfTest } from "./tools.service";
 import { handleUnexpectedError } from "../../utils/error-handler";
-import type { AdfInputPoint } from "../../utils";
+import type { AdfInputPoint } from "../../utils/adf";
 
 const toolsController = new Hono();
 
