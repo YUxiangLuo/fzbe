@@ -114,12 +114,27 @@ export async function getAllExperiments(studentId: number) {
 }
 
 export async function deleteExperiment(experimentId: number, studentId: number) {
-  const [[experimentRow]] = await pool.query<RowDataPacket[]>("SELECT status, student_id FROM experiment_status WHERE experiment_id = ?", [experimentId]);
-  if (!experimentRow || experimentRow.student_id !== studentId) return { error: "not_found" as const };
-  if (experimentRow.status === "Completed") return { error: "completed" as const };
-
-  await pool.query("DELETE FROM experiment_status WHERE experiment_id = ?", [experimentId]);
-  return { success: true };
+  const connection = await pool.getConnection();
+  try {
+    await connection.beginTransaction();
+    const [[experimentRow]] = await connection.query<RowDataPacket[]>("SELECT status, student_id FROM experiment_status WHERE experiment_id = ? FOR UPDATE", [experimentId]);
+    if (!experimentRow || experimentRow.student_id !== studentId) {
+      await connection.rollback();
+      return { error: "not_found" as const };
+    }
+    if (experimentRow.status === "Completed") {
+      await connection.rollback();
+      return { error: "completed" as const };
+    }
+    await connection.query("DELETE FROM experiment_status WHERE experiment_id = ?", [experimentId]);
+    await connection.commit();
+    return { success: true };
+  } catch (error) {
+    await connection.rollback();
+    throw error;
+  } finally {
+    connection.release();
+  }
 }
 
 export async function updateExperiment(experimentId: number, studentId: number, data: UpdateExperimentInput) {

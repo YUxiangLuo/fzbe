@@ -185,7 +185,7 @@ export async function submitReport(
   const browser = await puppeteer.launch({
     executablePath: PATHS.CHROMIUM_PATH,
     headless: true,
-    args: ["--no-sandbox", "--disable-setuid-sandbox", "--disable-web-security", "--disable-features=IsolateOrigins,site-per-process"],
+    args: ["--no-sandbox", "--disable-setuid-sandbox"],
   });
 
   try {
