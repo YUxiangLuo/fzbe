@@ -15,9 +15,9 @@ function toPublicFilePath(absolutePath: string | null | undefined): string | nul
   if (!absolutePath) return null;
   const relative = path.relative(uploadsRoot, absolutePath);
   if (!relative || relative.startsWith("..")) {
-    return `uploads/${path.basename(absolutePath)}`.replace(/\\/g, "/");
+    return `manuals/${path.basename(absolutePath)}`.replace(/\\/g, "/");
   }
-  return `uploads/${relative}`.replace(/\\/g, "/");
+  return relative.replace(/\\/g, "/");
 }
 
 function normalizeManualRow<T extends { file_path?: string | null }>(row: T): T & { file_path: string | null } {

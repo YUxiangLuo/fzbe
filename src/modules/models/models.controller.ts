@@ -5,6 +5,7 @@ import { trainSchema, predictSchema, ALL_MODELS, type ModelType } from "./models
 import { trainModel, predictModel, tryAcquireModelSlot, releaseModelSlot } from "./models.service";
 import { handleUnexpectedError } from "../../utils/error-handler";
 import type { JwtPayload } from "../../types";
+import { TIMEOUTS } from "../../utils/constants";
 
 const modelsController = new Hono();
 
@@ -36,9 +37,8 @@ modelsController.post(
       return c.json(result);
     } catch (error: unknown) {
       const err = error as Error;
-      if (err.message?.includes("timed out")) {
-        const isEnsembleModel = ["stacking", "weighted_avg", "boosting"].includes(modelType);
-        const timeoutSeconds = isEnsembleModel ? 120 : 30;
+      if (err.message?.includes("timed out") || err.message?.includes("超时")) {
+        const timeoutSeconds = Math.ceil(TIMEOUTS.MODEL_TRAINING / 1000);
         return c.json({ error: `训练超时（${timeoutSeconds}秒）` }, 504);
       }
       if (err.message?.startsWith("[PYTHON_VALIDATION]")) {

@@ -22,6 +22,7 @@ import { usersController } from "./modules/users";
 
 // --- Hono App Initialization ---
 const app = new Hono();
+const uploadsRoot = path.resolve(import.meta.dir, "../uploads");
 
 // --- Global Middleware ---
 // app.use(timestampedLogger);
@@ -29,25 +30,29 @@ app.use(cors());
 app.use(
   "/manuals/*",
   serveStatic({
-    root: path.resolve(import.meta.dir, "../uploads"),
+    root: path.resolve(uploadsRoot, "manuals"),
+    rewriteRequestPath: (requestPath) => requestPath.replace(/^\/manuals/, "") || "/",
   }),
 );
 app.use(
   "/datasets/*",
   serveStatic({
-    root: path.resolve(import.meta.dir, "../uploads"),
+    root: path.resolve(uploadsRoot, "datasets"),
+    rewriteRequestPath: (requestPath) => requestPath.replace(/^\/datasets/, "") || "/",
   }),
 );
 app.use(
   "/reports/*",
   serveStatic({
-    root: path.resolve(import.meta.dir, "../uploads"),
+    root: path.resolve(uploadsRoot, "reports"),
+    rewriteRequestPath: (requestPath) => requestPath.replace(/^\/reports/, "") || "/",
   }),
 );
 app.use(
   "/exports/*",
   serveStatic({
-    root: path.resolve(import.meta.dir, "../uploads"),
+    root: path.resolve(uploadsRoot, "exports"),
+    rewriteRequestPath: (requestPath) => requestPath.replace(/^\/exports/, "") || "/",
   }),
 );
 app.use(

@@ -1,4 +1,5 @@
 import path from "path";
+import { existsSync } from "node:fs";
 
 // 输入：时间序列的单个元素
 export interface AdfInputPoint {
@@ -31,6 +32,26 @@ export interface AdfResultItem {
 // 输出整体数组
 export type AdfResult = AdfResultItem[];
 
+function resolvePythonExecutable(toolRoot: string): string {
+  const candidates = process.platform === "win32"
+    ? [
+      path.join(toolRoot, "venv", "Scripts", "python.exe"),
+      path.join(toolRoot, ".venv", "Scripts", "python.exe"),
+    ]
+    : [
+      path.join(toolRoot, "venv", "bin", "python"),
+      path.join(toolRoot, ".venv", "bin", "python"),
+    ];
+
+  const executable = candidates.find((candidate) => existsSync(candidate));
+  if (!executable) {
+    throw new Error(
+      "ADF Python virtual environment not found. Please run py/adf/bootstrap.sh",
+    );
+  }
+  return executable;
+}
+
 /**
  * 调用 Python ADF 工具，执行固定 d=0,1,2 三阶差分检验。
  *
@@ -41,11 +62,8 @@ export async function runAdf(data: AdfInputPoint[]): Promise<AdfResult> {
   // 序列化成 JSON，确保 key 带双引号
   const jsonArg = JSON.stringify(data);
 
-  const toolRoot = path.resolve(import.meta.dir, "..", "..", "py_tools", "adf");
-  const pythonExec =
-    process.platform === "win32"
-      ? path.join(toolRoot, "venv", "Scripts", "python.exe")
-      : path.join(toolRoot, "venv", "bin", "python");
+  const toolRoot = path.resolve(import.meta.dir, "..", "..", "py", "adf");
+  const pythonExec = resolvePythonExecutable(toolRoot);
 
   const proc = Bun.spawn([pythonExec, "-m", "adf_tool", jsonArg, "--pretty"], {
     cwd: toolRoot,

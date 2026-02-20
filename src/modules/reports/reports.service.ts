@@ -5,7 +5,7 @@ import { marked } from "marked";
 import puppeteer from "puppeteer-core";
 import { pool } from "../../config";
 import { sanitizeHTML, HTMLSanitizationError } from "../../utils/html-sanitizer";
-import { CONTENT_LIMITS, PATHS, TIMEOUTS } from "../../utils/constants";
+import { CONTENT_LIMITS, PATHS } from "../../utils/constants";
 
 const MODEL_TYPES = [
   "ma", "exp", "arima", "lstm",
@@ -61,6 +61,12 @@ interface ReportRow extends RowDataPacket {
   report_id: number;
   status: string;
   feedback: string | null;
+  pdf_file_path?: string | null;
+}
+
+function toPublicReportPath(filePath: string | null | undefined): string | null {
+  if (!filePath) return null;
+  return `reports/${path.basename(filePath)}`;
 }
 
 function getBestModel(experiment: ExperimentRow): ModelType | null {
@@ -255,7 +261,14 @@ export async function submitReport(
       }
     }
 
-    return { data: { message: isUpdate ? "报告更新成功" : "报告提交成功", report_id: reportId, pdf_path: pdfPath }, isUpdate };
+    return {
+      data: {
+        message: isUpdate ? "报告更新成功" : "报告提交成功",
+        report_id: reportId,
+        pdf_path: toPublicReportPath(pdfPath) ?? "",
+      },
+      isUpdate,
+    };
   } catch (error) {
     await connection.rollback();
     throw error;
@@ -281,7 +294,14 @@ export async function getLatestReportStatus(studentId: number) {
   );
 
   if (report && report.status === "rejected") {
-    return { is_rejected: true, experiment: latestExperiment, report };
+    return {
+      is_rejected: true,
+      experiment: latestExperiment,
+      report: {
+        ...report,
+        pdf_file_path: toPublicReportPath(report.pdf_file_path),
+      },
+    };
   }
 
   return { is_rejected: false };

@@ -49,6 +49,24 @@ const allPossiblePythonParams: Record<string, string> = {
   models: "models",
 };
 
+function resolvePythonExecutable(pyDir: string): string {
+  const candidates = process.platform === "win32"
+    ? [
+      path.join(pyDir, "venv", "Scripts", "python.exe"),
+      path.join(pyDir, ".venv", "Scripts", "python.exe"),
+    ]
+    : [
+      path.join(pyDir, "venv", "bin", "python"),
+      path.join(pyDir, ".venv", "bin", "python"),
+    ];
+
+  const executable = candidates.find((candidate) => fs.existsSync(candidate));
+  if (!executable) {
+    throw new Error("Python virtual environment not found. Please initialize py/venv first.");
+  }
+  return executable;
+}
+
 export async function loadDatasetFromDb(
   industry: string,
   company: string,
@@ -81,9 +99,7 @@ export async function runPythonModel(
   timeoutMs?: number,
 ): Promise<unknown> {
   const pyDir = path.resolve(import.meta.dir, "../../../py");
-  const pythonExec = process.platform === "win32"
-    ? path.join(pyDir, "venv", "Scripts", "python.exe")
-    : path.join(pyDir, "venv", "bin", "python");
+  const pythonExec = resolvePythonExecutable(pyDir);
 
   const scriptPath = path.join(pyDir, "run_model.py");
   if (!fs.existsSync(scriptPath)) {
@@ -103,7 +119,10 @@ export async function runPythonModel(
     cwd: pyDir,
     stdout: "pipe",
     stderr: "pipe",
-    env: { ...process.env, PATH: `${pyDir}/venv/bin:${process.env.PATH}` },
+    env: {
+      ...process.env,
+      PATH: `${path.dirname(pythonExec)}${path.delimiter}${process.env.PATH ?? ""}`,
+    },
   });
 
   let timeoutId: ReturnType<typeof setTimeout> | undefined;
@@ -214,7 +233,6 @@ export async function trainModel(modelType: ModelType, studentId: number, body: 
     }
   }
 
-  const isEnsembleModel = ["stacking", "weighted_avg", "boosting"].includes(modelType);
   const timeout = TRAINING_TIMEOUT;
   const result = (await runPythonModel(modelType, pythonParams, timeout)) as Record<string, unknown>;
 

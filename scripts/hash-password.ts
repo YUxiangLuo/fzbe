@@ -4,7 +4,7 @@ const password = process.argv[2];
 
 // 检查是否提供了密码作为命令行参数
 if (!password) {
-  console.error("Usage: bun tsx scripts/hash-password.ts <password-to-hash>");
+  console.error("Usage: bun run scripts/hash-password.ts <password-to-hash>");
   process.exit(1);
 }
 

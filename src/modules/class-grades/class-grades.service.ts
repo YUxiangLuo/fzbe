@@ -8,6 +8,11 @@ import { EXP_FLOW_FIELDS, EXPERIMENT_GRADE_FIELDS, EXPERIMENT_GRADE_MUTABLE_FIEL
 const STEP_COUNT = 7;
 const EXPORTS_DIR = path.resolve(import.meta.dir, "../../../uploads", "exports");
 
+function toPublicReportPath(filePath: string | null | undefined): string | null {
+  if (!filePath) return null;
+  return `reports/${path.basename(filePath)}`;
+}
+
 type Queryable = Pool | PoolConnection;
 
 interface ClassRow extends RowDataPacket { teacher_id: number; }
@@ -118,7 +123,11 @@ export async function getClassReports(classId: number) {
       if (value !== null && value !== undefined) hasGrade = true;
       delete sanitizedRow[alias];
     }
-    return { ...sanitizedRow, experiment_grade: hasGrade ? gradePayload : null };
+    return {
+      ...sanitizedRow,
+      pdf_file_path: toPublicReportPath(sanitizedRow.pdf_file_path as string | null | undefined),
+      experiment_grade: hasGrade ? gradePayload : null,
+    };
   });
 }
 
@@ -172,7 +181,13 @@ export async function gradeReport(reportId: number, userId: number, userRole: st
 
     const experimentGradeResponse = updatedExperimentGrade ? EXPERIMENT_GRADE_FIELDS.reduce<Record<string, number | null>>((acc, field) => { acc[field] = updatedExperimentGrade[field] ?? null; return acc; }, {}) : null;
 
-    return { data: { ...updatedReport, experiment_grade: experimentGradeResponse } };
+    return {
+      data: {
+        ...updatedReport,
+        pdf_file_path: toPublicReportPath(updatedReport?.pdf_file_path as string | null | undefined),
+        experiment_grade: experimentGradeResponse,
+      },
+    };
   } catch (error) {
     await connection.rollback();
     throw error;
@@ -294,7 +309,7 @@ export async function exportReportArchive(classId: number) {
     const exportFilePath = path.join(EXPORTS_DIR, exportFileName);
     await copyFile(zipPath, exportFilePath);
 
-    return { data: { file_path: `uploads/exports/${exportFileName}` } };
+    return { data: { file_path: `exports/${exportFileName}` } };
   } finally {
     await rm(tempDir, { recursive: true, force: true });
   }
@@ -333,7 +348,7 @@ export async function exportGradeCsv(classId: number) {
   const exportFilePath = path.join(EXPORTS_DIR, exportFileName);
   await Bun.write(exportFilePath, csvContent);
 
-  return { data: { file_path: `uploads/exports/${exportFileName}` } };
+  return { data: { file_path: `exports/${exportFileName}` } };
 }
 
 export async function exportReportCsv(classId: number) {
@@ -364,7 +379,7 @@ export async function exportReportCsv(classId: number) {
   const exportFilePath = path.join(EXPORTS_DIR, exportFileName);
   await Bun.write(exportFilePath, csvContent);
 
-  return { data: { file_path: `uploads/exports/${exportFileName}` } };
+  return { data: { file_path: `exports/${exportFileName}` } };
 }
 
 type RawStepEvent = { event_id: number; experiment_id: number; student_id: number; step_order: number; event_type: "STARTED" | "COMPLETED"; event_timestamp: unknown };
