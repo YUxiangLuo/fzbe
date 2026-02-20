@@ -39,7 +39,7 @@ classGradesController.get("/api/v1/classes/:classId/experiment-runs", jwtAuth, z
   try {
     const payload = c.get("jwtPayload") as JwtPayload;
     const { classId } = c.req.valid("param");
-    const access = await checkClassAccess(parseInt(classId, 10), payload.sub, payload.role, true);
+    const access = await checkClassAccess(parseInt(classId, 10), payload.sub, payload.role);
     if ("error" in access) return c.json({ error: access.error === "not_found" ? "班级不存在" : "权限不足" }, access.error === "not_found" ? 404 : 403);
     const experiments = await getClassExperimentRuns(parseInt(classId, 10));
     return c.json(experiments);
@@ -76,7 +76,7 @@ classGradesController.get("/api/v1/classes/:classId/grade-summaries", jwtAuth, z
   try {
     const payload = c.get("jwtPayload") as JwtPayload;
     const { classId } = c.req.valid("param");
-    const access = await checkClassAccess(parseInt(classId, 10), payload.sub, payload.role, true);
+    const access = await checkClassAccess(parseInt(classId, 10), payload.sub, payload.role);
     if ("error" in access) return c.json({ error: access.error === "not_found" ? "班级不存在" : "权限不足" }, access.error === "not_found" ? 404 : 403);
     const result = await getGradeSummaries(parseInt(classId, 10));
     if ("error" in result) return c.json({ error: "该班级未配置成绩权重" }, 404);
@@ -130,7 +130,7 @@ classGradesController.get("/api/v1/classes/:classId/experiment-events", jwtAuth,
   try {
     const payload = c.get("jwtPayload") as JwtPayload;
     const { classId } = c.req.valid("param");
-    const access = await checkClassAccess(parseInt(classId, 10), payload.sub, payload.role, true);
+    const access = await checkClassAccess(parseInt(classId, 10), payload.sub, payload.role);
     if ("error" in access) return c.json({ error: access.error === "not_found" ? "班级不存在" : "权限不足" }, access.error === "not_found" ? 404 : 403);
     const events = await getExperimentEvents(parseInt(classId, 10));
     return c.json(events);

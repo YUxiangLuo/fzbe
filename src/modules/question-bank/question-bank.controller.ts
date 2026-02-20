@@ -56,13 +56,17 @@ questionBankController.put(
   zValidator("json", updateQuestionSchema),
   async (c) => {
     try {
+      const payload = c.get("jwtPayload") as JwtPayload;
       const { questionId } = c.req.valid("param");
       const input = c.req.valid("json");
-      const result = await updateQuestion(parseInt(questionId, 10), input);
+      const result = await updateQuestion(parseInt(questionId, 10), input, payload.sub, payload.role);
 
       if ("error" in result) {
         if (result.error === "not_found") {
           return c.json({ error: "题目不存在" }, 404);
+        }
+        if (result.error === "forbidden") {
+          return c.json({ error: "权限不足" }, 403);
         }
         return c.json({ error: "没有需要更新的字段" }, 400);
       }
@@ -81,10 +85,14 @@ questionBankController.delete(
   zValidator("param", questionIdParamSchema),
   async (c) => {
     try {
+      const payload = c.get("jwtPayload") as JwtPayload;
       const { questionId } = c.req.valid("param");
-      const result = await deleteQuestion(parseInt(questionId, 10));
+      const result = await deleteQuestion(parseInt(questionId, 10), payload.sub, payload.role);
 
       if ("error" in result) {
+        if (result.error === "forbidden") {
+          return c.json({ error: "权限不足" }, 403);
+        }
         return c.json({ error: "题目不存在" }, 404);
       }
 

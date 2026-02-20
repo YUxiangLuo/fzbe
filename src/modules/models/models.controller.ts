@@ -58,6 +58,7 @@ modelsController.post(
 modelsController.post(
   "/api/v1/models/:model_type/predict",
   jwtAuth,
+  requireStudent,
   zValidator("json", predictSchema),
   async (c) => {
     const modelType = c.req.param("model_type") as ModelType;

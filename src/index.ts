@@ -3,8 +3,11 @@ import { HTTPException } from "hono/http-exception";
 import { cors } from "hono/cors";
 import { serveStatic } from "hono/bun";
 import path from "path";
+import type { RowDataPacket } from "mysql2/promise";
 import { env, pool } from "./config";
+import { jwtAuth } from "./middleware";
 import logger from "./logger";
+import type { JwtPayload, UserRole } from "./types";
 // Import new modular controllers
 import { authController } from "./modules/auth";
 import { toolsController } from "./modules/tools";
@@ -23,6 +26,106 @@ import { usersController } from "./modules/users";
 // --- Hono App Initialization ---
 const app = new Hono();
 const uploadsRoot = path.resolve(import.meta.dir, "../uploads");
+const reportsRoot = path.resolve(uploadsRoot, "reports");
+const exportsRoot = path.resolve(uploadsRoot, "exports");
+
+interface StudentOwnerRow extends RowDataPacket {
+  student_id: number;
+}
+
+interface ClassOwnerRow extends RowDataPacket {
+  teacher_id: number;
+}
+
+interface AssignmentRow extends RowDataPacket {
+  assignment_id?: number;
+  enrollment_id?: number;
+}
+
+function isSafeFilename(filename: string): boolean {
+  return filename === path.basename(filename) && !filename.includes("\0");
+}
+
+function toHeaderFilename(filename: string): string {
+  return filename.replace(/["\\]/g, "_");
+}
+
+async function isTeacherOfStudent(studentId: number, teacherId: number): Promise<boolean> {
+  const [[row]] = await pool.query<AssignmentRow[]>(
+    `SELECT 1
+       FROM enrollments e
+       JOIN classes c ON e.class_id = c.class_id
+      WHERE e.student_id = ? AND c.teacher_id = ?
+      LIMIT 1`,
+    [studentId, teacherId],
+  );
+  return Boolean(row);
+}
+
+async function isAssistantOfStudent(studentId: number, assistantId: number): Promise<boolean> {
+  const [[row]] = await pool.query<AssignmentRow[]>(
+    `SELECT 1
+       FROM enrollments e
+       JOIN class_assistants ca ON e.class_id = ca.class_id
+      WHERE e.student_id = ? AND ca.assistant_id = ?
+      LIMIT 1`,
+    [studentId, assistantId],
+  );
+  return Boolean(row);
+}
+
+async function canAccessReportFile(filename: string, userId: number, role: UserRole): Promise<boolean> {
+  if (role === "Admin") return true;
+
+  const [rows] = await pool.query<StudentOwnerRow[]>(
+    `SELECT student_id
+       FROM experiment_reports
+      WHERE pdf_file_path LIKE ?
+      ORDER BY report_id DESC
+      LIMIT 1`,
+    [`%/${filename}`],
+  );
+  const ownerStudentId = rows[0]?.student_id;
+  if (!ownerStudentId) return false;
+
+  if (role === "Student") return ownerStudentId === userId;
+  if (role === "Teacher") return isTeacherOfStudent(ownerStudentId, userId);
+  if (role === "Assistant") return isAssistantOfStudent(ownerStudentId, userId);
+
+  return false;
+}
+
+function parseClassIdFromExportFilename(filename: string): number | null {
+  const match = filename.match(/^class-(\d+)-[a-z-]+-\d+\.(zip|csv)$/);
+  if (!match?.[1]) return null;
+  const classId = Number(match[1]);
+  return Number.isInteger(classId) ? classId : null;
+}
+
+async function canAccessExportFile(filename: string, userId: number, role: UserRole): Promise<boolean> {
+  if (role === "Admin") return true;
+
+  const classId = parseClassIdFromExportFilename(filename);
+  if (!classId) return false;
+
+  if (role === "Teacher") {
+    const [rows] = await pool.query<ClassOwnerRow[]>(
+      "SELECT teacher_id FROM classes WHERE class_id = ? LIMIT 1",
+      [classId],
+    );
+    return rows[0]?.teacher_id === userId;
+  }
+
+  if (role === "Assistant") {
+    const [[row]] = await pool.query<AssignmentRow[]>(
+      "SELECT assignment_id FROM class_assistants WHERE class_id = ? AND assistant_id = ? LIMIT 1",
+      [classId, userId],
+    );
+    return Boolean(row);
+  }
+
+  return false;
+}
 
 // --- Global Middleware ---
 // app.use(timestampedLogger);
@@ -41,20 +144,47 @@ app.use(
     rewriteRequestPath: (requestPath) => requestPath.replace(/^\/datasets/, "") || "/",
   }),
 );
-app.use(
-  "/reports/*",
-  serveStatic({
-    root: path.resolve(uploadsRoot, "reports"),
-    rewriteRequestPath: (requestPath) => requestPath.replace(/^\/reports/, "") || "/",
-  }),
-);
-app.use(
-  "/exports/*",
-  serveStatic({
-    root: path.resolve(uploadsRoot, "exports"),
-    rewriteRequestPath: (requestPath) => requestPath.replace(/^\/exports/, "") || "/",
-  }),
-);
+app.get("/reports/:filename", jwtAuth, async (c) => {
+  const payload = c.get("jwtPayload") as JwtPayload;
+  const filename = c.req.param("filename");
+
+  if (!isSafeFilename(filename)) return c.json({ error: "无效的文件名" }, 400);
+
+  const allowed = await canAccessReportFile(filename, payload.sub, payload.role);
+  if (!allowed) return c.json({ error: "权限不足" }, 403);
+
+  const file = Bun.file(path.resolve(reportsRoot, filename));
+  if (!(await file.exists())) return c.json({ error: "文件不存在" }, 404);
+
+  return new Response(file, {
+    headers: {
+      "Content-Type": file.type || "application/pdf",
+      "Content-Disposition": `inline; filename="${toHeaderFilename(filename)}"`,
+      "Cache-Control": "private, max-age=60",
+    },
+  });
+});
+
+app.get("/exports/:filename", jwtAuth, async (c) => {
+  const payload = c.get("jwtPayload") as JwtPayload;
+  const filename = c.req.param("filename");
+
+  if (!isSafeFilename(filename)) return c.json({ error: "无效的文件名" }, 400);
+
+  const allowed = await canAccessExportFile(filename, payload.sub, payload.role);
+  if (!allowed) return c.json({ error: "权限不足" }, 403);
+
+  const file = Bun.file(path.resolve(exportsRoot, filename));
+  if (!(await file.exists())) return c.json({ error: "文件不存在" }, 404);
+
+  return new Response(file, {
+    headers: {
+      "Content-Type": file.type || "application/octet-stream",
+      "Content-Disposition": `attachment; filename="${toHeaderFilename(filename)}"`,
+      "Cache-Control": "private, max-age=60",
+    },
+  });
+});
 app.use(
   "/js/*",
   serveStatic({

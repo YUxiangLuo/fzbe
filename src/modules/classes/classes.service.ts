@@ -231,6 +231,11 @@ export async function getClassById(classId: number, userId: number, userRole: st
 
   if (!isAllowed) return { error: "forbidden" as const };
 
+  // Students can view class metadata but should not receive full roster/contact lists.
+  if (userRole === "Student") {
+    return { data: { ...classInfo, students: [], assistants: [] } };
+  }
+
   const [studentRows] = await pool.query<UserRow[]>(
     "SELECT u.user_id, u.username, u.full_name, u.email FROM users u JOIN enrollments e ON u.user_id = e.student_id WHERE e.class_id = ?",
     [classId],

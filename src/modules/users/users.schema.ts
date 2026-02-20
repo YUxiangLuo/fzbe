@@ -64,7 +64,7 @@ export const paginationQuerySchema = z.object({
 });
 
 export const roleParamSchema = z.object({
-  role: z.enum(["Student", "Teacher", "Assistant"], "无效的角色。必须是 Student, Teacher, 或 Assistant"),
+  role: z.enum(["Student"], "无效的角色。仅允许 Student 自助注册"),
 });
 
 export const studentSelfRegisterSchema = z.object({

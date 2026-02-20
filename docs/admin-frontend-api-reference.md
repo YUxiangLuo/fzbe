@@ -57,6 +57,7 @@
 
 - `finalUrl = ${API_BASE}/${file_path}`
 - 不要再手动加 `uploads/` 前缀
+- 访问 `reports/*`、`exports/*` 时必须携带 `Authorization: Bearer <JWT>`，后端会做对象级权限校验
 
 静态资源路由：
 

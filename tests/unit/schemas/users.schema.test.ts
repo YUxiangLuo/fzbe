@@ -9,6 +9,7 @@ import {
   teacherAssistantSelfRegisterSchema,
   userSearchQuerySchema,
   paginationQuerySchema,
+  roleParamSchema,
 } from "../../../src/modules/users/users.schema";
 
 describe("User Schemas", () => {
@@ -274,6 +275,23 @@ describe("User Schemas", () => {
 
     test("should reject page less than 1", () => {
       const result = paginationQuerySchema.safeParse({ page: 0 });
+      expect(result.success).toBe(false);
+    });
+  });
+
+  describe("roleParamSchema", () => {
+    test("should allow Student self-registration role", () => {
+      const result = roleParamSchema.safeParse({ role: "Student" });
+      expect(result.success).toBe(true);
+    });
+
+    test("should reject Teacher self-registration role", () => {
+      const result = roleParamSchema.safeParse({ role: "Teacher" });
+      expect(result.success).toBe(false);
+    });
+
+    test("should reject Assistant self-registration role", () => {
+      const result = roleParamSchema.safeParse({ role: "Assistant" });
       expect(result.success).toBe(false);
     });
   });

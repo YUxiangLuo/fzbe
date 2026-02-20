@@ -105,7 +105,22 @@ export async function createQuestion(input: CreateQuestionInput, creatorId: numb
   return normalizeQuestionRow(rows[0]!, true);
 }
 
-export async function updateQuestion(questionId: number, input: UpdateQuestionInput) {
+export async function updateQuestion(
+  questionId: number,
+  input: UpdateQuestionInput,
+  requesterId: number,
+  requesterRole: string,
+) {
+  const [ownerRows] = await pool.query<QuestionRow[]>(
+    "SELECT creator_id FROM question_bank WHERE question_id = ? LIMIT 1",
+    [questionId],
+  );
+  const existing = ownerRows[0];
+  if (!existing) return { error: "not_found" as const };
+  if (requesterRole !== "Admin" && existing.creator_id !== requesterId) {
+    return { error: "forbidden" as const };
+  }
+
   const fields: string[] = [];
   const values: unknown[] = [];
 
@@ -138,12 +153,11 @@ export async function updateQuestion(questionId: number, input: UpdateQuestionIn
   }
 
   values.push(questionId);
-  const [result] = await pool.query<ResultSetHeader>(
+  const [updateResult] = await pool.query<ResultSetHeader>(
     `UPDATE question_bank SET ${fields.join(", ")} WHERE question_id = ?`,
     values,
   );
-
-  if (result.affectedRows === 0) {
+  if (updateResult.affectedRows === 0) {
     return { error: "not_found" as const };
   }
 
@@ -163,18 +177,29 @@ export async function updateQuestion(questionId: number, input: UpdateQuestionIn
     [questionId],
   );
 
-  return { data: normalizeQuestionRow(rows[0]!, true) };
+  if (!rows[0]) return { error: "not_found" as const };
+  return { data: normalizeQuestionRow(rows[0], true) };
 }
 
-export async function deleteQuestion(questionId: number) {
-  const [result] = await pool.query<ResultSetHeader>(
+export async function deleteQuestion(
+  questionId: number,
+  requesterId: number,
+  requesterRole: string,
+) {
+  const [ownerRows] = await pool.query<QuestionRow[]>(
+    "SELECT creator_id FROM question_bank WHERE question_id = ? LIMIT 1",
+    [questionId],
+  );
+  const existing = ownerRows[0];
+  if (!existing) return { error: "not_found" as const };
+  if (requesterRole !== "Admin" && existing.creator_id !== requesterId) {
+    return { error: "forbidden" as const };
+  }
+
+  await pool.query<ResultSetHeader>(
     "DELETE FROM question_bank WHERE question_id = ?",
     [questionId],
   );
-
-  if (result.affectedRows === 0) {
-    return { error: "not_found" as const };
-  }
 
   return { success: true };
 }
