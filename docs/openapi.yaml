@@ -1,0 +1,3392 @@
+openapi: 3.0.3
+info:
+  title: Fangzhen Backend API
+  version: 1.0.0
+  description: |
+    根据当前后端代码整理的 OpenAPI 文档。
+
+    返回约定：
+    - 大多数 2xx JSON 响应会被全局中间件包装为 `{ "data": ... }`。
+    - 少数已经包含顶层 `data` 的响应（例如 `/api/v1/users`、`/api/v1/users/search`）保持原样，不再二次包装。
+    - 错误响应统一为 `{ "error": "..." }`，并可能带扩展字段（`details`、`invalid_rows`、`conflicts`、`current_class` 等）。
+servers:
+  - url: http://localhost:3000
+    description: Local development
+
+tags:
+  - name: Auth
+  - name: Users
+  - name: Classes
+  - name: Class Members
+  - name: Datasets
+  - name: Manuals
+  - name: Question Bank
+  - name: Quizzes
+  - name: Experiments
+  - name: Reports
+  - name: Models
+  - name: Grades
+  - name: Tools
+  - name: Files
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+
+  schemas:
+    ErrorResponse:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: string
+        details:
+          type: object
+          additionalProperties: true
+        invalid_rows:
+          type: array
+          items:
+            type: object
+            additionalProperties: true
+        conflicts:
+          type: array
+          items:
+            type: object
+            additionalProperties: true
+        current_class:
+          type: object
+          additionalProperties: true
+        current_class_id:
+          type: integer
+        cleanup:
+          type: object
+          additionalProperties: true
+      additionalProperties: true
+
+    DataEnvelope:
+      type: object
+      required: [data]
+      properties:
+        data:
+          type: object
+          additionalProperties: true
+
+    DataEnvelopeArray:
+      type: object
+      required: [data]
+      properties:
+        data:
+          type: array
+          items:
+            type: object
+            additionalProperties: true
+
+    Pagination:
+      type: object
+      required: [currentPage, pageSize, totalItems, totalPages]
+      properties:
+        currentPage:
+          type: integer
+        pageSize:
+          type: integer
+        totalItems:
+          type: integer
+        totalPages:
+          type: integer
+
+    UserListResponse:
+      type: object
+      required: [data, pagination]
+      properties:
+        data:
+          type: array
+          items:
+            type: object
+            additionalProperties: true
+        pagination:
+          $ref: '#/components/schemas/Pagination'
+
+    UserSearchResponse:
+      type: object
+      required: [data, pagination, searchMethod]
+      properties:
+        data:
+          type: array
+          items:
+            type: object
+            additionalProperties: true
+        pagination:
+          $ref: '#/components/schemas/Pagination'
+        searchMethod:
+          type: string
+          enum: [fulltext, like]
+
+    LoginRequest:
+      type: object
+      required: [username, password]
+      properties:
+        username:
+          type: string
+          minLength: 1
+        password:
+          type: string
+          minLength: 1
+        role:
+          type: string
+          enum: [Student, Teacher, Assistant, Admin]
+
+    LoginSuccess:
+      type: object
+      required: [data]
+      properties:
+        data:
+          type: object
+          required: [token, user]
+          properties:
+            token:
+              type: string
+            user:
+              type: object
+              required: [role]
+              properties:
+                role:
+                  type: string
+                  enum: [Student, Teacher, Assistant, Admin]
+
+    AdfPoint:
+      type: object
+      required: [month, sales]
+      properties:
+        month:
+          type: string
+        sales:
+          type: number
+
+    AdfRequest:
+      type: object
+      required: [series]
+      properties:
+        series:
+          type: array
+          minItems: 4
+          items:
+            $ref: '#/components/schemas/AdfPoint'
+
+    ManualUpdateRequest:
+      type: object
+      properties:
+        file_name:
+          type: string
+          minLength: 1
+        description:
+          type: string
+        is_active:
+          type: boolean
+
+    QuestionCreateRequest:
+      type: object
+      required: [question_type, question_text, correct_answers]
+      properties:
+        knowledge_point:
+          type: string
+          minLength: 1
+        question_type:
+          type: string
+          enum: ['Single Choice', 'Multiple Choice', 'True/False']
+        question_text:
+          type: string
+          minLength: 1
+        options:
+          oneOf:
+            - type: object
+              additionalProperties:
+                type: string
+            - type: array
+              items:
+                type: string
+                minLength: 1
+        correct_answers:
+          type: array
+          minItems: 1
+          items:
+            type: string
+            minLength: 1
+
+    QuestionUpdateRequest:
+      type: object
+      properties:
+        knowledge_point:
+          type: string
+          minLength: 1
+        question_type:
+          type: string
+          enum: ['Single Choice', 'Multiple Choice', 'True/False']
+        question_text:
+          type: string
+          minLength: 1
+        options:
+          oneOf:
+            - type: object
+              additionalProperties:
+                type: string
+            - type: array
+              items:
+                type: string
+                minLength: 1
+        correct_answers:
+          type: array
+          minItems: 1
+          items:
+            type: string
+            minLength: 1
+
+    QuizSubmitRequest:
+      type: object
+      required: [experiment_id, answers]
+      properties:
+        experiment_id:
+          type: integer
+          minimum: 1
+        answers:
+          type: array
+          minItems: 1
+          items:
+            type: object
+            required: [question_id, submitted_answer]
+            properties:
+              question_id:
+                type: integer
+                minimum: 1
+              submitted_answer:
+                type: array
+                minItems: 1
+                items:
+                  type: string
+                  minLength: 1
+
+    SubmitReportRequest:
+      type: object
+      required: [report_content]
+      properties:
+        report_content:
+          type: string
+          minLength: 1
+
+    ModelTrainRequest:
+      type: object
+      required:
+        - selected_industry
+        - selected_company
+        - selected_product
+        - data_window_train_start_index
+        - data_window_train_end_index
+        - data_window_evaluate_start_index
+        - data_window_evaluate_end_index
+      properties:
+        selected_industry:
+          type: string
+          minLength: 1
+        selected_company:
+          type: string
+          minLength: 1
+        selected_product:
+          type: string
+          minLength: 1
+        data_window_train_start_index:
+          type: integer
+          minimum: 0
+        data_window_train_end_index:
+          type: integer
+          minimum: 0
+        data_window_evaluate_start_index:
+          type: integer
+          minimum: 0
+        data_window_evaluate_end_index:
+          type: integer
+          minimum: 0
+        moving_average_window:
+          type: integer
+          minimum: 2
+        exponential_smoothing_alpha:
+          type: number
+          minimum: 0
+          maximum: 1
+        arimaD:
+          type: integer
+          minimum: 0
+        lstmFeatures:
+          type: string
+        lstmTargetFeature:
+          type: string
+        lstmNormalization:
+          type: string
+          enum: [minmax, zscore]
+        models:
+          type: string
+
+    ModelPredictRequest:
+      type: object
+      required: [forecast_steps]
+      properties:
+        forecast_steps:
+          type: integer
+          minimum: 1
+
+    ClassUpdateRequest:
+      type: object
+      properties:
+        class_name:
+          type: string
+          minLength: 1
+        class_code:
+          type: string
+
+    CreateStudentRequest:
+      type: object
+      required: [username, full_name]
+      properties:
+        username:
+          type: string
+          pattern: '^\\d{8,}$'
+        full_name:
+          type: string
+          minLength: 2
+          maxLength: 64
+        email:
+          type: string
+          format: email
+        phone_number:
+          type: string
+          pattern: '^\\d{6,15}$'
+        password:
+          type: string
+          minLength: 6
+
+    EnrollStudentRequest:
+      type: object
+      required: [student_id]
+      properties:
+        student_id:
+          type: integer
+          minimum: 1
+
+    AddAssistantRequest:
+      type: object
+      required: [assistant_id]
+      properties:
+        assistant_id:
+          type: integer
+          minimum: 1
+
+    JoinClassRequest:
+      type: object
+      properties:
+        class_code:
+          type: string
+
+    DatasetUpdateRequest:
+      type: object
+      properties:
+        data_name:
+          type: string
+          minLength: 1
+        description:
+          type: string
+
+    ExperimentCreateRequest:
+      type: object
+      properties:
+        status:
+          type: string
+          enum: ['Not Started', 'In Progress', 'Completed']
+        current_step:
+          type: integer
+          minimum: 1
+          maximum: 7
+        highest_completed_step:
+          type: integer
+          minimum: 0
+          maximum: 7
+        selected_industry:
+          type: string
+          nullable: true
+        selected_company:
+          type: string
+          nullable: true
+        selected_product:
+          type: string
+          nullable: true
+        data_window_train_start_index:
+          type: integer
+          minimum: 0
+          nullable: true
+        data_window_train_end_index:
+          type: integer
+          minimum: 0
+          nullable: true
+        data_window_evaluate_start_index:
+          type: integer
+          minimum: 0
+          nullable: true
+        data_window_evaluate_end_index:
+          type: integer
+          minimum: 0
+          nullable: true
+        moving_average_completed:
+          type: boolean
+          nullable: true
+        moving_average_window:
+          type: integer
+          minimum: 1
+          nullable: true
+        exponential_smoothing_completed:
+          type: boolean
+          nullable: true
+        exponential_smoothing_alpha:
+          type: number
+          minimum: 0
+          nullable: true
+        arima_completed:
+          type: boolean
+          nullable: true
+        arima_p:
+          type: integer
+          minimum: 0
+          nullable: true
+        arima_d:
+          type: integer
+          minimum: 0
+          nullable: true
+        arima_q:
+          type: integer
+          minimum: 0
+          nullable: true
+        lstm_completed:
+          type: boolean
+          nullable: true
+        lstm_normalization:
+          type: string
+          enum: [minmax, zscore]
+          nullable: true
+        lstm_features:
+          oneOf:
+            - type: array
+              items: {}
+            - type: object
+              additionalProperties: true
+            - type: string
+          nullable: true
+        lstm_target_field:
+          type: string
+          nullable: true
+        ensemble_weighted_completed:
+          type: boolean
+          nullable: true
+        ensemble_boosting_completed:
+          type: boolean
+          nullable: true
+        ensemble_stacking_completed:
+          type: boolean
+          nullable: true
+        selected_best_model:
+          type: string
+          enum: [ma, exp, arima, lstm, ensemble_weighted, ensemble_boosting, ensemble_stacking]
+          nullable: true
+        quiz_about_model_completed:
+          type: boolean
+          nullable: true
+        quiz_about_plan_completed:
+          type: boolean
+          nullable: true
+        production_plan_completed:
+          type: boolean
+          nullable: true
+        production_forecast_periods:
+          type: integer
+          minimum: 1
+          nullable: true
+        production_initial_inventory:
+          type: number
+          minimum: 0
+          nullable: true
+        production_target_service_level:
+          type: number
+          minimum: 0
+          nullable: true
+        production_capacity_mode:
+          type: string
+          enum: [scenario, auto, custom]
+          nullable: true
+        production_capacity_scenario:
+          type: string
+          enum: [tight, normal, abundant]
+          nullable: true
+        production_capacity:
+          type: integer
+          minimum: 0
+          nullable: true
+        production_custom_capacity:
+          type: integer
+          minimum: 0
+          nullable: true
+        start_time:
+          type: string
+          format: date-time
+          nullable: true
+        last_activity_at:
+          type: string
+          format: date-time
+          nullable: true
+        completion_time:
+          type: string
+          format: date-time
+          nullable: true
+        total_active_duration_seconds:
+          type: integer
+          minimum: 0
+          nullable: true
+      additionalProperties: true
+
+    ExperimentUpdateRequest:
+      allOf:
+        - $ref: '#/components/schemas/ExperimentCreateRequest'
+
+    ExperimentEventRequest:
+      type: object
+      required: [step_order, event_type]
+      properties:
+        step_order:
+          type: integer
+          minimum: 1
+          maximum: 7
+        event_type:
+          type: string
+          enum: [STARTED, COMPLETED]
+
+    GradeReportRequest:
+      type: object
+      properties:
+        grade:
+          type: number
+          minimum: 0
+          maximum: 100
+        feedback:
+          type: string
+        status:
+          type: string
+          enum: [graded, rejected]
+        experiment_grade:
+          type: object
+          properties:
+            exp_flow_demand_data_preparation:
+              type: number
+              minimum: 0
+              maximum: 100
+            exp_flow_demand_descriptive_stats:
+              type: number
+              minimum: 0
+              maximum: 100
+            exp_flow_demand_model_selection:
+              type: number
+              minimum: 0
+              maximum: 100
+            exp_flow_demand_generate_results:
+              type: number
+              minimum: 0
+              maximum: 100
+            exp_flow_production_inventory_calc:
+              type: number
+              minimum: 0
+              maximum: 100
+            exp_flow_production_service_level:
+              type: number
+              minimum: 0
+              maximum: 100
+            exp_flow_production_variable_calc:
+              type: number
+              minimum: 0
+              maximum: 100
+            exp_flow_production_plan_creation:
+              type: number
+              minimum: 0
+              maximum: 100
+            exp_flow_report_submission:
+              type: number
+              minimum: 0
+              maximum: 100
+            model_quality:
+              type: number
+              minimum: 0
+              maximum: 100
+
+    UpdateGradeWeightsRequest:
+      type: object
+      properties:
+        exp_flow_weight:
+          type: number
+          minimum: 0
+          maximum: 100
+        model_quality_weight:
+          type: number
+          minimum: 0
+          maximum: 100
+        knowledge_test_weight:
+          type: number
+          minimum: 0
+          maximum: 100
+        report_quality_weight:
+          type: number
+          minimum: 0
+          maximum: 100
+
+    CreateAssistantSingleRequest:
+      type: object
+      required: [username, full_name]
+      properties:
+        username:
+          type: string
+          minLength: 3
+        full_name:
+          type: string
+          minLength: 1
+        email:
+          type: string
+          format: email
+        phone:
+          type: string
+          pattern: '^1\\d{10}$'
+        password:
+          type: string
+          minLength: 6
+
+    CreateTeacherRequest:
+      type: object
+      required: [username, full_name]
+      properties:
+        username:
+          type: string
+          minLength: 3
+        full_name:
+          type: string
+          minLength: 1
+        email:
+          type: string
+          format: email
+        phone:
+          type: string
+          pattern: '^1\\d{10}$'
+        password:
+          type: string
+          minLength: 6
+
+    CreateAssistantWithClassesRequest:
+      type: object
+      required: [username, password, full_name, email, class_ids]
+      properties:
+        username:
+          type: string
+          minLength: 3
+        password:
+          type: string
+          minLength: 6
+        full_name:
+          type: string
+          minLength: 1
+        email:
+          type: string
+          format: email
+        phone_number:
+          type: string
+        class_ids:
+          type: array
+          minItems: 1
+          items:
+            type: integer
+            minimum: 1
+
+    UpdateCurrentUserRequest:
+      type: object
+      properties:
+        full_name:
+          type: string
+          minLength: 1
+        phone_number:
+          type: string
+          minLength: 1
+        email:
+          type: string
+          format: email
+
+    ChangePasswordRequest:
+      type: object
+      required: [currentPassword, newPassword]
+      properties:
+        currentPassword:
+          type: string
+          minLength: 1
+        newPassword:
+          type: string
+          minLength: 6
+
+    AdminChangePasswordRequest:
+      type: object
+      required: [newPassword]
+      properties:
+        newPassword:
+          type: string
+          minLength: 6
+
+    ResetPasswordRequest:
+      type: object
+      properties:
+        newPassword:
+          type: string
+          minLength: 6
+
+  parameters:
+    classId:
+      name: classId
+      in: path
+      required: true
+      schema:
+        type: string
+        pattern: '^\\d+$'
+    teacherId:
+      name: teacherId
+      in: path
+      required: true
+      schema:
+        type: string
+        pattern: '^\\d+$'
+    assistantId:
+      name: assistantId
+      in: path
+      required: true
+      schema:
+        type: string
+        pattern: '^\\d+$'
+    studentId:
+      name: studentId
+      in: path
+      required: true
+      schema:
+        type: string
+        pattern: '^\\d+$'
+    userId:
+      name: userId
+      in: path
+      required: true
+      schema:
+        type: string
+        pattern: '^\\d+$'
+    datasetId:
+      name: datasetId
+      in: path
+      required: true
+      schema:
+        type: string
+        pattern: '^\\d+$'
+    manualId:
+      name: manualId
+      in: path
+      required: true
+      schema:
+        type: string
+        pattern: '^\\d+$'
+    questionId:
+      name: questionId
+      in: path
+      required: true
+      schema:
+        type: string
+        pattern: '^\\d+$'
+    experimentId:
+      name: experimentId
+      in: path
+      required: true
+      schema:
+        type: string
+        pattern: '^\\d+$'
+    reportId:
+      name: reportId
+      in: path
+      required: true
+      schema:
+        type: string
+        pattern: '^\\d+$'
+    industry:
+      name: industry
+      in: path
+      required: true
+      schema:
+        type: string
+        minLength: 1
+    company:
+      name: company
+      in: path
+      required: true
+      schema:
+        type: string
+        minLength: 1
+    product:
+      name: product
+      in: path
+      required: true
+      schema:
+        type: string
+        minLength: 1
+    modelType:
+      name: model_type
+      in: path
+      required: true
+      schema:
+        type: string
+        enum: [ma, es, arima, lstm, stacking, weighted_avg, boosting]
+    filename:
+      name: filename
+      in: path
+      required: true
+      schema:
+        type: string
+    role:
+      name: role
+      in: path
+      required: true
+      schema:
+        type: string
+        enum: [Student]
+    page:
+      name: page
+      in: query
+      schema:
+        type: integer
+        minimum: 1
+        default: 1
+    limit:
+      name: limit
+      in: query
+      schema:
+        type: integer
+        minimum: 1
+        maximum: 100
+        default: 10
+    q:
+      name: q
+      in: query
+      required: true
+      schema:
+        type: string
+        minLength: 1
+
+paths:
+  /api/v1/sessions:
+    post:
+      tags: [Auth]
+      summary: 登录
+      operationId: createSession
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/LoginRequest'
+      responses:
+        '200':
+          description: 登录成功
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/LoginSuccess'
+        '401':
+          description: 用户名或密码错误
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '403':
+          description: 角色不匹配
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /api/v1/tools/adf:
+    post:
+      tags: [Tools]
+      summary: 执行 ADF 检验
+      operationId: runAdf
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AdfRequest'
+      responses:
+        '200':
+          description: 成功
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DataEnvelope'
+        '401':
+          description: 未授权
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /api/v1/manuals:
+    post:
+      tags: [Manuals]
+      summary: 上传实验手册
+      operationId: uploadManual
+      description: 仅 Admin 可访问
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              required: [file, file_name]
+              properties:
+                file:
+                  type: string
+                  format: binary
+                file_name:
+                  type: string
+                description:
+                  type: string
+      responses:
+        '201':
+          description: 上传成功
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DataEnvelope'
+        '400':
+          description: 参数或文件错误
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '403':
+          description: 权限不足
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+    get:
+      tags: [Manuals]
+      summary: 获取手册列表
+      operationId: listManuals
+      description: 仅 Admin 可访问
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: 成功
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DataEnvelopeArray'
+
+  /api/v1/manuals/active:
+    get:
+      tags: [Manuals]
+      summary: 获取当前激活手册
+      operationId: getActiveManual
+      responses:
+        '200':
+          description: 成功
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DataEnvelope'
+        '404':
+          description: 未找到激活手册
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /api/v1/manuals/{manualId}:
+    put:
+      tags: [Manuals]
+      summary: 更新手册
+      operationId: updateManual
+      description: 仅 Admin 可访问
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/manualId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ManualUpdateRequest'
+      responses:
+        '200':
+          description: 成功
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DataEnvelope'
+        '400':
+          description: 请求无效
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '404':
+          description: 手册不存在
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+    delete:
+      tags: [Manuals]
+      summary: 删除手册
+      operationId: deleteManual
+      description: 仅 Admin 可访问
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/manualId'
+      responses:
+        '200':
+          description: 成功
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DataEnvelope'
+        '404':
+          description: 手册不存在
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /api/v1/question-bank/questions:
+    get:
+      tags: [Question Bank]
+      summary: 获取题库
+      operationId: listQuestions
+      description: Teacher/Assistant/Admin
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: 成功
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DataEnvelopeArray'
+
+    post:
+      tags: [Question Bank]
+      summary: 创建题目
+      operationId: createQuestion
+      description: Teacher/Assistant/Admin
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/QuestionCreateRequest'
+      responses:
+        '201':
+          description: 创建成功
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DataEnvelope'
+        '400':
+          description: 参数错误
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /api/v1/question-bank/questions/{questionId}:
+    put:
+      tags: [Question Bank]
+      summary: 更新题目
+      operationId: updateQuestion
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/questionId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/QuestionUpdateRequest'
+      responses:
+        '200':
+          description: 更新成功
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DataEnvelope'
+        '400':
+          description: 参数错误
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '403':
+          description: 权限不足
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '404':
+          description: 题目不存在
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+    delete:
+      tags: [Question Bank]
+      summary: 删除题目
+      operationId: deleteQuestion
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/questionId'
+      responses:
+        '200':
+          description: 删除成功
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DataEnvelope'
+        '403':
+          description: 权限不足
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '404':
+          description: 题目不存在
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /api/v1/quizzes/model/questions:
+    get:
+      tags: [Quizzes]
+      summary: 获取模型测试题
+      operationId: getModelQuizQuestions
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: 成功
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DataEnvelopeArray'
+        '404':
+          description: 无可用题目
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /api/v1/quizzes/plan/questions:
+    get:
+      tags: [Quizzes]
+      summary: 获取生产计划测试题
+      operationId: getPlanQuizQuestions
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: 成功
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DataEnvelopeArray'
+        '404':
+          description: 无可用题目
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /api/v1/quizzes/answers:
+    post:
+      tags: [Quizzes]
+      summary: 提交测试答案
+      operationId: submitQuizAnswers
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/QuizSubmitRequest'
+      responses:
+        '201':
+          description: 提交成功
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DataEnvelopeArray'
+        '400':
+          description: 参数错误
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '403':
+          description: 权限不足
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '404':
+          description: 实验不存在
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /api/v1/experiment-runs/{experimentId}/report:
+    post:
+      tags: [Reports]
+      summary: 提交或更新实验报告
+      operationId: submitReport
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/experimentId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SubmitReportRequest'
+      responses:
+        '200':
+          description: 更新成功
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DataEnvelope'
+        '201':
+          description: 提交成功
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DataEnvelope'
+        '400':
+          description: 内容无效
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '403':
+          description: 权限不足
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '404':
+          description: 实验不存在
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /api/v1/my-latest-report-status:
+    get:
+      tags: [Reports]
+      summary: 获取当前学生最近报告状态
+      operationId: getLatestReportStatus
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: 成功
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DataEnvelope'
+
+  /api/v1/models/{model_type}/training:
+    post:
+      tags: [Models]
+      summary: 模型训练
+      operationId: trainModel
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/modelType'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ModelTrainRequest'
+      responses:
+        '200':
+          description: 训练成功
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DataEnvelope'
+        '400':
+          description: 参数/数据错误
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '429':
+          description: 模型服务繁忙
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '504':
+          description: 训练超时
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /api/v1/models/{model_type}/predict:
+    post:
+      tags: [Models]
+      summary: 模型预测
+      operationId: predictModel
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/modelType'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ModelPredictRequest'
+      responses:
+        '200':
+          description: 预测成功
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DataEnvelope'
+        '400':
+          description: 参数错误
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '404':
+          description: 模型不存在
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '429':
+          description: 模型服务繁忙
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /api/v1/classes:
+    post:
+      tags: [Classes]
+      summary: 创建班级
+      operationId: createClass
+      description: Teacher/Admin
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              required: [class_name]
+              properties:
+                class_name:
+                  type: string
+                class_code:
+                  type: string
+                student_list:
+                  type: string
+                  format: binary
+      responses:
+        '201':
+          description: 创建成功
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DataEnvelope'
+        '400':
+          description: 参数或文件错误
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '409':
+          description: 冲突（班级码重复/导入冲突）
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+    get:
+      tags: [Classes]
+      summary: 获取全部班级
+      operationId: listClasses
+      description: Admin
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: 成功
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DataEnvelopeArray'
+
+  /api/v1/classes/{classId}:
+    get:
+      tags: [Classes]
+      summary: 获取班级详情
+      operationId: getClassById
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/classId'
+      responses:
+        '200':
+          description: 成功
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DataEnvelope'
+        '403':
+          description: 权限不足
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '404':
+          description: 班级不存在
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+    put:
+      tags: [Classes]
+      summary: 更新班级
+      operationId: updateClass
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/classId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ClassUpdateRequest'
+      responses:
+        '200':
+          description: 成功
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DataEnvelope'
+        '400':
+          description: 请求无效
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '403':
+          description: 权限不足
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '404':
+          description: 班级不存在
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '409':
+          description: 班级代码冲突
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+    delete:
+      tags: [Classes]
+      summary: 删除班级
+      operationId: deleteClass
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/classId'
+      responses:
+        '200':
+          description: 删除成功
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DataEnvelope'
+        '403':
+          description: 权限不足
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '404':
+          description: 班级不存在
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /api/v1/teachers/{teacherId}/classes:
+    get:
+      tags: [Classes]
+      summary: 获取教师班级
+      operationId: getTeacherClasses
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/teacherId'
+      responses:
+        '200':
+          description: 成功
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DataEnvelopeArray'
+        '403':
+          description: 权限不足
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '404':
+          description: 目标用户不是教师
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /api/v1/assistants/{assistantId}/classes:
+    get:
+      tags: [Classes]
+      summary: 获取助教班级
+      operationId: getAssistantClasses
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/assistantId'
+      responses:
+        '200':
+          description: 成功
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DataEnvelopeArray'
+        '403':
+          description: 权限不足
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '404':
+          description: 目标用户不是助教
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /api/v1/classes/{classId}/students:
+    post:
+      tags: [Class Members]
+      summary: 创建学生并加入班级
+      operationId: createStudentInClass
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/classId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateStudentRequest'
+      responses:
+        '201':
+          description: 创建成功
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DataEnvelope'
+        '403':
+          description: 权限不足
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '404':
+          description: 班级不存在
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '409':
+          description: 用户冲突
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+    get:
+      tags: [Class Members]
+      summary: 获取班级学生列表
+      operationId: getClassStudents
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/classId'
+      responses:
+        '200':
+          description: 成功
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DataEnvelopeArray'
+        '403':
+          description: 权限不足
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '404':
+          description: 班级不存在
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /api/v1/classes/{classId}/enroll:
+    post:
+      tags: [Class Members]
+      summary: 将已有学生加入班级
+      operationId: enrollStudent
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/classId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/EnrollStudentRequest'
+      responses:
+        '201':
+          description: 加入成功
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DataEnvelope'
+        '400':
+          description: 请求无效
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '403':
+          description: 权限不足
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '404':
+          description: 班级或学生不存在
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '409':
+          description: 学生已加入班级
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /api/v1/classes/{classId}/students/{studentId}:
+    delete:
+      tags: [Class Members]
+      summary: 从班级移除学生
+      operationId: removeStudentFromClass
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/classId'
+        - $ref: '#/components/parameters/studentId'
+      responses:
+        '200':
+          description: 移除成功
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DataEnvelope'
+        '400':
+          description: 目标用户不是学生
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '403':
+          description: 权限不足
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '404':
+          description: 记录不存在
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /api/v1/classes/{classId}/join:
+    post:
+      tags: [Class Members]
+      summary: 学生加入班级
+      operationId: joinClass
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/classId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/JoinClassRequest'
+      responses:
+        '201':
+          description: 加入成功
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DataEnvelope'
+        '400':
+          description: 缺少班级码
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '403':
+          description: 班级码无效
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '404':
+          description: 班级不存在
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '409':
+          description: 已在其他班级
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /api/v1/classes/joinable:
+    get:
+      tags: [Class Members]
+      summary: 获取可加入班级列表
+      operationId: getJoinableClasses
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: 成功
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DataEnvelopeArray'
+        '409':
+          description: 当前已加入班级
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /api/v1/classes/{classId}/assistants:
+    post:
+      tags: [Class Members]
+      summary: 添加班级助教
+      operationId: addAssistantToClass
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/classId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AddAssistantRequest'
+      responses:
+        '201':
+          description: 添加成功
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DataEnvelope'
+        '400':
+          description: 用户不是助教
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '403':
+          description: 权限不足
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '404':
+          description: 班级不存在
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '409':
+          description: 已分配
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+    get:
+      tags: [Class Members]
+      summary: 获取班级助教列表
+      operationId: getClassAssistants
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/classId'
+      responses:
+        '200':
+          description: 成功
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DataEnvelopeArray'
+        '403':
+          description: 权限不足
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '404':
+          description: 班级不存在
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /api/v1/classes/{classId}/assistants/{assistantId}:
+    delete:
+      tags: [Class Members]
+      summary: 移除班级助教
+      operationId: removeAssistantFromClass
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/classId'
+        - $ref: '#/components/parameters/assistantId'
+      responses:
+        '200':
+          description: 移除成功
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DataEnvelope'
+        '403':
+          description: 权限不足
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '404':
+          description: 班级或分配记录不存在
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /api/v1/datasets:
+    post:
+      tags: [Datasets]
+      summary: 上传数据集
+      operationId: uploadDataset
+      description: 仅 Admin
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              required: [file, data_name]
+              properties:
+                file:
+                  type: string
+                  format: binary
+                data_name:
+                  type: string
+                description:
+                  type: string
+      responses:
+        '201':
+          description: 上传成功
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DataEnvelope'
+        '400':
+          description: 参数或文件错误
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '409':
+          description: 产品数据冲突
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+    get:
+      tags: [Datasets]
+      summary: 获取数据集列表
+      operationId: listDatasets
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: 成功
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DataEnvelopeArray'
+
+  /api/v1/datasets/industries:
+    get:
+      tags: [Datasets]
+      summary: 获取行业列表
+      operationId: listIndustries
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: 成功
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DataEnvelope'
+
+  /api/v1/datasets/industries/{industry}/companies:
+    get:
+      tags: [Datasets]
+      summary: 获取行业下公司列表
+      operationId: listCompaniesByIndustry
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/industry'
+      responses:
+        '200':
+          description: 成功
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DataEnvelope'
+
+  /api/v1/datasets/industries/{industry}/companies/{company}/products:
+    get:
+      tags: [Datasets]
+      summary: 获取公司下产品列表
+      operationId: listProductsByCompany
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/industry'
+        - $ref: '#/components/parameters/company'
+      responses:
+        '200':
+          description: 成功
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DataEnvelope'
+
+  /api/v1/datasets/industries/{industry}/companies/{company}/products/{product}/fields:
+    get:
+      tags: [Datasets]
+      summary: 获取产品字段
+      operationId: getProductFields
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/industry'
+        - $ref: '#/components/parameters/company'
+        - $ref: '#/components/parameters/product'
+      responses:
+        '200':
+          description: 成功
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DataEnvelope'
+        '404':
+          description: 产品分段不存在
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /api/v1/datasets/industries/{industry}/companies/{company}/products/{product}/sales:
+    get:
+      tags: [Datasets]
+      summary: 获取产品销售数据
+      operationId: getProductSales
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/industry'
+        - $ref: '#/components/parameters/company'
+        - $ref: '#/components/parameters/product'
+      responses:
+        '200':
+          description: 成功
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DataEnvelope'
+        '404':
+          description: 产品分段不存在
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /api/v1/datasets/{datasetId}:
+    get:
+      tags: [Datasets]
+      summary: 获取数据集详情
+      operationId: getDatasetById
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/datasetId'
+      responses:
+        '200':
+          description: 成功
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DataEnvelope'
+        '404':
+          description: 数据集不存在
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+    put:
+      tags: [Datasets]
+      summary: 更新数据集
+      operationId: updateDataset
+      description: 仅 Admin
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/datasetId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/DatasetUpdateRequest'
+      responses:
+        '200':
+          description: 成功
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DataEnvelope'
+        '400':
+          description: 请求无效
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '404':
+          description: 数据集不存在
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+    delete:
+      tags: [Datasets]
+      summary: 删除数据集
+      operationId: deleteDataset
+      description: 仅 Admin
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/datasetId'
+      responses:
+        '200':
+          description: 删除成功
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DataEnvelope'
+        '404':
+          description: 数据集不存在
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /api/v1/students/me/experiment-runs/active:
+    get:
+      tags: [Experiments]
+      summary: 获取最近一次未完成实验
+      operationId: getActiveExperiment
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: 成功
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DataEnvelope'
+        '404':
+          description: 未找到实验状态
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /api/v1/students/me/experiment-runs:
+    post:
+      tags: [Experiments]
+      summary: 创建实验
+      operationId: createExperiment
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ExperimentCreateRequest'
+      responses:
+        '201':
+          description: 创建成功
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DataEnvelope'
+
+    get:
+      tags: [Experiments]
+      summary: 获取当前学生实验列表
+      operationId: listMyExperiments
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: 成功
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DataEnvelopeArray'
+
+  /api/v1/students/me/experiment-runs/{experimentId}:
+    delete:
+      tags: [Experiments]
+      summary: 删除实验
+      operationId: deleteExperiment
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/experimentId'
+      responses:
+        '200':
+          description: 删除成功
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DataEnvelope'
+        '400':
+          description: 已完成实验不可删除
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '404':
+          description: 实验不存在
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /api/v1/experiment-runs/{experimentId}:
+    put:
+      tags: [Experiments]
+      summary: 更新实验状态
+      operationId: updateExperiment
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/experimentId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ExperimentUpdateRequest'
+      responses:
+        '200':
+          description: 更新成功
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DataEnvelope'
+        '400':
+          description: 字段无效
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '403':
+          description: 权限不足
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '404':
+          description: 实验不存在
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /api/v1/experiment-runs/{experimentId}/events:
+    post:
+      tags: [Experiments]
+      summary: 记录实验步骤事件
+      operationId: createExperimentEvent
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/experimentId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ExperimentEventRequest'
+      responses:
+        '201':
+          description: 创建成功
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DataEnvelope'
+        '403':
+          description: 权限不足
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '404':
+          description: 实验不存在
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /api/v1/classes/{classId}/reports:
+    get:
+      tags: [Grades]
+      summary: 获取班级报告列表
+      operationId: getClassReports
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/classId'
+      responses:
+        '200':
+          description: 成功
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DataEnvelopeArray'
+        '403':
+          description: 权限不足
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '404':
+          description: 班级不存在
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /api/v1/reports/{reportId}:
+    put:
+      tags: [Grades]
+      summary: 批改报告
+      operationId: gradeReport
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/reportId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/GradeReportRequest'
+      responses:
+        '200':
+          description: 批改成功
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DataEnvelope'
+        '403':
+          description: 权限不足
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '404':
+          description: 报告或成绩记录不存在
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /api/v1/classes/{classId}/experiment-runs:
+    get:
+      tags: [Grades]
+      summary: 获取班级实验进度
+      operationId: getClassExperimentRuns
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/classId'
+      responses:
+        '200':
+          description: 成功
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DataEnvelopeArray'
+        '403':
+          description: 权限不足
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '404':
+          description: 班级不存在
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /api/v1/classes/{classId}/grading-policy:
+    get:
+      tags: [Grades]
+      summary: 获取成绩权重
+      operationId: getGradingPolicy
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/classId'
+      responses:
+        '200':
+          description: 成功
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DataEnvelope'
+        '403':
+          description: 权限不足
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '404':
+          description: 班级或权重不存在
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+    put:
+      tags: [Grades]
+      summary: 更新成绩权重
+      operationId: updateGradingPolicy
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/classId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UpdateGradeWeightsRequest'
+      responses:
+        '200':
+          description: 更新成功
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DataEnvelope'
+        '403':
+          description: 权限不足
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '404':
+          description: 班级或权重不存在
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /api/v1/classes/{classId}/grade-summaries:
+    get:
+      tags: [Grades]
+      summary: 获取成绩汇总
+      operationId: getGradeSummaries
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/classId'
+      responses:
+        '200':
+          description: 成功
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DataEnvelopeArray'
+        '403':
+          description: 权限不足
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '404':
+          description: 班级或权重不存在
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /api/v1/classes/{classId}/report-archive:
+    get:
+      tags: [Grades]
+      summary: 导出报告压缩包
+      operationId: exportReportArchive
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/classId'
+      responses:
+        '200':
+          description: 成功，返回下载路径
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DataEnvelope'
+        '403':
+          description: 权限不足
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '404':
+          description: 无可导出报告
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /api/v1/classes/{classId}/grade-export.csv:
+    get:
+      tags: [Grades]
+      summary: 导出成绩 CSV
+      operationId: exportGradeCsv
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/classId'
+      responses:
+        '200':
+          description: 成功，返回下载路径
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DataEnvelope'
+        '403':
+          description: 权限不足
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '404':
+          description: 无可导出数据
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /api/v1/classes/{classId}/report-export.csv:
+    get:
+      tags: [Grades]
+      summary: 导出报告 CSV
+      operationId: exportReportCsv
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/classId'
+      responses:
+        '200':
+          description: 成功，返回下载路径
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DataEnvelope'
+        '403':
+          description: 权限不足
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '404':
+          description: 无可导出数据
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /api/v1/classes/{classId}/experiment-events:
+    get:
+      tags: [Grades]
+      summary: 获取实验步骤事件时间线
+      operationId: getExperimentEvents
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/classId'
+      responses:
+        '200':
+          description: 成功
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DataEnvelopeArray'
+        '403':
+          description: 权限不足
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '404':
+          description: 班级不存在
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /api/v1/users/register/{role}:
+    post:
+      tags: [Users]
+      summary: 学生自助注册
+      operationId: registerUser
+      parameters:
+        - $ref: '#/components/parameters/role'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [username, password, name, email]
+              properties:
+                username:
+                  type: string
+                password:
+                  type: string
+                  minLength: 6
+                name:
+                  type: string
+                email:
+                  type: string
+                  format: email
+      responses:
+        '201':
+          description: 注册成功
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DataEnvelope'
+        '400':
+          description: 参数错误
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '409':
+          description: 用户信息冲突
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /api/v1/users/assistants:
+    post:
+      tags: [Users]
+      summary: 创建助教（单个）
+      operationId: createAssistantSingle
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateAssistantSingleRequest'
+      responses:
+        '201':
+          description: 创建成功
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DataEnvelope'
+        '403':
+          description: 权限不足（仅 Admin）
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '409':
+          description: 冲突
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /api/v1/users/search:
+    get:
+      tags: [Users]
+      summary: 搜索用户
+      operationId: searchUsers
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/q'
+        - $ref: '#/components/parameters/page'
+        - $ref: '#/components/parameters/limit'
+      responses:
+        '200':
+          description: 搜索成功（该接口保持原始 `{data, pagination, searchMethod}`）
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UserSearchResponse'
+        '400':
+          description: 查询参数错误
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '403':
+          description: 权限不足（仅 Admin）
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /api/v1/assistants:
+    get:
+      tags: [Users]
+      summary: 获取助教列表
+      operationId: listAssistants
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: 成功
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DataEnvelopeArray'
+        '403':
+          description: 权限不足
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+    post:
+      tags: [Users]
+      summary: 创建助教并分配班级
+      operationId: createAssistantWithClasses
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateAssistantWithClassesRequest'
+      responses:
+        '201':
+          description: 创建成功
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DataEnvelope'
+        '400':
+          description: 班级参数无效
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '403':
+          description: 权限不足
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '409':
+          description: 冲突
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /api/v1/users/teachers:
+    post:
+      tags: [Users]
+      summary: 创建教师（单个）
+      operationId: createTeacher
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateTeacherRequest'
+      responses:
+        '201':
+          description: 创建成功
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DataEnvelope'
+        '403':
+          description: 权限不足（仅 Admin）
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '409':
+          description: 冲突
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /api/v1/users/teachers/batch:
+    post:
+      tags: [Users]
+      summary: 批量创建教师
+      operationId: batchCreateTeachers
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              required: [file]
+              properties:
+                file:
+                  type: string
+                  format: binary
+                password:
+                  type: string
+      responses:
+        '201':
+          description: 创建成功
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DataEnvelope'
+        '400':
+          description: 参数错误
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '403':
+          description: 权限不足（仅 Admin）
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '409':
+          description: 冲突
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '413':
+          description: 文件过大
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /api/v1/users/assistants/batch:
+    post:
+      tags: [Users]
+      summary: 批量创建助教
+      operationId: batchCreateAssistants
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              required: [file]
+              properties:
+                file:
+                  type: string
+                  format: binary
+                password:
+                  type: string
+      responses:
+        '201':
+          description: 创建成功
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DataEnvelope'
+        '400':
+          description: 参数错误
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '403':
+          description: 权限不足（仅 Admin）
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '409':
+          description: 冲突
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '413':
+          description: 文件过大
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /api/v1/teachers/{teacherId}/assistants:
+    get:
+      tags: [Users]
+      summary: 获取教师名下助教
+      operationId: listTeacherAssistants
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/teacherId'
+      responses:
+        '200':
+          description: 成功
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DataEnvelopeArray'
+        '403':
+          description: 权限不足
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /api/v1/users:
+    get:
+      tags: [Users]
+      summary: 分页获取全部用户
+      operationId: listUsers
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/page'
+        - $ref: '#/components/parameters/limit'
+      responses:
+        '200':
+          description: 成功（该接口保持原始 `{data, pagination}`）
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UserListResponse'
+        '403':
+          description: 权限不足（仅 Admin）
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /api/v1/students/unenrolled:
+    get:
+      tags: [Users]
+      summary: 获取未入班学生
+      operationId: listUnenrolledStudents
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: 成功
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DataEnvelopeArray'
+        '403':
+          description: 权限不足
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /api/v1/users/me:
+    get:
+      tags: [Users]
+      summary: 获取当前用户信息
+      operationId: getCurrentUser
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: 成功
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DataEnvelope'
+        '404':
+          description: 用户不存在
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+    put:
+      tags: [Users]
+      summary: 更新当前用户信息
+      operationId: updateCurrentUser
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UpdateCurrentUserRequest'
+      responses:
+        '200':
+          description: 更新成功
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DataEnvelope'
+        '409':
+          description: 邮箱冲突
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /api/v1/users/me/password:
+    put:
+      tags: [Users]
+      summary: 修改当前用户密码
+      operationId: changeMyPassword
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ChangePasswordRequest'
+      responses:
+        '200':
+          description: 修改成功
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DataEnvelope'
+        '401':
+          description: 当前密码错误
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '404':
+          description: 用户不存在
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /api/v1/users/{userId}:
+    get:
+      tags: [Users]
+      summary: 获取用户详情
+      operationId: getUserById
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/userId'
+      responses:
+        '200':
+          description: 成功
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DataEnvelope'
+        '403':
+          description: 权限不足
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '404':
+          description: 用户不存在
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+    delete:
+      tags: [Users]
+      summary: 删除用户
+      operationId: deleteUser
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/userId'
+      responses:
+        '200':
+          description: 删除成功
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DataEnvelope'
+        '400':
+          description: 请求无效（管理员不能删除自己）
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '403':
+          description: 权限不足（仅 Admin）
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '404':
+          description: 用户不存在
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /api/v1/users/{userId}/password:
+    put:
+      tags: [Users]
+      summary: 管理员强制修改用户密码
+      operationId: adminChangeUserPassword
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/userId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AdminChangePasswordRequest'
+      responses:
+        '200':
+          description: 修改成功
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DataEnvelope'
+        '400':
+          description: 请求无效（管理员改自己密码应走 /users/me/password）
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '403':
+          description: 权限不足（仅 Admin）
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '404':
+          description: 用户不存在
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /api/v1/users/{userId}/reset-password:
+    post:
+      tags: [Users]
+      summary: 重置学生密码
+      operationId: resetStudentPassword
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/userId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ResetPasswordRequest'
+      responses:
+        '200':
+          description: 重置成功
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DataEnvelope'
+        '400':
+          description: 非学生或参数错误
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '403':
+          description: 权限不足
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '404':
+          description: 用户不存在
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /reports/{filename}:
+    get:
+      tags: [Files]
+      summary: 访问报告 PDF（鉴权）
+      operationId: getReportFile
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/filename'
+      responses:
+        '200':
+          description: PDF 文件
+          content:
+            application/pdf:
+              schema:
+                type: string
+                format: binary
+        '400':
+          description: 文件名无效
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '403':
+          description: 权限不足
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '404':
+          description: 文件不存在
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /exports/{filename}:
+    get:
+      tags: [Files]
+      summary: 访问导出文件（鉴权）
+      operationId: getExportFile
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/filename'
+      responses:
+        '200':
+          description: 导出文件
+          content:
+            application/octet-stream:
+              schema:
+                type: string
+                format: binary
+        '400':
+          description: 文件名无效
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '403':
+          description: 权限不足
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '404':
+          description: 文件不存在
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /manuals/{filename}:
+    get:
+      tags: [Files]
+      summary: 公开访问手册静态文件
+      operationId: getManualStaticFile
+      parameters:
+        - $ref: '#/components/parameters/filename'
+      responses:
+        '200':
+          description: 静态文件
+          content:
+            application/pdf:
+              schema:
+                type: string
+                format: binary
+
+  /datasets/{filename}:
+    get:
+      tags: [Files]
+      summary: 公开访问数据集静态文件
+      operationId: getDatasetStaticFile
+      parameters:
+        - $ref: '#/components/parameters/filename'
+      responses:
+        '200':
+          description: 静态文件
+          content:
+            text/csv:
+              schema:
+                type: string
+                format: binary
+
+  /js/{filename}:
+    get:
+      tags: [Files]
+      summary: 公开访问前端静态脚本
+      operationId: getJsStaticFile
+      parameters:
+        - $ref: '#/components/parameters/filename'
+      responses:
+        '200':
+          description: 静态文件
+          content:
+            application/javascript:
+              schema:
+                type: string
+                format: binary
+
+  /images/{filename}:
+    get:
+      tags: [Files]
+      summary: 公开访问前端静态图片
+      operationId: getImageStaticFile
+      parameters:
+        - $ref: '#/components/parameters/filename'
+      responses:
+        '200':
+          description: 静态文件
+          content:
+            image/*:
+              schema:
+                type: string
+                format: binary
