@@ -87,10 +87,10 @@ export async function submitAnswers(
   experimentId: number,
   studentId: number,
   submittedAnswers: SubmittedAnswer[],
-): Promise<{ error: string; status: 403 | 404 } | { results: AnswerResult[] }> {
+): Promise<{ error: string; status: 400 | 403 | 404 } | { results: AnswerResult[] }> {
   const questionIds = submittedAnswers.map((a) => a.question_id);
   if (questionIds.length === 0) {
-    return { error: "未提供答案", status: 404 };
+    return { error: "未提供答案", status: 400 };
   }
 
   const connection = await pool.getConnection();

@@ -66,7 +66,7 @@ classMembersController.post(
         }
         return c.json({ error: "学生已加入该班级" }, 409);
       }
-      return c.json({ message: "Student enrolled successfully", student: { user_id: result.data.user_id, full_name: result.data.full_name }, class_id: result.data.class_id }, 201);
+      return c.json({ message: "学生加入班级成功", student: { user_id: result.data.user_id, full_name: result.data.full_name }, class_id: result.data.class_id }, 201);
     } catch (error) {
       return handleUnexpectedError(c, error, "添加学生失败");
     }

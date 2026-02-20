@@ -96,7 +96,7 @@ questionBankController.delete(
         return c.json({ error: "题目不存在" }, 404);
       }
 
-      return c.json({ message: "Question deleted successfully" });
+      return c.json({ message: "题目删除成功" });
     } catch (error) {
       return handleUnexpectedError(c, error, "删除题目失败");
     }

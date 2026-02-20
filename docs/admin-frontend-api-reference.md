@@ -21,9 +21,11 @@
 
 ```json
 {
-  "token": "<JWT>",
-  "user": {
-    "role": "Admin"
+  "data": {
+    "token": "<JWT>",
+    "user": {
+      "role": "Admin"
+    }
   }
 }
 ```
@@ -35,6 +37,7 @@
 
 ### 1.3 错误格式
 
+- 成功格式：`{ "data": ... }`
 - 常见格式：`{ "error": "..." }`
 - 部分接口会附带额外字段：
 - `details`
@@ -219,13 +222,13 @@
 - 用途：实验步骤事件时间线
 
 - `GET /api/v1/classes/:classId/report-archive`
-- 返回：`{ "file_path": "exports/xxx.zip" }`
+- 返回：`{ "data": { "file_path": "exports/xxx.zip" } }`
 
 - `GET /api/v1/classes/:classId/grade-export.csv`
-- 返回：`{ "file_path": "exports/xxx.csv" }`
+- 返回：`{ "data": { "file_path": "exports/xxx.csv" } }`
 
 - `GET /api/v1/classes/:classId/report-export.csv`
-- 返回：`{ "file_path": "exports/xxx.csv" }`
+- 返回：`{ "data": { "file_path": "exports/xxx.csv" } }`
 
 以上接口权限由班级归属校验控制，`Admin` 全量可访问。
 

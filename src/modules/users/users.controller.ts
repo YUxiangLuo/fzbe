@@ -28,7 +28,13 @@ usersController.post("/api/v1/users/register/:role", zValidator("param", rolePar
       if (result.error === "dup_email") return c.json({ error: "邮箱已存在" }, 409);
       if (result.error === "dup_phone") return c.json({ error: "手机号已存在" }, 409);
     }
-    return c.json({ ...result.data, message: `${role} account created successfully` }, 201);
+    const roleNameMap: Record<string, string> = {
+      Student: "学生",
+      Teacher: "教师",
+      Assistant: "助教",
+    };
+    const roleName = roleNameMap[role] ?? role;
+    return c.json({ ...result.data, message: `${roleName}账号创建成功` }, 201);
   } catch (error) { return handleUnexpectedError(c, error, "注册失败"); }
 });
 

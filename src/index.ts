@@ -42,6 +42,10 @@ interface AssignmentRow extends RowDataPacket {
   enrollment_id?: number;
 }
 
+function isPlainObject(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
 function isSafeFilename(filename: string): boolean {
   return filename === path.basename(filename) && !filename.includes("\0");
 }
@@ -130,6 +134,41 @@ async function canAccessExportFile(filename: string, userId: number, role: UserR
 // --- Global Middleware ---
 // app.use(timestampedLogger);
 app.use(cors());
+app.use("*", async (c, next) => {
+  await next();
+
+  const currentResponse = c.res;
+  if (currentResponse.status < 200 || currentResponse.status >= 300) {
+    return;
+  }
+
+  const contentType = currentResponse.headers.get("content-type") ?? "";
+  if (!contentType.includes("application/json")) {
+    return;
+  }
+
+  let payload: unknown;
+  try {
+    payload = await currentResponse.clone().json();
+  } catch {
+    return;
+  }
+
+  if (isPlainObject(payload) && ("data" in payload || "error" in payload)) {
+    return;
+  }
+
+  const wrappedHeaders = new Headers(currentResponse.headers);
+  wrappedHeaders.set("content-type", "application/json; charset=UTF-8");
+
+  c.res = new Response(
+    JSON.stringify({ data: payload }),
+    {
+      status: currentResponse.status,
+      headers: wrappedHeaders,
+    },
+  );
+});
 app.use(
   "/manuals/*",
   serveStatic({
@@ -215,7 +254,7 @@ app.route("/", classGradesController);
 app.route("/", usersController);
 
 // --- 404 & Error Handling ---
-app.notFound((c) => c.json({ message: "Not Found" }, 404));
+app.notFound((c) => c.json({ error: "接口不存在" }, 404));
 
 app.onError((err, c) => {
   logger.error(
@@ -229,7 +268,7 @@ app.onError((err, c) => {
   if (err instanceof HTTPException) {
     return c.json({ error: err.message }, err.status);
   }
-  return c.json({ error: "Internal Server Error" }, 500);
+  return c.json({ error: "服务器内部错误" }, 500);
 });
 
 // --- Server Startup ---
