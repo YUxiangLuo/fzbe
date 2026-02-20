@@ -248,10 +248,7 @@ export async function updateClass(classId: number, userId: number, userRole: str
   if (classRows.length === 0) return { error: "not_found" as const };
 
   const classOwner = classRows[0]!.teacher_id;
-  let isAllowed = userRole === "Admin" || userId === classOwner;
-  if (!isAllowed && userRole === "Assistant") {
-    isAllowed = await isAssistantAssignedToClass(classId, userId);
-  }
+  const isAllowed = userRole === "Admin" || userId === classOwner;
   if (!isAllowed) return { error: "forbidden" as const };
 
   const fields: string[] = [];
@@ -327,7 +324,7 @@ export async function getClassesByTeacher(teacherId: number, userId: number, use
   if (userRole !== "Admin" && userId !== teacherId) return { error: "forbidden" as const };
 
   const [teacherRows] = await pool.query<UserRow[]>("SELECT role FROM users WHERE user_id = ? AND role = 'Teacher'", [teacherId]);
-  if (teacherRows.length === 0 && userRole !== "Admin") return { error: "not_teacher" as const };
+  if (teacherRows.length === 0) return { error: "not_teacher" as const };
 
   const [classRows] = await pool.query<ClassRow[]>(
     "SELECT c.*, u.full_name as teacher_name FROM classes c JOIN users u ON c.teacher_id = u.user_id WHERE c.teacher_id = ?",
@@ -340,7 +337,7 @@ export async function getClassesByAssistant(assistantId: number, userId: number,
   if (userRole !== "Admin" && userId !== assistantId) return { error: "forbidden" as const };
 
   const [assistantRows] = await pool.query<UserRow[]>("SELECT role FROM users WHERE user_id = ? AND role = 'Assistant'", [assistantId]);
-  if (assistantRows.length === 0 && userRole !== "Admin") return { error: "not_assistant" as const };
+  if (assistantRows.length === 0) return { error: "not_assistant" as const };
 
   const [classRows] = await pool.query<ClassRow[]>(
     `SELECT c.*, u.full_name as teacher_name FROM classes c JOIN class_assistants ca ON c.class_id = ca.class_id JOIN users u ON c.teacher_id = u.user_id WHERE ca.assistant_id = ?`,

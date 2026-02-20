@@ -15,10 +15,15 @@ export const classStudentParamSchema = z.object({
 });
 
 export const createStudentSchema = z.object({
-  username: z.string().min(1, "学号不能为空"),
-  full_name: z.string().min(1, "姓名不能为空"),
+  username: z.string()
+    .min(8, "学号至少为8位数字")
+    .regex(/^\d+$/, "学号只能包含数字"),
+  full_name: z.string()
+    .min(2, "姓名长度至少为2个字符")
+    .max(64, "姓名长度不能超过64个字符")
+    .regex(/^[\u4e00-\u9fa5a-zA-Z\s]+$/, "姓名只能包含中文字符、英文字母和空格"),
   email: z.string().regex(/^[^\s@]+@[^\s@]+\.[^\s@]+$/, "无效的邮箱格式").optional(),
-  phone_number: z.string().optional(),
+  phone_number: z.string().regex(/^\d{6,15}$/, "手机号应为 6-15 位数字").optional(),
   password: z.string().min(6, "密码必须至少6位").optional(),
 });
 

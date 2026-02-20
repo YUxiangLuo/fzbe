@@ -95,6 +95,9 @@ classesController.put(
   async (c) => {
     try {
       const payload = c.get("jwtPayload") as JwtPayload;
+      if (payload.role !== "Admin" && payload.role !== "Teacher") {
+        return c.json({ error: "权限不足" }, 403);
+      }
       const { classId } = c.req.valid("param");
       const input = c.req.valid("json");
       const result = await updateClass(parseInt(classId, 10), payload.sub, payload.role, input);
