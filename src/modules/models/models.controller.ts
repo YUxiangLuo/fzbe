@@ -2,7 +2,14 @@ import { Hono } from "hono";
 import { zValidator } from "@hono/zod-validator";
 import { jwtAuth, requireStudent } from "../../middleware";
 import { trainSchema, predictSchema, ALL_MODELS, type ModelType } from "./models.schema";
-import { trainModel, predictModel, tryAcquireModelSlot, releaseModelSlot } from "./models.service";
+import {
+  trainModel,
+  predictModel,
+  tryAcquireModelSlot,
+  releaseModelSlot,
+  tryAcquireModelLock,
+  releaseModelLock,
+} from "./models.service";
 import { handleUnexpectedError } from "../../utils/error-handler";
 import type { JwtPayload } from "../../types";
 import { TIMEOUTS } from "../../utils/constants";
@@ -23,7 +30,12 @@ modelsController.post(
     const payload = c.get("jwtPayload") as JwtPayload;
     const body = c.req.valid("json");
 
+    if (!tryAcquireModelLock(payload.sub, modelType)) {
+      return c.json({ error: "同一模型正在训练或预测，请稍后再试" }, 409);
+    }
+
     if (!tryAcquireModelSlot()) {
+      releaseModelLock(payload.sub, modelType);
       return c.json({ error: "模型服务繁忙，请稍后再试" }, 429);
     }
 
@@ -51,6 +63,7 @@ modelsController.post(
       return handleUnexpectedError(c, error, message);
     } finally {
       releaseModelSlot();
+      releaseModelLock(payload.sub, modelType);
     }
   },
 );
@@ -69,7 +82,12 @@ modelsController.post(
     const payload = c.get("jwtPayload") as JwtPayload;
     const body = c.req.valid("json");
 
+    if (!tryAcquireModelLock(payload.sub, modelType)) {
+      return c.json({ error: "同一模型正在训练或预测，请稍后再试" }, 409);
+    }
+
     if (!tryAcquireModelSlot()) {
+      releaseModelLock(payload.sub, modelType);
       return c.json({ error: "模型服务繁忙，请稍后再试" }, 429);
     }
 
@@ -87,6 +105,7 @@ modelsController.post(
       return handleUnexpectedError(c, error, message);
     } finally {
       releaseModelSlot();
+      releaseModelLock(payload.sub, modelType);
     }
   },
 );

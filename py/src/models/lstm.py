@@ -447,8 +447,17 @@ def run(args) -> None:
         if save_path:
             log.info(f"Saving model to {save_path}")
             keras_model_path = os.path.splitext(save_path)[0] + "_keras_model.h5"
-            log.debug(f"Saving Keras model to {keras_model_path}")
-            model.save(keras_model_path)
+            temp_keras_model_path = os.path.splitext(save_path)[0] + f"_keras_model.tmp-{os.getpid()}.h5"
+            log.debug(f"Saving Keras model to temporary path {temp_keras_model_path}")
+            try:
+                model.save(temp_keras_model_path)
+                os.replace(temp_keras_model_path, keras_model_path)
+            finally:
+                if os.path.exists(temp_keras_model_path):
+                    try:
+                        os.remove(temp_keras_model_path)
+                    except OSError:
+                        pass
 
             state = {
                 "model_type": MODEL_TYPE,

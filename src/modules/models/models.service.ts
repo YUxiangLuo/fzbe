@@ -10,6 +10,7 @@ import { TIMEOUTS, CONCURRENCY_LIMITS } from "../../utils/constants";
 const TRAINING_TIMEOUT = TIMEOUTS.MODEL_TRAINING;
 const MAX_CONCURRENT_MODEL_JOBS = CONCURRENCY_LIMITS.MAX_CONCURRENT_MODEL_JOBS;
 let activeModelJobs = 0;
+const activeModelLocks = new Set<string>();
 
 export const tryAcquireModelSlot = (): boolean => {
   if (activeModelJobs >= MAX_CONCURRENT_MODEL_JOBS) return false;
@@ -19,6 +20,19 @@ export const tryAcquireModelSlot = (): boolean => {
 
 export const releaseModelSlot = () => {
   if (activeModelJobs > 0) activeModelJobs -= 1;
+};
+
+const buildModelLockKey = (studentId: number, modelType: ModelType) => `${studentId}:${modelType}`;
+
+export const tryAcquireModelLock = (studentId: number, modelType: ModelType): boolean => {
+  const lockKey = buildModelLockKey(studentId, modelType);
+  if (activeModelLocks.has(lockKey)) return false;
+  activeModelLocks.add(lockKey);
+  return true;
+};
+
+export const releaseModelLock = (studentId: number, modelType: ModelType) => {
+  activeModelLocks.delete(buildModelLockKey(studentId, modelType));
 };
 
 interface SegmentRow extends RowDataPacket {
@@ -48,6 +62,8 @@ const allPossiblePythonParams: Record<string, string> = {
   lstmNormalization: "normalization",
   models: "models",
 };
+
+const SETSID_PATH = process.platform === "win32" ? undefined : Bun.which("setsid");
 
 function resolvePythonExecutable(pyDir: string): string {
   const candidates = process.platform === "win32"
@@ -114,8 +130,11 @@ export async function runPythonModel(
   });
 
   const fullArgs = [modelType, ...args];
+  const command = process.platform !== "win32" && SETSID_PATH
+    ? [SETSID_PATH, pythonExec, scriptPath, ...fullArgs]
+    : [pythonExec, scriptPath, ...fullArgs];
 
-  const proc = Bun.spawn([pythonExec, scriptPath, ...fullArgs], {
+  const proc = Bun.spawn(command, {
     cwd: pyDir,
     stdout: "pipe",
     stderr: "pipe",
@@ -124,6 +143,28 @@ export async function runPythonModel(
       PATH: `${path.dirname(pythonExec)}${path.delimiter}${process.env.PATH ?? ""}`,
     },
   });
+
+  const killPythonProcessTree = () => {
+    if (proc.exitCode !== null || proc.killed) return;
+
+    if (process.platform !== "win32" && SETSID_PATH) {
+      try {
+        process.kill(-proc.pid, "SIGKILL");
+        return;
+      } catch (error) {
+        logger.warn(
+          { error, pid: proc.pid, modelType },
+          "终止 Python 进程组失败，回退为终止主进程",
+        );
+      }
+    }
+
+    try {
+      proc.kill("SIGKILL");
+    } catch (error) {
+      logger.warn({ error, pid: proc.pid, modelType }, "终止 Python 主进程失败");
+    }
+  };
 
   let timeoutId: ReturnType<typeof setTimeout> | undefined;
 
@@ -172,7 +213,7 @@ export async function runPythonModel(
 
   const timeoutPromise = new Promise<unknown>((_, reject) => {
     timeoutId = setTimeout(() => {
-      proc.kill();
+      killPythonProcessTree();
       reject(new Error(`Python 执行超时 (${timeoutMs}ms)`));
     }, timeoutMs);
   });

@@ -17,7 +17,9 @@ Design Decision:
     are small enough that the performance difference is negligible.
 """
 import pickle
-from typing import Any
+import os
+import tempfile
+from typing import Any, Optional
 from pathlib import Path
 
 
@@ -42,13 +44,35 @@ def dump_model(obj: Any, path: str) -> None:
         >>> state = {"model_type": "ma", "window": 3, "history": [1, 2, 3]}
         >>> dump_model(state, "trained_models/ma_model.pkl")
     """
+    target_path = Path(path)
+    target_path.parent.mkdir(parents=True, exist_ok=True)
+    temp_path: Optional[Path] = None
+
     try:
-        with open(path, "wb") as fh:
+        fd, temp_name = tempfile.mkstemp(
+            prefix=f".{target_path.name}.",
+            suffix=".tmp",
+            dir=str(target_path.parent),
+        )
+        temp_path = Path(temp_name)
+
+        with os.fdopen(fd, "wb") as fh:
             pickle.dump(obj, fh, protocol=pickle.HIGHEST_PROTOCOL)
+            fh.flush()
+            os.fsync(fh.fileno())
+
+        os.replace(temp_path, target_path)
+        temp_path = None
     except (pickle.PicklingError, TypeError) as e:
         raise SerializationError(f"Failed to serialize object: {e}") from e
     except OSError as e:
         raise OSError(f"Failed to write to '{path}': {e}") from e
+    finally:
+        if temp_path is not None and temp_path.exists():
+            try:
+                temp_path.unlink()
+            except OSError:
+                pass
 
 
 def load_model(path: str) -> Any:
