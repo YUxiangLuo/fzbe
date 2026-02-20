@@ -32,6 +32,8 @@ interface StatsRow extends RowDataPacket {
   total_count: number;
 }
 
+type QuizType = "quiz_about_model" | "quiz_about_plan";
+
 function shuffleArray<T>(arr: T[]): T[] {
   const shuffled = [...arr];
   for (let i = shuffled.length - 1; i > 0; i--) {
@@ -129,6 +131,7 @@ export async function submitAnswers(
     }
 
     const insertValues: unknown[][] = [];
+    const submittedQuizTypes = new Set<QuizType>();
     const resultsForFrontend: AnswerResult[] = [];
 
     for (const submitted of submittedAnswers) {
@@ -139,15 +142,16 @@ export async function submitAnswers(
         JSON.stringify([...submitted.submitted_answer].sort()) ===
         JSON.stringify([...questionData.answers].sort());
 
-      const quiz_type = questionData.knowledge.includes("生产计划")
+      const quizType: QuizType = questionData.knowledge.includes("生产计划")
         ? "quiz_about_plan"
         : "quiz_about_model";
+      submittedQuizTypes.add(quizType);
 
       insertValues.push([
         experimentId,
         studentId,
         submitted.question_id,
-        quiz_type,
+        quizType,
         JSON.stringify(submitted.submitted_answer),
         isCorrect,
       ]);
@@ -159,6 +163,17 @@ export async function submitAnswers(
       });
     }
 
+    if (submittedQuizTypes.size > 0) {
+      const types = Array.from(submittedQuizTypes);
+      const typePlaceholders = types.map(() => "?").join(",");
+      await connection.query(
+        `DELETE FROM quiz_answers
+          WHERE experiment_id = ? AND student_id = ?
+            AND quiz_type IN (${typePlaceholders})`,
+        [experimentId, studentId, ...types],
+      );
+    }
+
     if (insertValues.length > 0) {
       await connection.query(
         `INSERT INTO quiz_answers
@@ -168,7 +183,7 @@ export async function submitAnswers(
       );
     }
 
-    if (insertValues.some((value) => value[3] === "quiz_about_plan")) {
+    if (submittedQuizTypes.size > 0) {
       const [[stats]] = await connection.query<StatsRow[]>(
         `SELECT
            SUM(is_correct) AS correct_count,
