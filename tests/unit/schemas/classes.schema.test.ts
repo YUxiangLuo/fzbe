@@ -3,6 +3,7 @@ import {
   createClassSchema,
   updateClassSchema,
   classIdParamSchema,
+  teacherAssistantParamSchema,
 } from "../../../src/modules/classes/classes.schema";
 
 describe("Classes Schemas", () => {
@@ -115,6 +116,32 @@ describe("Classes Schemas", () => {
     test("should accept zero", () => {
       const result = classIdParamSchema.safeParse({ classId: "0" });
       expect(result.success).toBe(true);
+    });
+  });
+
+  describe("teacherAssistantParamSchema", () => {
+    test("should accept numeric teacherId and assistantId", () => {
+      const result = teacherAssistantParamSchema.safeParse({
+        teacherId: "101",
+        assistantId: "201",
+      });
+      expect(result.success).toBe(true);
+    });
+
+    test("should reject non-numeric teacherId", () => {
+      const result = teacherAssistantParamSchema.safeParse({
+        teacherId: "teacher-1",
+        assistantId: "201",
+      });
+      expect(result.success).toBe(false);
+    });
+
+    test("should reject non-numeric assistantId", () => {
+      const result = teacherAssistantParamSchema.safeParse({
+        teacherId: "101",
+        assistantId: "assistant-1",
+      });
+      expect(result.success).toBe(false);
     });
   });
 });

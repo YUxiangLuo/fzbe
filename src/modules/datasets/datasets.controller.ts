@@ -38,7 +38,7 @@ datasetsController.post("/api/v1/datasets", jwtAuth, requireAdmin, async (c) => 
   }
 });
 
-datasetsController.get("/api/v1/datasets", jwtAuth, async (c) => {
+datasetsController.get("/api/v1/datasets", jwtAuth, requireAdmin, async (c) => {
   try {
     const datasets = await getAllDatasets();
     return c.json(datasets);
@@ -104,7 +104,7 @@ datasetsController.get("/api/v1/datasets/industries/:industry/companies/:company
   }
 });
 
-datasetsController.get("/api/v1/datasets/:datasetId", jwtAuth, zValidator("param", datasetIdParamSchema), async (c) => {
+datasetsController.get("/api/v1/datasets/:datasetId", jwtAuth, requireAdmin, zValidator("param", datasetIdParamSchema), async (c) => {
   try {
     const { datasetId } = c.req.valid("param");
     const dataset = await getDatasetById(parseInt(datasetId, 10));

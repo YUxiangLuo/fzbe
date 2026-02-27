@@ -42,6 +42,11 @@ interface AssignmentRow extends RowDataPacket {
   enrollment_id?: number;
 }
 
+interface ManualAccessRow extends RowDataPacket {
+  manual_id: number;
+  is_active: number | boolean;
+}
+
 function isPlainObject(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
@@ -131,6 +136,23 @@ async function canAccessExportFile(filename: string, userId: number, role: UserR
   return false;
 }
 
+async function checkManualFileAccess(filename: string, role: UserRole): Promise<"allowed" | "forbidden" | "not_found"> {
+  const [rows] = await pool.query<ManualAccessRow[]>(
+    `SELECT manual_id, is_active
+       FROM experiment_manuals
+      WHERE file_path LIKE ?
+      ORDER BY manual_id DESC
+      LIMIT 1`,
+    [`%/${filename}`],
+  );
+
+  const manual = rows[0];
+  if (!manual) return "not_found";
+
+  if (role === "Admin") return "allowed";
+  return manual.is_active ? "allowed" : "forbidden";
+}
+
 // --- Global Middleware ---
 // app.use(timestampedLogger);
 app.use(cors());
@@ -169,20 +191,46 @@ app.use("*", async (c, next) => {
     },
   );
 });
-app.use(
-  "/manuals/*",
-  serveStatic({
-    root: path.resolve(uploadsRoot, "manuals"),
-    rewriteRequestPath: (requestPath) => requestPath.replace(/^\/manuals/, "") || "/",
-  }),
-);
-app.use(
-  "/datasets/*",
-  serveStatic({
-    root: path.resolve(uploadsRoot, "datasets"),
-    rewriteRequestPath: (requestPath) => requestPath.replace(/^\/datasets/, "") || "/",
-  }),
-);
+app.get("/manuals/:filename", jwtAuth, async (c) => {
+  const payload = c.get("jwtPayload") as JwtPayload;
+  const filename = c.req.param("filename");
+
+  if (!isSafeFilename(filename)) return c.json({ error: "无效的文件名" }, 400);
+
+  const access = await checkManualFileAccess(filename, payload.role);
+  if (access === "not_found") return c.json({ error: "文件不存在" }, 404);
+  if (access === "forbidden") return c.json({ error: "权限不足" }, 403);
+
+  const file = Bun.file(path.resolve(uploadsRoot, "manuals", filename));
+  if (!(await file.exists())) return c.json({ error: "文件不存在" }, 404);
+
+  return new Response(file, {
+    headers: {
+      "Content-Type": file.type || "application/pdf",
+      "Content-Disposition": `inline; filename="${toHeaderFilename(filename)}"`,
+      "Cache-Control": "private, max-age=60",
+    },
+  });
+});
+
+app.get("/datasets/:filename", jwtAuth, async (c) => {
+  const payload = c.get("jwtPayload") as JwtPayload;
+  if (payload.role !== "Admin") return c.json({ error: "权限不足" }, 403);
+
+  const filename = c.req.param("filename");
+  if (!isSafeFilename(filename)) return c.json({ error: "无效的文件名" }, 400);
+
+  const file = Bun.file(path.resolve(uploadsRoot, "datasets", filename));
+  if (!(await file.exists())) return c.json({ error: "文件不存在" }, 404);
+
+  return new Response(file, {
+    headers: {
+      "Content-Type": file.type || "text/csv; charset=UTF-8",
+      "Content-Disposition": `attachment; filename="${toHeaderFilename(filename)}"`,
+      "Cache-Control": "private, max-age=60",
+    },
+  });
+});
 app.get("/reports/:filename", jwtAuth, async (c) => {
   const payload = c.get("jwtPayload") as JwtPayload;
   const filename = c.req.param("filename");

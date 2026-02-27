@@ -12,6 +12,11 @@ export const assistantIdParamSchema = z.object({
   assistantId: z.string().regex(/^\d+$/, { message: "assistantId 必须是数字" }),
 });
 
+export const teacherAssistantParamSchema = z.object({
+  teacherId: z.string().regex(/^\d+$/, { message: "teacherId 必须是数字" }),
+  assistantId: z.string().regex(/^\d+$/, { message: "assistantId 必须是数字" }),
+});
+
 export const createClassSchema = z.object({
   class_name: z.string().min(1),
   class_code: z.string().optional(),
@@ -29,5 +34,6 @@ export const updateClassSchema = z
 export type ClassIdParam = z.infer<typeof classIdParamSchema>;
 export type TeacherIdParam = z.infer<typeof teacherIdParamSchema>;
 export type AssistantIdParam = z.infer<typeof assistantIdParamSchema>;
+export type TeacherAssistantParam = z.infer<typeof teacherAssistantParamSchema>;
 export type CreateClassInput = z.infer<typeof createClassSchema>;
 export type UpdateClassInput = z.infer<typeof updateClassSchema>;

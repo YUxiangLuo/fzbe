@@ -319,8 +319,17 @@ export async function batchCreateAssistants(file: File, password: unknown) {
 }
 
 export async function getTeacherAssistants(teacherId: number) {
-  const [rows] = await pool.query<RowDataPacket[]>("SELECT DISTINCT u.user_id, u.username, u.full_name, u.email, u.phone_number FROM users u JOIN class_assistants ca ON u.user_id = ca.assistant_id JOIN classes c ON ca.class_id = c.class_id WHERE c.teacher_id = ? AND u.role = 'Assistant'", [teacherId]);
-  return rows;
+  const [teacherRows] = await pool.query<UserRow[]>(
+    "SELECT role FROM users WHERE user_id = ? AND role = 'Teacher'",
+    [teacherId],
+  );
+  if (teacherRows.length === 0) return { error: "not_teacher" as const };
+
+  const [rows] = await pool.query<RowDataPacket[]>(
+    "SELECT DISTINCT u.user_id, u.username, u.full_name, u.email, u.phone_number FROM users u JOIN class_assistants ca ON u.user_id = ca.assistant_id JOIN classes c ON ca.class_id = c.class_id WHERE c.teacher_id = ? AND u.role = 'Assistant'",
+    [teacherId],
+  );
+  return { data: rows };
 }
 
 export async function getAllUsers(query: PaginationQuery) {

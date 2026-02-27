@@ -65,7 +65,7 @@ manualsController.get(
   },
 );
 
-manualsController.get("/api/v1/manuals/active", async (c) => {
+manualsController.get("/api/v1/manuals/active", jwtAuth, async (c) => {
   try {
     const manual = await getActiveManual();
     if (!manual) {

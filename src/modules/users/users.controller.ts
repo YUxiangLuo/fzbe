@@ -145,8 +145,9 @@ usersController.get("/api/v1/teachers/:teacherId/assistants", jwtAuth, zValidato
     const { teacherId } = c.req.valid("param");
     const teacherIdNumber = parseInt(teacherId, 10);
     if (payload.role !== "Admin" && payload.sub !== teacherIdNumber) return c.json({ error: "权限不足" }, 403);
-    const assistants = await getTeacherAssistants(teacherIdNumber);
-    return c.json(assistants);
+    const result = await getTeacherAssistants(teacherIdNumber);
+    if ("error" in result) return c.json({ error: "目标用户不是教师" }, 404);
+    return c.json(result.data);
   } catch (error) { return handleUnexpectedError(c, error, "获取教师的助教失败"); }
 });
 

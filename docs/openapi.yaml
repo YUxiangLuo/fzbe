@@ -10,8 +10,10 @@ info:
     - 少数已经包含顶层 `data` 的响应（例如 `/api/v1/users`、`/api/v1/users/search`）保持原样，不再二次包装。
     - 错误响应统一为 `{ "error": "..." }`，并可能带扩展字段（`details`、`invalid_rows`、`conflicts`、`current_class` 等）。
 servers:
+  - url: http://localhost:3001
+    description: Local development (current .env)
   - url: http://localhost:3000
-    description: Local development
+    description: Local development (env example/default)
 
 tags:
   - name: Auth
@@ -1003,6 +1005,8 @@ paths:
       tags: [Manuals]
       summary: 获取当前激活手册
       operationId: getActiveManual
+      security:
+        - bearerAuth: []
       responses:
         '200':
           description: 成功
@@ -1010,6 +1014,12 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/DataEnvelope'
+        '401':
+          description: 未授权
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
         '404':
           description: 未找到激活手册
           content:
@@ -1603,6 +1613,36 @@ paths:
               schema:
                 $ref: '#/components/schemas/ErrorResponse'
 
+  /api/v1/teachers/{teacherId}/assistants/{assistantId}/classes:
+    get:
+      tags: [Classes]
+      summary: 获取教师名下某助教已分配班级
+      operationId: getTeacherAssistantClasses
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/teacherId'
+        - $ref: '#/components/parameters/assistantId'
+      responses:
+        '200':
+          description: 成功
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DataEnvelopeArray'
+        '403':
+          description: 权限不足
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '404':
+          description: 目标用户角色不匹配（教师或助教）
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
   /api/v1/assistants/{assistantId}/classes:
     get:
       tags: [Classes]
@@ -2004,6 +2044,7 @@ paths:
       tags: [Datasets]
       summary: 获取数据集列表
       operationId: listDatasets
+      description: 仅 Admin
       security:
         - bearerAuth: []
       responses:
@@ -2013,6 +2054,12 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/DataEnvelopeArray'
+        '403':
+          description: 权限不足
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
 
   /api/v1/datasets/industries:
     get:
@@ -2119,6 +2166,7 @@ paths:
       tags: [Datasets]
       summary: 获取数据集详情
       operationId: getDatasetById
+      description: 仅 Admin
       security:
         - bearerAuth: []
       parameters:
@@ -2132,6 +2180,12 @@ paths:
                 $ref: '#/components/schemas/DataEnvelope'
         '404':
           description: 数据集不存在
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '403':
+          description: 权限不足
           content:
             application/json:
               schema:
@@ -3330,8 +3384,11 @@ paths:
   /manuals/{filename}:
     get:
       tags: [Files]
-      summary: 公开访问手册静态文件
+      summary: 访问手册静态文件
       operationId: getManualStaticFile
+      description: 需登录；Admin 可访问所有手册，非 Admin 仅可访问当前激活手册文件
+      security:
+        - bearerAuth: []
       parameters:
         - $ref: '#/components/parameters/filename'
       responses:
@@ -3342,12 +3399,33 @@ paths:
               schema:
                 type: string
                 format: binary
+        '401':
+          description: 未授权
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '403':
+          description: 权限不足
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '404':
+          description: 文件不存在
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
 
   /datasets/{filename}:
     get:
       tags: [Files]
-      summary: 公开访问数据集静态文件
+      summary: 下载数据集静态文件
       operationId: getDatasetStaticFile
+      description: 需登录且仅 Admin 可访问
+      security:
+        - bearerAuth: []
       parameters:
         - $ref: '#/components/parameters/filename'
       responses:
@@ -3358,6 +3436,24 @@ paths:
               schema:
                 type: string
                 format: binary
+        '401':
+          description: 未授权
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '403':
+          description: 权限不足
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '404':
+          description: 文件不存在
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
 
   /js/{filename}:
     get:

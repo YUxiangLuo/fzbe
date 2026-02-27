@@ -5,6 +5,7 @@ import {
   classIdParamSchema,
   teacherIdParamSchema,
   assistantIdParamSchema,
+  teacherAssistantParamSchema,
   updateClassSchema,
 } from "./classes.schema";
 import {
@@ -14,6 +15,7 @@ import {
   updateClass,
   deleteClass,
   getClassesByTeacher,
+  getClassesByTeacherAssistant,
   getClassesByAssistant,
   FileValidationError,
 } from "./classes.service";
@@ -156,6 +158,34 @@ classesController.get(
       return c.json(result.data);
     } catch (error) {
       return handleUnexpectedError(c, error, "获取教师班级失败");
+    }
+  },
+);
+
+classesController.get(
+  "/api/v1/teachers/:teacherId/assistants/:assistantId/classes",
+  jwtAuth,
+  zValidator("param", teacherAssistantParamSchema),
+  async (c) => {
+    try {
+      const payload = c.get("jwtPayload") as JwtPayload;
+      const { teacherId, assistantId } = c.req.valid("param");
+      const result = await getClassesByTeacherAssistant(
+        parseInt(teacherId, 10),
+        parseInt(assistantId, 10),
+        payload.sub,
+        payload.role,
+      );
+
+      if ("error" in result) {
+        if (result.error === "forbidden") return c.json({ error: "权限不足" }, 403);
+        if (result.error === "not_teacher") return c.json({ error: "目标用户不是教师" }, 404);
+        return c.json({ error: "目标用户不是助教" }, 404);
+      }
+
+      return c.json(result.data);
+    } catch (error) {
+      return handleUnexpectedError(c, error, "获取教师助教班级失败");
     }
   },
 );
