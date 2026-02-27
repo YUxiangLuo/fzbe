@@ -379,4 +379,4 @@ if (import.meta.main) {
   logger.info(`Server listening on ${server.url.href}`);
 }
 
-export default app;
+export { app };

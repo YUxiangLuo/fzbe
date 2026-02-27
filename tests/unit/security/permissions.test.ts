@@ -21,7 +21,7 @@ let appPromise: Promise<AppLike> | null = null;
 const getApp = async (): Promise<AppLike> => {
   if (!appPromise) {
     ensureTestEnv();
-    appPromise = import("../../../src/index").then((module) => module.default as AppLike);
+    appPromise = import("../../../src/index").then((module) => module.app as AppLike);
   }
   return appPromise;
 };
