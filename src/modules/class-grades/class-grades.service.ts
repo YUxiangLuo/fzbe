@@ -17,6 +17,20 @@ type Queryable = Pool | PoolConnection;
 
 interface ClassRow extends RowDataPacket { teacher_id: number; }
 interface AssignmentRow extends RowDataPacket { }
+interface TeacherClassRow extends RowDataPacket { class_id: number; class_name: string; }
+interface AssistantClassRow extends RowDataPacket { class_id: number; class_name: string; }
+interface UserRoleRow extends RowDataPacket { role: string; }
+
+export interface TeacherClassGradeSummary {
+  class_id: number;
+  class_name: string;
+  total_students: number;
+  graded_count: number;
+  submitted_count: number;
+  rejected_count: number;
+  not_submitted_count: number;
+  average_score: number | null;
+}
 
 export async function isAssistantAssignedToClass(db: Queryable, classId: number, assistantId: number): Promise<boolean> {
   const [[assignment]] = await db.query<AssignmentRow[]>("SELECT 1 FROM class_assistants WHERE class_id = ? AND assistant_id = ? LIMIT 1", [classId, assistantId]);
@@ -267,6 +281,114 @@ export async function getGradeSummaries(classId: number) {
       };
     }),
   };
+}
+
+function buildTeacherClassSummary(
+  classId: number,
+  className: string,
+  gradeRows: Array<{ report_status: string | null; final_score: number | null }>,
+): TeacherClassGradeSummary {
+  const gradedCount = gradeRows.filter((row) => row.report_status === "graded").length;
+  const submittedCount = gradeRows.filter((row) => row.report_status === "submitted").length;
+  const rejectedCount = gradeRows.filter((row) => row.report_status === "rejected").length;
+  const notSubmittedCount = gradeRows.filter((row) => !row.report_status).length;
+  const validScores = gradeRows
+    .filter((row) => row.report_status === "graded" && row.final_score !== null)
+    .map((row) => row.final_score as number);
+
+  const averageScore = validScores.length > 0
+    ? validScores.reduce((sum, score) => sum + score, 0) / validScores.length
+    : null;
+
+  return {
+    class_id: classId,
+    class_name: className,
+    total_students: gradeRows.length,
+    graded_count: gradedCount,
+    submitted_count: submittedCount,
+    rejected_count: rejectedCount,
+    not_submitted_count: notSubmittedCount,
+    average_score: averageScore,
+  };
+}
+
+const createEmptyTeacherClassSummary = (classId: number, className: string): TeacherClassGradeSummary => ({
+  class_id: classId,
+  class_name: className,
+  total_students: 0,
+  graded_count: 0,
+  submitted_count: 0,
+  rejected_count: 0,
+  not_submitted_count: 0,
+  average_score: null,
+});
+
+async function buildClassGradeSummaries(classRows: Array<{ class_id: number; class_name: string }>) {
+  const summaries = await Promise.all(
+    classRows.map(async (classRow) => {
+      try {
+        const result = await getGradeSummaries(classRow.class_id);
+        if ("error" in result) return createEmptyTeacherClassSummary(classRow.class_id, classRow.class_name);
+
+        const summaryRows = result.data.map((row) => ({
+          report_status: row.report_status ?? null,
+          final_score: toNumberOrNull(row.final_score),
+        }));
+
+        return buildTeacherClassSummary(classRow.class_id, classRow.class_name, summaryRows);
+      } catch {
+        return createEmptyTeacherClassSummary(classRow.class_id, classRow.class_name);
+      }
+    }),
+  );
+
+  return summaries;
+}
+
+export async function getTeacherClassGradeSummaries(teacherId: number, userId: number, userRole: string) {
+  if (userRole !== "Admin" && userId !== teacherId) return { error: "forbidden" as const };
+
+  const [teacherRows] = await pool.query<UserRoleRow[]>(
+    "SELECT role FROM users WHERE user_id = ? AND role = 'Teacher'",
+    [teacherId],
+  );
+  if (teacherRows.length === 0) return { error: "not_teacher" as const };
+
+  const [classRows] = await pool.query<TeacherClassRow[]>(
+    "SELECT class_id, class_name FROM classes WHERE teacher_id = ? ORDER BY class_id ASC",
+    [teacherId],
+  );
+  if (classRows.length === 0) return { data: [] as TeacherClassGradeSummary[] };
+
+  const summaries = await buildClassGradeSummaries(
+    classRows.map((row) => ({ class_id: row.class_id, class_name: row.class_name })),
+  );
+  return { data: summaries };
+}
+
+export async function getAssistantClassGradeSummaries(assistantId: number, userId: number, userRole: string) {
+  if (userRole !== "Admin" && userId !== assistantId) return { error: "forbidden" as const };
+
+  const [assistantRows] = await pool.query<UserRoleRow[]>(
+    "SELECT role FROM users WHERE user_id = ? AND role = 'Assistant'",
+    [assistantId],
+  );
+  if (assistantRows.length === 0) return { error: "not_assistant" as const };
+
+  const [classRows] = await pool.query<AssistantClassRow[]>(
+    `SELECT c.class_id, c.class_name
+       FROM class_assistants ca
+       JOIN classes c ON c.class_id = ca.class_id
+      WHERE ca.assistant_id = ?
+      ORDER BY c.class_id ASC`,
+    [assistantId],
+  );
+  if (classRows.length === 0) return { data: [] as TeacherClassGradeSummary[] };
+
+  const summaries = await buildClassGradeSummaries(
+    classRows.map((row) => ({ class_id: row.class_id, class_name: row.class_name })),
+  );
+  return { data: summaries };
 }
 
 export async function exportReportArchive(classId: number) {

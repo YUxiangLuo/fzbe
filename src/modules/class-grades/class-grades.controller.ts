@@ -1,8 +1,8 @@
 import { Hono } from "hono";
 import { zValidator } from "@hono/zod-validator";
 import { jwtAuth } from "../../middleware";
-import { classIdParamSchema, reportIdParamSchema, gradeReportSchema, updateGradeWeightsSchema } from "./class-grades.schema";
-import { checkClassAccess, getClassReports, gradeReport, getClassExperimentRuns, getGradingPolicy, updateGradingPolicy, getGradeSummaries, exportReportArchive, exportGradeCsv, exportReportCsv, getExperimentEvents } from "./class-grades.service";
+import { classIdParamSchema, teacherIdParamSchema, assistantIdParamSchema, reportIdParamSchema, gradeReportSchema, updateGradeWeightsSchema } from "./class-grades.schema";
+import { checkClassAccess, getClassReports, gradeReport, getClassExperimentRuns, getGradingPolicy, updateGradingPolicy, getGradeSummaries, getTeacherClassGradeSummaries, getAssistantClassGradeSummaries, exportReportArchive, exportGradeCsv, exportReportCsv, getExperimentEvents } from "./class-grades.service";
 import { handleUnexpectedError } from "../../utils/error-handler";
 import type { JwtPayload } from "../../types";
 
@@ -82,6 +82,32 @@ classGradesController.get("/api/v1/classes/:classId/grade-summaries", jwtAuth, z
     if ("error" in result) return c.json({ error: "该班级未配置成绩权重" }, 404);
     return c.json(result.data);
   } catch (error) { return handleUnexpectedError(c, error, "获取最新成绩失败"); }
+});
+
+classGradesController.get("/api/v1/teachers/:teacherId/grade-summaries", jwtAuth, zValidator("param", teacherIdParamSchema), async (c) => {
+  try {
+    const payload = c.get("jwtPayload") as JwtPayload;
+    const { teacherId } = c.req.valid("param");
+    const result = await getTeacherClassGradeSummaries(parseInt(teacherId, 10), payload.sub, payload.role);
+    if ("error" in result) {
+      if (result.error === "forbidden") return c.json({ error: "权限不足" }, 403);
+      return c.json({ error: "目标用户不是教师" }, 404);
+    }
+    return c.json(result.data);
+  } catch (error) { return handleUnexpectedError(c, error, "获取班级成绩汇总失败"); }
+});
+
+classGradesController.get("/api/v1/assistants/:assistantId/grade-summaries", jwtAuth, zValidator("param", assistantIdParamSchema), async (c) => {
+  try {
+    const payload = c.get("jwtPayload") as JwtPayload;
+    const { assistantId } = c.req.valid("param");
+    const result = await getAssistantClassGradeSummaries(parseInt(assistantId, 10), payload.sub, payload.role);
+    if ("error" in result) {
+      if (result.error === "forbidden") return c.json({ error: "权限不足" }, 403);
+      return c.json({ error: "目标用户不是助教" }, 404);
+    }
+    return c.json(result.data);
+  } catch (error) { return handleUnexpectedError(c, error, "获取助教班级成绩汇总失败"); }
 });
 
 classGradesController.get("/api/v1/classes/:classId/report-archive", jwtAuth, zValidator("param", classIdParamSchema), async (c) => {

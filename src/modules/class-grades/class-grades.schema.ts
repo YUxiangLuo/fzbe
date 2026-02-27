@@ -4,6 +4,14 @@ export const classIdParamSchema = z.object({
   classId: z.string().regex(/^\d+$/, { message: "classId 必须是数字" }),
 });
 
+export const teacherIdParamSchema = z.object({
+  teacherId: z.string().regex(/^\d+$/, { message: "teacherId 必须是数字" }),
+});
+
+export const assistantIdParamSchema = z.object({
+  assistantId: z.string().regex(/^\d+$/, { message: "assistantId 必须是数字" }),
+});
+
 export const reportIdParamSchema = z.object({
   reportId: z.string().regex(/^\d+$/, { message: "reportId 必须是数字" }),
 });
@@ -50,6 +58,8 @@ export const updateGradeWeightsSchema = z.object({
 }).refine((data) => Object.values(data).some((v) => v !== undefined), { message: "至少需要提供一个权重字段" });
 
 export type ClassIdParam = z.infer<typeof classIdParamSchema>;
+export type TeacherIdParam = z.infer<typeof teacherIdParamSchema>;
+export type AssistantIdParam = z.infer<typeof assistantIdParamSchema>;
 export type ReportIdParam = z.infer<typeof reportIdParamSchema>;
 export type GradeReportInput = z.infer<typeof gradeReportSchema>;
 export type UpdateGradeWeightsInput = z.infer<typeof updateGradeWeightsSchema>;
