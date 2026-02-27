@@ -369,10 +369,14 @@ app.onError((err, c) => {
   return c.json({ error: "服务器内部错误" }, 500);
 });
 
-// --- Server Startup ---
-logger.info(`Server listening on http://localhost:${env.PORT}`);
-
-export default {
+export const serverConfig = {
   port: env.PORT,
   fetch: app.fetch,
 };
+
+if (import.meta.main) {
+  const server = Bun.serve(serverConfig);
+  logger.info(`Server listening on ${server.url.href}`);
+}
+
+export default app;
