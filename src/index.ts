@@ -55,8 +55,37 @@ function isSafeFilename(filename: string): boolean {
   return filename === path.basename(filename) && !filename.includes("\0");
 }
 
-function toHeaderFilename(filename: string): string {
-  return filename.replace(/["\\]/g, "_");
+function toAsciiHeaderFilename(filename: string): string {
+  const basename = path.basename(filename).replace(/[\r\n]/g, "_").replace(/["\\]/g, "_");
+  const extension = path.extname(basename);
+  const stem = extension ? basename.slice(0, -extension.length) : basename;
+
+  const safeStem = stem
+    .replace(/[^A-Za-z0-9_-]/g, "_")
+    .replace(/_+/g, "_")
+    .replace(/^_+|_+$/g, "");
+
+  const normalizedStem = safeStem.length > 0 ? safeStem : "download";
+
+  const safeExtensionBody = extension
+    .replace(/^\./, "")
+    .replace(/[^A-Za-z0-9]/g, "");
+  const normalizedExtension = safeExtensionBody ? `.${safeExtensionBody}` : "";
+
+  return `${normalizedStem}${normalizedExtension}`;
+}
+
+function encodeRFC5987Value(value: string): string {
+  return encodeURIComponent(value).replace(/[!'()*]/g, (char) =>
+    `%${char.charCodeAt(0).toString(16).toUpperCase()}`,
+  );
+}
+
+function buildContentDisposition(type: "inline" | "attachment", filename: string): string {
+  const basename = path.basename(filename);
+  const asciiFilename = toAsciiHeaderFilename(basename);
+  const encodedFilename = encodeRFC5987Value(basename);
+  return `${type}; filename="${asciiFilename}"; filename*=UTF-8''${encodedFilename}`;
 }
 
 async function isTeacherOfStudent(studentId: number, teacherId: number): Promise<boolean> {
@@ -207,7 +236,7 @@ app.get("/manuals/:filename", jwtAuth, async (c) => {
   return new Response(file, {
     headers: {
       "Content-Type": file.type || "application/pdf",
-      "Content-Disposition": `inline; filename="${toHeaderFilename(filename)}"`,
+      "Content-Disposition": buildContentDisposition("inline", filename),
       "Cache-Control": "private, max-age=60",
     },
   });
@@ -226,7 +255,7 @@ app.get("/datasets/:filename", jwtAuth, async (c) => {
   return new Response(file, {
     headers: {
       "Content-Type": file.type || "text/csv; charset=UTF-8",
-      "Content-Disposition": `attachment; filename="${toHeaderFilename(filename)}"`,
+      "Content-Disposition": buildContentDisposition("attachment", filename),
       "Cache-Control": "private, max-age=60",
     },
   });
@@ -246,7 +275,7 @@ app.get("/reports/:filename", jwtAuth, async (c) => {
   return new Response(file, {
     headers: {
       "Content-Type": file.type || "application/pdf",
-      "Content-Disposition": `inline; filename="${toHeaderFilename(filename)}"`,
+      "Content-Disposition": buildContentDisposition("inline", filename),
       "Cache-Control": "private, max-age=60",
     },
   });
@@ -267,7 +296,7 @@ app.get("/exports/:filename", jwtAuth, async (c) => {
   return new Response(file, {
     headers: {
       "Content-Type": file.type || "application/octet-stream",
-      "Content-Disposition": `attachment; filename="${toHeaderFilename(filename)}"`,
+      "Content-Disposition": buildContentDisposition("attachment", filename),
       "Cache-Control": "private, max-age=60",
     },
   });
