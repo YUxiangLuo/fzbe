@@ -305,6 +305,30 @@ app.route("/", usersController);
 app.notFound((c) => c.json({ error: "接口不存在" }, 404));
 
 app.onError((err, c) => {
+  if (err instanceof HTTPException) {
+    if (err.status >= 500) {
+      logger.error(
+        {
+          err: { message: err.message, stack: err.stack },
+          path: c.req.path,
+          method: c.req.method,
+          status: err.status,
+        },
+        "HTTP exception",
+      );
+    } else if (err.status !== 401 && err.status !== 403) {
+      logger.warn(
+        {
+          path: c.req.path,
+          method: c.req.method,
+          status: err.status,
+          message: err.message,
+        },
+        "Handled client error",
+      );
+    }
+    return c.json({ error: err.message }, err.status);
+  }
   logger.error(
     {
       err: err instanceof Error ? { message: err.message, stack: err.stack } : err,
@@ -313,9 +337,6 @@ app.onError((err, c) => {
     },
     "Unhandled error",
   );
-  if (err instanceof HTTPException) {
-    return c.json({ error: err.message }, err.status);
-  }
   return c.json({ error: "服务器内部错误" }, 500);
 });
 

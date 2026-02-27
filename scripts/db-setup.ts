@@ -1,4 +1,3 @@
-
 import mysql from 'mysql2/promise';
 import fs from 'fs/promises';
 import path from 'path';
@@ -11,6 +10,48 @@ const { DB_HOST, DB_USER, DB_PASSWORD, DB_DATABASE } = process.env;
 const SQL_DIR = path.join(process.cwd(), 'sql');
 const SCHEMA_FILE = path.join(SQL_DIR, 'schema.sql');
 const SEED_FILE = path.join(SQL_DIR, 'seed.sql');
+const SYSTEM_DATABASES = new Set(['mysql', 'information_schema', 'performance_schema', 'sys']);
+const LOCAL_HOSTS = new Set(['localhost', '127.0.0.1', '::1']);
+
+function exitWithSafetyError(message: string): never {
+  console.error(`\n🚫 Safety check failed: ${message}`);
+  process.exit(1);
+}
+
+function requireNonEmptyEnv(name: string, value: string | undefined): string {
+  const normalized = value?.trim();
+  if (!normalized) {
+    exitWithSafetyError(`Missing required env var: ${name}`);
+  }
+  return normalized;
+}
+
+function assertDbSetupSafety() {
+  const dbHost = requireNonEmptyEnv('DB_HOST', DB_HOST);
+  const dbDatabase = requireNonEmptyEnv('DB_DATABASE', DB_DATABASE);
+  requireNonEmptyEnv('DB_USER', DB_USER);
+
+  if (SYSTEM_DATABASES.has(dbDatabase.toLowerCase())) {
+    exitWithSafetyError(`Refusing to run against system database "${dbDatabase}".`);
+  }
+
+  if (process.env.NODE_ENV === 'production' && process.env.DB_SETUP_ALLOW_PROD !== '1') {
+    exitWithSafetyError('Refusing to run in production. Set DB_SETUP_ALLOW_PROD=1 to override.');
+  }
+
+  if (!LOCAL_HOSTS.has(dbHost.toLowerCase()) && process.env.DB_SETUP_ALLOW_REMOTE !== '1') {
+    exitWithSafetyError(`Refusing to run against remote host "${dbHost}". Set DB_SETUP_ALLOW_REMOTE=1 to override.`);
+  }
+
+  const expectedConfirmToken = `RESET:${dbDatabase}`;
+  if (process.env.DB_SETUP_CONFIRM !== expectedConfirmToken) {
+    exitWithSafetyError(
+      `Destructive reset requires confirmation token. Re-run with DB_SETUP_CONFIRM=${expectedConfirmToken}`,
+    );
+  }
+
+  return { dbHost, dbDatabase };
+}
 
 /**
  * 执行一个 .sql 文件中的多个 SQL 语句
@@ -70,10 +111,12 @@ async function dropAllTables(connection: mysql.Connection, database: string) {
 async function setupDatabase() {
   let connection: mysql.Connection | null = null;
   try {
+    const { dbHost, dbDatabase } = assertDbSetupSafety();
+
     // 1. 连接到 MySQL/MariaDB 服务器 (不指定具体数据库)
-    console.log(`Connecting to MySQL server at ${DB_HOST}...`);
+    console.log(`Connecting to MySQL server at ${dbHost}...`);
     connection = await mysql.createConnection({
-      host: DB_HOST,
+      host: dbHost,
       user: DB_USER,
       password: DB_PASSWORD,
       multipleStatements: true, // 允许执行多个语句
@@ -82,16 +125,16 @@ async function setupDatabase() {
     console.log('✅ Connection successful.');
 
     // 2. 创建数据库
-    console.log(`Creating database '${DB_DATABASE}' if it doesn't exist...`);
-    await connection.query(`CREATE DATABASE IF NOT EXISTS \`${DB_DATABASE}\`;`);
-    console.log(`✅ Database '${DB_DATABASE}' is ready.`);
+    console.log(`Creating database '${dbDatabase}' if it doesn't exist...`);
+    await connection.query(`CREATE DATABASE IF NOT EXISTS \`${dbDatabase}\`;`);
+    console.log(`✅ Database '${dbDatabase}' is ready.`);
 
     // 3. 切换到指定数据库
-    await connection.changeUser({ database: DB_DATABASE });
-    console.log(`Switched to database '${DB_DATABASE}'.`);
+    await connection.changeUser({ database: dbDatabase });
+    console.log(`Switched to database '${dbDatabase}'.`);
 
     // 4. 删除已有表
-    await dropAllTables(connection, DB_DATABASE!);
+    await dropAllTables(connection, dbDatabase);
 
     // 5. 执行 schema.sql 来创建表结构
     console.log('Executing schema.sql...');
