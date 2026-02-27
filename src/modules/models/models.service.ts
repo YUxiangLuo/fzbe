@@ -3,7 +3,7 @@ import fs from "fs";
 import type { RowDataPacket } from "mysql2";
 import csv from "csv-parser";
 import { pool } from "../../config";
-import logger from "../../logger";
+import logger from "../../utils/logger";
 import type { ModelType, TrainInput } from "./models.schema";
 import { TIMEOUTS, CONCURRENCY_LIMITS } from "../../utils/constants";
 import { PY_DIR, resolvePythonExecutable } from "../../utils/python";

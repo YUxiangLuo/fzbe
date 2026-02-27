@@ -1,6 +1,6 @@
 import mysql from "mysql2/promise";
 import { env } from "./env";
-import logger from "../logger";
+import logger from "../utils/logger";
 
 export const pool = mysql.createPool({
   host: env.DB_HOST,

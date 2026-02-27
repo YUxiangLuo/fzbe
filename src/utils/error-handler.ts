@@ -1,5 +1,5 @@
 import type { Context } from "hono";
-import logger from "../logger";
+import logger from "./logger";
 
 export const handleUnexpectedError = (
   c: Context,

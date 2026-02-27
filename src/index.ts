@@ -6,7 +6,7 @@ import path from "path";
 import type { RowDataPacket } from "mysql2/promise";
 import { env, pool } from "./config";
 import { jwtAuth } from "./middleware";
-import logger from "./logger";
+import logger from "./utils/logger";
 import type { JwtPayload, UserRole } from "./types";
 // Import new modular controllers
 import { authController } from "./modules/auth";
