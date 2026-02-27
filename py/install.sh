@@ -1,10 +1,18 @@
 #!/usr/bin/env bash
 # 安装 Python 虚拟环境和所有依赖（模型训练 + ADF 检测）
+# 使用 uv 管理 Python 版本和依赖安装
 set -euo pipefail
 
 cd "$(dirname "$0")"
 
+PYTHON_VERSION="3.13"
 VENV_DIR="venv"
+
+# 检查 uv 是否可用
+if ! command -v uv &>/dev/null; then
+  echo "Error: uv is not installed. Install it first: https://docs.astral.sh/uv/getting-started/installation/"
+  exit 1
+fi
 
 # 如果存在旧的 .venv 目录，迁移为 venv
 if [ -d ".venv" ] && [ ! -d "$VENV_DIR" ]; then
@@ -12,18 +20,25 @@ if [ -d ".venv" ] && [ ! -d "$VENV_DIR" ]; then
   echo "Migrated .venv -> $VENV_DIR"
 fi
 
-if [ ! -d "$VENV_DIR" ]; then
-  echo "Creating virtual environment..."
-  python3 -m venv "$VENV_DIR"
+# 检测 venv 是否损坏或 Python 版本不匹配
+if [ -d "$VENV_DIR" ]; then
+  if [ ! -x "$VENV_DIR/bin/python3" ]; then
+    echo "Detected broken venv, recreating..."
+    rm -rf "$VENV_DIR"
+  elif ! "$VENV_DIR/bin/python3" -c "import sys; assert sys.version_info[:2] == (${PYTHON_VERSION/./, })" 2>/dev/null; then
+    echo "Detected Python version mismatch, recreating venv for $PYTHON_VERSION..."
+    rm -rf "$VENV_DIR"
+  fi
 fi
 
-# shellcheck disable=SC1091
-source "$VENV_DIR/bin/activate"
-
-pip install --upgrade pip
+if [ ! -d "$VENV_DIR" ]; then
+  echo "Creating virtual environment (Python $PYTHON_VERSION)..."
+  uv venv --python "$PYTHON_VERSION" "$VENV_DIR"
+fi
 
 echo "Installing dependencies..."
-pip install --no-cache-dir \
+uv pip install \
+  --python "$VENV_DIR/bin/python3" \
   --extra-index-url https://download.pytorch.org/whl/cpu \
   -r requirements.txt
 
