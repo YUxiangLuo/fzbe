@@ -182,18 +182,23 @@ def load_data_from_json(
         feature_keys = detected_features if detected_features else []
         log.info(f"Auto-detected feature_keys: {feature_keys}")
         
-    # Explicitly convert all feature and target columns to numeric, coercing errors
-    cols_to_convert = [target_key] + [fk for fk in feature_keys if fk != target_key]
-    log.debug(f"Attempting to convert columns to numeric: {cols_to_convert}")
-    for col in cols_to_convert:
-        if col in df.columns:
-            if pd.api.types.is_numeric_dtype(df[col]):
-                continue
-            original_non_nulls = df[col].notnull().sum()
-            df[col] = pd.to_numeric(df[col], errors='coerce')
-            if df[col].isnull().sum() > original_non_nulls:
-                log.error(f"Column '{col}' contains non-numeric values that were coerced to NaN.")
-                raise ValueError(f"Column '{col}' contains non-numeric values that cannot be converted.")
+    # Target column must be numeric
+    if target_key in df.columns and not pd.api.types.is_numeric_dtype(df[target_key]):
+        df[target_key] = pd.to_numeric(df[target_key], errors='coerce')
+        if df[target_key].isnull().any():
+            raise ValueError(f"Target column '{target_key}' contains non-numeric values.")
+        log.debug(f"Converted target column '{target_key}' to numeric")
+
+    # Feature columns: convert if numeric-like, keep as-is if categorical
+    for col in [fk for fk in (feature_keys or []) if fk != target_key and fk in df.columns]:
+        if pd.api.types.is_numeric_dtype(df[col]):
+            continue
+        converted = pd.to_numeric(df[col], errors='coerce')
+        if converted.isnull().sum() <= df[col].isnull().sum():
+            df[col] = converted
+            log.debug(f"Converted feature column '{col}' to numeric")
+        else:
+            log.debug(f"Keeping feature column '{col}' as categorical (dtype: {df[col].dtype})")
 
     # --- CRITICAL: Filter the DataFrame to only the used columns ---
     columns_to_keep = [target_key]

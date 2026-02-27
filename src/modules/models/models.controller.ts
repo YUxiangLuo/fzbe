@@ -1,7 +1,7 @@
 import { Hono } from "hono";
 import { zValidator } from "@hono/zod-validator";
 import { jwtAuth, requireStudent } from "../../middleware";
-import { trainSchema, predictSchema, ALL_MODELS, type ModelType } from "./models.schema";
+import { trainSchema, predictSchema, isModelType } from "./models.schema";
 import {
   trainModel,
   predictModel,
@@ -9,6 +9,8 @@ import {
   releaseModelSlot,
   tryAcquireModelLock,
   releaseModelLock,
+  ModelValidationError,
+  ModelNotFoundError,
 } from "./models.service";
 import { handleUnexpectedError } from "../../utils/error-handler";
 import type { JwtPayload } from "../../types";
@@ -22,10 +24,11 @@ modelsController.post(
   requireStudent,
   zValidator("json", trainSchema),
   async (c) => {
-    const modelType = c.req.param("model_type") as ModelType;
-    if (!ALL_MODELS.includes(modelType)) {
+    const modelTypeParam = c.req.param("model_type");
+    if (!isModelType(modelTypeParam)) {
       return c.json({ error: "指定的模型类型无效" }, 400);
     }
+    const modelType = modelTypeParam;
 
     const payload = c.get("jwtPayload") as JwtPayload;
     const body = c.req.valid("json");
@@ -41,13 +44,11 @@ modelsController.post(
 
     try {
       const result = await trainModel(modelType, payload.sub, body);
-
-      if ("error" in result && "dataset_size" in result) {
-        return c.json({ error: result.error, dataset_size: result.dataset_size }, 400);
-      }
-
       return c.json(result);
     } catch (error: unknown) {
+      if (error instanceof ModelValidationError) {
+        return c.json({ error: error.message, ...error.details }, 400);
+      }
       const err = error as Error;
       if (err.message?.includes("timed out") || err.message?.includes("超时")) {
         const timeoutSeconds = Math.ceil(TIMEOUTS.MODEL_TRAINING / 1000);
@@ -74,10 +75,11 @@ modelsController.post(
   requireStudent,
   zValidator("json", predictSchema),
   async (c) => {
-    const modelType = c.req.param("model_type") as ModelType;
-    if (!ALL_MODELS.includes(modelType)) {
+    const modelTypeParam = c.req.param("model_type");
+    if (!isModelType(modelTypeParam)) {
       return c.json({ error: "指定的模型类型无效" }, 400);
     }
+    const modelType = modelTypeParam;
 
     const payload = c.get("jwtPayload") as JwtPayload;
     const body = c.req.valid("json");
@@ -93,14 +95,16 @@ modelsController.post(
 
     try {
       const result = await predictModel(modelType, payload.sub, body.forecast_steps);
-
-      if ("error" in result) {
-        return c.json({ error: result.error }, 404);
-      }
-
       return c.json(result);
     } catch (error: unknown) {
+      if (error instanceof ModelNotFoundError) {
+        return c.json({ error: error.message }, 404);
+      }
       const err = error as Error;
+      if (err.message?.includes("timed out") || err.message?.includes("超时")) {
+        const timeoutSeconds = Math.ceil(TIMEOUTS.MODEL_PREDICTION / 1000);
+        return c.json({ error: `预测超时（${timeoutSeconds}秒）` }, 504);
+      }
       const message = err.message || `${modelType.toUpperCase()} 预测失败`;
       return handleUnexpectedError(c, error, message);
     } finally {

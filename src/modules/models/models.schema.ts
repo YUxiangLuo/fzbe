@@ -48,5 +48,9 @@ export const predictSchema = z.object({
 export const ALL_MODELS = ["ma", "es", "arima", "lstm", "stacking", "weighted_avg", "boosting"] as const;
 export type ModelType = (typeof ALL_MODELS)[number];
 
+export function isModelType(value: string): value is ModelType {
+  return (ALL_MODELS as readonly string[]).includes(value);
+}
+
 export type TrainInput = z.infer<typeof trainSchema>;
 export type PredictInput = z.infer<typeof predictSchema>;

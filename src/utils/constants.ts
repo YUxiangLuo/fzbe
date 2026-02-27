@@ -43,6 +43,10 @@ export const CONTENT_LIMITS = {
 export const TIMEOUTS = {
   /** Python 模型训练超时 */
   MODEL_TRAINING: 300000,
+  /** Python 模型预测超时 */
+  MODEL_PREDICTION: 60000,
+  /** ADF 平稳性检测超时 */
+  ADF: 30000,
   /** PDF 生成超时 */
   PDF_GENERATION: 30000,
 } as const;

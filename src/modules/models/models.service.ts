@@ -6,6 +6,7 @@ import { pool } from "../../config";
 import logger from "../../logger";
 import type { ModelType, TrainInput } from "./models.schema";
 import { TIMEOUTS, CONCURRENCY_LIMITS } from "../../utils/constants";
+import { PY_DIR, resolvePythonExecutable } from "../../utils/python";
 
 const TRAINING_TIMEOUT = TIMEOUTS.MODEL_TRAINING;
 const MAX_CONCURRENT_MODEL_JOBS = CONCURRENCY_LIMITS.MAX_CONCURRENT_MODEL_JOBS;
@@ -39,7 +40,18 @@ interface SegmentRow extends RowDataPacket {
   file_path: string;
 }
 
+export class ModelValidationError extends Error {
+  constructor(message: string, public details?: Record<string, unknown>) {
+    super(message);
+  }
+}
+
+export class ModelNotFoundError extends Error {}
+
+
+/** TS 参数名 → Python CLI 参数名 的映射 */
 const allPossiblePythonParams: Record<string, string> = {
+  // 通用参数（由 service 层手动设置）
   data: "data",
   trainStart: "train-start",
   trainEnd: "train-end",
@@ -49,39 +61,17 @@ const allPossiblePythonParams: Record<string, string> = {
   loadModel: "load-model",
   forecastSteps: "forecast-steps",
   pretty: "pretty",
+  // 模型参数（从前端 body 透传）
   moving_average_window: "window",
   exponential_smoothing_alpha: "alpha",
   arimaD: "d",
-  arimaMaxP: "max-p",
-  arimaMaxQ: "max-q",
-  lstmLookBack: "look-back",
-  lstmEpochs: "epochs",
   lstmFeatures: "lstm-features",
   lstmTargetFeature: "lstm-target-feature",
-  lstmFeatureTypes: "feature-types",
   lstmNormalization: "normalization",
   models: "models",
 };
 
 const SETSID_PATH = process.platform === "win32" ? undefined : Bun.which("setsid");
-
-function resolvePythonExecutable(pyDir: string): string {
-  const candidates = process.platform === "win32"
-    ? [
-      path.join(pyDir, "venv", "Scripts", "python.exe"),
-      path.join(pyDir, ".venv", "Scripts", "python.exe"),
-    ]
-    : [
-      path.join(pyDir, "venv", "bin", "python"),
-      path.join(pyDir, ".venv", "bin", "python"),
-    ];
-
-  const executable = candidates.find((candidate) => fs.existsSync(candidate));
-  if (!executable) {
-    throw new Error("Python virtual environment not found. Please initialize py/venv first.");
-  }
-  return executable;
-}
 
 export async function loadDatasetFromDb(
   industry: string,
@@ -89,12 +79,12 @@ export async function loadDatasetFromDb(
   product: string,
 ): Promise<Record<string, unknown>[]> {
   const [segmentRows] = await pool.query<SegmentRow[]>(
-    "SELECT file_path FROM dataset_segments WHERE industry_name = ? AND company_name = ? AND product_name = ?",
+    "SELECT file_path FROM dataset_segments WHERE industry_name = ? AND company_name = ? AND product_name = ? LIMIT 1",
     [industry, company, product],
   );
 
   if (segmentRows.length === 0) {
-    throw new Error("未找到数据集分段文件");
+    throw new ModelValidationError("未找到数据集分段文件");
   }
 
   const allData: Record<string, unknown>[] = [];
@@ -114,10 +104,9 @@ export async function runPythonModel(
   params: Record<string, unknown>,
   timeoutMs?: number,
 ): Promise<unknown> {
-  const pyDir = path.resolve(import.meta.dir, "../../../py");
-  const pythonExec = resolvePythonExecutable(pyDir);
+  const pythonExec = resolvePythonExecutable();
 
-  const scriptPath = path.join(pyDir, "run_model.py");
+  const scriptPath = path.join(PY_DIR, "run_model.py");
   if (!fs.existsSync(scriptPath)) {
     throw new Error(`未找到 Python 入口脚本: ${scriptPath}`);
   }
@@ -135,7 +124,7 @@ export async function runPythonModel(
     : [pythonExec, scriptPath, ...fullArgs];
 
   const proc = Bun.spawn(command, {
-    cwd: pyDir,
+    cwd: PY_DIR,
     stdout: "pipe",
     stderr: "pipe",
     env: {
@@ -252,10 +241,10 @@ export async function trainModel(modelType: ModelType, studentId: number, body: 
   const allData = await loadDatasetFromDb(body.selected_industry, body.selected_company, body.selected_product);
 
   if (body.data_window_train_end_index >= allData.length || body.data_window_evaluate_end_index >= allData.length) {
-    return { error: "数据窗口索引超出范围", dataset_size: allData.length };
+    throw new ModelValidationError("数据窗口索引超出范围", { dataset_size: allData.length });
   }
 
-  const modelSaveLoc = path.resolve(import.meta.dir, `../../../py/trained_models/${studentId}_${modelType}.pkl`);
+  const modelSaveLoc = path.join(PY_DIR, `trained_models/${studentId}_${modelType}.pkl`);
 
   const pythonParams: Record<string, unknown> = {
     data: JSON.stringify(allData),
@@ -267,10 +256,10 @@ export async function trainModel(modelType: ModelType, studentId: number, body: 
     pretty: true,
   };
 
-  for (const [bodyKey, scriptKey] of Object.entries(allPossiblePythonParams)) {
+  for (const bodyKey of Object.keys(allPossiblePythonParams)) {
     const value = body[bodyKey as keyof TrainInput];
     if (value !== undefined) {
-      pythonParams[scriptKey] = value;
+      pythonParams[bodyKey] = value;
     }
   }
 
@@ -302,10 +291,10 @@ export async function trainModel(modelType: ModelType, studentId: number, body: 
 }
 
 export async function predictModel(modelType: ModelType, studentId: number, forecastSteps: number) {
-  const modelLoadPath = path.resolve(import.meta.dir, `../../../py/trained_models/${studentId}_${modelType}.pkl`);
+  const modelLoadPath = path.join(PY_DIR, `trained_models/${studentId}_${modelType}.pkl`);
 
   if (!fs.existsSync(modelLoadPath)) {
-    return { error: `未找到该用户的已训练 ${modelType.toUpperCase()} 模型` };
+    throw new ModelNotFoundError(`未找到该用户的已训练 ${modelType.toUpperCase()} 模型`);
   }
 
   const pythonParams = {
@@ -314,7 +303,7 @@ export async function predictModel(modelType: ModelType, studentId: number, fore
     pretty: true,
   };
 
-  const result = (await runPythonModel(modelType, pythonParams)) as Record<string, unknown>;
+  const result = (await runPythonModel(modelType, pythonParams, TIMEOUTS.MODEL_PREDICTION)) as Record<string, unknown>;
 
   return {
     status: "success",
