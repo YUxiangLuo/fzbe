@@ -5,7 +5,6 @@ import {
   classStudentParamSchema,
   createStudentSchema,
   addAssistantSchema,
-  joinClassSchema,
   enrollStudentSchema,
 } from "../../../src/modules/class-members/class-members.schema";
 
@@ -75,14 +74,8 @@ describe("Class Members Schemas", () => {
       expect(addAssistantSchema.safeParse({ assistant_id: 1 }).success).toBe(true);
     });
 
-    test("joinClassSchema should accept optional class_code", () => {
-      expect(joinClassSchema.safeParse({ class_code: "C-001" }).success).toBe(true);
-      expect(joinClassSchema.safeParse({}).success).toBe(true);
-    });
-
     test("enrollStudentSchema should reject non-positive student_id", () => {
       expect(enrollStudentSchema.safeParse({ student_id: 0 }).success).toBe(false);
     });
   });
 });
-

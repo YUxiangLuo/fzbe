@@ -30,7 +30,8 @@ classesController.post("/api/v1/classes", jwtAuth, requireTeacher, async (c) => 
     const body = await c.req.parseBody();
     const className = body["class_name"];
     const classCode = body["class_code"];
-    const studentListFile = body["student_list"];
+    // Backward-compatible field support: FE currently uses `students_file`.
+    const studentListFile = body["student_list"] ?? body["students_file"];
 
     if (!className || typeof className !== "string") {
       return c.json({ error: "班级名称不能为空" }, 400);

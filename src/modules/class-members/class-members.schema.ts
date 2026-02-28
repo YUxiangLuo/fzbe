@@ -31,10 +31,6 @@ export const addAssistantSchema = z.object({
   assistant_id: z.number().int().min(1),
 });
 
-export const joinClassSchema = z.object({
-  class_code: z.string().optional(),
-});
-
 export const enrollStudentSchema = z.object({
   student_id: z.number().int().positive("学生 ID 必须是正整数"),
 });
@@ -44,5 +40,4 @@ export type ClassAssistantParam = z.infer<typeof classAssistantParamSchema>;
 export type ClassStudentParam = z.infer<typeof classStudentParamSchema>;
 export type CreateStudentInput = z.infer<typeof createStudentSchema>;
 export type AddAssistantInput = z.infer<typeof addAssistantSchema>;
-export type JoinClassInput = z.infer<typeof joinClassSchema>;
 export type EnrollStudentInput = z.infer<typeof enrollStudentSchema>;

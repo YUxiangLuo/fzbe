@@ -158,7 +158,14 @@ export async function enrollExistingStudent(classId: number, studentId: number, 
   } catch (error: unknown) {
     await connection.rollback();
     const err = error as { code?: string };
-    if (err.code === "ER_DUP_ENTRY") return { error: "dup_entry" as const };
+    if (err.code === "ER_DUP_ENTRY") {
+      const [[currentEnrollment]] = await pool.query<EnrollmentRow[]>(
+        "SELECT e.class_id, c.class_name FROM enrollments e JOIN classes c ON e.class_id = c.class_id WHERE e.student_id = ? LIMIT 1",
+        [studentId],
+      );
+      if (currentEnrollment) return { error: "already_enrolled" as const, currentClass: currentEnrollment };
+      return { error: "dup_entry" as const };
+    }
     throw error;
   } finally {
     connection.release();
@@ -193,72 +200,6 @@ export async function removeStudentFromClass(classId: number, studentId: number,
   if (result.affectedRows === 0) return { error: "enrollment_not_found" as const };
 
   return { success: true };
-}
-
-export async function studentJoinClass(classId: number, studentId: number, classCode?: string) {
-  const connection = await pool.getConnection();
-  try {
-    await connection.beginTransaction();
-
-    await connection.query("SELECT user_id FROM users WHERE user_id = ? LIMIT 1 FOR UPDATE", [studentId]);
-
-    const [existingEnrollments] = await connection.query<EnrollmentRow[]>(
-      "SELECT e.class_id, c.class_name FROM enrollments e JOIN classes c ON e.class_id = c.class_id WHERE e.student_id = ? LIMIT 1",
-      [studentId],
-    );
-    if (existingEnrollments.length > 0) {
-      await connection.rollback();
-      return { error: "already_enrolled" as const, currentClass: existingEnrollments[0]! };
-    }
-
-    const [classRows] = await connection.query<ClassRow[]>(
-      "SELECT class_id, class_name, class_code, teacher_id FROM classes WHERE class_id = ? LIMIT 1 FOR UPDATE",
-      [classId],
-    );
-    if (classRows.length === 0) {
-      await connection.rollback();
-      return { error: "class_not_found" as const };
-    }
-
-    const classInfo = classRows[0]!;
-    if (classInfo.class_code) {
-      if (!classCode) {
-        await connection.rollback();
-        return { error: "code_required" as const };
-      }
-      if (classCode !== classInfo.class_code) {
-        await connection.rollback();
-        return { error: "invalid_code" as const };
-      }
-    }
-
-    await connection.query("INSERT INTO enrollments (student_id, class_id) VALUES (?, ?)", [studentId, classId]);
-    await connection.commit();
-
-    return { data: { class_id: classInfo.class_id, class_name: classInfo.class_name, teacher_id: classInfo.teacher_id } };
-  } catch (error) {
-    await connection.rollback();
-    throw error;
-  } finally {
-    connection.release();
-  }
-}
-
-export async function getJoinableClasses(studentId: number) {
-  const [[existingEnrollment]] = await pool.query<EnrollmentRow[]>(
-    "SELECT e.class_id FROM enrollments e WHERE e.student_id = ? LIMIT 1",
-    [studentId],
-  );
-  if (existingEnrollment) {
-    return { error: "already_enrolled" as const, currentClassId: existingEnrollment.class_id };
-  }
-
-  const [rows] = await pool.query<RowDataPacket[]>(
-    `SELECT c.class_id, c.class_name, c.class_code IS NOT NULL AS requires_class_code, c.created_at,
-            teacher.user_id AS teacher_id, teacher.full_name AS teacher_name, teacher.email AS teacher_email
-     FROM classes c LEFT JOIN users teacher ON teacher.user_id = c.teacher_id ORDER BY c.class_id ASC`,
-  );
-  return { data: rows };
 }
 
 export async function addAssistantToClass(classId: number, assistantId: number, userId: number, userRole: string) {

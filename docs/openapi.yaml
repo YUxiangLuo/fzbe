@@ -383,12 +383,6 @@ components:
           type: integer
           minimum: 1
 
-    JoinClassRequest:
-      type: object
-      properties:
-        class_code:
-          type: string
-
     DatasetUpdateRequest:
       type: object
       properties:
@@ -1819,74 +1813,6 @@ paths:
                 $ref: '#/components/schemas/ErrorResponse'
         '404':
           description: 记录不存在
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/ErrorResponse'
-
-  /api/v1/classes/{classId}/join:
-    post:
-      tags: [Class Members]
-      summary: 学生加入班级
-      operationId: joinClass
-      security:
-        - bearerAuth: []
-      parameters:
-        - $ref: '#/components/parameters/classId'
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema:
-              $ref: '#/components/schemas/JoinClassRequest'
-      responses:
-        '201':
-          description: 加入成功
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/DataEnvelope'
-        '400':
-          description: 缺少班级码
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/ErrorResponse'
-        '403':
-          description: 班级码无效
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/ErrorResponse'
-        '404':
-          description: 班级不存在
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/ErrorResponse'
-        '409':
-          description: 已在其他班级
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/ErrorResponse'
-
-  /api/v1/classes/joinable:
-    get:
-      tags: [Class Members]
-      summary: 获取可加入班级列表
-      operationId: getJoinableClasses
-      security:
-        - bearerAuth: []
-      responses:
-        '200':
-          description: 成功
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/DataEnvelopeArray'
-        '409':
-          description: 当前已加入班级
           content:
             application/json:
               schema:

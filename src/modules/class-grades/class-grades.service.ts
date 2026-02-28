@@ -242,12 +242,23 @@ export async function updateGradingPolicy(classId: number, input: UpdateGradeWei
   const [existing] = await pool.query<RowDataPacket[]>("SELECT weight_id FROM grade_weights WHERE class_id = ?", [classId]);
   if (existing.length === 0) return { error: "not_found" as const };
 
+  const editableWeightFields = [
+    "exp_flow_weight",
+    ...EXP_FLOW_FIELDS,
+    "model_quality_weight",
+    "knowledge_test_weight",
+    "report_quality_weight",
+  ] as const;
+
   const fields: string[] = [];
   const values: unknown[] = [];
-  if (input.exp_flow_weight !== undefined) { fields.push("exp_flow_weight = ?"); values.push(input.exp_flow_weight); }
-  if (input.model_quality_weight !== undefined) { fields.push("model_quality_weight = ?"); values.push(input.model_quality_weight); }
-  if (input.knowledge_test_weight !== undefined) { fields.push("knowledge_test_weight = ?"); values.push(input.knowledge_test_weight); }
-  if (input.report_quality_weight !== undefined) { fields.push("report_quality_weight = ?"); values.push(input.report_quality_weight); }
+  for (const field of editableWeightFields) {
+    const value = input[field];
+    if (value !== undefined) {
+      fields.push(`${field} = ?`);
+      values.push(value);
+    }
+  }
 
   values.push(classId);
   await pool.query(`UPDATE grade_weights SET ${fields.join(", ")} WHERE class_id = ?`, values);

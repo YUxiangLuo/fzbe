@@ -1,13 +1,13 @@
 import { Hono } from "hono";
 import { zValidator } from "@hono/zod-validator";
-import { jwtAuth, requireStudent } from "../../middleware";
+import { jwtAuth } from "../../middleware";
 import {
   classIdParamSchema, classAssistantParamSchema, classStudentParamSchema,
-  createStudentSchema, addAssistantSchema, joinClassSchema, enrollStudentSchema,
+  createStudentSchema, addAssistantSchema, enrollStudentSchema,
 } from "./class-members.schema";
 import {
   createStudentInClass, enrollExistingStudent, getClassStudents, removeStudentFromClass,
-  studentJoinClass, getJoinableClasses, addAssistantToClass, getClassAssistants, removeAssistantFromClass,
+  addAssistantToClass, getClassAssistants, removeAssistantFromClass,
 } from "./class-members.service";
 import { handleUnexpectedError } from "../../utils/error-handler";
 import type { JwtPayload } from "../../types";
@@ -117,48 +117,6 @@ classMembersController.delete(
     }
   },
 );
-
-classMembersController.post(
-  "/api/v1/classes/:classId/join",
-  jwtAuth,
-  requireStudent,
-  zValidator("param", classIdParamSchema),
-  zValidator("json", joinClassSchema),
-  async (c) => {
-    try {
-      const payload = c.get("jwtPayload") as JwtPayload;
-      const { classId } = c.req.valid("param");
-      const { class_code } = c.req.valid("json");
-      const result = await studentJoinClass(parseInt(classId, 10), payload.sub, class_code);
-
-      if ("error" in result) {
-        if (result.error === "already_enrolled") {
-          return c.json({ error: "已加入班级", message: "您已加入其他班级。请先退出当前班级再加入新班级。", current_class: result.currentClass }, 409);
-        }
-        if (result.error === "class_not_found") return c.json({ error: "班级不存在" }, 404);
-        if (result.error === "code_required") return c.json({ error: "该班级需要班级代码" }, 400);
-        if (result.error === "invalid_code") return c.json({ error: "班级代码无效" }, 403);
-      }
-      return c.json({ message: "成功加入班级", class: result.data }, 201);
-    } catch (error) {
-      return handleUnexpectedError(c, error, "加入班级失败");
-    }
-  },
-);
-
-classMembersController.get("/api/v1/classes/joinable", jwtAuth, requireStudent, async (c) => {
-  try {
-    const payload = c.get("jwtPayload") as JwtPayload;
-    const result = await getJoinableClasses(payload.sub);
-
-    if ("error" in result) {
-      return c.json({ error: "已加入班级", message: "您已加入班级。请先退出再加入新班级。", current_class_id: result.currentClassId }, 409);
-    }
-    return c.json(result.data);
-  } catch (error) {
-    return handleUnexpectedError(c, error, "加载可加入班级列表失败");
-  }
-});
 
 classMembersController.post(
   "/api/v1/classes/:classId/assistants",

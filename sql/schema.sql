@@ -42,6 +42,7 @@ CREATE TABLE IF NOT EXISTS `enrollments` (
   `class_id` INT NOT NULL,
   FOREIGN KEY (`student_id`) REFERENCES `users`(`user_id`) ON DELETE CASCADE,
   FOREIGN KEY (`class_id`) REFERENCES `classes`(`class_id`) ON DELETE CASCADE,
+  UNIQUE KEY `student_single_class_unique` (`student_id`),
   UNIQUE KEY `student_class_unique` (`student_id`, `class_id`),
   INDEX `idx_class_student` (`class_id`, `student_id`)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
