@@ -620,8 +620,45 @@ components:
 
     UpdateGradeWeightsRequest:
       type: object
+      minProperties: 1
       properties:
         exp_flow_weight:
+          type: number
+          minimum: 0
+          maximum: 100
+        exp_flow_demand_data_preparation:
+          type: number
+          minimum: 0
+          maximum: 100
+        exp_flow_demand_descriptive_stats:
+          type: number
+          minimum: 0
+          maximum: 100
+        exp_flow_demand_model_selection:
+          type: number
+          minimum: 0
+          maximum: 100
+        exp_flow_demand_generate_results:
+          type: number
+          minimum: 0
+          maximum: 100
+        exp_flow_production_inventory_calc:
+          type: number
+          minimum: 0
+          maximum: 100
+        exp_flow_production_service_level:
+          type: number
+          minimum: 0
+          maximum: 100
+        exp_flow_production_variable_calc:
+          type: number
+          minimum: 0
+          maximum: 100
+        exp_flow_production_plan_creation:
+          type: number
+          minimum: 0
+          maximum: 100
+        exp_flow_report_submission:
           type: number
           minimum: 0
           maximum: 100
@@ -1440,6 +1477,11 @@ paths:
                 student_list:
                   type: string
                   format: binary
+                  description: 学生名单 CSV（推荐字段）
+                students_file:
+                  type: string
+                  format: binary
+                  description: 兼容旧前端的别名字段，等价于 `student_list`
       responses:
         '201':
           description: 创建成功
@@ -1776,7 +1818,7 @@ paths:
               schema:
                 $ref: '#/components/schemas/ErrorResponse'
         '409':
-          description: 学生已加入班级
+          description: 学生已加入班级（可能返回 current_class 指明当前班级）
           content:
             application/json:
               schema:
@@ -2516,6 +2558,64 @@ paths:
                 $ref: '#/components/schemas/ErrorResponse'
         '404':
           description: 班级或权重不存在
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /api/v1/teachers/{teacherId}/grade-summaries:
+    get:
+      tags: [Grades]
+      summary: 获取教师班级成绩汇总
+      operationId: getTeacherClassGradeSummaries
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/teacherId'
+      responses:
+        '200':
+          description: 成功
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DataEnvelopeArray'
+        '403':
+          description: 权限不足
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '404':
+          description: 目标用户不是教师
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /api/v1/assistants/{assistantId}/grade-summaries:
+    get:
+      tags: [Grades]
+      summary: 获取助教班级成绩汇总
+      operationId: getAssistantClassGradeSummaries
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/assistantId'
+      responses:
+        '200':
+          description: 成功
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DataEnvelopeArray'
+        '403':
+          description: 权限不足
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '404':
+          description: 目标用户不是助教
           content:
             application/json:
               schema:
