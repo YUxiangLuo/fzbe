@@ -26,7 +26,13 @@ from typing import Any, Dict, List, Optional, Tuple
 import numpy as np
 
 # Import shared utilities
-from data_utils import ParsedData, load_data_from_json
+from data_utils import (
+    ParsedData,
+    build_numeric_subprocess_records,
+    build_subprocess_records,
+    infer_feature_types,
+    load_data_from_json,
+)
 from metrics import mae, mape, r2, rmse
 from serialization import dump_model, load_model
 from subprocess_utils import run_base_model_subprocess, run_base_model_predict_subprocess, extract_predictions_from_result
@@ -229,14 +235,13 @@ def train_and_evaluate(
     print(f"  Learning Rate: {learning_rate}", file=sys.stderr)
     print(f"  Max Rounds: {max_rounds}", file=sys.stderr)
 
-    # Convert parsed_data to list of dicts for subprocess
-    data_dicts = []
-    for i in range(parsed_data.n_obs):
-        row = {parsed_data.target_key: float(parsed_data.y[i])}
-        if parsed_data.feature_keys:
-            for feat_key in parsed_data.feature_keys:
-                row[feat_key] = float(parsed_data.df.iloc[i][feat_key])
-        data_dicts.append(row)
+    # Non-LSTM base models keep numeric-only rows; LSTM can use categorical features.
+    numeric_data_dicts, _ = build_numeric_subprocess_records(parsed_data)
+    lstm_data_dicts = numeric_data_dicts
+    if "lstm" in models_to_use:
+        lstm_feature_types = model_params.get("lstm", {}).get("feature_types", {})
+        lstm_feature_keys = [k for k in lstm_feature_types.keys() if k != parsed_data.target_key]
+        lstm_data_dicts, _ = build_subprocess_records(parsed_data, feature_keys=lstm_feature_keys)
 
     y_true_val = parsed_data.y[boost_val_range]
     current_residual_val = y_true_val.copy()  # Initial residual = y
@@ -259,30 +264,10 @@ def train_and_evaluate(
     for round_num in range(max_rounds):
         print(f"\n--- Round {round_num + 1}/{max_rounds} ---", file=sys.stderr)
 
-        # Prepare training data for this round
+        # Prepare training target description for this round.
         if round_num == 0:
-            # First round: predict original y
-            train_data = data_dicts
             train_target_description = "original y"
         else:
-            # Subsequent rounds: predict residual
-            # Calculate residual on boost_train using current ensemble
-            current_residual_train = parsed_data.y[boost_train_range].copy()
-            for i, model_name in enumerate(model_chain):
-                # Get prediction from this model in the chain (on boost_train)
-                # We need to recalculate because we're using a new training target
-                # For simplicity, we'll use the stored predictions
-                pass
-
-            # For residual learning, we need to calculate what the current ensemble
-            # predicts on boost_train, then train next model on the residual
-            # Since we don't have boost_train predictions stored, we'll calculate residual
-            # based on the assumption that boost_train residual ≈ boost_val residual pattern
-
-            # Simplified approach: use current_residual_val as target
-            train_data = _create_residual_data(
-                data_dicts, current_residual_val, boost_val_range, parsed_data.target_key
-            )
             train_target_description = f"residual (round {round_num})"
 
         print(f"  Target: {train_target_description}", file=sys.stderr)
@@ -303,7 +288,7 @@ def train_and_evaluate(
                 # First round: train on original data
                 result = run_base_model_subprocess(
                     model_type=model_name,
-                    data=train_data,
+                    data=lstm_data_dicts if model_name == "lstm" else numeric_data_dicts,
                     train_start=boost_train_range.start,
                     train_end=boost_train_range.stop - 1,
                     eval_start=boost_val_range.start,
@@ -316,7 +301,10 @@ def train_and_evaluate(
                 # Create dataset where boost_train predicts current residual
                 residual_train = current_residual_val  # Approximate
                 residual_data = _create_residual_data(
-                    data_dicts, residual_train, boost_val_range, parsed_data.target_key
+                    lstm_data_dicts if model_name == "lstm" else numeric_data_dicts,
+                    residual_train,
+                    boost_val_range,
+                    parsed_data.target_key,
                 )
 
                 result = run_base_model_subprocess(
@@ -429,7 +417,7 @@ def train_and_evaluate(
             print(f"  Round {round_idx + 1}: Training {model_name} to predict y", file=sys.stderr)
             result = run_base_model_subprocess(
                 model_type=model_name,
-                data=data_dicts,
+                data=lstm_data_dicts if model_name == "lstm" else numeric_data_dicts,
                 train_start=train_range.start,
                 train_end=train_range.stop - 1,
                 eval_start=eval_range.start,
@@ -447,7 +435,10 @@ def train_and_evaluate(
 
             # Create residual dataset for training
             residual_data_train = _create_residual_data(
-                data_dicts, current_residual_eval, eval_range, parsed_data.target_key
+                lstm_data_dicts if model_name == "lstm" else numeric_data_dicts,
+                current_residual_eval,
+                eval_range,
+                parsed_data.target_key,
             )
 
             # Train on train_range to predict residual, evaluate on eval_range
@@ -578,25 +569,39 @@ def run(args) -> None:
 
     if "lstm" in models_to_use:
         feature_types_str = get_arg("feature_types", None)
+        lstm_features_str = get_arg("lstm_features", None)
+        target_feature = get_arg("lstm_target_feature", parsed_data.target_key)
+        lstm_feature_names = (
+            [f.strip() for f in lstm_features_str.split(",") if f.strip()]
+            if lstm_features_str
+            else parsed_data.feature_keys
+        )
+
         if feature_types_str:
             feature_types = json.loads(feature_types_str)
         else:
-            lstm_features_str = get_arg("lstm_features", None)
-            target_feature = get_arg("lstm_target_feature", "y")
+            feature_types = infer_feature_types(
+                parsed_data=parsed_data,
+                target_key=target_feature,
+                feature_keys=lstm_feature_names,
+            )
 
-            if lstm_features_str:
-                feature_names = [f.strip() for f in lstm_features_str.split(',')]
-                feature_types = {feat: "numeric" for feat in feature_names}
-                feature_types[target_feature] = "numeric"
-            else:
-                feature_types = {}
+        if lstm_feature_names:
+            allowed_keys = set(lstm_feature_names + [target_feature])
+            feature_types = {k: v for k, v in feature_types.items() if k in allowed_keys}
+        feature_types[target_feature] = "numeric"
 
-        model_params["lstm"] = {
+        lstm_params = {
             "look_back": get_arg("look_back", auto_look_back, int),
             "epochs": get_arg("epochs", auto_epochs, int),
             "feature_types": feature_types,
-            "normalization": get_arg("normalization", "minmax")
+            "normalization": get_arg("normalization", "minmax"),
+            "lstm_target_feature": target_feature,
         }
+        if lstm_features_str:
+            lstm_params["lstm_features"] = lstm_features_str
+
+        model_params["lstm"] = lstm_params
 
     _validate_training_args(parsed_data, ts, te, es, ee, models_to_use, model_params)
 

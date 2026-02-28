@@ -16,7 +16,13 @@ import numpy as np
 from sklearn.linear_model import LinearRegression
 
 # Import shared utilities
-from data_utils import ParsedData, load_data_from_json
+from data_utils import (
+    ParsedData,
+    build_numeric_subprocess_records,
+    build_subprocess_records,
+    infer_feature_types,
+    load_data_from_json,
+)
 from metrics import mae, mape, r2, rmse
 from serialization import dump_model, load_model
 from subprocess_utils import run_base_model_subprocess, run_base_model_predict_subprocess, extract_predictions_from_result
@@ -202,15 +208,13 @@ def train_and_evaluate(
     print(f"  Level-1 训练集 (元模型): {level1_train_range} ({len(level1_train_range)} points)", file=sys.stderr)
     print(f"  评估集: {eval_range} ({len(eval_range)} points)", file=sys.stderr)
 
-    # Convert parsed_data to list of dicts for subprocess
-    data_dicts = []
-    for i in range(parsed_data.n_obs):
-        row = {parsed_data.target_key: float(parsed_data.y[i])}
-        # Add feature columns if they exist
-        if parsed_data.feature_keys:
-            for feat_key in parsed_data.feature_keys:
-                row[feat_key] = float(parsed_data.df.iloc[i][feat_key])
-        data_dicts.append(row)
+    # Non-LSTM base models keep numeric-only rows; LSTM can use categorical features.
+    numeric_data_dicts, _ = build_numeric_subprocess_records(parsed_data)
+    lstm_data_dicts = numeric_data_dicts
+    if "lstm" in models_to_use:
+        lstm_feature_types = model_params.get("lstm", {}).get("feature_types", {})
+        lstm_feature_keys = [k for k in lstm_feature_types.keys() if k != parsed_data.target_key]
+        lstm_data_dicts, _ = build_subprocess_records(parsed_data, feature_keys=lstm_feature_keys)
 
     # === Step 2: Phase 1 - Train base models on level0, predict on level1 ===
     print(f"\n[Stacking Phase 1] 训练基础模型（level0）并生成level1预测", file=sys.stderr)
@@ -232,7 +236,7 @@ def train_and_evaluate(
         print(f"  训练 {model_name} 在 level0，预测 level1...", file=sys.stderr)
         result = run_base_model_subprocess(
             model_type=model_name,
-            data=data_dicts,
+            data=lstm_data_dicts if model_name == "lstm" else numeric_data_dicts,
             train_start=level0_train_range.start,
             train_end=level0_train_range.stop - 1,
             eval_start=level1_train_range.start,  # ✅ 在level1上预测（out-of-fold）
@@ -279,7 +283,7 @@ def train_and_evaluate(
         # Run base model in subprocess on FULL train_range
         result = run_base_model_subprocess(
             model_type=model_name,
-            data=data_dicts,
+            data=lstm_data_dicts if model_name == "lstm" else numeric_data_dicts,
             train_start=train_range.start,  # ✅ 完整训练集
             train_end=train_range.stop - 1,
             eval_start=eval_range.start,  # ✅ 独立评估集
@@ -401,30 +405,40 @@ def run(args) -> None:
         model_params["ma"] = {"window": get_arg("window", auto_window, int)}
 
     if "lstm" in models_to_use:
-        # Try to get feature_types from the argument
         feature_types_str = get_arg("feature_types", None)
+        lstm_features_str = get_arg("lstm_features", None)
+        target_feature = get_arg("lstm_target_feature", parsed_data.target_key)
+        lstm_feature_names = (
+            [f.strip() for f in lstm_features_str.split(",") if f.strip()]
+            if lstm_features_str
+            else parsed_data.feature_keys
+        )
+
         if feature_types_str:
             feature_types = json.loads(feature_types_str)
         else:
-            # If feature_types not provided, try to infer from lstm-features
-            lstm_features_str = get_arg("lstm_features", None)
-            target_feature = get_arg("lstm_target_feature", "y")
+            feature_types = infer_feature_types(
+                parsed_data=parsed_data,
+                target_key=target_feature,
+                feature_keys=lstm_feature_names,
+            )
 
-            if lstm_features_str:
-                # Build feature_types from feature list
-                feature_names = [f.strip() for f in lstm_features_str.split(',')]
-                feature_types = {feat: "numeric" for feat in feature_names}
-                feature_types[target_feature] = "numeric"
-            else:
-                # Use auto-detection
-                feature_types = {}
+        if lstm_feature_names:
+            allowed_keys = set(lstm_feature_names + [target_feature])
+            feature_types = {k: v for k, v in feature_types.items() if k in allowed_keys}
+        feature_types[target_feature] = "numeric"
 
-        model_params["lstm"] = {
+        lstm_params = {
             "look_back": get_arg("look_back", auto_look_back, int),
             "epochs": get_arg("epochs", auto_epochs, int),
             "feature_types": feature_types,
-            "normalization": get_arg("normalization", "minmax")
+            "normalization": get_arg("normalization", "minmax"),
+            "lstm_target_feature": target_feature,
         }
+        if lstm_features_str:
+            lstm_params["lstm_features"] = lstm_features_str
+
+        model_params["lstm"] = lstm_params
 
     # Validate all parameters
     _validate_training_args(parsed_data, ts, te, es, ee, models_to_use, model_params)

@@ -7,7 +7,7 @@ Centralized data parsing and preparation utilities for all time series models.
 from __future__ import annotations
 
 import json
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
@@ -64,6 +64,150 @@ class ParsedData:
         if self.time_key:
             return self.df[self.time_key].astype(str).tolist()
         return None
+
+
+def build_numeric_subprocess_records(parsed_data: "ParsedData") -> Tuple[List[Dict[str, float]], List[str]]:
+    """
+    Build row dicts for subprocess-based models and keep only numeric features.
+
+    Some datasets include categorical metadata columns (e.g. 行业/公司/产品名称) that
+    cannot be converted to float directly. This helper keeps numeric columns and skips
+    categorical columns to avoid runtime float-conversion failures in ensemble models.
+    """
+    numeric_feature_keys: List[str] = []
+
+    for feat_key in parsed_data.feature_keys:
+        if feat_key not in parsed_data.df.columns:
+            continue
+
+        series = parsed_data.df[feat_key]
+        if pd.api.types.is_numeric_dtype(series):
+            numeric_feature_keys.append(feat_key)
+            continue
+
+        converted = pd.to_numeric(series, errors="coerce")
+        if converted.notna().all():
+            parsed_data.df[feat_key] = converted
+            numeric_feature_keys.append(feat_key)
+            continue
+
+        log.warning("Skipping non-numeric feature for subprocess model: %s", feat_key)
+
+    data_dicts: List[Dict[str, float]] = []
+    for i in range(parsed_data.n_obs):
+        row: Dict[str, float] = {parsed_data.target_key: float(parsed_data.y[i])}
+        for feat_key in numeric_feature_keys:
+            row[feat_key] = float(parsed_data.df.iloc[i][feat_key])
+        data_dicts.append(row)
+
+    return data_dicts, numeric_feature_keys
+
+
+def _to_json_scalar(value: Any) -> Any:
+    """Convert pandas/numpy scalar values into JSON-serializable Python scalars."""
+    if value is None:
+        return None
+
+    if isinstance(value, np.generic):
+        value = value.item()
+
+    if isinstance(value, (float, np.floating)) and np.isnan(value):
+        return None
+
+    # Keep native JSON scalar types unchanged.
+    if isinstance(value, (str, int, float, bool)):
+        return value
+
+    # Fallback for pandas NA / other scalar-like values.
+    try:
+        if pd.isna(value):
+            return None
+    except Exception:
+        pass
+
+    return str(value)
+
+
+def build_subprocess_records(
+    parsed_data: "ParsedData",
+    feature_keys: Optional[List[str]] = None,
+) -> Tuple[List[Dict[str, Any]], List[str]]:
+    """
+    Build subprocess row dicts while preserving categorical feature values.
+
+    This is primarily for models (e.g. LSTM) that can consume categorical
+    features via their own preprocessing pipeline.
+    """
+    source_keys = feature_keys if feature_keys is not None else parsed_data.feature_keys
+    selected_feature_keys: List[str] = []
+
+    for feat_key in source_keys:
+        if not feat_key or feat_key == parsed_data.target_key:
+            continue
+        if feat_key not in parsed_data.df.columns:
+            log.warning("Feature not found in dataframe, skipping: %s", feat_key)
+            continue
+        if feat_key in selected_feature_keys:
+            continue
+        selected_feature_keys.append(feat_key)
+
+    # Convert numeric-like string columns to numeric, keep true categorical columns.
+    for feat_key in selected_feature_keys:
+        series = parsed_data.df[feat_key]
+        if pd.api.types.is_numeric_dtype(series):
+            continue
+        converted = pd.to_numeric(series, errors="coerce")
+        if converted.notna().all():
+            parsed_data.df[feat_key] = converted
+
+    data_dicts: List[Dict[str, Any]] = []
+    for i in range(parsed_data.n_obs):
+        row: Dict[str, Any] = {parsed_data.target_key: float(parsed_data.y[i])}
+        for feat_key in selected_feature_keys:
+            row[feat_key] = _to_json_scalar(parsed_data.df.iloc[i][feat_key])
+        data_dicts.append(row)
+
+    return data_dicts, selected_feature_keys
+
+
+def infer_feature_types(
+    parsed_data: "ParsedData",
+    target_key: Optional[str] = None,
+    feature_keys: Optional[List[str]] = None,
+) -> Dict[str, str]:
+    """
+    Infer feature_types mapping for LSTM from dataframe dtypes.
+
+    Numeric-like string columns are treated as numeric after coercion.
+    """
+    resolved_target_key = target_key or parsed_data.target_key
+    source_keys = feature_keys if feature_keys is not None else parsed_data.feature_keys
+
+    inferred: Dict[str, str] = {resolved_target_key: "numeric"}
+    seen: set[str] = set()
+
+    for feat_key in source_keys:
+        if not feat_key or feat_key == resolved_target_key or feat_key in seen:
+            continue
+        seen.add(feat_key)
+
+        if feat_key not in parsed_data.df.columns:
+            log.warning("Feature not found in dataframe when inferring feature_types: %s", feat_key)
+            continue
+
+        series = parsed_data.df[feat_key]
+        if pd.api.types.is_numeric_dtype(series):
+            inferred[feat_key] = "numeric"
+            continue
+
+        converted = pd.to_numeric(series, errors="coerce")
+        if converted.notna().all():
+            parsed_data.df[feat_key] = converted
+            inferred[feat_key] = "numeric"
+        else:
+            inferred[feat_key] = "categorical"
+
+    return inferred
 
 
 def _parse_records(
