@@ -192,6 +192,47 @@ const FIXTURES: ExperimentFixture[] = [
     lastActivityAt: "2026-01-23 08:55:00",
     completionTime: null,
   },
+  // ========== Additional Pending Reviews for Assistant Testing ==========
+  // 20240055 与 Teacher Seed 共用，测试助教评阅后教师可见性
+  {
+    username: "20240055",
+    classId: 2,
+    experimentId: 902055,
+    status: "Completed",
+    highestCompletedStep: 7,
+    currentStep: 7,
+    totalActiveDurationSeconds: 4800,
+    selectedIndustry: "光伏能源",
+    selectedCompany: "阳光电源",
+    selectedProduct: "逆变器",
+    selectedBestModel: "arima",
+    startTime: "2026-01-24 08:00:00",
+    lastActivityAt: "2026-01-24 09:50:00",
+    completionTime: "2026-01-24 09:50:00",
+    grade: {
+      exp_flow_demand_data_preparation: 82,
+      exp_flow_demand_descriptive_stats: 81,
+      exp_flow_demand_model_selection: 83,
+      exp_flow_demand_generate_results: 82,
+      exp_flow_production_inventory_calc: 80,
+      exp_flow_production_service_level: 79,
+      exp_flow_production_variable_calc: 81,
+      exp_flow_production_plan_creation: 82,
+      exp_flow_report_submission: 83,
+      knowledge_test: 78,
+      model_quality: 82,
+      report_quality: 0,
+    },
+    report: {
+      status: "submitted",
+      submittedAt: "2026-01-24 09:55:00",
+      grade: null,
+      feedback: null,
+      gradedBy: null,
+      useReportPdf: true,
+      content: "<h1>E2E Assistant Test - Shared Student Review Test</h1>",
+    },
+  },
 ];
 
 function requireEnv(name: string): string {
