@@ -46,10 +46,27 @@ function extractAssistantStudents(): Array<{ id: string; status: string; classId
   ];
 }
 
+// 提取 Shiyan Fixtures 中的数据
+function extractShiyanData(): { 
+  student: { id: string; username: string };
+  dataset: { name: string; industry: string; company: string; products: string[] };
+} {
+  return {
+    student: { id: "20240002", username: "20240002" },
+    dataset: {
+      name: "E2E-Shiyan-全链路真实训练专用数据集",
+      industry: "E2E智能制造业",
+      company: "E2E样本企业A",
+      products: ["智能传感器A型", "智能传感器B型"],
+    },
+  };
+}
+
 // 生成前端 fixtures.ts 内容
 function generateFixturesContent(): string {
   const teacherStudents = extractTeacherStudents();
   const assistantStudents = extractAssistantStudents();
+  const shiyanData = extractShiyanData();
 
   return `/**
  * E2E Test Fixtures and Constants
@@ -108,6 +125,31 @@ ${teacherStudents.map(s => `    "${s.id}": { status: "${s.status}"${s.tags ? `, 
   assistantClass: {
 ${assistantStudents.map(s => `    "${s.id}": { status: "${s.status}"${s.tags ? `, tags: ${JSON.stringify(s.tags)}` : ""} },`).join("\n")}
   } as const,
+} as const;
+
+// ===== Shiyan Experiment Data =====
+
+export const SHIYAN = {
+  student: {
+    id: "${shiyanData.student.id}",
+    username: "${shiyanData.student.username}",
+  },
+  dataset: {
+    name: "${shiyanData.dataset.name}",
+    industry: "${shiyanData.dataset.industry}",
+    company: "${shiyanData.dataset.company}",
+    products: ${JSON.stringify(shiyanData.dataset.products)} as const,
+    primaryProduct: "${shiyanData.dataset.products[0]}",
+    secondaryProduct: "${shiyanData.dataset.products[1]}",
+  },
+  // Common report analyses for copy-paste
+  reportAnalyses: [
+    "训练集与评估集区间划分合理，训练集覆盖完整季节波动，评估集用于检验泛化表现。",
+    "基础模型与融合模型对比显示融合模型在误差指标上更均衡，稳定性更好。",
+    "综合 RMSE、MAE 与 R² 指标，最终选择融合模型以兼顾精度与鲁棒性。",
+    "安全库存与预测量计算遵循服务水平约束，能够在需求波动下保持供给连续性。",
+    "完整 MPS 结果表明服务水平可接受，缺货周期可控，后续可继续优化产能与库存权衡。",
+  ] as const,
 } as const;
 
 // ===== Legacy Test Data (for backward compatibility) =====
@@ -198,6 +240,7 @@ function main() {
       teacherClass: extractTeacherStudents(),
       assistantClass: extractAssistantStudents(),
     },
+    shiyan: extractShiyanData(),
   };
   
   fs.writeFileSync(jsonOutputPath, JSON.stringify(jsonContent, null, 2), "utf-8");
