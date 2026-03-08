@@ -46,9 +46,20 @@ export const adminChangePasswordSchema = z.object({
   newPassword: z.string().min(6, { message: "新密码长度至少为6位" }),
 });
 
-export const resetPasswordSchema = z.object({
-  newPassword: z.string().min(6, { message: "新密码长度至少为6位" }).optional(),
-});
+export const resetPasswordSchema = z
+  .object({
+    newPassword: z.string().min(6, { message: "新密码长度至少为6位" }).optional(),
+    /** @deprecated Use `newPassword` instead. Kept for backward compatibility with older clients. */
+    new_password: z.string().min(6, { message: "新密码长度至少为6位" }).optional(),
+  })
+  .refine(
+    ({ newPassword, new_password }) =>
+      !newPassword || !new_password || newPassword === new_password,
+    { message: "newPassword 与 new_password 不一致，请只传其中一个" },
+  )
+  .transform(({ newPassword, new_password }) => ({
+    newPassword: newPassword ?? new_password,
+  }));
 
 export const userSearchQuerySchema = z.object({
   q: z.string().trim().min(1, { message: "搜索关键词不能为空" }),
