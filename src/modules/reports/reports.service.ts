@@ -6,6 +6,10 @@ import puppeteer from "puppeteer-core";
 import { pool } from "../../config";
 import { sanitizeHTML, HTMLSanitizationError } from "../../utils/html-sanitizer";
 import { CONTENT_LIMITS, PATHS } from "../../utils/constants";
+import {
+  buildExperimentFlowGradeValues,
+  getReportSubmissionEligibilityError,
+} from "./report-submission-policy";
 
 const MODEL_TYPES = [
   "ma", "exp", "arima", "lstm",
@@ -26,7 +30,28 @@ interface ExperimentRow extends RowDataPacket {
   student_id: number;
   status: string;
   current_step: number;
+  highest_completed_step: number;
+  selected_industry: string | null;
+  selected_company: string | null;
+  selected_product: string | null;
   selected_best_model: string | null;
+  quiz_about_model_completed: boolean;
+  quiz_about_plan_completed: boolean;
+  production_plan_completed: boolean;
+  data_window_train_start_index: number | null;
+  data_window_train_end_index: number | null;
+  data_window_evaluate_start_index: number | null;
+  data_window_evaluate_end_index: number | null;
+  production_forecast_periods: number | null;
+  production_initial_inventory: number | null;
+  production_target_service_level: number | null;
+  production_safety_stock_z_score: number | null;
+  production_forecast_results: unknown;
+  production_mps_table: unknown;
+  production_capacity_mode: string | null;
+  production_capacity_scenario: string | null;
+  production_capacity: number | null;
+  production_custom_capacity: number | null;
   moving_average_completed: boolean;
   moving_average_metrics_rmse: number | null;
   moving_average_metrics_mae: number | null;
@@ -166,16 +191,16 @@ export async function submitReport(
     };
   }
 
-  const [[experiment]] = await pool.query<ExperimentRow[]>(
+  const [[precheckExperiment]] = await pool.query<ExperimentRow[]>(
     `SELECT * FROM experiment_status WHERE experiment_id = ? LIMIT 1`,
     [experimentId],
   );
 
-  if (!experiment) {
+  if (!precheckExperiment) {
     return { error: "实验不存在", status: 404 };
   }
 
-  if (experiment.student_id !== studentId) {
+  if (precheckExperiment.student_id !== studentId) {
     return { error: "权限不足：该实验不属于当前用户", status: 403 };
   }
 
@@ -208,6 +233,27 @@ export async function submitReport(
   try {
     await connection.beginTransaction();
 
+    const [[experiment]] = await connection.query<ExperimentRow[]>(
+      `SELECT * FROM experiment_status WHERE experiment_id = ? LIMIT 1 FOR UPDATE`,
+      [experimentId],
+    );
+
+    if (!experiment) {
+      await connection.rollback();
+      return { error: "实验不存在", status: 404 };
+    }
+
+    if (experiment.student_id !== studentId) {
+      await connection.rollback();
+      return { error: "权限不足：该实验不属于当前用户", status: 403 };
+    }
+
+    const eligibilityError = getReportSubmissionEligibilityError(experiment);
+    if (eligibilityError) {
+      await connection.rollback();
+      return { error: eligibilityError, status: 400 };
+    }
+
     const [reportResult] = await connection.query<ResultSetHeader>(
       `INSERT INTO experiment_reports (experiment_id, student_id, report_content, pdf_file_path, status, submitted_at)
        VALUES (?, ?, ?, ?, 'submitted', NOW())
@@ -228,21 +274,24 @@ export async function submitReport(
       modelQualityScore = 50;
     }
 
-    const EXP_FLOW_GRADE_COLUMNS = [
-      "exp_flow_demand_data_preparation", "exp_flow_demand_descriptive_stats",
-      "exp_flow_demand_model_selection", "exp_flow_demand_generate_results",
-      "exp_flow_production_inventory_calc", "exp_flow_production_service_level",
-      "exp_flow_production_variable_calc", "exp_flow_production_plan_creation",
-      "exp_flow_report_submission",
-    ] as const;
-
+    const flowGradeValues = buildExperimentFlowGradeValues(experiment);
+    const EXP_FLOW_GRADE_COLUMNS = Object.keys(flowGradeValues) as Array<keyof typeof flowGradeValues>;
     const GRADE_COLUMNS = [...EXP_FLOW_GRADE_COLUMNS, "model_quality"];
     const GRADE_UPDATE_SET = GRADE_COLUMNS.map((col) => `${col} = ?`).join(", ");
-    const gradeValues = [...EXP_FLOW_GRADE_COLUMNS.map(() => 100), modelQualityScore];
+    const gradeValues = [...EXP_FLOW_GRADE_COLUMNS.map((column) => flowGradeValues[column]), modelQualityScore];
 
     await connection.query(
       `UPDATE experiment_grade SET ${GRADE_UPDATE_SET} WHERE experiment_id = ? AND student_id = ?`,
       [...gradeValues, experimentId, studentId],
+    );
+
+    await connection.query(
+      `UPDATE experiment_status
+          SET status = 'Completed',
+              completion_time = NOW(),
+              last_activity_at = NOW()
+        WHERE experiment_id = ? AND student_id = ?`,
+      [experimentId, studentId],
     );
 
     await connection.commit();

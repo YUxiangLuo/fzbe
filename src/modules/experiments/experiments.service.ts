@@ -1,6 +1,7 @@
 import type { RowDataPacket, ResultSetHeader } from "mysql2/promise";
 import { pool } from "../../config";
 import type { CreateExperimentInput, UpdateExperimentInput, ExperimentEventInput } from "./experiments.schema";
+import { prepareStudentExperimentUpdate } from "./experiment-update-policy";
 
 const BOOLEAN_FIELDS = new Set(["moving_average_completed", "exponential_smoothing_completed", "arima_completed", "lstm_completed", "ensemble_weighted_completed", "ensemble_boosting_completed", "ensemble_stacking_completed", "quiz_about_model_completed", "quiz_about_plan_completed", "production_plan_completed"]);
 const JSON_FIELDS = new Set(["arima_adf_stationarity", "lstm_features", "ensemble_weighted_base_models", "ensemble_boosting_base_models", "ensemble_stacking_base_models", "production_mps_table", "production_forecast_results"]);
@@ -138,60 +139,82 @@ export async function deleteExperiment(experimentId: number, studentId: number) 
 }
 
 export async function updateExperiment(experimentId: number, studentId: number, data: UpdateExperimentInput) {
-  const row = await fetchExperimentById(experimentId);
-  if (!row) return { error: "not_found" as const };
-  if (row.student_id !== studentId) return { error: "forbidden" as const };
+  const connection = await pool.getConnection();
+  try {
+    await connection.beginTransaction();
 
-  const sanitized = sanitizeForDb(data);
-  delete sanitized.total_active_duration_seconds;
-  if (Object.keys(sanitized).length === 0) return { error: "no_fields" as const };
-  if (sanitized["current_step"] === null) return { error: "invalid_current_step" as const };
-  if (sanitized["highest_completed_step"] === null) return { error: "invalid_highest_step" as const };
+    const [[row]] = await connection.query<RowDataPacket[]>(
+      "SELECT * FROM experiment_status WHERE experiment_id = ? LIMIT 1 FOR UPDATE",
+      [experimentId],
+    );
 
-  if (Object.prototype.hasOwnProperty.call(sanitized, "last_activity_at")) {
-    const newValue = sanitized["last_activity_at"];
-    let newTimestamp: Date | null = null;
-    if (newValue instanceof Date) newTimestamp = newValue;
-    else if (typeof newValue === "string") {
-      const parsed = new Date(newValue);
-      if (!Number.isNaN(parsed.getTime())) { newTimestamp = parsed; sanitized["last_activity_at"] = parsed; }
+    if (!row) {
+      await connection.rollback();
+      return { error: "not_found" as const };
     }
 
-    const previousLastValue = row.last_activity_at ?? row.start_time ?? null;
-    const previousLast = previousLastValue instanceof Date ? previousLastValue : previousLastValue ? new Date(previousLastValue as string) : null;
-
-    if (newTimestamp && previousLast) {
-      const diffMs = newTimestamp.getTime() - previousLast.getTime();
-      const maxGapMs = 1 * 60 * 60 * 1000;
-      if (diffMs > 0 && diffMs <= maxGapMs) {
-        const prevTotal = Number(row.total_active_duration_seconds ?? 0);
-        sanitized.total_active_duration_seconds = prevTotal + Math.max(1, Math.floor(diffMs / 1000));
-      }
+    if (row.student_id !== studentId) {
+      await connection.rollback();
+      return { error: "forbidden" as const };
     }
+
+    const sanitized = sanitizeForDb(data);
+    const preparedUpdate = prepareStudentExperimentUpdate(row as typeof row & {
+      status: string;
+      start_time: string | Date | null;
+      last_activity_at: string | Date | null;
+      total_active_duration_seconds: number | null;
+    }, sanitized);
+    if ("error" in preparedUpdate) {
+      await connection.rollback();
+      return preparedUpdate;
+    }
+
+    const columns = Object.keys(preparedUpdate.data);
+    const assignments = columns.map((col) => `${col} = ?`).join(", ");
+    const values = columns.map((key) => preparedUpdate.data[key]);
+    values.push(experimentId);
+
+    await connection.query(`UPDATE experiment_status SET ${assignments} WHERE experiment_id = ?`, values);
+
+    const [[updatedRow]] = await connection.query<RowDataPacket[]>(
+      "SELECT * FROM experiment_status WHERE experiment_id = ? LIMIT 1",
+      [experimentId],
+    );
+
+    await connection.commit();
+    return { data: normalizeExperimentRow(updatedRow!) };
+  } catch (error) {
+    await connection.rollback().catch(() => {});
+    throw error;
+  } finally {
+    connection.release();
   }
-
-  const columns = Object.keys(sanitized);
-  const assignments = columns.map((col) => `${col} = ?`).join(", ");
-  const values = columns.map((key) => sanitized[key]);
-  values.push(experimentId);
-
-  await pool.query(`UPDATE experiment_status SET ${assignments} WHERE experiment_id = ?`, values);
-  const updatedRow = await fetchExperimentById(experimentId);
-  return { data: normalizeExperimentRow(updatedRow!) };
 }
 
 export async function createExperimentEvent(experimentId: number, studentId: number, input: ExperimentEventInput) {
   const connection = await pool.getConnection();
   try {
-    const [experimentRows] = await connection.query<RowDataPacket[]>("SELECT student_id FROM experiment_status WHERE experiment_id = ? LIMIT 1", [experimentId]);
-    if (experimentRows.length === 0) return { error: "not_found" as const };
-    if (experimentRows[0]!.student_id !== studentId) return { error: "forbidden" as const };
+    await connection.beginTransaction();
 
-    let transactionStarted = false;
+    const [experimentRows] = await connection.query<RowDataPacket[]>(
+      "SELECT student_id, status FROM experiment_status WHERE experiment_id = ? LIMIT 1 FOR UPDATE",
+      [experimentId],
+    );
+    if (experimentRows.length === 0) {
+      await connection.rollback();
+      return { error: "not_found" as const };
+    }
+    if (experimentRows[0]!.student_id !== studentId) {
+      await connection.rollback();
+      return { error: "forbidden" as const };
+    }
+    if (experimentRows[0]!.status === "Completed") {
+      await connection.rollback();
+      return { error: "completed" as const };
+    }
+
     if (input.event_type === "COMPLETED") {
-      await connection.beginTransaction();
-      transactionStarted = true;
-
       const [latestEventRows] = await connection.query<RowDataPacket[]>(
         "SELECT step_order FROM experiment_step_events WHERE experiment_id = ? ORDER BY event_timestamp DESC LIMIT 1 FOR UPDATE",
         [experimentId],
@@ -212,7 +235,7 @@ export async function createExperimentEvent(experimentId: number, studentId: num
       [experimentId, studentId, input.step_order, input.event_type],
     );
 
-    if (transactionStarted) await connection.commit();
+    await connection.commit();
     return { data: { event_id: result.insertId } };
   } catch (error) {
     await connection.rollback().catch(() => {});

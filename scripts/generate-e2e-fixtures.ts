@@ -11,8 +11,15 @@
 import fs from "node:fs";
 import path from "node:path";
 
+type E2EStudentFixture = {
+  id: string;
+  status: string;
+  classId: number;
+  tags?: string[];
+};
+
 // 提取 Teacher Fixtures 中的学生数据
-function extractTeacherStudents(): Array<{ id: string; status: string; classId: number }> {
+function extractTeacherStudents(): E2EStudentFixture[] {
   // 从 e2e-seed-teacher-fixtures.ts 中提取
   return [
     { id: "20240001", status: "completed", classId: 1 },
@@ -36,7 +43,7 @@ function extractTeacherStudents(): Array<{ id: string; status: string; classId: 
 }
 
 // 提取 Assistant Fixtures 中的学生数据
-function extractAssistantStudents(): Array<{ id: string; status: string; classId: number; tags?: string[] }> {
+function extractAssistantStudents(): E2EStudentFixture[] {
   return [
     { id: "20240051", status: "graded", classId: 2, tags: ["graded_by_assistant"] },
     { id: "20240052", status: "pending_review", classId: 2, tags: ["pending_for_assistant"] },

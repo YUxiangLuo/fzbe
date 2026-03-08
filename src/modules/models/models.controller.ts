@@ -4,13 +4,14 @@ import { jwtAuth, requireStudent } from "../../middleware";
 import { trainSchema, predictSchema, isModelType } from "./models.schema";
 import {
   trainModel,
-  predictModel,
-  tryAcquireModelSlot,
+  predictExperimentModel,
+  acquireModelSlot,
   releaseModelSlot,
-  tryAcquireModelLock,
-  releaseModelLock,
+  acquireModelExecutionLock,
+  releaseModelExecutionLock,
   ModelValidationError,
   ModelNotFoundError,
+  ModelAccessError,
 } from "./models.service";
 import { handleUnexpectedError } from "../../utils/error-handler";
 import type { JwtPayload } from "../../types";
@@ -33,19 +34,26 @@ modelsController.post(
     const payload = c.get("jwtPayload") as JwtPayload;
     const body = c.req.valid("json");
 
-    if (!tryAcquireModelLock(payload.sub, modelType)) {
-      return c.json({ error: "同一模型正在训练或预测，请稍后再试" }, 409);
-    }
-
-    if (!tryAcquireModelSlot()) {
-      releaseModelLock(payload.sub, modelType);
-      return c.json({ error: "模型服务繁忙，请稍后再试" }, 429);
-    }
+    let executionLock = null;
+    let slotLock = null;
 
     try {
+      executionLock = await acquireModelExecutionLock(body.experiment_id, modelType);
+      if (!executionLock) {
+        return c.json({ error: "同一模型正在训练或预测，请稍后再试" }, 409);
+      }
+
+      slotLock = await acquireModelSlot();
+      if (!slotLock) {
+        return c.json({ error: "模型服务繁忙，请稍后再试" }, 429);
+      }
+
       const result = await trainModel(modelType, payload.sub, body);
       return c.json(result);
     } catch (error: unknown) {
+      if (error instanceof ModelAccessError) {
+        return c.json({ error: error.message }, error.status);
+      }
       if (error instanceof ModelValidationError) {
         return c.json({ error: error.message, ...error.details }, 400);
       }
@@ -63,8 +71,8 @@ modelsController.post(
       const message = err.message || `${modelType.toUpperCase()} 训练失败`;
       return handleUnexpectedError(c, error, message);
     } finally {
-      releaseModelSlot();
-      releaseModelLock(payload.sub, modelType);
+      await releaseModelSlot(slotLock);
+      await releaseModelExecutionLock(executionLock);
     }
   },
 );
@@ -84,19 +92,31 @@ modelsController.post(
     const payload = c.get("jwtPayload") as JwtPayload;
     const body = c.req.valid("json");
 
-    if (!tryAcquireModelLock(payload.sub, modelType)) {
-      return c.json({ error: "同一模型正在训练或预测，请稍后再试" }, 409);
-    }
-
-    if (!tryAcquireModelSlot()) {
-      releaseModelLock(payload.sub, modelType);
-      return c.json({ error: "模型服务繁忙，请稍后再试" }, 429);
-    }
+    let executionLock = null;
+    let slotLock = null;
 
     try {
-      const result = await predictModel(modelType, payload.sub, body.forecast_steps);
+      executionLock = await acquireModelExecutionLock(body.experiment_id, modelType);
+      if (!executionLock) {
+        return c.json({ error: "同一模型正在训练或预测，请稍后再试" }, 409);
+      }
+
+      slotLock = await acquireModelSlot();
+      if (!slotLock) {
+        return c.json({ error: "模型服务繁忙，请稍后再试" }, 429);
+      }
+
+      const result = await predictExperimentModel(
+        modelType,
+        payload.sub,
+        body.experiment_id,
+        body.forecast_steps,
+      );
       return c.json(result);
     } catch (error: unknown) {
+      if (error instanceof ModelAccessError) {
+        return c.json({ error: error.message }, error.status);
+      }
       if (error instanceof ModelNotFoundError) {
         return c.json({ error: error.message }, 404);
       }
@@ -108,8 +128,8 @@ modelsController.post(
       const message = err.message || `${modelType.toUpperCase()} 预测失败`;
       return handleUnexpectedError(c, error, message);
     } finally {
-      releaseModelSlot();
-      releaseModelLock(payload.sub, modelType);
+      await releaseModelSlot(slotLock);
+      await releaseModelExecutionLock(executionLock);
     }
   },
 );
