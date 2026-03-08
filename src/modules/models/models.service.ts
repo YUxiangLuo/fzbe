@@ -167,6 +167,33 @@ const allPossiblePythonParams: Record<string, string> = {
 
 const SETSID_PATH = process.platform === "win32" ? undefined : Bun.which("setsid");
 
+const extractPythonTaggedError = (stderr: string): Error | null => {
+  const markers = [
+    { marker: "[VALIDATION]", prefix: "[PYTHON_VALIDATION]" },
+    { marker: "[DATA]", prefix: "[PYTHON_DATA]" },
+  ] as const;
+
+  const lines = stderr
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter((line) => line.length > 0);
+
+  for (let index = lines.length - 1; index >= 0; index -= 1) {
+    const line = lines[index]!;
+    for (const { marker, prefix } of markers) {
+      const markerIndex = line.indexOf(marker);
+      if (markerIndex === -1) {
+        continue;
+      }
+
+      const detail = line.slice(markerIndex + marker.length).trim();
+      return new Error(`${prefix} ${detail}`.trim());
+    }
+  }
+
+  return null;
+};
+
 export async function loadDatasetFromDb(
   industry: string,
   company: string,
@@ -385,11 +412,9 @@ export async function runPythonModel(
           typeof arg === "string" && arg.length > 200 ? `${arg.slice(0, 200)}...[truncated]` : arg,
         );
         logger.error({ stderr: stderr.slice(0, 2000), modelType, args: truncatedArgs }, "Python 执行失败");
-        const pythonErrorMessage = stderr.trim();
-        if (pythonErrorMessage.startsWith("[VALIDATION]")) {
-          reject(new Error(`[PYTHON_VALIDATION] ${pythonErrorMessage.substring(13).trim()}`));
-        } else if (pythonErrorMessage.startsWith("[DATA]")) {
-          reject(new Error(`[PYTHON_DATA] ${pythonErrorMessage.substring(7).trim()}`));
+        const taggedError = extractPythonTaggedError(stderr);
+        if (taggedError) {
+          reject(taggedError);
         } else {
           reject(new Error(`Python 执行失败: ${stderr}`));
         }

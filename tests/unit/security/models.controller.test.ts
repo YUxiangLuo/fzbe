@@ -156,6 +156,34 @@ describe("models controller", () => {
     expect(releaseModelExecutionLock).toHaveBeenCalledTimes(1);
   });
 
+  test("maps python validation failures from training to 400", async () => {
+    trainModel.mockRejectedValueOnce(new Error("[PYTHON_VALIDATION] Weighted Average requires at least 2 base models."));
+
+    const response = await requestJson("/api/v1/models/weighted_avg/training", {
+      ...buildTrainBody(),
+      models: "ma",
+    });
+    const data = await response.json();
+
+    expect(response.status).toBe(400);
+    expect(data).toEqual({ error: "Weighted Average requires at least 2 base models." });
+  });
+
+  test("maps python data failures from training to 400", async () => {
+    trainModel.mockRejectedValueOnce(new Error("[PYTHON_DATA] Failed to parse or process --data: bad column"));
+
+    const response = await requestJson("/api/v1/models/lstm/training", {
+      ...buildTrainBody(),
+      lstmNormalization: "minmax",
+      lstmTargetFeature: "销售数量",
+      lstmFeatures: "bad column",
+    });
+    const data = await response.json();
+
+    expect(response.status).toBe(400);
+    expect(data).toEqual({ error: "Failed to parse or process --data: bad column" });
+  });
+
   test("releases the execution lock when slot acquisition throws during training", async () => {
     const executionLock = { connection: {} as never, name: "exec:throw" };
     acquireModelExecutionLock.mockResolvedValueOnce(executionLock);

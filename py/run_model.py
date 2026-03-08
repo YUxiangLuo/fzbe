@@ -18,6 +18,15 @@ MODEL_MODULES = {
     "boosting": boosting,
 }
 
+
+def _format_known_error(exc: Exception):
+    message = str(exc).strip()
+    if message.startswith("[VALIDATION]"):
+        return f"[VALIDATION] {message[13:].strip()}".strip()
+    if message.startswith("[DATA]"):
+        return f"[DATA] {message[7:].strip()}".strip()
+    return None
+
 def main():
     parser = argparse.ArgumentParser(description="Run a specified time series model.")
     parser.add_argument("model_type", type=str, help="Type of model to run (e.g., arima, lstm)")
@@ -68,4 +77,11 @@ def main():
     model_module.run(args)
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except Exception as exc:
+        formatted_error = _format_known_error(exc)
+        if formatted_error is None:
+            raise
+        print(formatted_error, file=sys.stderr, flush=True)
+        sys.exit(1)
