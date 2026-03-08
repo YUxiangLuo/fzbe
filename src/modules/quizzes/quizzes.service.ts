@@ -98,24 +98,27 @@ export async function submitAnswers(
 
   const connection = await pool.getConnection();
   try {
+    await connection.beginTransaction();
+
     const [[experimentOwnership]] = await connection.query<ExperimentOwnerRow[]>(
-      `SELECT student_id, status FROM experiment_status WHERE experiment_id = ? LIMIT 1`,
+      `SELECT student_id, status FROM experiment_status WHERE experiment_id = ? LIMIT 1 FOR UPDATE`,
       [experimentId],
     );
 
     if (!experimentOwnership) {
+      await connection.rollback();
       return { error: "实验不存在", status: 404 };
     }
 
     if (experimentOwnership.student_id !== studentId) {
+      await connection.rollback();
       return { error: "权限不足：该实验不属于当前用户", status: 403 };
     }
 
     if (experimentOwnership.status === "Completed") {
+      await connection.rollback();
       return { error: "已完成的实验不允许继续提交测试答案", status: 400 };
     }
-
-    await connection.beginTransaction();
 
     const placeholders = questionIds.map(() => "?").join(",");
     const [questionRows] = await connection.query<QuestionAnswerRow[]>(

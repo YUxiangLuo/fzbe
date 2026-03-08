@@ -34,18 +34,20 @@ modelsController.post(
     const payload = c.get("jwtPayload") as JwtPayload;
     const body = c.req.valid("json");
 
-    const executionLock = await acquireModelExecutionLock(body.experiment_id, modelType);
-    if (!executionLock) {
-      return c.json({ error: "同一模型正在训练或预测，请稍后再试" }, 409);
-    }
-
-    const slotLock = await acquireModelSlot();
-    if (!slotLock) {
-      await releaseModelExecutionLock(executionLock);
-      return c.json({ error: "模型服务繁忙，请稍后再试" }, 429);
-    }
+    let executionLock = null;
+    let slotLock = null;
 
     try {
+      executionLock = await acquireModelExecutionLock(body.experiment_id, modelType);
+      if (!executionLock) {
+        return c.json({ error: "同一模型正在训练或预测，请稍后再试" }, 409);
+      }
+
+      slotLock = await acquireModelSlot();
+      if (!slotLock) {
+        return c.json({ error: "模型服务繁忙，请稍后再试" }, 429);
+      }
+
       const result = await trainModel(modelType, payload.sub, body);
       return c.json(result);
     } catch (error: unknown) {
@@ -90,18 +92,20 @@ modelsController.post(
     const payload = c.get("jwtPayload") as JwtPayload;
     const body = c.req.valid("json");
 
-    const executionLock = await acquireModelExecutionLock(body.experiment_id, modelType);
-    if (!executionLock) {
-      return c.json({ error: "同一模型正在训练或预测，请稍后再试" }, 409);
-    }
-
-    const slotLock = await acquireModelSlot();
-    if (!slotLock) {
-      await releaseModelExecutionLock(executionLock);
-      return c.json({ error: "模型服务繁忙，请稍后再试" }, 429);
-    }
+    let executionLock = null;
+    let slotLock = null;
 
     try {
+      executionLock = await acquireModelExecutionLock(body.experiment_id, modelType);
+      if (!executionLock) {
+        return c.json({ error: "同一模型正在训练或预测，请稍后再试" }, 409);
+      }
+
+      slotLock = await acquireModelSlot();
+      if (!slotLock) {
+        return c.json({ error: "模型服务繁忙，请稍后再试" }, 429);
+      }
+
       const result = await predictExperimentModel(
         modelType,
         payload.sub,

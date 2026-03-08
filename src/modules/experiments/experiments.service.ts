@@ -139,42 +139,82 @@ export async function deleteExperiment(experimentId: number, studentId: number) 
 }
 
 export async function updateExperiment(experimentId: number, studentId: number, data: UpdateExperimentInput) {
-  const row = await fetchExperimentById(experimentId);
-  if (!row) return { error: "not_found" as const };
-  if (row.student_id !== studentId) return { error: "forbidden" as const };
+  const connection = await pool.getConnection();
+  try {
+    await connection.beginTransaction();
 
-  const sanitized = sanitizeForDb(data);
-  const preparedUpdate = prepareStudentExperimentUpdate(row as typeof row & {
-    status: string;
-    start_time: string | Date | null;
-    last_activity_at: string | Date | null;
-    total_active_duration_seconds: number | null;
-  }, sanitized);
-  if ("error" in preparedUpdate) return preparedUpdate;
+    const [[row]] = await connection.query<RowDataPacket[]>(
+      "SELECT * FROM experiment_status WHERE experiment_id = ? LIMIT 1 FOR UPDATE",
+      [experimentId],
+    );
 
-  const columns = Object.keys(preparedUpdate.data);
-  const assignments = columns.map((col) => `${col} = ?`).join(", ");
-  const values = columns.map((key) => preparedUpdate.data[key]);
-  values.push(experimentId);
+    if (!row) {
+      await connection.rollback();
+      return { error: "not_found" as const };
+    }
 
-  await pool.query(`UPDATE experiment_status SET ${assignments} WHERE experiment_id = ?`, values);
-  const updatedRow = await fetchExperimentById(experimentId);
-  return { data: normalizeExperimentRow(updatedRow!) };
+    if (row.student_id !== studentId) {
+      await connection.rollback();
+      return { error: "forbidden" as const };
+    }
+
+    const sanitized = sanitizeForDb(data);
+    const preparedUpdate = prepareStudentExperimentUpdate(row as typeof row & {
+      status: string;
+      start_time: string | Date | null;
+      last_activity_at: string | Date | null;
+      total_active_duration_seconds: number | null;
+    }, sanitized);
+    if ("error" in preparedUpdate) {
+      await connection.rollback();
+      return preparedUpdate;
+    }
+
+    const columns = Object.keys(preparedUpdate.data);
+    const assignments = columns.map((col) => `${col} = ?`).join(", ");
+    const values = columns.map((key) => preparedUpdate.data[key]);
+    values.push(experimentId);
+
+    await connection.query(`UPDATE experiment_status SET ${assignments} WHERE experiment_id = ?`, values);
+
+    const [[updatedRow]] = await connection.query<RowDataPacket[]>(
+      "SELECT * FROM experiment_status WHERE experiment_id = ? LIMIT 1",
+      [experimentId],
+    );
+
+    await connection.commit();
+    return { data: normalizeExperimentRow(updatedRow!) };
+  } catch (error) {
+    await connection.rollback().catch(() => {});
+    throw error;
+  } finally {
+    connection.release();
+  }
 }
 
 export async function createExperimentEvent(experimentId: number, studentId: number, input: ExperimentEventInput) {
   const connection = await pool.getConnection();
   try {
-    const [experimentRows] = await connection.query<RowDataPacket[]>("SELECT student_id, status FROM experiment_status WHERE experiment_id = ? LIMIT 1", [experimentId]);
-    if (experimentRows.length === 0) return { error: "not_found" as const };
-    if (experimentRows[0]!.student_id !== studentId) return { error: "forbidden" as const };
-    if (experimentRows[0]!.status === "Completed") return { error: "completed" as const };
+    await connection.beginTransaction();
 
-    let transactionStarted = false;
+    const [experimentRows] = await connection.query<RowDataPacket[]>(
+      "SELECT student_id, status FROM experiment_status WHERE experiment_id = ? LIMIT 1 FOR UPDATE",
+      [experimentId],
+    );
+    if (experimentRows.length === 0) {
+      await connection.rollback();
+      return { error: "not_found" as const };
+    }
+    if (experimentRows[0]!.student_id !== studentId) {
+      await connection.rollback();
+      return { error: "forbidden" as const };
+    }
+    if (experimentRows[0]!.status === "Completed") {
+      await connection.rollback();
+      return { error: "completed" as const };
+    }
+
     if (input.event_type === "COMPLETED") {
-      await connection.beginTransaction();
-      transactionStarted = true;
-
       const [latestEventRows] = await connection.query<RowDataPacket[]>(
         "SELECT step_order FROM experiment_step_events WHERE experiment_id = ? ORDER BY event_timestamp DESC LIMIT 1 FOR UPDATE",
         [experimentId],
@@ -195,7 +235,7 @@ export async function createExperimentEvent(experimentId: number, studentId: num
       [experimentId, studentId, input.step_order, input.event_type],
     );
 
-    if (transactionStarted) await connection.commit();
+    await connection.commit();
     return { data: { event_id: result.insertId } };
   } catch (error) {
     await connection.rollback().catch(() => {});

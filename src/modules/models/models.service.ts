@@ -87,14 +87,27 @@ async function releaseAdvisoryLock(handle: AdvisoryLockHandle | null | undefined
 }
 
 export const acquireModelSlot = async (): Promise<AdvisoryLockHandle | null> => {
-  for (let slot = 1; slot <= MAX_CONCURRENT_MODEL_JOBS; slot += 1) {
-    const handle = await acquireAdvisoryLock(buildModelSlotLockName(slot));
-    if (handle) {
-      return handle;
-    }
-  }
+  const connection = await pool.getConnection();
 
-  return null;
+  try {
+    for (let slot = 1; slot <= MAX_CONCURRENT_MODEL_JOBS; slot += 1) {
+      const name = buildModelSlotLockName(slot);
+      const [rows] = await connection.query<AdvisoryLockRow[]>(
+        "SELECT GET_LOCK(?, 0) AS acquired",
+        [name],
+      );
+
+      if (rows[0]?.acquired === 1) {
+        return { connection, name };
+      }
+    }
+
+    connection.release();
+    return null;
+  } catch (error) {
+    connection.release();
+    throw error;
+  }
 };
 
 export const releaseModelSlot = async (handle: AdvisoryLockHandle | null | undefined) => {

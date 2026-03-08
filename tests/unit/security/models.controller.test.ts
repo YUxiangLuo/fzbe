@@ -156,6 +156,18 @@ describe("models controller", () => {
     expect(releaseModelExecutionLock).toHaveBeenCalledTimes(1);
   });
 
+  test("releases the execution lock when slot acquisition throws during training", async () => {
+    const executionLock = { connection: {} as never, name: "exec:throw" };
+    acquireModelExecutionLock.mockResolvedValueOnce(executionLock);
+    acquireModelSlot.mockRejectedValueOnce(new Error("slot acquisition failed"));
+
+    const response = await requestJson("/api/v1/models/ma/training", buildTrainBody());
+
+    expect(response.status).toBe(500);
+    expect(releaseModelExecutionLock).toHaveBeenCalledWith(executionLock);
+    expect(releaseModelSlot).toHaveBeenCalledWith(null);
+  });
+
   test("maps ModelNotFoundError from prediction to 404", async () => {
     predictExperimentModel.mockRejectedValueOnce(new ModelNotFoundError("未找到该实验的已训练 MA 模型"));
 
@@ -180,6 +192,21 @@ describe("models controller", () => {
 
     expect(response.status).toBe(504);
     expect(data.error).toContain("预测超时");
+  });
+
+  test("releases the execution lock when slot acquisition throws during prediction", async () => {
+    const executionLock = { connection: {} as never, name: "exec:predict-throw" };
+    acquireModelExecutionLock.mockResolvedValueOnce(executionLock);
+    acquireModelSlot.mockRejectedValueOnce(new Error("slot acquisition failed"));
+
+    const response = await requestJson("/api/v1/models/ma/predict", {
+      experiment_id: 990002,
+      forecast_steps: 6,
+    });
+
+    expect(response.status).toBe(500);
+    expect(releaseModelExecutionLock).toHaveBeenCalledWith(executionLock);
+    expect(releaseModelSlot).toHaveBeenCalledWith(null);
   });
 
   test("rejects unsupported model types before invoking the service layer", async () => {

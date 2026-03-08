@@ -191,22 +191,17 @@ export async function submitReport(
     };
   }
 
-  const [[experiment]] = await pool.query<ExperimentRow[]>(
+  const [[precheckExperiment]] = await pool.query<ExperimentRow[]>(
     `SELECT * FROM experiment_status WHERE experiment_id = ? LIMIT 1`,
     [experimentId],
   );
 
-  if (!experiment) {
+  if (!precheckExperiment) {
     return { error: "实验不存在", status: 404 };
   }
 
-  if (experiment.student_id !== studentId) {
+  if (precheckExperiment.student_id !== studentId) {
     return { error: "权限不足：该实验不属于当前用户", status: 403 };
-  }
-
-  const eligibilityError = getReportSubmissionEligibilityError(experiment);
-  if (eligibilityError) {
-    return { error: eligibilityError, status: 400 };
   }
 
   const sanitizedReportContent = await markdownToSanitizedHtml(markdownContent);
@@ -237,6 +232,27 @@ export async function submitReport(
   const connection = await pool.getConnection();
   try {
     await connection.beginTransaction();
+
+    const [[experiment]] = await connection.query<ExperimentRow[]>(
+      `SELECT * FROM experiment_status WHERE experiment_id = ? LIMIT 1 FOR UPDATE`,
+      [experimentId],
+    );
+
+    if (!experiment) {
+      await connection.rollback();
+      return { error: "实验不存在", status: 404 };
+    }
+
+    if (experiment.student_id !== studentId) {
+      await connection.rollback();
+      return { error: "权限不足：该实验不属于当前用户", status: 403 };
+    }
+
+    const eligibilityError = getReportSubmissionEligibilityError(experiment);
+    if (eligibilityError) {
+      await connection.rollback();
+      return { error: eligibilityError, status: 400 };
+    }
 
     const [reportResult] = await connection.query<ResultSetHeader>(
       `INSERT INTO experiment_reports (experiment_id, student_id, report_content, pdf_file_path, status, submitted_at)

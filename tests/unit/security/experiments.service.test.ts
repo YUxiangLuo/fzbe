@@ -29,7 +29,7 @@ mock.module(configModulePath, () => ({
   },
 }));
 
-const { createExperimentEvent } = await import(freshExperimentsServiceModulePath);
+const { createExperimentEvent, updateExperiment } = await import(freshExperimentsServiceModulePath);
 
 describe("experiments service", () => {
   beforeEach(() => {
@@ -42,7 +42,7 @@ describe("experiments service", () => {
     getConnection.mockClear();
   });
 
-  test("blocks step-event writes for completed experiments", async () => {
+  test("blocks step-event writes for completed experiments after locking the experiment row", async () => {
     connectionQuery.mockResolvedValueOnce([
       [{ student_id: 20240002, status: "Completed" }],
     ]);
@@ -53,7 +53,31 @@ describe("experiments service", () => {
     });
 
     expect(result).toEqual({ error: "completed" });
-    expect(beginTransaction).not.toHaveBeenCalled();
+    expect(beginTransaction).toHaveBeenCalledTimes(1);
+    expect(rollback).toHaveBeenCalledTimes(1);
+    expect(commit).not.toHaveBeenCalled();
+    expect(release).toHaveBeenCalledTimes(1);
+  });
+
+  test("blocks experiment updates for completed experiments after locking the experiment row", async () => {
+    connectionQuery.mockResolvedValueOnce([
+      [{
+        experiment_id: 990002,
+        student_id: 20240002,
+        status: "Completed",
+        start_time: "2026-03-08T09:00:00.000Z",
+        last_activity_at: "2026-03-08T09:30:00.000Z",
+        total_active_duration_seconds: 120,
+      }],
+    ]);
+
+    const result = await updateExperiment(990002, 20240002, {
+      selected_company: "企业A",
+    });
+
+    expect(result).toEqual({ error: "completed" });
+    expect(beginTransaction).toHaveBeenCalledTimes(1);
+    expect(rollback).toHaveBeenCalledTimes(1);
     expect(commit).not.toHaveBeenCalled();
     expect(release).toHaveBeenCalledTimes(1);
   });

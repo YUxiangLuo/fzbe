@@ -40,7 +40,7 @@ describe("quizzes service", () => {
     getConnection.mockClear();
   });
 
-  test("blocks quiz submissions for completed experiments before opening a transaction", async () => {
+  test("blocks quiz submissions for completed experiments after locking the experiment row", async () => {
     connectionQuery.mockResolvedValueOnce([
       [{ student_id: 20240002, status: "Completed" }],
     ]);
@@ -53,7 +53,8 @@ describe("quizzes service", () => {
       error: "已完成的实验不允许继续提交测试答案",
       status: 400,
     });
-    expect(beginTransaction).not.toHaveBeenCalled();
+    expect(beginTransaction).toHaveBeenCalledTimes(1);
+    expect(rollback).toHaveBeenCalledTimes(1);
     expect(commit).not.toHaveBeenCalled();
     expect(release).toHaveBeenCalledTimes(1);
   });
