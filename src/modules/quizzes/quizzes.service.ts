@@ -25,6 +25,7 @@ interface QuestionAnswerRow extends RowDataPacket {
 
 interface ExperimentOwnerRow extends RowDataPacket {
   student_id: number;
+  status: string;
 }
 
 interface StatsRow extends RowDataPacket {
@@ -98,7 +99,7 @@ export async function submitAnswers(
   const connection = await pool.getConnection();
   try {
     const [[experimentOwnership]] = await connection.query<ExperimentOwnerRow[]>(
-      `SELECT student_id FROM experiment_status WHERE experiment_id = ? LIMIT 1`,
+      `SELECT student_id, status FROM experiment_status WHERE experiment_id = ? LIMIT 1`,
       [experimentId],
     );
 
@@ -108,6 +109,10 @@ export async function submitAnswers(
 
     if (experimentOwnership.student_id !== studentId) {
       return { error: "权限不足：该实验不属于当前用户", status: 403 };
+    }
+
+    if (experimentOwnership.status === "Completed") {
+      return { error: "已完成的实验不允许继续提交测试答案", status: 400 };
     }
 
     await connection.beginTransaction();
@@ -203,6 +208,28 @@ export async function submitAnswers(
             SET knowledge_test = ?
           WHERE experiment_id = ? AND student_id = ?`,
         [knowledgeScore, experimentId, studentId],
+      );
+
+      const completedModelQuiz = submittedQuizTypes.has("quiz_about_model") ? 1 : 0;
+      const completedPlanQuiz = submittedQuizTypes.has("quiz_about_plan") ? 1 : 0;
+      await connection.query(
+        `UPDATE experiment_status
+            SET quiz_about_model_completed = CASE
+                  WHEN ? = 1 THEN 1
+                  ELSE quiz_about_model_completed
+                END,
+                quiz_about_plan_completed = CASE
+                  WHEN ? = 1 THEN 1
+                  ELSE quiz_about_plan_completed
+                END,
+                status = CASE
+                  WHEN status = 'Not Started' THEN 'In Progress'
+                  ELSE status
+                END,
+                last_activity_at = NOW(),
+                start_time = COALESCE(start_time, NOW())
+          WHERE experiment_id = ? AND student_id = ?`,
+        [completedModelQuiz, completedPlanQuiz, experimentId, studentId],
       );
     }
 

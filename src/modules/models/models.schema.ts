@@ -1,19 +1,20 @@
 import { z } from "zod";
 
 const baseDataSchema = z.object({
-  selected_industry: z.string().min(1),
-  selected_company: z.string().min(1),
-  selected_product: z.string().min(1),
+  experiment_id: z.coerce.number().int().min(1),
+  selected_industry: z.string().min(1).optional(),
+  selected_company: z.string().min(1).optional(),
+  selected_product: z.string().min(1).optional(),
 });
 
 const trainRangeSchema = z.object({
-  data_window_train_start_index: z.coerce.number().int().min(0),
-  data_window_train_end_index: z.coerce.number().int().min(0),
+  data_window_train_start_index: z.coerce.number().int().min(0).optional(),
+  data_window_train_end_index: z.coerce.number().int().min(0).optional(),
 });
 
 const evalRangeSchema = z.object({
-  data_window_evaluate_start_index: z.coerce.number().int().min(0),
-  data_window_evaluate_end_index: z.coerce.number().int().min(0),
+  data_window_evaluate_start_index: z.coerce.number().int().min(0).optional(),
+  data_window_evaluate_end_index: z.coerce.number().int().min(0).optional(),
 });
 
 const modelParamsSchema = z.object({
@@ -33,15 +34,22 @@ const trainSchemaBase = baseDataSchema
 
 export const trainSchema = trainSchemaBase
   .refine(
-    (data) => data.data_window_train_start_index <= data.data_window_train_end_index,
+    (data) =>
+      data.data_window_train_start_index === undefined
+      || data.data_window_train_end_index === undefined
+      || data.data_window_train_start_index <= data.data_window_train_end_index,
     { message: "训练起始索引必须小于等于训练结束索引", path: ["data_window_train_end_index"] },
   )
   .refine(
-    (data) => data.data_window_evaluate_start_index <= data.data_window_evaluate_end_index,
+    (data) =>
+      data.data_window_evaluate_start_index === undefined
+      || data.data_window_evaluate_end_index === undefined
+      || data.data_window_evaluate_start_index <= data.data_window_evaluate_end_index,
     { message: "评估起始索引必须小于等于评估结束索引", path: ["data_window_evaluate_end_index"] },
   );
 
 export const predictSchema = z.object({
+  experiment_id: z.coerce.number().int().min(1),
   forecast_steps: z.coerce.number().int().min(1),
 });
 

@@ -1,6 +1,7 @@
 import type { RowDataPacket, ResultSetHeader } from "mysql2/promise";
 import { pool } from "../../config";
 import type { CreateExperimentInput, UpdateExperimentInput, ExperimentEventInput } from "./experiments.schema";
+import { prepareStudentExperimentUpdate } from "./experiment-update-policy";
 
 const BOOLEAN_FIELDS = new Set(["moving_average_completed", "exponential_smoothing_completed", "arima_completed", "lstm_completed", "ensemble_weighted_completed", "ensemble_boosting_completed", "ensemble_stacking_completed", "quiz_about_model_completed", "quiz_about_plan_completed", "production_plan_completed"]);
 const JSON_FIELDS = new Set(["arima_adf_stationarity", "lstm_features", "ensemble_weighted_base_models", "ensemble_boosting_base_models", "ensemble_stacking_base_models", "production_mps_table", "production_forecast_results"]);
@@ -143,36 +144,17 @@ export async function updateExperiment(experimentId: number, studentId: number, 
   if (row.student_id !== studentId) return { error: "forbidden" as const };
 
   const sanitized = sanitizeForDb(data);
-  delete sanitized.total_active_duration_seconds;
-  if (Object.keys(sanitized).length === 0) return { error: "no_fields" as const };
-  if (sanitized["current_step"] === null) return { error: "invalid_current_step" as const };
-  if (sanitized["highest_completed_step"] === null) return { error: "invalid_highest_step" as const };
+  const preparedUpdate = prepareStudentExperimentUpdate(row as typeof row & {
+    status: string;
+    start_time: string | Date | null;
+    last_activity_at: string | Date | null;
+    total_active_duration_seconds: number | null;
+  }, sanitized);
+  if ("error" in preparedUpdate) return preparedUpdate;
 
-  if (Object.prototype.hasOwnProperty.call(sanitized, "last_activity_at")) {
-    const newValue = sanitized["last_activity_at"];
-    let newTimestamp: Date | null = null;
-    if (newValue instanceof Date) newTimestamp = newValue;
-    else if (typeof newValue === "string") {
-      const parsed = new Date(newValue);
-      if (!Number.isNaN(parsed.getTime())) { newTimestamp = parsed; sanitized["last_activity_at"] = parsed; }
-    }
-
-    const previousLastValue = row.last_activity_at ?? row.start_time ?? null;
-    const previousLast = previousLastValue instanceof Date ? previousLastValue : previousLastValue ? new Date(previousLastValue as string) : null;
-
-    if (newTimestamp && previousLast) {
-      const diffMs = newTimestamp.getTime() - previousLast.getTime();
-      const maxGapMs = 1 * 60 * 60 * 1000;
-      if (diffMs > 0 && diffMs <= maxGapMs) {
-        const prevTotal = Number(row.total_active_duration_seconds ?? 0);
-        sanitized.total_active_duration_seconds = prevTotal + Math.max(1, Math.floor(diffMs / 1000));
-      }
-    }
-  }
-
-  const columns = Object.keys(sanitized);
+  const columns = Object.keys(preparedUpdate.data);
   const assignments = columns.map((col) => `${col} = ?`).join(", ");
-  const values = columns.map((key) => sanitized[key]);
+  const values = columns.map((key) => preparedUpdate.data[key]);
   values.push(experimentId);
 
   await pool.query(`UPDATE experiment_status SET ${assignments} WHERE experiment_id = ?`, values);
@@ -183,9 +165,10 @@ export async function updateExperiment(experimentId: number, studentId: number, 
 export async function createExperimentEvent(experimentId: number, studentId: number, input: ExperimentEventInput) {
   const connection = await pool.getConnection();
   try {
-    const [experimentRows] = await connection.query<RowDataPacket[]>("SELECT student_id FROM experiment_status WHERE experiment_id = ? LIMIT 1", [experimentId]);
+    const [experimentRows] = await connection.query<RowDataPacket[]>("SELECT student_id, status FROM experiment_status WHERE experiment_id = ? LIMIT 1", [experimentId]);
     if (experimentRows.length === 0) return { error: "not_found" as const };
     if (experimentRows[0]!.student_id !== studentId) return { error: "forbidden" as const };
+    if (experimentRows[0]!.status === "Completed") return { error: "completed" as const };
 
     let transactionStarted = false;
     if (input.event_type === "COMPLETED") {
