@@ -68,6 +68,9 @@ questionBankController.put(
         if (result.error === "forbidden") {
           return c.json({ error: "权限不足" }, 403);
         }
+        if (result.error === "invalid_answers") {
+          return c.json({ error: "正确答案必须来自题目选项" }, 400);
+        }
         return c.json({ error: "没有需要更新的字段" }, 400);
       }
 

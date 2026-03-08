@@ -50,6 +50,14 @@ export const gradeReportSchema = z.object({
   experiment_grade: experimentGradeUpdateSchema,
 }).refine((data) => data.grade !== undefined || data.feedback !== undefined || data.status !== undefined || data.experiment_grade !== undefined, {
   message: "至少需要提供分数、反馈、状态或实验成绩中的一项",
+}).superRefine((data, ctx) => {
+  if (data.status === "graded" && data.grade === undefined) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: ["grade"],
+      message: "标记为已评阅时必须填写报告得分",
+    });
+  }
 });
 
 const expFlowWeightFieldSchemas = EXP_FLOW_FIELDS.reduce((acc, field) => {

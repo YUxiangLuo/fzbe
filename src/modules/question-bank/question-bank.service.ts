@@ -1,6 +1,7 @@
 import type { RowDataPacket, ResultSetHeader } from "mysql2";
 import { pool } from "../../config";
 import type { CreateQuestionInput, UpdateQuestionInput } from "./question-bank.schema";
+import { hasValidQuestionAnswerMapping } from "./question-bank.schema";
 
 interface QuestionRow extends RowDataPacket {
   question_id: number;
@@ -119,6 +120,25 @@ export async function updateQuestion(
   if (!existing) return { error: "not_found" as const };
   if (requesterRole !== "Admin" && existing.creator_id !== requesterId) {
     return { error: "forbidden" as const };
+  }
+
+  const [questionRows] = await pool.query<QuestionRow[]>(
+    "SELECT question_type, options, correct_answers FROM question_bank WHERE question_id = ? LIMIT 1",
+    [questionId],
+  );
+  const currentQuestion = questionRows[0];
+  if (!currentQuestion) return { error: "not_found" as const };
+
+  const nextQuestionType = (input.question_type ?? currentQuestion.question_type) as CreateQuestionInput["question_type"];
+  const nextOptions = input.options ?? (parseJsonField(currentQuestion.options) as CreateQuestionInput["options"]);
+  const nextCorrectAnswers = input.correct_answers ?? (parseJsonField(currentQuestion.correct_answers) as string[]);
+
+  if (!hasValidQuestionAnswerMapping({
+    question_type: nextQuestionType,
+    options: nextOptions,
+    correct_answers: nextCorrectAnswers,
+  })) {
+    return { error: "invalid_answers" as const };
   }
 
   const fields: string[] = [];

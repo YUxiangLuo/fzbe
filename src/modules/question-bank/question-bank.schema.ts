@@ -5,6 +5,34 @@ const optionsSchema = z.union([
   z.array(z.string().min(1)),
 ]);
 
+type QuestionType = "Single Choice" | "Multiple Choice" | "True/False";
+type QuestionOptions = z.infer<typeof optionsSchema> | undefined;
+
+const TRUE_FALSE_ANSWERS = new Set(["正确", "错误"]);
+
+function normalizeOptionValues(options: QuestionOptions): string[] {
+  if (!options) return [];
+  const rawValues = Array.isArray(options) ? options : Object.values(options);
+  return rawValues.map((value) => value.trim()).filter(Boolean);
+}
+
+export function hasValidQuestionAnswerMapping(input: {
+  question_type: QuestionType;
+  options?: QuestionOptions;
+  correct_answers: string[];
+}): boolean {
+  const answers = input.correct_answers.map((answer) => answer.trim()).filter(Boolean);
+
+  if (input.question_type === "True/False") {
+    return answers.every((answer) => TRUE_FALSE_ANSWERS.has(answer));
+  }
+
+  const optionValues = new Set(normalizeOptionValues(input.options));
+  if (optionValues.size === 0) return false;
+
+  return answers.every((answer) => optionValues.has(answer));
+}
+
 export const createQuestionSchema = z
   .object({
     knowledge_point: z.string().trim().min(1).optional(),
@@ -39,6 +67,10 @@ export const createQuestionSchema = z
   }, {
     message: "选择题必须包含选项",
     path: ["options"],
+  })
+  .refine((data) => hasValidQuestionAnswerMapping(data), {
+    message: "正确答案必须来自题目选项",
+    path: ["correct_answers"],
   });
 
 export const updateQuestionSchema = z

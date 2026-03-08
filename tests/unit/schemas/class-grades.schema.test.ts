@@ -43,9 +43,9 @@ describe("Class Grades Schemas", () => {
       expect(result.success).toBe(true);
     });
 
-    test("should accept status only", () => {
+    test("should reject graded status without score", () => {
       const result = gradeReportSchema.safeParse({ status: "graded" });
-      expect(result.success).toBe(true);
+      expect(result.success).toBe(false);
     });
 
     test("should accept rejected status", () => {
@@ -101,6 +101,25 @@ describe("Class Grades Schemas", () => {
       if (result.success) {
         expect(result.data.feedback).toBeNull();
       }
+    });
+
+    test("should reject graded status without report grade", () => {
+      const result = gradeReportSchema.safeParse({
+        status: "graded",
+        feedback: "Only feedback",
+        experiment_grade: {
+          model_quality: 93,
+        },
+      });
+      expect(result.success).toBe(false);
+    });
+
+    test("should accept rejected status without report grade", () => {
+      const result = gradeReportSchema.safeParse({
+        status: "rejected",
+        feedback: "Need revision",
+      });
+      expect(result.success).toBe(true);
     });
   });
 
