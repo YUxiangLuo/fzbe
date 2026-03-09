@@ -194,7 +194,10 @@ usersController.put("/api/v1/users/me", jwtAuth, zValidator("json", updateUserSc
     const payload = c.get("jwtPayload") as JwtPayload;
     const input = c.req.valid("json");
     const result = await updateCurrentUser(payload.sub, input);
-    if ("error" in result) return c.json({ error: "邮箱已存在" }, 409);
+    if ("error" in result) {
+      if (result.error === "dup_email") return c.json({ error: "邮箱已存在" }, 409);
+      if (result.error === "dup_phone") return c.json({ error: "手机号已存在" }, 409);
+    }
     return c.json(result.data);
   } catch (error) { return handleUnexpectedError(c, error, "更新用户信息失败"); }
 });
