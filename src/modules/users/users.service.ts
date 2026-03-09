@@ -18,6 +18,73 @@ interface ClassRow extends RowDataPacket { class_id: number; teacher_id: number;
 interface CountRow extends RowDataPacket { total: number; }
 interface AssignmentRow extends RowDataPacket { class_id: number; }
 
+type Queryable = {
+  query<T extends RowDataPacket[] | ResultSetHeader>(sql: string, values?: unknown[]): Promise<[T, unknown]>;
+};
+
+async function findUserConflict(
+  db: Queryable,
+  input: { username?: string; email?: string; phone?: string | null; excludeUserId?: number },
+) {
+  const conditions: string[] = [];
+  const params: unknown[] = [];
+
+  if (input.username) {
+    conditions.push("username = ?");
+    params.push(input.username);
+  }
+
+  if (input.email) {
+    conditions.push("email = ?");
+    params.push(input.email);
+  }
+
+  if (input.phone) {
+    conditions.push("phone_number = ?");
+    params.push(input.phone);
+  }
+
+  if (conditions.length === 0) return null;
+
+  const whereClause = conditions.length > 1 ? `(${conditions.join(" OR ")})` : conditions[0]!;
+  const excludeClause = input.excludeUserId ? " AND user_id <> ?" : "";
+  if (input.excludeUserId) params.push(input.excludeUserId);
+
+  const [rows] = await db.query<RowDataPacket[]>(
+    `SELECT user_id, username, email, phone_number FROM users WHERE ${whereClause}${excludeClause} LIMIT 20`,
+    params,
+  );
+
+  for (const row of rows) {
+    if (input.username && row.username === input.username) return { error: "dup_username" as const };
+    if (input.email && row.email === input.email) return { error: "dup_email" as const };
+    if (input.phone && row.phone_number === input.phone) return { error: "dup_phone" as const };
+  }
+
+  return null;
+}
+
+function mapDuplicateUserError(error: unknown) {
+  const err = error as { code?: string; message?: string };
+  if (err.code !== "ER_DUP_ENTRY") return null;
+
+  const rawMessage = err.message ?? "";
+  const keyMatch = rawMessage.match(/for key '([^']+)'/i);
+  const normalizedKey = keyMatch?.[1]?.split(".").pop()?.toLowerCase() ?? null;
+
+  if (normalizedKey === "username" || rawMessage.includes("users.username")) {
+    return { error: "dup_username" as const };
+  }
+  if (normalizedKey === "email" || rawMessage.includes("users.email")) {
+    return { error: "dup_email" as const };
+  }
+  if (normalizedKey === "phone_number" || rawMessage.includes("users.phone_number")) {
+    return { error: "dup_phone" as const };
+  }
+
+  return null;
+}
+
 export async function registerSelfUser(role: "Student" | "Teacher" | "Assistant", body: unknown) {
   const schema = role === "Student" ? studentSelfRegisterSchema : teacherAssistantSelfRegisterSchema;
   const result = schema.safeParse(body);
@@ -25,18 +92,18 @@ export async function registerSelfUser(role: "Student" | "Teacher" | "Assistant"
 
   const { username, password, name, email } = result.data;
   const phone = (result.data as { phone?: string }).phone || null;
+
+  const conflict = await findUserConflict(pool, { username, email, phone });
+  if (conflict) return conflict;
+
   const password_hash = await hashPassword(password);
 
   try {
     const [insertResult] = await pool.query<ResultSetHeader>("INSERT INTO users (username, password_hash, full_name, email, phone_number, role) VALUES (?, ?, ?, ?, ?, ?)", [username, password_hash, name, email, phone, role]);
     return { data: { user_id: insertResult.insertId, username, full_name: name, email, phone_number: phone, role } };
   } catch (error: unknown) {
-    const err = error as { code?: string; message?: string };
-    if (err.code === "ER_DUP_ENTRY") {
-      if (err.message?.includes("users.username")) return { error: "dup_username" as const };
-      if (err.message?.includes("users.email")) return { error: "dup_email" as const };
-      if (err.message?.includes("users.phone_number")) return { error: "dup_phone" as const };
-    }
+    const duplicateError = mapDuplicateUserError(error);
+    if (duplicateError) return duplicateError;
     throw error;
   }
 }
@@ -44,18 +111,18 @@ export async function registerSelfUser(role: "Student" | "Teacher" | "Assistant"
 export async function createAssistantSingle(input: CreateAssistantSingleInput) {
   const { username, full_name, email, phone, password } = input;
   const assistantEmail = email ?? `${username}@${ASSISTANT_EMAIL_DOMAIN}`;
+
+  const conflict = await findUserConflict(pool, { username, email: assistantEmail, phone: phone ?? null });
+  if (conflict) return conflict;
+
   const password_hash = password ? await hashPassword(password) : DEFAULT_PASSWORD_HASH;
 
   try {
     const [result] = await pool.query<ResultSetHeader>("INSERT INTO users (username, password_hash, full_name, email, phone_number, role) VALUES (?, ?, ?, ?, ?, 'Assistant')", [username, password_hash, full_name, assistantEmail, phone || null]);
     return { data: { user_id: result.insertId, username, full_name, email: assistantEmail, phone_number: phone || null, role: "Assistant" } };
   } catch (error: unknown) {
-    const err = error as { code?: string; message?: string };
-    if (err.code === "ER_DUP_ENTRY") {
-      if (err.message?.includes("users.username")) return { error: "dup_username" as const };
-      if (err.message?.includes("users.email")) return { error: "dup_email" as const };
-      if (err.message?.includes("users.phone_number")) return { error: "dup_phone" as const };
-    }
+    const duplicateError = mapDuplicateUserError(error);
+    if (duplicateError) return duplicateError;
     throw error;
   }
 }
@@ -107,6 +174,9 @@ export async function createAssistantWithClasses(input: CreateAssistantInput, re
       }
     }
 
+    const conflict = await findUserConflict(connection, { username, email, phone: phone_number || null });
+    if (conflict) { await connection.rollback(); return conflict; }
+
     const password_hash = await hashPassword(password);
     const [userResult] = await connection.query<ResultSetHeader>("INSERT INTO users (username, password_hash, full_name, email, role, phone_number) VALUES (?, ?, ?, ?, 'Assistant', ?)", [username, password_hash, full_name, email, phone_number || null]);
     const newAssistantId = userResult.insertId;
@@ -116,11 +186,8 @@ export async function createAssistantWithClasses(input: CreateAssistantInput, re
     return { data: { user_id: newAssistantId, username, full_name, email, phone_number: phone_number || null, role: "Assistant", assigned_classes: class_ids } };
   } catch (error: unknown) {
     await connection.rollback();
-    const err = error as { code?: string; message?: string };
-    if (err.code === "ER_DUP_ENTRY") {
-      if (err.message?.includes("users.username")) return { error: "dup_username" as const };
-      if (err.message?.includes("users.email")) return { error: "dup_email" as const };
-    }
+    const duplicateError = mapDuplicateUserError(error);
+    if (duplicateError) return duplicateError;
     throw error;
   } finally { connection.release(); }
 }
@@ -128,18 +195,18 @@ export async function createAssistantWithClasses(input: CreateAssistantInput, re
 export async function createTeacher(input: CreateTeacherInput) {
   const { username, full_name, email, phone, password } = input;
   const teacherEmail = email ?? `${username}@${TEACHER_EMAIL_DOMAIN}`;
+
+  const conflict = await findUserConflict(pool, { username, email: teacherEmail, phone: phone ?? null });
+  if (conflict) return conflict;
+
   const password_hash = password ? await hashPassword(password) : DEFAULT_PASSWORD_HASH;
 
   try {
     const [result] = await pool.query<ResultSetHeader>("INSERT INTO users (username, password_hash, full_name, email, phone_number, role) VALUES (?, ?, ?, ?, ?, 'Teacher')", [username, password_hash, full_name, teacherEmail, phone || null]);
     return { data: { user_id: result.insertId, username, full_name, email: teacherEmail, phone_number: phone || null, role: "Teacher" } };
   } catch (error: unknown) {
-    const err = error as { code?: string; message?: string };
-    if (err.code === "ER_DUP_ENTRY") {
-      if (err.message?.includes("users.username")) return { error: "dup_username" as const };
-      if (err.message?.includes("users.email")) return { error: "dup_email" as const };
-      if (err.message?.includes("users.phone_number")) return { error: "dup_phone" as const };
-    }
+    const duplicateError = mapDuplicateUserError(error);
+    if (duplicateError) return duplicateError;
     throw error;
   }
 }
@@ -379,8 +446,22 @@ export async function getCurrentUser(userId: number) {
 
 export async function updateCurrentUser(userId: number, input: UpdateUserInput) {
   const { full_name, phone_number, email } = input;
+
+  if (!full_name && !phone_number && !email) {
+    const [[user]] = await pool.query<RowDataPacket[]>("SELECT user_id, username, full_name, email, phone_number, role, created_at FROM users WHERE user_id = ?", [userId]);
+    return { data: user };
+  }
+
   const fields: string[] = [];
   const values: unknown[] = [];
+
+  const conflict = await findUserConflict(pool, {
+    email,
+    phone: phone_number,
+    excludeUserId: userId,
+  });
+  if (conflict) return conflict;
+
   if (full_name) { fields.push("full_name = ?"); values.push(full_name); }
   if (phone_number) { fields.push("phone_number = ?"); values.push(phone_number); }
   if (email) { fields.push("email = ?"); values.push(email); }
@@ -391,8 +472,8 @@ export async function updateCurrentUser(userId: number, input: UpdateUserInput) 
     const [[user]] = await pool.query<RowDataPacket[]>("SELECT user_id, username, full_name, email, phone_number, role, created_at FROM users WHERE user_id = ?", [userId]);
     return { data: user };
   } catch (error: unknown) {
-    const err = error as { code?: string };
-    if (err.code === "ER_DUP_ENTRY") return { error: "dup_email" as const };
+    const duplicateError = mapDuplicateUserError(error);
+    if (duplicateError) return duplicateError;
     throw error;
   }
 }

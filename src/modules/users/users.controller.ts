@@ -75,6 +75,7 @@ usersController.post("/api/v1/assistants", jwtAuth, zValidator("json", createAss
       if (result.error === "not_class_owner") return c.json({ error: `禁止将助教分配给您不拥有的班级 (ID: ${result.classId})` }, 403);
       if (result.error === "dup_username") return c.json({ error: "用户名已存在" }, 409);
       if (result.error === "dup_email") return c.json({ error: "邮箱已存在" }, 409);
+      if (result.error === "dup_phone") return c.json({ error: "手机号已存在" }, 409);
     }
     return c.json(result.data, 201);
   } catch (error) { return handleUnexpectedError(c, error, "创建助教失败"); }
