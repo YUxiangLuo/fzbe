@@ -33,7 +33,17 @@ function isEnabled(...values: Array<string | undefined>) {
   return values.some(value => value === '1');
 }
 
+function warnDeprecatedEnv(oldName: string, newName: string) {
+  if (process.env[oldName]) {
+    console.warn(`⚠️  ${oldName} is deprecated, use ${newName}`);
+  }
+}
+
 function assertDbResetSafety(force: boolean) {
+  if (!force) {
+    exitWithSafetyError('Destructive reset requires --force. Re-run with `bun run db:reset --force`.');
+  }
+
   const dbHost = requireNonEmptyEnv('DB_HOST', DB_HOST);
   const dbDatabase = requireNonEmptyEnv('DB_DATABASE', DB_DATABASE);
   requireNonEmptyEnv('DB_USER', DB_USER);
@@ -42,6 +52,7 @@ function assertDbResetSafety(force: boolean) {
     exitWithSafetyError(`Refusing to run against system database "${dbDatabase}".`);
   }
 
+  warnDeprecatedEnv('DB_SETUP_ALLOW_PROD', 'DB_RESET_ALLOW_PROD');
   if (
     process.env.NODE_ENV === 'production' &&
     !isEnabled(process.env.DB_RESET_ALLOW_PROD, process.env.DB_SETUP_ALLOW_PROD)
@@ -49,6 +60,7 @@ function assertDbResetSafety(force: boolean) {
     exitWithSafetyError('Refusing to run in production. Set DB_RESET_ALLOW_PROD=1 to override.');
   }
 
+  warnDeprecatedEnv('DB_SETUP_ALLOW_REMOTE', 'DB_RESET_ALLOW_REMOTE');
   if (
     !LOCAL_HOSTS.has(dbHost.toLowerCase()) &&
     !isEnabled(process.env.DB_RESET_ALLOW_REMOTE, process.env.DB_SETUP_ALLOW_REMOTE)
@@ -56,10 +68,6 @@ function assertDbResetSafety(force: boolean) {
     exitWithSafetyError(
       `Refusing to run against remote host "${dbHost}". Set DB_RESET_ALLOW_REMOTE=1 to override.`,
     );
-  }
-
-  if (!force) {
-    exitWithSafetyError('Destructive reset requires --force. Re-run with `bun run db:reset --force`.');
   }
 
   return { dbHost, dbDatabase };
