@@ -372,9 +372,40 @@ app.onError((err, c) => {
 export const serverConfig = {
   port: env.PORT,
   fetch: app.fetch,
+  error(error: Error) {
+    logger.error(
+      { err: { message: error.message, stack: error.stack } },
+      "Bun.serve unhandled error",
+    );
+    return new Response("Internal Server Error", { status: 500 });
+  },
 };
 
 if (import.meta.main) {
+  process.on("unhandledRejection", (reason) => {
+    try {
+      logger.error(
+        {
+          err:
+            reason instanceof Error
+              ? { message: reason.message, stack: reason.stack }
+              : { message: String(reason) },
+        },
+        "Unhandled promise rejection",
+      );
+    } catch {
+      // Avoid cascading failures if serialization throws
+    }
+  });
+
+  process.on("uncaughtException", (err) => {
+    logger.fatal(
+      { err: { message: err.message, stack: err.stack } },
+      "Uncaught exception",
+    );
+    setTimeout(() => process.exit(1), 1000);
+  });
+
   const server = Bun.serve(serverConfig);
   logger.info(`Server listening on ${server.url.href}`);
 }

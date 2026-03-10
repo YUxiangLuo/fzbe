@@ -216,7 +216,12 @@ export async function submitReport(
   const browser = await puppeteer.launch({
     executablePath: PATHS.CHROMIUM_PATH,
     headless: true,
-    args: ["--no-sandbox", "--disable-setuid-sandbox"],
+    args: [
+      "--no-sandbox",
+      "--disable-setuid-sandbox",
+      "--disable-gpu",
+      "--disable-dev-shm-usage",
+    ],
   });
 
   try {
@@ -226,7 +231,7 @@ export async function submitReport(
     await page.setContent(htmlDocument, { waitUntil: "domcontentloaded", timeout: 10000 });
     await page.pdf({ path: pdfPath, format: "A4", printBackground: true });
   } finally {
-    await browser.close();
+    await browser.close().catch(() => { /* browser may already be closed or crashed */ });
   }
 
   const connection = await pool.getConnection();
