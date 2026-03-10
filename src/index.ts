@@ -383,15 +383,19 @@ export const serverConfig = {
 
 if (import.meta.main) {
   process.on("unhandledRejection", (reason) => {
-    logger.error(
-      {
-        err:
-          reason instanceof Error
-            ? { message: reason.message, stack: reason.stack }
-            : reason,
-      },
-      "Unhandled promise rejection",
-    );
+    try {
+      logger.error(
+        {
+          err:
+            reason instanceof Error
+              ? { message: reason.message, stack: reason.stack }
+              : { message: String(reason) },
+        },
+        "Unhandled promise rejection",
+      );
+    } catch {
+      // Avoid cascading failures if serialization throws
+    }
   });
 
   process.on("uncaughtException", (err) => {
