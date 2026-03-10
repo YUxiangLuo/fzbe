@@ -4,9 +4,10 @@ import { cors } from "hono/cors";
 import { serveStatic } from "hono/bun";
 import path from "path";
 import type { RowDataPacket } from "mysql2/promise";
-import { env, pool } from "./config";
+import { env, pool, connectionLimit } from "./config";
 import { jwtAuth } from "./middleware";
 import logger from "./utils/logger";
+import { CONCURRENCY_LIMITS } from "./utils/constants";
 import type { JwtPayload, UserRole } from "./types";
 // Import new modular controllers
 import { authController } from "./modules/auth";
@@ -382,6 +383,16 @@ export const serverConfig = {
 };
 
 if (import.meta.main) {
+  // ---- 启动校验：连接池容量 vs. 并发模型任务 ----
+  const minRequired = 2 * CONCURRENCY_LIMITS.MAX_CONCURRENT_MODEL_JOBS;
+  if (connectionLimit <= minRequired) {
+    logger.fatal(
+      { connectionLimit, maxConcurrentModelJobs: CONCURRENCY_LIMITS.MAX_CONCURRENT_MODEL_JOBS, minRequired },
+      "数据库连接池容量不足：connectionLimit 应大于 2 × MAX_CONCURRENT_MODEL_JOBS，否则并发训练时将死锁",
+    );
+    process.exit(1);
+  }
+
   process.on("unhandledRejection", (reason) => {
     try {
       logger.error(

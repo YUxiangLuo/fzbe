@@ -449,6 +449,12 @@ export async function runPythonModel(
     }, timeoutMs);
   });
 
+  // 超时后 executionPromise 仍会 reject（进程被杀后 exitCode !== 0），
+  // 若不捕获会触发 unhandledRejection。用 .catch 吞掉滞后的 rejection。
+  executionPromise.catch((err) => {
+    logger.debug({ err, modelType }, "超时后 executionPromise 滞后 rejection（已忽略）");
+  });
+
   return Promise.race([executionPromise, timeoutPromise]);
 }
 
