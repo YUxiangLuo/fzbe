@@ -64,10 +64,10 @@ async function acquireAdvisoryLock(name: string): Promise<AdvisoryLockHandle | n
       return { connection, name };
     }
 
-    try { connection.release(); } catch {}
+    try { connection.release(); } catch { /* connection may already be destroyed */ }
     return null;
   } catch (error) {
-    try { connection.release(); } catch {}
+    try { connection.release(); } catch { /* connection may already be destroyed */ }
     throw error;
   }
 }
@@ -106,10 +106,10 @@ export const acquireModelSlot = async (): Promise<AdvisoryLockHandle | null> => 
       }
     }
 
-    try { connection.release(); } catch {}
+    try { connection.release(); } catch { /* connection may already be destroyed */ }
     return null;
   } catch (error) {
-    try { connection.release(); } catch {}
+    try { connection.release(); } catch { /* connection may already be destroyed */ }
     throw error;
   }
 };

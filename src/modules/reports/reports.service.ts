@@ -231,7 +231,7 @@ export async function submitReport(
     await page.setContent(htmlDocument, { waitUntil: "domcontentloaded", timeout: 10000 });
     await page.pdf({ path: pdfPath, format: "A4", printBackground: true });
   } finally {
-    await browser.close().catch(() => {});
+    await browser.close().catch(() => { /* browser may already be closed or crashed */ });
   }
 
   const connection = await pool.getConnection();
