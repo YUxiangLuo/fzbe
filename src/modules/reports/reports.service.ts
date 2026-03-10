@@ -5,11 +5,62 @@ import { marked } from "marked";
 import puppeteer from "puppeteer-core";
 import { pool } from "../../config";
 import { sanitizeHTML, HTMLSanitizationError } from "../../utils/html-sanitizer";
-import { CONTENT_LIMITS, PATHS } from "../../utils/constants";
+import { CONTENT_LIMITS, CONCURRENCY_LIMITS, TIMEOUTS, PATHS } from "../../utils/constants";
+import logger from "../../utils/logger";
 import {
   buildExperimentFlowGradeValues,
   getReportSubmissionEligibilityError,
 } from "./report-submission-policy";
+
+class Semaphore {
+  private running = 0;
+  private readonly queue: Array<{
+    resolve: () => void;
+    reject: (err: Error) => void;
+    timerId?: ReturnType<typeof setTimeout>;
+  }> = [];
+
+  constructor(private readonly max: number) {}
+
+  async acquire(timeoutMs?: number): Promise<void> {
+    if (this.running < this.max) {
+      this.running++;
+      return;
+    }
+    return new Promise<void>((resolve, reject) => {
+      const entry: (typeof this.queue)[number] = { resolve, reject };
+      this.queue.push(entry);
+
+      if (timeoutMs !== undefined) {
+        entry.timerId = setTimeout(() => {
+          const index = this.queue.indexOf(entry);
+          if (index !== -1) {
+            this.queue.splice(index, 1);
+            reject(new SemaphoreTimeoutError(timeoutMs));
+          }
+        }, timeoutMs);
+      }
+    });
+  }
+
+  release(): void {
+    this.running--;
+    const next = this.queue.shift();
+    if (next) {
+      this.running++;
+      if (next.timerId !== undefined) clearTimeout(next.timerId);
+      next.resolve();
+    }
+  }
+}
+
+class SemaphoreTimeoutError extends Error {
+  constructor(timeoutMs: number) {
+    super(`PDF 生成服务繁忙，排队等待超过 ${Math.ceil(timeoutMs / 1000)} 秒，请稍后再试`);
+  }
+}
+
+const pdfSemaphore = new Semaphore(CONCURRENCY_LIMITS.MAX_CONCURRENT_PDF_JOBS);
 
 const MODEL_TYPES = [
   "ma", "exp", "arima", "lstm",
@@ -213,25 +264,35 @@ export async function submitReport(
   const uniqueFilename = `report-exp${experimentId}-student${studentId}-${Date.now()}.pdf`;
   const pdfPath = path.join(reportsDir, uniqueFilename);
 
-  const browser = await puppeteer.launch({
-    executablePath: PATHS.CHROMIUM_PATH,
-    headless: true,
-    args: [
-      "--no-sandbox",
-      "--disable-setuid-sandbox",
-      "--disable-gpu",
-      "--disable-dev-shm-usage",
-    ],
-  });
-
+  await pdfSemaphore.acquire(TIMEOUTS.PDF_QUEUE);
   try {
-    const page = await browser.newPage();
-    await page.setExtraHTTPHeaders({ "Content-Security-Policy": "default-src 'none'; style-src 'unsafe-inline';" });
-    await page.setJavaScriptEnabled(false);
-    await page.setContent(htmlDocument, { waitUntil: "domcontentloaded", timeout: 10000 });
-    await page.pdf({ path: pdfPath, format: "A4", printBackground: true });
+    const browser = await puppeteer.launch({
+      executablePath: PATHS.CHROMIUM_PATH,
+      headless: true,
+      args: [
+        "--no-sandbox",
+        "--disable-setuid-sandbox",
+        "--disable-gpu",
+        "--disable-dev-shm-usage",
+      ],
+    });
+
+    try {
+      const page = await browser.newPage();
+      await page.setExtraHTTPHeaders({ "Content-Security-Policy": "default-src 'none'; style-src 'unsafe-inline';" });
+      await page.setJavaScriptEnabled(false);
+      await page.setContent(htmlDocument, { waitUntil: "domcontentloaded", timeout: 10000 });
+      await page.pdf({ path: pdfPath, format: "A4", printBackground: true });
+    } finally {
+      await browser.close().catch(() => { /* browser may already be closed or crashed */ });
+    }
+  } catch (error) {
+    if (!(error instanceof SemaphoreTimeoutError)) {
+      logger.error({ error, experimentId, studentId }, "PDF 生成失败");
+    }
+    throw error;
   } finally {
-    await browser.close().catch(() => { /* browser may already be closed or crashed */ });
+    pdfSemaphore.release();
   }
 
   const connection = await pool.getConnection();
@@ -361,4 +422,4 @@ export async function getLatestReportStatus(studentId: number) {
   return { is_rejected: false };
 }
 
-export { HTMLSanitizationError };
+export { HTMLSanitizationError, SemaphoreTimeoutError };

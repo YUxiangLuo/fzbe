@@ -2,7 +2,7 @@ import { Hono } from "hono";
 import { zValidator } from "@hono/zod-validator";
 import { jwtAuth, requireStudent } from "../../middleware";
 import { experimentIdParamSchema, submitReportSchema } from "./reports.schema";
-import { submitReport, getLatestReportStatus, HTMLSanitizationError } from "./reports.service";
+import { submitReport, getLatestReportStatus, HTMLSanitizationError, SemaphoreTimeoutError } from "./reports.service";
 import { handleUnexpectedError } from "../../utils/error-handler";
 import type { JwtPayload } from "../../types";
 
@@ -32,6 +32,9 @@ reportsController.post(
 
       return c.json(result.data, result.isUpdate ? 200 : 201);
     } catch (error) {
+      if (error instanceof SemaphoreTimeoutError) {
+        return c.json({ error: error.message }, 503);
+      }
       if (error instanceof HTMLSanitizationError) {
         return c.json({ error: "无效的报告内容： " + error.message }, 400);
       }

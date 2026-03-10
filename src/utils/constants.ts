@@ -47,8 +47,10 @@ export const TIMEOUTS = {
   MODEL_PREDICTION: 60000,
   /** ADF 平稳性检测超时 */
   ADF: 30000,
-  /** PDF 生成超时 */
+  /** PDF 生成超时（Puppeteer 执行） */
   PDF_GENERATION: 30000,
+  /** PDF 生成排队等待超时 */
+  PDF_QUEUE: 30000,
 } as const;
 
 // ============================================
@@ -57,6 +59,8 @@ export const TIMEOUTS = {
 export const CONCURRENCY_LIMITS = {
   /** 最大并发模型训练任务 */
   MAX_CONCURRENT_MODEL_JOBS: 16,
+  /** 最大并发 PDF 生成（Puppeteer）任务 */
+  MAX_CONCURRENT_PDF_JOBS: 3,
 } as const;
 
 // ============================================
