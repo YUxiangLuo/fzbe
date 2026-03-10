@@ -5,11 +5,15 @@ import { marked } from "marked";
 import puppeteer from "puppeteer-core";
 import { pool } from "../../config";
 import { sanitizeHTML, HTMLSanitizationError } from "../../utils/html-sanitizer";
-import { CONTENT_LIMITS, PATHS } from "../../utils/constants";
+import { CONTENT_LIMITS, CONCURRENCY_LIMITS, TIMEOUTS, PATHS } from "../../utils/constants";
+import { Semaphore } from "../../utils/semaphore";
+import logger from "../../utils/logger";
 import {
   buildExperimentFlowGradeValues,
   getReportSubmissionEligibilityError,
 } from "./report-submission-policy";
+
+const pdfSemaphore = new Semaphore(CONCURRENCY_LIMITS.MAX_CONCURRENT_PDF_JOBS);
 
 const MODEL_TYPES = [
   "ma", "exp", "arima", "lstm",
@@ -213,25 +217,33 @@ export async function submitReport(
   const uniqueFilename = `report-exp${experimentId}-student${studentId}-${Date.now()}.pdf`;
   const pdfPath = path.join(reportsDir, uniqueFilename);
 
-  const browser = await puppeteer.launch({
-    executablePath: PATHS.CHROMIUM_PATH,
-    headless: true,
-    args: [
-      "--no-sandbox",
-      "--disable-setuid-sandbox",
-      "--disable-gpu",
-      "--disable-dev-shm-usage",
-    ],
-  });
-
+  await pdfSemaphore.acquire(TIMEOUTS.PDF_QUEUE);
   try {
-    const page = await browser.newPage();
-    await page.setExtraHTTPHeaders({ "Content-Security-Policy": "default-src 'none'; style-src 'unsafe-inline';" });
-    await page.setJavaScriptEnabled(false);
-    await page.setContent(htmlDocument, { waitUntil: "domcontentloaded", timeout: 10000 });
-    await page.pdf({ path: pdfPath, format: "A4", printBackground: true });
+    const browser = await puppeteer.launch({
+      executablePath: PATHS.CHROMIUM_PATH,
+      headless: true,
+      args: [
+        "--no-sandbox",
+        "--disable-setuid-sandbox",
+        "--disable-gpu",
+        "--disable-dev-shm-usage",
+      ],
+    });
+
+    try {
+      const page = await browser.newPage();
+      await page.setExtraHTTPHeaders({ "Content-Security-Policy": "default-src 'none'; style-src 'unsafe-inline';" });
+      await page.setJavaScriptEnabled(false);
+      await page.setContent(htmlDocument, { waitUntil: "domcontentloaded", timeout: 10000 });
+      await page.pdf({ path: pdfPath, format: "A4", printBackground: true });
+    } finally {
+      await browser.close().catch(() => { /* browser may already be closed or crashed */ });
+    }
+  } catch (error) {
+    logger.error({ err: error, experimentId, studentId }, "PDF 生成失败");
+    throw error;
   } finally {
-    await browser.close().catch(() => { /* browser may already be closed or crashed */ });
+    pdfSemaphore.release();
   }
 
   const connection = await pool.getConnection();

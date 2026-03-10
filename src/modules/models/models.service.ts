@@ -84,7 +84,7 @@ async function releaseAdvisoryLock(handle: AdvisoryLockHandle | null | undefined
   try {
     await handle.connection.query("SELECT RELEASE_LOCK(?)", [handle.name]);
   } catch (error) {
-    logger.warn({ error, lock: handle.name }, "释放数据库 advisory lock 失败");
+    logger.warn({ err: error, lock: handle.name }, "释放数据库 advisory lock 失败");
   } finally {
     safeRelease(handle.connection);
   }
@@ -395,7 +395,7 @@ export async function runPythonModel(
     try {
       proc.kill("SIGKILL");
     } catch (error) {
-      logger.warn({ error, pid: proc.pid, modelType }, "终止 Python 主进程失败");
+      logger.warn({ err: error, pid: proc.pid, modelType }, "终止 Python 主进程失败");
     }
   };
 
