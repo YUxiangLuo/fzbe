@@ -195,6 +195,7 @@ usersController.put("/api/v1/users/me", jwtAuth, zValidator("json", updateUserSc
     const input = c.req.valid("json");
     const result = await updateCurrentUser(payload.sub, input);
     if ("error" in result) {
+      if (result.error === "dup_username") return c.json({ error: "用户名已存在" }, 409);
       if (result.error === "dup_email") return c.json({ error: "邮箱已存在" }, 409);
       if (result.error === "dup_phone") return c.json({ error: "手机号已存在" }, 409);
     }
