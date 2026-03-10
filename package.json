@@ -15,7 +15,7 @@
     "lint": "bunx tsc --noEmit --pretty false",
     "test": "bun test",
     "test:unit": "bun test tests/unit",
-    "db:setup": "bun run scripts/db-setup.ts",
+    "db:reset": "bun run scripts/db-reset.ts",
     "hash-password": "bun run scripts/hash-password.ts"
   },
   "type": "module",
