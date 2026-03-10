@@ -145,4 +145,16 @@ describe("Semaphore", () => {
     }
     throw new Error("expected SemaphoreTimeoutError");
   });
+
+  test("constructor rejects zero", () => {
+    expect(() => new Semaphore(0)).toThrow("positive integer");
+  });
+
+  test("constructor rejects negative", () => {
+    expect(() => new Semaphore(-1)).toThrow("positive integer");
+  });
+
+  test("constructor rejects non-integer", () => {
+    expect(() => new Semaphore(1.5)).toThrow("positive integer");
+  });
 });

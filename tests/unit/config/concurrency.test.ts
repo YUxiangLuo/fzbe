@@ -15,4 +15,9 @@ describe("concurrency safeguards", () => {
     expect(CONCURRENCY_LIMITS.MAX_CONCURRENT_MODEL_JOBS).toBeGreaterThan(0);
     expect(Number.isInteger(CONCURRENCY_LIMITS.MAX_CONCURRENT_MODEL_JOBS)).toBe(true);
   });
+
+  test("MAX_CONCURRENT_PDF_JOBS is a positive integer", () => {
+    expect(CONCURRENCY_LIMITS.MAX_CONCURRENT_PDF_JOBS).toBeGreaterThan(0);
+    expect(Number.isInteger(CONCURRENCY_LIMITS.MAX_CONCURRENT_PDF_JOBS)).toBe(true);
+  });
 });

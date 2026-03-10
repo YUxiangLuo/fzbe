@@ -12,7 +12,11 @@ export class Semaphore {
     timerId?: ReturnType<typeof setTimeout>;
   }> = [];
 
-  constructor(private readonly max: number) {}
+  constructor(private readonly max: number) {
+    if (!Number.isInteger(max) || max <= 0) {
+      throw new Error(`Semaphore max must be a positive integer, got: ${max}`);
+    }
+  }
 
   get pending(): number {
     return this.queue.length;

@@ -6,7 +6,7 @@ import puppeteer from "puppeteer-core";
 import { pool } from "../../config";
 import { sanitizeHTML, HTMLSanitizationError } from "../../utils/html-sanitizer";
 import { CONTENT_LIMITS, CONCURRENCY_LIMITS, TIMEOUTS, PATHS } from "../../utils/constants";
-import { Semaphore, SemaphoreTimeoutError } from "../../utils/semaphore";
+import { Semaphore } from "../../utils/semaphore";
 import logger from "../../utils/logger";
 import {
   buildExperimentFlowGradeValues,
@@ -240,7 +240,7 @@ export async function submitReport(
       await browser.close().catch(() => { /* browser may already be closed or crashed */ });
     }
   } catch (error) {
-    logger.error({ error, experimentId, studentId }, "PDF 生成失败");
+    logger.error({ err: error, experimentId, studentId }, "PDF 生成失败");
     throw error;
   } finally {
     pdfSemaphore.release();
