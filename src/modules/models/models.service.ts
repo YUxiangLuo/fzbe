@@ -64,10 +64,10 @@ async function acquireAdvisoryLock(name: string): Promise<AdvisoryLockHandle | n
       return { connection, name };
     }
 
-    connection.release();
+    try { connection.release(); } catch {}
     return null;
   } catch (error) {
-    connection.release();
+    try { connection.release(); } catch {}
     throw error;
   }
 }
@@ -82,7 +82,11 @@ async function releaseAdvisoryLock(handle: AdvisoryLockHandle | null | undefined
   } catch (error) {
     logger.warn({ error, lock: handle.name }, "释放数据库 advisory lock 失败");
   } finally {
-    handle.connection.release();
+    try {
+      handle.connection.release();
+    } catch {
+      // Connection may already be released or destroyed
+    }
   }
 }
 
@@ -102,10 +106,10 @@ export const acquireModelSlot = async (): Promise<AdvisoryLockHandle | null> => 
       }
     }
 
-    connection.release();
+    try { connection.release(); } catch {}
     return null;
   } catch (error) {
-    connection.release();
+    try { connection.release(); } catch {}
     throw error;
   }
 };
