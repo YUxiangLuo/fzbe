@@ -399,6 +399,7 @@ if (import.meta.main) {
       { err: { message: err.message, stack: err.stack } },
       "Uncaught exception",
     );
+    setTimeout(() => process.exit(1), 1000);
   });
 
   const server = Bun.serve(serverConfig);
