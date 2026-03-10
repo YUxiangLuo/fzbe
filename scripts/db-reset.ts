@@ -1,5 +1,4 @@
 import mysql from 'mysql2/promise';
-import fs from 'fs/promises';
 import path from 'path';
 
 // --- 配置 ---
@@ -26,7 +25,25 @@ function requireNonEmptyEnv(name: string, value: string | undefined): string {
   return normalized;
 }
 
-function assertDbSetupSafety() {
+function hasForceFlag() {
+  return process.argv.includes('--force');
+}
+
+function isEnabled(...values: Array<string | undefined>) {
+  return values.some(value => value === '1');
+}
+
+function warnDeprecatedEnv(oldName: string, newName: string) {
+  if (process.env[oldName]) {
+    console.warn(`⚠️  ${oldName} is deprecated, use ${newName}`);
+  }
+}
+
+function assertDbResetSafety(force: boolean) {
+  if (!force) {
+    exitWithSafetyError('Destructive reset requires --force. Re-run with `bun run db:reset --force`.');
+  }
+
   const dbHost = requireNonEmptyEnv('DB_HOST', DB_HOST);
   const dbDatabase = requireNonEmptyEnv('DB_DATABASE', DB_DATABASE);
   requireNonEmptyEnv('DB_USER', DB_USER);
@@ -35,18 +52,21 @@ function assertDbSetupSafety() {
     exitWithSafetyError(`Refusing to run against system database "${dbDatabase}".`);
   }
 
-  if (process.env.NODE_ENV === 'production' && process.env.DB_SETUP_ALLOW_PROD !== '1') {
-    exitWithSafetyError('Refusing to run in production. Set DB_SETUP_ALLOW_PROD=1 to override.');
+  warnDeprecatedEnv('DB_SETUP_ALLOW_PROD', 'DB_RESET_ALLOW_PROD');
+  if (
+    process.env.NODE_ENV === 'production' &&
+    !isEnabled(process.env.DB_RESET_ALLOW_PROD, process.env.DB_SETUP_ALLOW_PROD)
+  ) {
+    exitWithSafetyError('Refusing to run in production. Set DB_RESET_ALLOW_PROD=1 to override.');
   }
 
-  if (!LOCAL_HOSTS.has(dbHost.toLowerCase()) && process.env.DB_SETUP_ALLOW_REMOTE !== '1') {
-    exitWithSafetyError(`Refusing to run against remote host "${dbHost}". Set DB_SETUP_ALLOW_REMOTE=1 to override.`);
-  }
-
-  const expectedConfirmToken = `RESET:${dbDatabase}`;
-  if (process.env.DB_SETUP_CONFIRM !== expectedConfirmToken) {
+  warnDeprecatedEnv('DB_SETUP_ALLOW_REMOTE', 'DB_RESET_ALLOW_REMOTE');
+  if (
+    !LOCAL_HOSTS.has(dbHost.toLowerCase()) &&
+    !isEnabled(process.env.DB_RESET_ALLOW_REMOTE, process.env.DB_SETUP_ALLOW_REMOTE)
+  ) {
     exitWithSafetyError(
-      `Destructive reset requires confirmation token. Re-run with DB_SETUP_CONFIRM=${expectedConfirmToken}`,
+      `Refusing to run against remote host "${dbHost}". Set DB_RESET_ALLOW_REMOTE=1 to override.`,
     );
   }
 
@@ -60,7 +80,7 @@ function assertDbSetupSafety() {
  */
 async function executeSqlFile(connection: mysql.Connection, filePath: string) {
   try {
-    const sql = await fs.readFile(filePath, 'utf-8');
+    const sql = await Bun.file(filePath).text();
     // 移除注释并按分号分割语句
     const statements = sql
       .split(/;(?=\s*CREATE|INSERT|ALTER|SET|TRUNCATE)/)
@@ -106,12 +126,12 @@ async function dropAllTables(connection: mysql.Connection, database: string) {
 }
 
 /**
- * 主函数：设置数据库
+ * 主函数：重置数据库
  */
-async function setupDatabase() {
+async function resetDatabase() {
   let connection: mysql.Connection | null = null;
   try {
-    const { dbHost, dbDatabase } = assertDbSetupSafety();
+    const { dbHost, dbDatabase } = assertDbResetSafety(hasForceFlag());
 
     // 1. 连接到 MySQL/MariaDB 服务器 (不指定具体数据库)
     console.log(`Connecting to MySQL server at ${dbHost}...`);
@@ -144,10 +164,10 @@ async function setupDatabase() {
     console.log('Executing seed.sql...');
     await executeSqlFile(connection, SEED_FILE);
 
-    console.log('\n🎉 Database setup complete! All tables created and seeded.');
+    console.log('\n🎉 Database reset complete! All tables recreated and seeded.');
 
   } catch (error) {
-    console.error('\n❌ An error occurred during database setup:', error);
+    console.error('\n❌ An error occurred during database reset:', error);
     process.exit(1); // 出错时退出
   } finally {
     if (connection) {
@@ -158,4 +178,4 @@ async function setupDatabase() {
 }
 
 // --- 运行脚本 ---
-setupDatabase();
+resetDatabase();
