@@ -382,6 +382,18 @@ export const serverConfig = {
 };
 
 if (import.meta.main) {
+  // ---- 启动校验：连接池容量 vs. 并发模型任务 ----
+  const poolCfg = (pool.pool as { config?: { connectionLimit?: number } }).config;
+  const connLimit = poolCfg?.connectionLimit ?? 0;
+  const { CONCURRENCY_LIMITS } = await import("./utils/constants");
+  const minRequired = 2 * CONCURRENCY_LIMITS.MAX_CONCURRENT_MODEL_JOBS;
+  if (connLimit > 0 && connLimit <= minRequired) {
+    logger.warn(
+      { connectionLimit: connLimit, maxConcurrentModelJobs: CONCURRENCY_LIMITS.MAX_CONCURRENT_MODEL_JOBS, minRequired },
+      "数据库连接池容量不足：connectionLimit 应大于 2 × MAX_CONCURRENT_MODEL_JOBS，否则并发训练时可能死锁",
+    );
+  }
+
   process.on("unhandledRejection", (reason) => {
     try {
       logger.error(

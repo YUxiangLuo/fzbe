@@ -449,7 +449,11 @@ export async function runPythonModel(
     }, timeoutMs);
   });
 
-  return Promise.race([executionPromise, timeoutPromise]);
+  // 超时后 executionPromise 仍会 reject（进程被杀后 exitCode !== 0），
+  // 若不捕获会触发 unhandledRejection。用 .catch 吞掉滞后的 rejection。
+  const guarded = executionPromise.catch(() => {});
+
+  return Promise.race([executionPromise, timeoutPromise]).finally(() => guarded);
 }
 
 const resultTransformers: Record<ModelType, (result: Record<string, unknown>) => Record<string, unknown>> = {
