@@ -1,2 +1,2 @@
 export { env } from "./env";
-export { pool, type DbPool } from "./database";
+export { pool, connectionLimit, type DbPool } from "./database";

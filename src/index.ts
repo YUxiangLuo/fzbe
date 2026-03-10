@@ -4,9 +4,10 @@ import { cors } from "hono/cors";
 import { serveStatic } from "hono/bun";
 import path from "path";
 import type { RowDataPacket } from "mysql2/promise";
-import { env, pool } from "./config";
+import { env, pool, connectionLimit } from "./config";
 import { jwtAuth } from "./middleware";
 import logger from "./utils/logger";
+import { CONCURRENCY_LIMITS } from "./utils/constants";
 import type { JwtPayload, UserRole } from "./types";
 // Import new modular controllers
 import { authController } from "./modules/auth";
@@ -383,13 +384,10 @@ export const serverConfig = {
 
 if (import.meta.main) {
   // ---- 启动校验：连接池容量 vs. 并发模型任务 ----
-  const poolCfg = (pool.pool as { config?: { connectionLimit?: number } }).config;
-  const connLimit = poolCfg?.connectionLimit ?? 0;
-  const { CONCURRENCY_LIMITS } = await import("./utils/constants");
   const minRequired = 2 * CONCURRENCY_LIMITS.MAX_CONCURRENT_MODEL_JOBS;
-  if (connLimit > 0 && connLimit <= minRequired) {
+  if (connectionLimit <= minRequired) {
     logger.warn(
-      { connectionLimit: connLimit, maxConcurrentModelJobs: CONCURRENCY_LIMITS.MAX_CONCURRENT_MODEL_JOBS, minRequired },
+      { connectionLimit, maxConcurrentModelJobs: CONCURRENCY_LIMITS.MAX_CONCURRENT_MODEL_JOBS, minRequired },
       "数据库连接池容量不足：connectionLimit 应大于 2 × MAX_CONCURRENT_MODEL_JOBS，否则并发训练时可能死锁",
     );
   }

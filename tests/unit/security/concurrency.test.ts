@@ -14,15 +14,11 @@ describe("concurrency safeguards", () => {
     process.env.PORT ??= "3001";
     process.env.DEFAULT_PASSWORD_HASH ??= "test-default-hash";
 
-    // Dynamic import to avoid env issues
-    const { pool } = await import("../../../src/config/database");
+    const { connectionLimit } = await import("../../../src/config/database");
 
-    // mysql2 exposes pool config on pool.pool.config
-    const poolInternal = pool.pool as { config?: { connectionLimit?: number } };
-    const connLimit = poolInternal.config?.connectionLimit ?? 0;
     const minRequired = 2 * CONCURRENCY_LIMITS.MAX_CONCURRENT_MODEL_JOBS;
 
-    expect(connLimit).toBeGreaterThan(minRequired);
+    expect(connectionLimit).toBeGreaterThan(minRequired);
   });
 
   test("MAX_CONCURRENT_MODEL_JOBS is a positive integer", () => {
