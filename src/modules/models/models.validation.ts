@@ -37,7 +37,7 @@ const formatMinimumMessage = (
   inclusive: boolean | undefined,
 ) => {
   if (minimum === undefined) {
-    return `${label}值过小`;
+    return `${label} 值过小`;
   }
 
   const comparator = inclusive === false ? "大于" : "大于等于";

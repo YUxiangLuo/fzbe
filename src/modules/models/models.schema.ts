@@ -107,6 +107,10 @@ export function getTrainSchemaForModel(modelType: ModelType) {
     case "weighted_avg":
     case "boosting":
       return ensembleTrainSchema;
+    default: {
+      const _exhaustive: never = modelType;
+      throw new Error(`No train schema defined for model type: ${_exhaustive}`);
+    }
   }
 }
 
