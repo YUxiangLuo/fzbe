@@ -347,11 +347,9 @@ const assertRequestMatchesPersistedValue = (
   }
 
   if (Array.isArray(persistedValue)) {
-    const normalizedRequest = typeof requestValue === "string"
-      ? requestValue
-      : JSON.stringify(requestValue);
-    const normalizedPersisted = persistedValue.join(",");
-    if (normalizedRequest !== normalizedPersisted) {
+    const normalizedPersisted = normalizePersistedStringArray(persistedValue);
+    const normalizedRequest = normalizePersistedStringArray(requestValue);
+    if (normalizedRequest.join(",") !== normalizedPersisted.join(",")) {
       throw new ModelValidationError(`请求中的${label}与已完成基础模型记录不一致，请刷新页面后重试`);
     }
     return;
