@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, mock, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
 import path from "node:path";
 
 mock.restore();
@@ -14,6 +14,25 @@ const existsSync = mock((_: string) => false);
 const createReadStream = mock(() => {
   throw new Error("createReadStream should not be called in this test");
 });
+const spawnMock = mock((_: string[], __: Record<string, unknown>) => ({
+  stdout: new ReadableStream({
+    start(controller) {
+      controller.enqueue(new TextEncoder().encode('{"predictions":[]}'));
+      controller.close();
+    },
+  }),
+  stderr: new ReadableStream({
+    start(controller) {
+      controller.close();
+    },
+  }),
+  exited: Promise.resolve(0),
+  exitCode: 0,
+  killed: false,
+  pid: 4321,
+  kill: mock(() => {}),
+}));
+const originalSpawn = Bun.spawn;
 
 mock.module(configModulePath, () => ({
   pool: {
@@ -42,42 +61,51 @@ const {
   ModelNotFoundError,
 } = await import(freshModelsServiceModulePath);
 
+const buildExperimentContextRow = (overrides: Record<string, unknown> = {}) => ({
+  student_id: 20240002,
+  status: "In Progress",
+  selected_industry: "制造业",
+  selected_company: "样本企业",
+  selected_product: "样本产品",
+  data_window_train_start_index: 0,
+  data_window_train_end_index: 11,
+  data_window_evaluate_start_index: 12,
+  data_window_evaluate_end_index: 17,
+  moving_average_completed: 1,
+  moving_average_window: 4,
+  exponential_smoothing_completed: 1,
+  exponential_smoothing_alpha: 0.35,
+  arima_completed: 1,
+  arima_d: 1,
+  lstm_completed: 1,
+  lstm_normalization: "minmax",
+  lstm_features: JSON.stringify(["价格指数", "产能利用率"]),
+  lstm_target_field: "销售数量",
+  ...overrides,
+});
+
 describe("models service", () => {
   beforeEach(() => {
     poolQuery.mockReset();
     poolQuery.mockResolvedValue([
-      [{
-        student_id: 20240002,
-        status: "In Progress",
-        selected_industry: "制造业",
-        selected_company: "样本企业",
-        selected_product: "样本产品",
-        data_window_train_start_index: 0,
-        data_window_train_end_index: 11,
-        data_window_evaluate_start_index: 12,
-        data_window_evaluate_end_index: 17,
-      }],
+      [buildExperimentContextRow()],
     ]);
 
     existsSync.mockReset();
     existsSync.mockReturnValue(false);
 
     createReadStream.mockClear();
+    spawnMock.mockClear();
+    (Bun as { spawn: typeof Bun.spawn }).spawn = spawnMock as typeof Bun.spawn;
+  });
+
+  afterEach(() => {
+    (Bun as { spawn: typeof Bun.spawn }).spawn = originalSpawn;
   });
 
   test("blocks training for completed experiments before loading dataset data", async () => {
     poolQuery.mockResolvedValueOnce([
-      [{
-        student_id: 20240002,
-        status: "Completed",
-        selected_industry: "制造业",
-        selected_company: "样本企业",
-        selected_product: "样本产品",
-        data_window_train_start_index: 0,
-        data_window_train_end_index: 11,
-        data_window_evaluate_start_index: 12,
-        data_window_evaluate_end_index: 17,
-      }],
+      [buildExperimentContextRow({ status: "Completed" })],
     ]);
 
     await expect(
@@ -124,17 +152,7 @@ describe("models service", () => {
 
   test("rejects training when the persisted experiment setup is incomplete", async () => {
     poolQuery.mockResolvedValueOnce([
-      [{
-        student_id: 20240002,
-        status: "In Progress",
-        selected_industry: "制造业",
-        selected_company: "样本企业",
-        selected_product: null,
-        data_window_train_start_index: 0,
-        data_window_train_end_index: 11,
-        data_window_evaluate_start_index: 12,
-        data_window_evaluate_end_index: 17,
-      }],
+      [buildExperimentContextRow({ selected_product: null })],
     ]);
 
     await expect(
@@ -151,17 +169,7 @@ describe("models service", () => {
 
   test("rejects prediction when the experiment belongs to another student", async () => {
     poolQuery.mockResolvedValueOnce([
-      [{
-        student_id: 99999999,
-        status: "In Progress",
-        selected_industry: "制造业",
-        selected_company: "样本企业",
-        selected_product: "样本产品",
-        data_window_train_start_index: 0,
-        data_window_train_end_index: 11,
-        data_window_evaluate_start_index: 12,
-        data_window_evaluate_end_index: 17,
-      }],
+      [buildExperimentContextRow({ student_id: 99999999 })],
     ]);
 
     const predictionPromise = predictExperimentModel("ma", 20240002, 990002, 6);
@@ -192,5 +200,157 @@ describe("models service", () => {
     expect(existsSync).toHaveBeenCalledWith(
       expect.stringContaining("exp990002-student20240002-ma.pkl"),
     );
+  });
+
+  test("runs prediction with the experiment-scoped model artifact and returns python predictions", async () => {
+    existsSync.mockImplementation(() => true);
+    spawnMock.mockImplementationOnce((command: string[]) => ({
+      stdout: new ReadableStream({
+        start(controller) {
+          controller.enqueue(new TextEncoder().encode('{"predictions":[{"prediction":101.2},{"prediction":98.4}]}'));
+          controller.close();
+        },
+      }),
+      stderr: new ReadableStream({
+        start(controller) {
+          controller.close();
+        },
+      }),
+      exited: Promise.resolve(0),
+      exitCode: 0,
+      killed: false,
+      pid: 4321,
+      kill: mock(() => {}),
+    }));
+
+    const result = await predictExperimentModel("ma", 20240002, 990002, 6);
+
+    expect(result).toEqual({
+      status: "success",
+      results: {
+        predictions: [{ prediction: 101.2 }, { prediction: 98.4 }],
+      },
+    });
+
+    const [command, options] = spawnMock.mock.calls[0] ?? [];
+    expect(command).toContain("ma");
+    expect(command).toContain("--load-model");
+    expect(command).toContain("--forecast-steps");
+    expect(command).toContain("6");
+    expect(command).toContain("--pretty");
+    expect(command).toContain("/tmp/fangzhen-py/run_model.py");
+    expect(command.some((arg) => arg.includes("exp990002-student20240002-ma.pkl"))).toBe(true);
+    expect(options).toMatchObject({
+      cwd: "/tmp/fangzhen-py",
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+  });
+
+  test("returns an empty prediction list when python omits predictions", async () => {
+    existsSync.mockImplementation(() => true);
+    spawnMock.mockImplementationOnce(() => ({
+      stdout: new ReadableStream({
+        start(controller) {
+          controller.enqueue(new TextEncoder().encode('{"status":"ok"}'));
+          controller.close();
+        },
+      }),
+      stderr: new ReadableStream({
+        start(controller) {
+          controller.close();
+        },
+      }),
+      exited: Promise.resolve(0),
+      exitCode: 0,
+      killed: false,
+      pid: 4321,
+      kill: mock(() => {}),
+    }));
+
+    const result = await predictExperimentModel("lstm", 20240002, 990002, 3);
+
+    expect(result).toEqual({
+      status: "success",
+      results: {
+        predictions: [],
+      },
+    });
+  });
+
+  test("rejects ensemble training when a requested base model is not completed", async () => {
+    poolQuery.mockResolvedValueOnce([
+      [buildExperimentContextRow({ arima_completed: 0 })],
+    ]);
+
+    await expect(
+      trainModel("stacking", 20240002, {
+        experiment_id: 990002,
+        selected_industry: "制造业",
+        selected_company: "样本企业",
+        selected_product: "样本产品",
+        data_window_train_start_index: 0,
+        data_window_train_end_index: 11,
+        data_window_evaluate_start_index: 12,
+        data_window_evaluate_end_index: 17,
+        models: "ma,arima",
+        moving_average_window: 4,
+        arimaD: 1,
+      }),
+    ).rejects.toMatchObject({
+      message: "融合模型依赖的 ARIMA 基础模型尚未完成训练",
+    });
+
+    expect(createReadStream).not.toHaveBeenCalled();
+  });
+
+  test("rejects ensemble training when persisted LSTM config is incomplete", async () => {
+    poolQuery.mockResolvedValueOnce([
+      [buildExperimentContextRow({ lstm_features: JSON.stringify([]) })],
+    ]);
+
+    await expect(
+      trainModel("weighted_avg", 20240002, {
+        experiment_id: 990002,
+        selected_industry: "制造业",
+        selected_company: "样本企业",
+        selected_product: "样本产品",
+        data_window_train_start_index: 0,
+        data_window_train_end_index: 11,
+        data_window_evaluate_start_index: 12,
+        data_window_evaluate_end_index: 17,
+        models: "ma,lstm",
+        moving_average_window: 4,
+        lstmNormalization: "minmax",
+        lstmTargetFeature: "销售数量",
+        lstmFeatures: "价格指数,产能利用率",
+      }),
+    ).rejects.toMatchObject({
+      message: "融合模型依赖的 LSTM 基础模型缺少特征或归一化配置",
+    });
+
+    expect(createReadStream).not.toHaveBeenCalled();
+  });
+
+  test("rejects ensemble training when client ARIMA params differ from persisted config", async () => {
+    await expect(
+      trainModel("boosting", 20240002, {
+        experiment_id: 990002,
+        selected_industry: "制造业",
+        selected_company: "样本企业",
+        selected_product: "样本产品",
+        data_window_train_start_index: 0,
+        data_window_train_end_index: 11,
+        data_window_evaluate_start_index: 12,
+        data_window_evaluate_end_index: 17,
+        models: "es,arima",
+        exponential_smoothing_alpha: 0.35,
+        arimaD: 2,
+      }),
+    ).rejects.toMatchObject({
+      message: "请求中的ARIMA 差分阶数与已完成基础模型记录不一致，请刷新页面后重试",
+    });
+
+    expect(createReadStream).not.toHaveBeenCalled();
   });
 });
