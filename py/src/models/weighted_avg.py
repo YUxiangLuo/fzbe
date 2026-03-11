@@ -35,6 +35,16 @@ def _format_predictions(preds: List[float], std_dev: float = 0.0) -> List[Dict[s
     return [{"prediction": float(p), "std_dev": float(std_dev)} for p in preds]
 
 
+def _compute_phase1_train_size(train_size: int) -> int:
+    """Compute the Phase 1 internal training split size (weight_train).
+
+    Shared between validation and train_and_evaluate to keep them in sync.
+    """
+    if train_size <= 15:
+        return max(train_size - 3, int(train_size * 0.85))
+    return max(3, int(train_size * 0.8))
+
+
 def _load_state(model_path: str) -> Dict[str, Any]:
     """Load and validate a saved Weighted Average model state."""
     state = load_model(model_path)
@@ -96,7 +106,7 @@ def _validate_training_args(
             if te - ts + 1 <= params["look_back"]: raise ValueError("[VALIDATION] Training range must be larger than LSTM look_back.")
             # Also validate against the Phase 1 sub-range (weight_train) which is smaller
             train_size = te - ts + 1
-            weight_train_size = max(train_size - 3, int(train_size * 0.85)) if train_size <= 15 else int(train_size * 0.8)
+            weight_train_size = _compute_phase1_train_size(train_size)
             if weight_train_size <= params["look_back"]:
                 raise ValueError(
                     f"[VALIDATION] LSTM look_back ({params['look_back']}) is too large for "
@@ -176,10 +186,7 @@ def train_and_evaluate(
 
     # For small datasets, use 85% for weight_train to ensure sufficient training data
     # For larger datasets, use standard 80% split
-    if train_len <= 15:
-        weight_split = max(train_len - 3, int(train_len * 0.85))  # Leave at least 3 points for weight_val
-    else:
-        weight_split = max(3, int(train_len * 0.8))  # At least 3 points for weight_train
+    weight_split = _compute_phase1_train_size(train_len)
 
     weight_train_range = range(train_range.start, train_range.start + weight_split)
     weight_val_range = range(train_range.start + weight_split, train_range.stop)

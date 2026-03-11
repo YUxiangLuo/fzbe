@@ -49,6 +49,16 @@ def _format_predictions(preds: List[float], std_dev: float = 0.0) -> List[Dict[s
     return [{"prediction": float(p), "std_dev": float(std_dev)} for p in preds]
 
 
+def _compute_phase1_train_size(train_size: int) -> int:
+    """Compute the Phase 1 internal training split size (boost_train).
+
+    Shared between validation and train_and_evaluate to keep them in sync.
+    """
+    if train_size <= 15:
+        return max(train_size - 3, int(train_size * 0.85))
+    return max(3, int(train_size * 0.8))
+
+
 def _load_state(model_path: str) -> Dict[str, Any]:
     """Load and validate a saved Boosting model state."""
     state = load_model(model_path)
@@ -120,7 +130,7 @@ def _validate_training_args(
                 raise ValueError("[VALIDATION] Training range must be larger than LSTM look_back.")
             # Also validate against the Phase 1 sub-range (boost_train) which is smaller
             train_size = te - ts + 1
-            boost_train_size = max(train_size - 3, int(train_size * 0.85)) if train_size <= 15 else int(train_size * 0.8)
+            boost_train_size = _compute_phase1_train_size(train_size)
             if boost_train_size <= params["look_back"]:
                 raise ValueError(
                     f"[VALIDATION] LSTM look_back ({params['look_back']}) is too large for "
@@ -175,8 +185,8 @@ def predict(
             timeout=60,
         )
 
-        residual_pred = np.array(extract_predictions_from_result(result))
-        final_predictions += learning_rate * residual_pred
+        stage_pred = np.array(extract_predictions_from_result(result))
+        final_predictions += learning_rate * stage_pred
 
     return final_predictions.tolist(), std_dev_residuals
 
@@ -217,10 +227,7 @@ def train_and_evaluate(
         raise ValueError("[VALIDATION] train_range too small for boosting (需要至少8个点，推荐≥12点)")
 
     # For small datasets, use 85% for boost_train to ensure sufficient training data
-    if train_len <= 15:
-        boost_split = max(train_len - 3, int(train_len * 0.85))
-    else:
-        boost_split = max(3, int(train_len * 0.8))
+    boost_split = _compute_phase1_train_size(train_len)
 
     boost_train_range = range(train_range.start, train_range.start + boost_split)
     boost_val_range = range(train_range.start + boost_split, train_range.stop)

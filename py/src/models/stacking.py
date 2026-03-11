@@ -36,6 +36,16 @@ def _format_predictions(preds: List[float], std_dev: float = 0.0) -> List[Dict[s
     return [{"prediction": float(p), "std_dev": float(std_dev)} for p in preds]
 
 
+def _compute_phase1_train_size(train_size: int) -> int:
+    """Compute the Phase 1 internal training split size (level0).
+
+    Shared between validation and train_and_evaluate to keep them in sync.
+    """
+    if train_size <= 15:
+        return max(train_size - 3, int(train_size * 0.85))
+    return max(3, int(train_size * 0.8))
+
+
 def _load_state(model_path: str) -> Dict[str, Any]:
     """Load and validate a saved Stacking model state."""
     state = load_model(model_path)
@@ -122,7 +132,7 @@ def _validate_training_args(
                 raise ValueError("[VALIDATION] Training range must be larger than LSTM look_back.")
             # Also validate against the Phase 1 sub-range (level0) which is smaller
             train_size = te - ts + 1
-            level0_size = max(train_size - 3, int(train_size * 0.85)) if train_size <= 15 else int(train_size * 0.8)
+            level0_size = _compute_phase1_train_size(train_size)
             if level0_size <= params["look_back"]:
                 raise ValueError(
                     f"[VALIDATION] LSTM look_back ({params['look_back']}) is too large for "
@@ -204,10 +214,7 @@ def train_and_evaluate(
 
     # For small datasets, use 85% for level0 to ensure sufficient training data
     # For larger datasets, use standard 80% split
-    if train_len <= 15:
-        level0_split = max(train_len - 3, int(train_len * 0.85))  # Leave at least 3 points for level1
-    else:
-        level0_split = max(3, int(train_len * 0.8))  # At least 3 points for level0
+    level0_split = _compute_phase1_train_size(train_len)
 
     level0_train_range = range(train_range.start, train_range.start + level0_split)
     level1_train_range = range(train_range.start + level0_split, train_range.stop)
