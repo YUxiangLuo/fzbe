@@ -94,6 +94,15 @@ def _validate_training_args(
             if params["look_back"] < 1: raise ValueError("[VALIDATION] LSTM look_back must be >= 1.")
             if params["epochs"] < 1: raise ValueError("[VALIDATION] LSTM epochs must be >= 1.")
             if te - ts + 1 <= params["look_back"]: raise ValueError("[VALIDATION] Training range must be larger than LSTM look_back.")
+            # Also validate against the Phase 1 sub-range (weight_train) which is smaller
+            train_size = te - ts + 1
+            weight_train_size = max(train_size - 3, int(train_size * 0.85)) if train_size <= 15 else int(train_size * 0.8)
+            if weight_train_size <= params["look_back"]:
+                raise ValueError(
+                    f"[VALIDATION] LSTM look_back ({params['look_back']}) is too large for "
+                    f"the weighted average internal training split ({weight_train_size} points). "
+                    f"Please reduce look_back or increase training data."
+                )
 
 
 # ---------- predict ----------
@@ -317,6 +326,9 @@ def run(args) -> None:
 
     if load_path:
         steps = int(getattr(args, "forecast_steps", 0))
+        if steps <= 0:
+            raise ValueError("[VALIDATION] --forecast_steps must be > 0.")
+
         preds, std_dev = predict(load_path, steps)
         out = {
             "mode": "weighted_avg_loaded_predict",
@@ -327,6 +339,9 @@ def run(args) -> None:
         return
 
     # Training Mode
+    if not hasattr(args, "data") or not args.data:
+        raise ValueError("[VALIDATION] --data is required for training mode.")
+
     parsed_data = load_data_from_json(args.data)
     ts, te = int(args.train_start), int(args.train_end)
     es, ee = int(args.eval_start), int(args.eval_end)

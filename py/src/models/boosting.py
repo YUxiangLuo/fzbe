@@ -1,20 +1,23 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Gradient-like Boosting Ensemble for Heterogeneous Time Series Models.
+Forward Stagewise Additive Ensemble for Heterogeneous Time Series Models.
 
-Uses residual learning to implement boosting for heterogeneous models (ARIMA, LSTM, MA, ES).
-Each model in the chain learns to predict the residual errors from previous models.
+Implements a greedy model selection approach with learning rate shrinkage.
+Each model in the chain is independently trained on original data; the subprocess
+architecture (eval_start > train_end) prevents in-sample residual computation,
+so true gradient-boosted residual learning is not feasible.
 
-Algorithm:
-1. Train first model to predict y
-2. Calculate residual = y - prediction_1
-3. Train second model to predict residual
-4. Update: residual = residual - learning_rate * prediction_2
-5. Repeat until no improvement or max_rounds reached
-6. Final prediction = prediction_1 + learning_rate * (prediction_2 + prediction_3 + ...)
+Algorithm (compromise for subprocess architecture):
+1. Train all candidate models on original y
+2. Select the model that best reduces ensemble RMSE on a held-out validation set
+3. Add it to the chain with learning rate shrinkage
+4. Repeat until no improvement or max_rounds reached
+5. Final prediction = model_0 + learning_rate * model_1 + learning_rate * model_2 + ...
 
-This approach allows boosting with models that don't support sample weights.
+All models independently predict original y; the learning rate controls each
+subsequent model's contribution to the ensemble.
+
 Uses subprocess to call base models for consistency with API behavior.
 """
 import json
@@ -115,36 +118,27 @@ def _validate_training_args(
                 raise ValueError("[VALIDATION] LSTM epochs must be >= 1.")
             if te - ts + 1 <= params["look_back"]:
                 raise ValueError("[VALIDATION] Training range must be larger than LSTM look_back.")
-
-
-def _create_residual_data(
-    original_data: List[Dict[str, Any]],
-    residual_values: np.ndarray,
-    indices: range,
-    target_key: str = "y"
-) -> List[Dict[str, Any]]:
-    """
-    Create new dataset with residual as target.
-
-    This allows training models to predict residuals without modifying base model code.
-    """
-    new_data = []
-    for i, idx in enumerate(indices):
-        new_row = original_data[idx].copy()
-        new_row[target_key] = float(residual_values[i])
-        new_data.append(new_row)
-
-    # Pad with original data before and after the residual range
-    # (base models need context, but will only evaluate on the specified range)
-    full_data = original_data[:indices.start] + new_data + original_data[indices.stop:]
-    return full_data
+            # Also validate against the Phase 1 sub-range (boost_train) which is smaller
+            train_size = te - ts + 1
+            boost_train_size = max(train_size - 3, int(train_size * 0.85)) if train_size <= 15 else int(train_size * 0.8)
+            if boost_train_size <= params["look_back"]:
+                raise ValueError(
+                    f"[VALIDATION] LSTM look_back ({params['look_back']}) is too large for "
+                    f"the boosting internal training split ({boost_train_size} points). "
+                    f"Please reduce look_back or increase training data."
+                )
 
 
 # ---------- predict ----------
 def predict(
     model_path: str, steps: int, state: Optional[Dict[str, Any]] = None
 ) -> Tuple[List[float], float]:
-    """Forecast using a saved Boosting model with subprocess calls."""
+    """Forecast using a saved Boosting model with subprocess calls.
+
+    All models in the chain independently predict original y. The ensemble
+    combination uses the first model directly, plus subsequent models scaled
+    by the learning rate: final = model_0 + lr * model_1 + lr * model_2 + ...
+    """
     if steps <= 0:
         raise ValueError("[VALIDATION] steps must be > 0 for forecasting.")
 
@@ -167,7 +161,7 @@ def predict(
     )
     final_predictions = np.array(extract_predictions_from_result(result))
 
-    # Subsequent models predict residuals
+    # Subsequent models: add with learning rate shrinkage
     for i in range(1, len(model_chain)):
         model_name = model_chain[i]
         # Each model is only selected once, so models list has only one element at index 0
@@ -194,20 +188,23 @@ def train_and_evaluate(
     max_rounds: int
 ) -> Tuple[Dict[str, Any], List[str], Dict[str, Any], List[float], List[float], float, Dict[str, Any]]:
     """
-    Trains and evaluates the Boosting model using Residual Learning.
+    Trains and evaluates the Boosting model using forward stagewise additive approach.
 
-    Correct Residual Boosting Flow:
+    Algorithm (adapted for subprocess architecture):
     1. Split train_range into boost_train (80-85%) and boost_val (20-15%)
-    2. Round 1: Train all candidate models to predict y on boost_train, evaluate on boost_val
-    3. Select best model, add to chain
-    4. For subsequent rounds:
-       - Calculate residual = y - current_ensemble_prediction
-       - Train all candidate models to predict residual
-       - Select best model
-       - If adding it improves RMSE on boost_val: add to chain
-       - Else: early stopping
-    5. Retrain entire chain on full train_range
-    6. Evaluate on independent eval_range
+    2. Phase 1 - Greedy model selection:
+       - Train all candidate models on original y (boost_train → boost_val)
+       - Select model that best reduces ensemble RMSE on boost_val
+       - Add with learning rate shrinkage: ensemble += lr * model_pred (or direct for round 0)
+       - Early stopping when no improvement
+    3. Phase 2 - Retrain on full data:
+       - Retrain selected models on full train_range
+       - Combine: final = model_0 + lr * model_1 + lr * model_2 + ...
+    4. Evaluate on independent eval_range
+
+    Note: True gradient boosting requires in-sample residual computation, which
+    is not feasible with the subprocess architecture (eval_start > train_end).
+    This approach trains all models on original y and combines with shrinkage.
 
     Args:
         learning_rate: Shrinkage parameter (0 < lr <= 1), typically 0.1-0.5
@@ -244,7 +241,6 @@ def train_and_evaluate(
         lstm_data_dicts, _ = build_subprocess_records(parsed_data, feature_keys=lstm_feature_keys)
 
     y_true_val = parsed_data.y[boost_val_range]
-    current_residual_val = y_true_val.copy()  # Initial residual = y
     ensemble_pred_val = np.zeros(len(boost_val_range))
 
     model_chain = []
@@ -259,21 +255,20 @@ def train_and_evaluate(
         base_timeout = max(120, lstm_epochs * 10)
 
     # === Step 2: Greedy Boosting Rounds ===
-    print(f"\n[Boosting Phase 1] Residual learning with greedy selection", file=sys.stderr)
+    # NOTE: Due to the subprocess architecture (eval_start > train_end constraint),
+    # we cannot compute in-sample training residuals. Instead, all candidate models
+    # are trained on original y data. The greedy selection evaluates how each model's
+    # prediction, when added with learning rate shrinkage, reduces ensemble RMSE on
+    # the held-out validation set. This is a forward stagewise additive approach
+    # rather than true gradient boosting with residual targets.
+    print(f"\n[Boosting Phase 1] Forward stagewise model selection", file=sys.stderr)
 
     for round_num in range(max_rounds):
         print(f"\n--- Round {round_num + 1}/{max_rounds} ---", file=sys.stderr)
 
-        # Prepare training target description for this round.
-        if round_num == 0:
-            train_target_description = "original y"
-        else:
-            train_target_description = f"residual (round {round_num})"
-
-        print(f"  Target: {train_target_description}", file=sys.stderr)
         print(f"  Current RMSE on val: {rmse(y_true_val, ensemble_pred_val) if round_num > 0 else 'N/A'}", file=sys.stderr)
 
-        # Train all candidate models
+        # Train all candidate models on original data
         stage_results = []
         available_models = [m for m in models_to_use if m not in model_chain]
 
@@ -284,39 +279,17 @@ def train_and_evaluate(
         for model_name in available_models:
             params = model_params[model_name]
 
-            if round_num == 0:
-                # First round: train on original data
-                result = run_base_model_subprocess(
-                    model_type=model_name,
-                    data=lstm_data_dicts if model_name == "lstm" else numeric_data_dicts,
-                    train_start=boost_train_range.start,
-                    train_end=boost_train_range.stop - 1,
-                    eval_start=boost_val_range.start,
-                    eval_end=boost_val_range.stop - 1,
-                    model_params=params,
-                    timeout=base_timeout,
-                )
-            else:
-                # Subsequent rounds: train on residual
-                # Create dataset where boost_train predicts current residual
-                residual_train = current_residual_val  # Approximate
-                residual_data = _create_residual_data(
-                    lstm_data_dicts if model_name == "lstm" else numeric_data_dicts,
-                    residual_train,
-                    boost_val_range,
-                    parsed_data.target_key,
-                )
-
-                result = run_base_model_subprocess(
-                    model_type=model_name,
-                    data=residual_data,
-                    train_start=boost_train_range.start,
-                    train_end=boost_train_range.stop - 1,
-                    eval_start=boost_val_range.start,
-                    eval_end=boost_val_range.stop - 1,
-                    model_params=params,
-                    timeout=base_timeout,
-                )
+            # All models train on original y (subprocess architecture compromise)
+            result = run_base_model_subprocess(
+                model_type=model_name,
+                data=lstm_data_dicts if model_name == "lstm" else numeric_data_dicts,
+                train_start=boost_train_range.start,
+                train_end=boost_train_range.stop - 1,
+                eval_start=boost_val_range.start,
+                eval_end=boost_val_range.stop - 1,
+                model_params=params,
+                timeout=base_timeout,
+            )
 
             y_pred_val = np.array(extract_predictions_from_result(result))
 
@@ -351,12 +324,6 @@ def train_and_evaluate(
             model_chain.append(winner_name)
             chain_predictions_val.append(winner_pred)
             ensemble_pred_val = winner_ensemble_pred
-
-            # Update residual for next round
-            if round_num == 0:
-                current_residual_val = y_true_val - ensemble_pred_val
-            else:
-                current_residual_val = current_residual_val - learning_rate * winner_pred
 
             improvement = best_overall_rmse - winner_rmse if best_overall_rmse != float('inf') else 0
             best_overall_rmse = winner_rmse
@@ -406,7 +373,6 @@ def train_and_evaluate(
 
     base_model_states = {}
     final_eval_preds = np.zeros(len(eval_range))
-    current_residual_eval = parsed_data.y[eval_range].copy()
 
     for round_idx, model_name in enumerate(model_chain):
         params = model_params[model_name]
@@ -417,50 +383,29 @@ def train_and_evaluate(
         params_with_save = params.copy()
         params_with_save["save_model"] = temp_model_file
 
+        # All models train on original y (subprocess architecture compromise).
+        # The ensemble combination with learning rate shrinkage is applied after
+        # extracting each model's independent predictions.
+        print(f"  Round {round_idx + 1}: Training {model_name} on original y", file=sys.stderr)
+        result = run_base_model_subprocess(
+            model_type=model_name,
+            data=lstm_data_dicts if model_name == "lstm" else numeric_data_dicts,
+            train_start=train_range.start,
+            train_end=train_range.stop - 1,
+            eval_start=eval_range.start,
+            eval_end=eval_range.stop - 1,
+            model_params=params_with_save,
+            timeout=base_timeout,
+        )
+
+        y_pred_eval = np.array(extract_predictions_from_result(result))
+
         if round_idx == 0:
-            # First model: predict original y
-            print(f"  Round {round_idx + 1}: Training {model_name} to predict y", file=sys.stderr)
-            result = run_base_model_subprocess(
-                model_type=model_name,
-                data=lstm_data_dicts if model_name == "lstm" else numeric_data_dicts,
-                train_start=train_range.start,
-                train_end=train_range.stop - 1,
-                eval_start=eval_range.start,
-                eval_end=eval_range.stop - 1,
-                model_params=params_with_save,
-                timeout=base_timeout,
-            )
-
-            y_pred_eval = np.array(extract_predictions_from_result(result))
+            # First model's prediction is used directly (no learning rate)
             final_eval_preds = y_pred_eval
-            current_residual_eval = parsed_data.y[eval_range] - final_eval_preds
         else:
-            # Subsequent models: predict residual
-            print(f"  Round {round_idx + 1}: Training {model_name} to predict residual", file=sys.stderr)
-
-            # Create residual dataset for training
-            residual_data_train = _create_residual_data(
-                lstm_data_dicts if model_name == "lstm" else numeric_data_dicts,
-                current_residual_eval,
-                eval_range,
-                parsed_data.target_key,
-            )
-
-            # Train on train_range to predict residual, evaluate on eval_range
-            result = run_base_model_subprocess(
-                model_type=model_name,
-                data=residual_data_train,
-                train_start=train_range.start,
-                train_end=train_range.stop - 1,
-                eval_start=eval_range.start,
-                eval_end=eval_range.stop - 1,
-                model_params=params_with_save,
-                timeout=base_timeout,
-            )
-
-            residual_pred_eval = np.array(extract_predictions_from_result(result))
-            final_eval_preds += learning_rate * residual_pred_eval
-            current_residual_eval -= learning_rate * residual_pred_eval
+            # Subsequent models are added with learning rate shrinkage
+            final_eval_preds += learning_rate * y_pred_eval
 
         # Store model state
         if model_name not in base_model_states:
@@ -471,7 +416,6 @@ def train_and_evaluate(
             "model_file": temp_model_file,
             "params": params,
             "round": round_idx,
-            "role": "predict_y" if round_idx == 0 else "predict_residual"
         })
 
         print(f"    ✓ RMSE on eval: {rmse(parsed_data.y[eval_range], final_eval_preds):.4f}", file=sys.stderr)
@@ -518,6 +462,9 @@ def run(args) -> None:
         return
 
     # Training Mode
+    if not hasattr(args, "data") or not args.data:
+        raise ValueError("[VALIDATION] --data is required for training mode.")
+
     parsed_data = load_data_from_json(args.data)
     ts, te = int(args.train_start), int(args.train_end)
     es, ee = int(args.eval_start), int(args.eval_end)

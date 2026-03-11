@@ -120,6 +120,15 @@ def _validate_training_args(
                 raise ValueError("[VALIDATION] LSTM epochs must be >= 1.")
             if te - ts + 1 <= params["look_back"]:
                 raise ValueError("[VALIDATION] Training range must be larger than LSTM look_back.")
+            # Also validate against the Phase 1 sub-range (level0) which is smaller
+            train_size = te - ts + 1
+            level0_size = max(train_size - 3, int(train_size * 0.85)) if train_size <= 15 else int(train_size * 0.8)
+            if level0_size <= params["look_back"]:
+                raise ValueError(
+                    f"[VALIDATION] LSTM look_back ({params['look_back']}) is too large for "
+                    f"the stacking internal training split ({level0_size} points). "
+                    f"Please reduce look_back or increase training data."
+                )
 
 
 # ---------- predict ----------
