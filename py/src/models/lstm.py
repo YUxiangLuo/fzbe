@@ -162,6 +162,7 @@ def train_and_evaluate(
     look_back: int,
     epochs: int,
     normalization: str = 'minmax',
+    timestamps: Optional[List[str]] = None,
 ) -> Tuple[Dict[str, Any], Any, Any, List[float], List[float], float, pd.DataFrame]:
     """
     Trains and evaluates the LSTM model with typed features.
@@ -303,6 +304,8 @@ def train_and_evaluate(
         "look_back": look_back,
         "epochs": epochs,
         "evaluated_points": len(y_true),
+        "evaluate_indices": list(eval_range),
+        "evaluate_months": [timestamps[i] for i in eval_range] if timestamps else [],
     }
 
     log.info(f"Evaluation metrics computed: RMSE={metrics['rmse']:.4f}, MAE={metrics['mae']:.4f}, MAPE={metrics['mape']:.4f}, R²={metrics['r2']:.4f}")
@@ -423,7 +426,7 @@ def run(args) -> None:
 
         log.info("Starting model training and evaluation...")
         metrics, model, preprocessor, y_true, y_pred, std_dev_residuals, history_df = train_and_evaluate(
-            parsed_data, feature_types, range(ts, te + 1), range(es, ee + 1), look_back, epochs, normalization
+            parsed_data, feature_types, range(ts, te + 1), range(es, ee + 1), look_back, epochs, normalization, months
         )
         log.info(f"Training finished. Metrics: {metrics}")
 
