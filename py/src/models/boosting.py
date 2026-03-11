@@ -639,16 +639,18 @@ def run(args) -> None:
                 if os.path.exists(temp_file):
                     shutil.move(temp_file, perm_file)
 
-                    # Also move LSTM Keras model if it exists
+                    # Also move LSTM Keras model and update internal path
                     if model_name == "lstm":
-                        temp_keras = os.path.splitext(temp_file)[0] + "_keras_model.h5"
-                        if os.path.exists(temp_keras):
-                            perm_keras = os.path.join(base_dir, f"{base_name}_base_{model_name}_round{idx}_keras.h5")
-                            shutil.move(temp_keras, perm_keras)
-                            # Update keras_model_path inside the pkl to point to new location
-                            lstm_pkl = load_model(perm_file)
-                            lstm_pkl["keras_model_path"] = perm_keras
-                            dump_model(lstm_pkl, perm_file)
+                        lstm_pkl = load_model(perm_file)
+                        temp_keras = lstm_pkl.get("keras_model_path")
+                        if not temp_keras or not os.path.exists(temp_keras):
+                            raise FileNotFoundError(
+                                f"LSTM Keras model file not found at {temp_keras}"
+                            )
+                        perm_keras = os.path.join(base_dir, f"{base_name}_base_{model_name}_round{idx}_keras.h5")
+                        shutil.move(temp_keras, perm_keras)
+                        lstm_pkl["keras_model_path"] = perm_keras
+                        dump_model(lstm_pkl, perm_file)
 
                 # Update state with permanent path
                 model_state["model_file"] = perm_file
