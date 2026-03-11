@@ -314,11 +314,14 @@ def train_and_evaluate(
     std_dev_residuals = float(np.std(residuals, ddof=1)) if len(residuals) > 1 else 0.0
 
     # ✅ 在独立的eval_range上计算指标
+    timestamps = parsed_data.timestamps
     metrics = {
         "rmse": rmse(y_true_final, y_pred_final),
         "mae": mae(y_true_final, y_pred_final),
         "mape": mape(y_true_final, y_pred_final),
         "r2": r2(y_true_final, y_pred_final),
+        "evaluate_indices": list(eval_range),
+        "evaluate_months": [timestamps[i] for i in eval_range] if timestamps else [],
     }
 
     print(f"  ✓ 评估完成: RMSE={metrics['rmse']:.4f}, R²={metrics['r2']:.4f}", file=sys.stderr)

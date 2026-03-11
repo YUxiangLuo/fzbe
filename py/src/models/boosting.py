@@ -396,7 +396,12 @@ def train_and_evaluate(
     if not model_chain:
         # No models were added
         y_true_eval = parsed_data.y[eval_range]
-        metrics = {"rmse": float('inf'), "mae": float('inf'), "mape": float('inf'), "r2": float('-inf')}
+        timestamps = parsed_data.timestamps
+        metrics = {
+            "rmse": float('inf'), "mae": float('inf'), "mape": float('inf'), "r2": float('-inf'),
+            "evaluate_indices": list(eval_range),
+            "evaluate_months": [timestamps[i] for i in eval_range] if timestamps else [],
+        }
         return metrics, [], {}, y_true_eval.tolist(), [0.0] * len(y_true_eval), 0.0, search_summary
 
     base_model_states = {}
@@ -475,11 +480,14 @@ def train_and_evaluate(
     print(f"\n[Boosting Phase 3] Final evaluation on eval_range", file=sys.stderr)
     y_true_eval = parsed_data.y[eval_range]
 
+    timestamps = parsed_data.timestamps
     metrics = {
         "rmse": rmse(y_true_eval, final_eval_preds),
         "mae": mae(y_true_eval, final_eval_preds),
         "mape": mape(y_true_eval, final_eval_preds),
-        "r2": r2(y_true_eval, final_eval_preds)
+        "r2": r2(y_true_eval, final_eval_preds),
+        "evaluate_indices": list(eval_range),
+        "evaluate_months": [timestamps[i] for i in eval_range] if timestamps else [],
     }
 
     final_residuals = y_true_eval - final_eval_preds
