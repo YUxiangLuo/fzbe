@@ -184,6 +184,98 @@ describe("models controller", () => {
     expect(data).toEqual({ error: "Failed to parse or process --data: bad column" });
   });
 
+  test("translates training timeouts to 504", async () => {
+    trainModel.mockRejectedValueOnce(new Error("Python 执行超时 (120000ms)"));
+
+    const response = await requestJson("/api/v1/models/ma/training", buildTrainBody());
+    const data = await response.json();
+
+    expect(response.status).toBe(504);
+    expect(data.error).toContain("训练超时");
+  });
+
+  test("rejects underspecified weighted ensemble training requests before invoking the service layer", async () => {
+    const response = await requestJson("/api/v1/models/weighted_avg/training", {
+      ...buildTrainBody(),
+    });
+    const data = await response.json();
+
+    expect(response.status).toBe(400);
+    expect(data).toEqual({
+      error: "基础模型列表不能为空",
+      details: {
+        formErrors: [],
+        fieldErrors: {
+          models: ["基础模型列表不能为空"],
+        },
+      },
+    });
+    expect(trainModel).not.toHaveBeenCalled();
+    expect(acquireModelExecutionLock).not.toHaveBeenCalled();
+  });
+
+  test("rejects underspecified LSTM training requests before invoking the service layer", async () => {
+    const response = await requestJson("/api/v1/models/lstm/training", {
+      ...buildTrainBody(),
+      lstmTargetFeature: "销售数量",
+      lstmFeatures: "价格指数,产能利用率",
+    });
+    const data = await response.json();
+
+    expect(response.status).toBe(400);
+    expect(data).toEqual({
+      error: "LSTM 归一化方式必须是 minmax 或 zscore",
+      details: {
+        formErrors: [],
+        fieldErrors: {
+          lstmNormalization: ["LSTM 归一化方式必须是 minmax 或 zscore"],
+        },
+      },
+    });
+    expect(trainModel).not.toHaveBeenCalled();
+    expect(acquireModelExecutionLock).not.toHaveBeenCalled();
+  });
+
+  test("returns localized field errors for missing moving-average params", async () => {
+    const body = buildTrainBody();
+    delete (body as Partial<TrainInput>).moving_average_window;
+
+    const response = await requestJson("/api/v1/models/ma/training", body as Record<string, unknown>);
+    const data = await response.json();
+
+    expect(response.status).toBe(400);
+    expect(data).toEqual({
+      error: "移动平均时间窗口不能为空",
+      details: {
+        formErrors: [],
+        fieldErrors: {
+          moving_average_window: ["移动平均时间窗口不能为空"],
+        },
+      },
+    });
+    expect(trainModel).not.toHaveBeenCalled();
+  });
+
+  test("returns localized lower-bound errors for invalid moving-average params", async () => {
+    const response = await requestJson("/api/v1/models/ma/training", {
+      ...buildTrainBody(),
+      moving_average_window: 1,
+    });
+    const data = await response.json();
+
+    expect(response.status).toBe(400);
+    expect(data).toEqual({
+      error: "移动平均时间窗口必须大于等于 2",
+      details: {
+        formErrors: [],
+        fieldErrors: {
+          moving_average_window: ["移动平均时间窗口必须大于等于 2"],
+        },
+      },
+    });
+    expect(trainModel).not.toHaveBeenCalled();
+  });
+
   test("releases the execution lock when slot acquisition throws during training", async () => {
     const executionLock = { connection: {} as never, name: "exec:throw" };
     acquireModelExecutionLock.mockResolvedValueOnce(executionLock);
@@ -207,6 +299,47 @@ describe("models controller", () => {
 
     expect(response.status).toBe(404);
     expect(data).toEqual({ error: "未找到该实验的已训练 MA 模型" });
+  });
+
+  test("returns localized field errors for missing prediction params", async () => {
+    const response = await requestJson("/api/v1/models/ma/predict", {
+      experiment_id: 990002,
+    });
+    const data = await response.json();
+
+    expect(response.status).toBe(400);
+    expect(data).toEqual({
+      error: "预测步数不能为空",
+      details: {
+        formErrors: [],
+        fieldErrors: {
+          forecast_steps: ["预测步数不能为空"],
+        },
+      },
+    });
+    expect(predictExperimentModel).not.toHaveBeenCalled();
+    expect(acquireModelExecutionLock).not.toHaveBeenCalled();
+  });
+
+  test("returns localized field errors for invalid prediction params", async () => {
+    const response = await requestJson("/api/v1/models/ma/predict", {
+      experiment_id: 990002,
+      forecast_steps: 0,
+    });
+    const data = await response.json();
+
+    expect(response.status).toBe(400);
+    expect(data).toEqual({
+      error: "预测步数必须大于等于 1",
+      details: {
+        formErrors: [],
+        fieldErrors: {
+          forecast_steps: ["预测步数必须大于等于 1"],
+        },
+      },
+    });
+    expect(predictExperimentModel).not.toHaveBeenCalled();
+    expect(acquireModelExecutionLock).not.toHaveBeenCalled();
   });
 
   test("translates prediction timeouts to 504", async () => {

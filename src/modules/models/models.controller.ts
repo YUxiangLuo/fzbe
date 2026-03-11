@@ -1,7 +1,12 @@
 import { Hono } from "hono";
-import { zValidator } from "@hono/zod-validator";
 import { jwtAuth, requireStudent } from "../../middleware";
-import { trainSchema, predictSchema, isModelType } from "./models.schema";
+import { predictSchema, isModelType, getTrainSchemaForModel } from "./models.schema";
+import {
+  buildLocalizedPredictValidationDetails,
+  buildLocalizedTrainValidationDetails,
+  localizePredictValidationIssue,
+  localizeTrainValidationIssue,
+} from "./models.validation";
 import {
   trainModel,
   predictExperimentModel,
@@ -23,7 +28,6 @@ modelsController.post(
   "/api/v1/models/:model_type/training",
   jwtAuth,
   requireStudent,
-  zValidator("json", trainSchema),
   async (c) => {
     const modelTypeParam = c.req.param("model_type");
     if (!isModelType(modelTypeParam)) {
@@ -32,7 +36,28 @@ modelsController.post(
     const modelType = modelTypeParam;
 
     const payload = c.get("jwtPayload") as JwtPayload;
-    const body = c.req.valid("json");
+    let rawBody: unknown;
+    try {
+      rawBody = await c.req.json();
+    } catch {
+      return c.json({ error: "请求体必须是有效的 JSON" }, 400);
+    }
+
+    const validation = getTrainSchemaForModel(modelType).safeParse(rawBody);
+    if (!validation.success) {
+      const localizedDetails = buildLocalizedTrainValidationDetails(validation.error.issues);
+      return c.json(
+        {
+          error: validation.error.issues[0]
+            ? localizeTrainValidationIssue(validation.error.issues[0])
+            : "训练请求参数无效",
+          details: localizedDetails,
+        },
+        400,
+      );
+    }
+
+    const body = validation.data;
 
     let executionLock = null;
     let slotLock = null;
@@ -81,7 +106,6 @@ modelsController.post(
   "/api/v1/models/:model_type/predict",
   jwtAuth,
   requireStudent,
-  zValidator("json", predictSchema),
   async (c) => {
     const modelTypeParam = c.req.param("model_type");
     if (!isModelType(modelTypeParam)) {
@@ -90,7 +114,28 @@ modelsController.post(
     const modelType = modelTypeParam;
 
     const payload = c.get("jwtPayload") as JwtPayload;
-    const body = c.req.valid("json");
+    let rawBody: unknown;
+    try {
+      rawBody = await c.req.json();
+    } catch {
+      return c.json({ error: "请求体必须是有效的 JSON" }, 400);
+    }
+
+    const validation = predictSchema.safeParse(rawBody);
+    if (!validation.success) {
+      const localizedDetails = buildLocalizedPredictValidationDetails(validation.error.issues);
+      return c.json(
+        {
+          error: validation.error.issues[0]
+            ? localizePredictValidationIssue(validation.error.issues[0])
+            : "预测请求参数无效",
+          details: localizedDetails,
+        },
+        400,
+      );
+    }
+
+    const body = validation.data;
 
     let executionLock = null;
     let slotLock = null;

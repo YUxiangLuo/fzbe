@@ -34,6 +34,16 @@ interface ExperimentModelContextRow extends ExperimentOwnershipRow {
   data_window_train_end_index: number | null;
   data_window_evaluate_start_index: number | null;
   data_window_evaluate_end_index: number | null;
+  moving_average_completed: number | boolean | null;
+  moving_average_window: number | null;
+  exponential_smoothing_completed: number | boolean | null;
+  exponential_smoothing_alpha: number | null;
+  arima_completed: number | boolean | null;
+  arima_d: number | null;
+  lstm_completed: number | boolean | null;
+  lstm_normalization: "minmax" | "zscore" | null;
+  lstm_features: unknown;
+  lstm_target_field: string | null;
 }
 
 interface ExperimentTrainingConfig {
@@ -45,6 +55,19 @@ interface ExperimentTrainingConfig {
   data_window_evaluate_start_index: number;
   data_window_evaluate_end_index: number;
 }
+
+type BaseModelType = "ma" | "es" | "arima" | "lstm";
+
+const ENSEMBLE_MODEL_TYPES = new Set<ModelType>(["weighted_avg", "boosting", "stacking"]);
+const ENSEMBLE_DERIVED_BODY_KEYS = new Set([
+  "models",
+  "moving_average_window",
+  "exponential_smoothing_alpha",
+  "arimaD",
+  "lstmFeatures",
+  "lstmTargetFeature",
+  "lstmNormalization",
+]);
 
 export interface AdvisoryLockHandle {
   connection: PoolConnection;
@@ -234,7 +257,17 @@ async function assertExperimentModelAccess(experimentId: number, studentId: numb
             data_window_train_start_index,
             data_window_train_end_index,
             data_window_evaluate_start_index,
-            data_window_evaluate_end_index
+            data_window_evaluate_end_index,
+            moving_average_completed,
+            moving_average_window,
+            exponential_smoothing_completed,
+            exponential_smoothing_alpha,
+            arima_completed,
+            arima_d,
+            lstm_completed,
+            lstm_normalization,
+            lstm_features,
+            lstm_target_field
        FROM experiment_status
       WHERE experiment_id = ?
       LIMIT 1`,
@@ -258,6 +291,161 @@ async function assertExperimentModelAccess(experimentId: number, studentId: numb
 }
 
 const hasDefinedValue = <T>(value: T | null | undefined): value is T => value !== null && value !== undefined;
+
+const isEnsembleModelType = (modelType: ModelType): modelType is Extract<ModelType, "weighted_avg" | "boosting" | "stacking"> => {
+  return ENSEMBLE_MODEL_TYPES.has(modelType);
+};
+
+const normalizeBooleanFlag = (value: number | boolean | null | undefined): boolean => {
+  return value === true || value === 1;
+};
+
+const normalizePersistedStringArray = (value: unknown): string[] => {
+  if (Array.isArray(value)) {
+    return value.filter((item): item is string => typeof item === "string" && item.length > 0);
+  }
+
+  if (typeof value === "string") {
+    try {
+      return normalizePersistedStringArray(JSON.parse(value));
+    } catch {
+      return value
+        .split(",")
+        .map((item) => item.trim())
+        .filter((item) => item.length > 0);
+    }
+  }
+
+  return [];
+};
+
+const parseRequestedBaseModels = (value: string): BaseModelType[] => {
+  const rawModels = value
+    .split(",")
+    .map((item) => item.trim())
+    .filter((item) => item.length > 0);
+
+  const dedupedModels = [...new Set(rawModels)];
+  const validModels = dedupedModels.filter(
+    (model): model is BaseModelType => ["ma", "es", "arima", "lstm"].includes(model),
+  );
+
+  if (validModels.length !== dedupedModels.length || validModels.length < 2) {
+    throw new ModelValidationError("融合模型至少需要选择两个有效且不重复的基础模型");
+  }
+
+  return validModels;
+};
+
+const assertRequestMatchesPersistedValue = (
+  label: string,
+  requestValue: unknown,
+  persistedValue: unknown,
+) => {
+  if (requestValue === undefined) {
+    return;
+  }
+
+  if (Array.isArray(persistedValue)) {
+    const normalizedRequest = typeof requestValue === "string"
+      ? requestValue
+      : JSON.stringify(requestValue);
+    const normalizedPersisted = persistedValue.join(",");
+    if (normalizedRequest !== normalizedPersisted) {
+      throw new ModelValidationError(`请求中的${label}与已完成基础模型记录不一致，请刷新页面后重试`);
+    }
+    return;
+  }
+
+  if (requestValue !== persistedValue) {
+    throw new ModelValidationError(`请求中的${label}与已完成基础模型记录不一致，请刷新页面后重试`);
+  }
+};
+
+const buildEnsemblePythonParams = (
+  experiment: ExperimentModelContextRow,
+  body: TrainInput,
+): Record<string, unknown> => {
+  if (!body.models) {
+    throw new ModelValidationError("融合模型缺少基础模型列表");
+  }
+
+  const requestedModels = parseRequestedBaseModels(body.models);
+  const pythonParams: Record<string, unknown> = {
+    models: requestedModels.join(","),
+  };
+
+  for (const requestedModel of requestedModels) {
+    switch (requestedModel) {
+      case "ma": {
+        if (!normalizeBooleanFlag(experiment.moving_average_completed)) {
+          throw new ModelValidationError("融合模型依赖的移动平均基础模型尚未完成训练");
+        }
+        if (!hasDefinedValue(experiment.moving_average_window)) {
+          throw new ModelValidationError("融合模型依赖的移动平均基础模型缺少时间窗口配置");
+        }
+        assertRequestMatchesPersistedValue(
+          "移动平均时间窗口",
+          body.moving_average_window,
+          experiment.moving_average_window,
+        );
+        pythonParams.moving_average_window = experiment.moving_average_window;
+        break;
+      }
+      case "es": {
+        if (!normalizeBooleanFlag(experiment.exponential_smoothing_completed)) {
+          throw new ModelValidationError("融合模型依赖的指数平滑基础模型尚未完成训练");
+        }
+        if (!hasDefinedValue(experiment.exponential_smoothing_alpha)) {
+          throw new ModelValidationError("融合模型依赖的指数平滑基础模型缺少平滑系数配置");
+        }
+        assertRequestMatchesPersistedValue(
+          "指数平滑系数",
+          body.exponential_smoothing_alpha,
+          experiment.exponential_smoothing_alpha,
+        );
+        pythonParams.exponential_smoothing_alpha = experiment.exponential_smoothing_alpha;
+        break;
+      }
+      case "arima": {
+        if (!normalizeBooleanFlag(experiment.arima_completed)) {
+          throw new ModelValidationError("融合模型依赖的 ARIMA 基础模型尚未完成训练");
+        }
+        if (!hasDefinedValue(experiment.arima_d)) {
+          throw new ModelValidationError("融合模型依赖的 ARIMA 基础模型缺少差分阶数配置");
+        }
+        assertRequestMatchesPersistedValue("ARIMA 差分阶数", body.arimaD, experiment.arima_d);
+        pythonParams.arimaD = experiment.arima_d;
+        break;
+      }
+      case "lstm": {
+        if (!normalizeBooleanFlag(experiment.lstm_completed)) {
+          throw new ModelValidationError("融合模型依赖的 LSTM 基础模型尚未完成训练");
+        }
+
+        const persistedFeatures = normalizePersistedStringArray(experiment.lstm_features);
+        if (
+          !hasDefinedValue(experiment.lstm_normalization)
+          || !hasDefinedValue(experiment.lstm_target_field)
+          || persistedFeatures.length === 0
+        ) {
+          throw new ModelValidationError("融合模型依赖的 LSTM 基础模型缺少特征或归一化配置");
+        }
+
+        assertRequestMatchesPersistedValue("LSTM 归一化方式", body.lstmNormalization, experiment.lstm_normalization);
+        assertRequestMatchesPersistedValue("LSTM 目标特征", body.lstmTargetFeature, experiment.lstm_target_field);
+        assertRequestMatchesPersistedValue("LSTM 输入特征", body.lstmFeatures, persistedFeatures);
+
+        pythonParams.lstmNormalization = experiment.lstm_normalization;
+        pythonParams.lstmTargetFeature = experiment.lstm_target_field;
+        pythonParams.lstmFeatures = persistedFeatures.join(",");
+        break;
+      }
+    }
+  }
+
+  return pythonParams;
+};
 
 const assertTrainingRequestMatchesExperiment = (
   experiment: ExperimentModelContextRow,
@@ -485,10 +673,41 @@ const resultTransformers: Record<ModelType, (result: Record<string, unknown>) =>
   }),
 };
 
+export function transformTrainingResult(
+  modelType: ModelType,
+  result: Record<string, unknown>,
+): { status: string; results: Record<string, unknown>; inferred_feature_types?: unknown } {
+  const baseResults = {
+    metrics: result.metrics,
+    eval_y_true: result.eval_y_true,
+    eval_predictions: (result.predictions as { prediction: number }[] | undefined)?.map((p) => p.prediction) || [],
+    notes: result.notes || [],
+    saved_model: result.saved_model,
+    logs: result.logs,
+  };
+
+  const modelSpecificTransformedResult = resultTransformers[modelType]?.(result) || {};
+  const finalTransformedResult = { ...baseResults, ...modelSpecificTransformedResult };
+
+  const finalResponse: { status: string; results: Record<string, unknown>; inferred_feature_types?: unknown } = {
+    status: "success",
+    results: finalTransformedResult,
+  };
+
+  if (modelType === "lstm" && result.feature_types) {
+    finalResponse.inferred_feature_types = result.feature_types;
+  }
+
+  return finalResponse;
+}
+
 export async function trainModel(modelType: ModelType, studentId: number, body: TrainInput) {
   const experiment = await assertExperimentModelAccess(body.experiment_id, studentId);
   assertTrainingRequestMatchesExperiment(experiment, body);
   const trainingConfig = getExperimentTrainingConfig(experiment);
+  const derivedModelParams = isEnsembleModelType(modelType)
+    ? buildEnsemblePythonParams(experiment, body)
+    : {};
 
   const allData = await loadDatasetFromDb(
     trainingConfig.selected_industry,
@@ -513,9 +732,14 @@ export async function trainModel(modelType: ModelType, studentId: number, body: 
     evalEnd: trainingConfig.data_window_evaluate_end_index,
     saveModel: modelSaveLoc,
     pretty: true,
+    ...derivedModelParams,
   };
 
   for (const bodyKey of Object.keys(allPossiblePythonParams)) {
+    if (isEnsembleModelType(modelType) && ENSEMBLE_DERIVED_BODY_KEYS.has(bodyKey)) {
+      continue;
+    }
+
     const value = body[bodyKey as keyof TrainInput];
     if (value !== undefined) {
       pythonParams[bodyKey] = value;
@@ -525,28 +749,7 @@ export async function trainModel(modelType: ModelType, studentId: number, body: 
   const timeout = TRAINING_TIMEOUT;
   const result = (await runPythonModel(modelType, pythonParams, timeout)) as Record<string, unknown>;
 
-  const baseResults = {
-    metrics: result.metrics,
-    eval_y_true: result.eval_y_true,
-    eval_predictions: (result.predictions as { prediction: number }[] | undefined)?.map((p) => p.prediction) || [],
-    notes: result.notes || [],
-    saved_model: result.saved_model,
-    logs: result.logs,
-  };
-
-  const modelSpecificTransformedResult = resultTransformers[modelType]?.(result) || {};
-  const finalTransformedResult = { ...baseResults, ...modelSpecificTransformedResult };
-
-  const finalResponse: { status: string; results: unknown; inferred_feature_types?: unknown } = {
-    status: "success",
-    results: finalTransformedResult,
-  };
-
-  if (modelType === "lstm" && result.feature_types) {
-    finalResponse.inferred_feature_types = result.feature_types;
-  }
-
-  return finalResponse;
+  return transformTrainingResult(modelType, result);
 }
 
 export async function predictExperimentModel(
