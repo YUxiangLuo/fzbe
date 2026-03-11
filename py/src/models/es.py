@@ -92,6 +92,8 @@ def train_and_evaluate(
         "mae": mae(y_true, y_pred),
         "mape": mape(y_true, y_pred),
         "r2": r2(y_true, y_pred),
+        "evaluate_indices": list(eval_range),
+        "evaluate_months": [timestamps[i] for i in eval_range] if timestamps else [],
     }
 
     log.info(f"Evaluation metrics computed: RMSE={metrics['rmse']:.4f}, MAE={metrics['mae']:.4f}, MAPE={metrics['mape']:.4f}, R²={metrics['r2']:.4f}")

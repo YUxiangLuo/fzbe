@@ -244,6 +244,8 @@ def train_and_evaluate(
         "bic": float(best_model.bic()),
         "converged": converged,
         "evaluated_points": len(y_eval),
+        "evaluate_indices": list(eval_range),
+        "evaluate_months": [timestamps[i] for i in eval_range] if timestamps else [],
     }
 
     log.info(f"Evaluation metrics computed: RMSE={metrics['rmse']:.4f}, MAE={metrics['mae']:.4f}, MAPE={metrics['mape']:.4f}, R²={metrics['r2']:.4f}, AIC={metrics['aic']:.4f}, BIC={metrics['bic']:.4f}")

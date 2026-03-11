@@ -56,6 +56,16 @@ const withRangeValidation = <TSchema extends z.ZodTypeAny>(schema: TSchema) => {
         || Number((data as Record<string, unknown>).data_window_evaluate_start_index)
           <= Number((data as Record<string, unknown>).data_window_evaluate_end_index),
       { message: "评估起始索引必须小于等于评估结束索引", path: ["data_window_evaluate_end_index"] },
+    )
+    .refine(
+      (data) =>
+        typeof data !== "object"
+        || data === null
+        || (data as Record<string, unknown>).data_window_train_end_index === undefined
+        || (data as Record<string, unknown>).data_window_evaluate_start_index === undefined
+        || Number((data as Record<string, unknown>).data_window_evaluate_start_index)
+          > Number((data as Record<string, unknown>).data_window_train_end_index),
+      { message: "评估起始索引必须大于训练结束索引", path: ["data_window_evaluate_start_index"] },
     );
 };
 
@@ -65,6 +75,17 @@ const movingAverageTrainSchema = withRangeValidation(
   trainSchemaBase.extend({
     moving_average_window: z.coerce.number().int().min(2),
   }),
+).refine(
+  (data) =>
+    data.data_window_train_start_index === undefined
+    || data.data_window_train_end_index === undefined
+    || data.moving_average_window === undefined
+    || data.moving_average_window
+      <= data.data_window_train_end_index - data.data_window_train_start_index + 1,
+  {
+    message: "移动平均时间窗口不能超过训练数据长度",
+    path: ["moving_average_window"],
+  },
 );
 
 const exponentialSmoothingTrainSchema = withRangeValidation(

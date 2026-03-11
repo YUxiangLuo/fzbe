@@ -56,6 +56,11 @@ interface ExperimentTrainingConfig {
   data_window_evaluate_end_index: number;
 }
 
+interface TrainingMetricsPayload extends Record<string, unknown> {
+  evaluate_indices?: unknown;
+  evaluate_months?: unknown;
+}
+
 type BaseModelType = "ma" | "es" | "arima" | "lstm";
 
 const ENSEMBLE_MODEL_TYPES = new Set<ModelType>(["weighted_avg", "boosting", "stacking"]);
@@ -300,6 +305,41 @@ const normalizeBooleanFlag = (value: number | boolean | null | undefined): boole
   return value === true || value === 1;
 };
 
+const normalizeNumericArray = (value: unknown): number[] | undefined => {
+  if (!Array.isArray(value)) {
+    return undefined;
+  }
+
+  return value.filter((item): item is number => typeof item === "number" && Number.isFinite(item));
+};
+
+const normalizeStringArray = (value: unknown): string[] | undefined => {
+  if (!Array.isArray(value)) {
+    return undefined;
+  }
+
+  return value.filter((item): item is string => typeof item === "string");
+};
+
+const validateMovingAverageWindow = (
+  trainingConfig: ExperimentTrainingConfig,
+  movingAverageWindow: number | undefined,
+) => {
+  if (movingAverageWindow === undefined) {
+    return;
+  }
+
+  const trainingLength =
+    trainingConfig.data_window_train_end_index - trainingConfig.data_window_train_start_index + 1;
+
+  if (movingAverageWindow > trainingLength) {
+    throw new ModelValidationError("移动平均时间窗口不能超过训练数据长度", {
+      moving_average_window: movingAverageWindow,
+      training_length: trainingLength,
+    });
+  }
+};
+
 const normalizePersistedStringArray = (value: unknown): string[] => {
   if (Array.isArray(value)) {
     return value.filter((item): item is string => typeof item === "string" && item.length > 0);
@@ -518,6 +558,10 @@ const getExperimentTrainingConfig = (
     throw new ModelValidationError("实验记录中的评估数据窗口无效，请重新选择数据窗口后重试");
   }
 
+  if (experiment.data_window_evaluate_start_index <= experiment.data_window_train_end_index) {
+    throw new ModelValidationError("实验记录中的评估起始索引必须大于训练结束索引，请重新选择数据窗口后重试");
+  }
+
   return {
     selected_industry: experiment.selected_industry,
     selected_company: experiment.selected_company,
@@ -675,10 +719,17 @@ export function transformTrainingResult(
   modelType: ModelType,
   result: Record<string, unknown>,
 ): { status: string; results: Record<string, unknown>; inferred_feature_types?: unknown } {
+  const metrics =
+    result.metrics && typeof result.metrics === "object"
+      ? (result.metrics as TrainingMetricsPayload)
+      : undefined;
+
   const baseResults = {
     metrics: result.metrics,
     eval_y_true: result.eval_y_true,
     eval_predictions: (result.predictions as { prediction: number }[] | undefined)?.map((p) => p.prediction) || [],
+    evaluate_indices: normalizeNumericArray(metrics?.evaluate_indices),
+    evaluate_months: normalizeStringArray(metrics?.evaluate_months),
     notes: result.notes || [],
     saved_model: result.saved_model,
     logs: result.logs,
@@ -703,6 +754,9 @@ export async function trainModel(modelType: ModelType, studentId: number, body: 
   const experiment = await assertExperimentModelAccess(body.experiment_id, studentId);
   assertTrainingRequestMatchesExperiment(experiment, body);
   const trainingConfig = getExperimentTrainingConfig(experiment);
+  if (modelType === "ma") {
+    validateMovingAverageWindow(trainingConfig, body.moving_average_window);
+  }
   const derivedModelParams = isEnsembleModelType(modelType)
     ? buildEnsemblePythonParams(experiment, body)
     : {};
