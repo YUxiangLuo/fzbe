@@ -3,15 +3,17 @@ import type { ModelType } from "./models.schema";
 import { PY_DIR } from "../../utils/python";
 
 const LOCK_NAMESPACE = "fangzhen-model";
+export type ModelArtifactPhase = "backtest" | "production";
 
 export const buildExperimentScopedModelPath = (
   experimentId: number,
   studentId: number,
   modelType: ModelType,
+  phase: ModelArtifactPhase = "backtest",
 ): string => path.join(
   PY_DIR,
   "trained_models",
-  `exp${experimentId}-student${studentId}-${modelType}.pkl`,
+  `exp${experimentId}-student${studentId}-${modelType}${phase === "production" ? "-production" : ""}.pkl`,
 );
 
 export const buildModelExecutionLockName = (

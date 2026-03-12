@@ -40,6 +40,7 @@ def main():
     parser.add_argument("--save-model", type=str, help="Path to save the trained model")
     parser.add_argument("--load-model", type=str, help="Path to load a trained model")
     parser.add_argument("--forecast-steps", type=int, help="Number of steps to forecast")
+    parser.add_argument("--fit-only", action="store_true", help="Fit a production model without evaluation")
     parser.add_argument("--pretty", action="store_true", help="Pretty print JSON output")
 
     # Add model-specific arguments (these will be parsed by the individual model's run function)
@@ -60,6 +61,7 @@ def main():
     parser.add_argument("--normalization", type=str, choices=['minmax', 'zscore'], help="LSTM normalization method")
     # Ensemble Models
     parser.add_argument("--models", type=str, help="Comma-separated list of base models for stacking/weighted_avg/boosting")
+    parser.add_argument("--base-model-files", type=str, help="JSON object mapping base model names to saved model artifact paths")
     # Boosting-specific
     parser.add_argument("--learning-rate", type=float, help="Boosting learning rate (shrinkage parameter)")
     parser.add_argument("--max-rounds", type=int, help="Boosting maximum number of rounds")

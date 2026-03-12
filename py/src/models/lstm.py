@@ -71,6 +71,70 @@ def _create_dataset(
     return np.array(dataX), np.array(dataY)
 
 
+def _estimate_std_dev(residuals: ArrayLike, reference_series: ArrayLike) -> float:
+    residuals_array = np.asarray(residuals, dtype=float)
+    if residuals_array.size > 1:
+        return float(np.std(residuals_array, ddof=1))
+
+    reference_array = np.asarray(reference_series, dtype=float)
+    if reference_array.size > 1:
+        return float(np.std(reference_array, ddof=1))
+
+    baseline = abs(float(np.mean(reference_array))) if reference_array.size else 0.0
+    return float(max(baseline * 0.05, 1.0))
+
+
+def _forecast_from_state(state: Dict[str, Any], steps: int) -> Tuple[List[float], float]:
+    keras_model = state["keras_model"]
+    preprocessor = state["preprocessor"]
+    look_back = state["look_back"]
+    history_df = state["history_df"]
+    std_dev_residuals = float(state.get("std_dev_residuals", 0.0))
+    normalization = state.get("normalization", 'minmax')
+
+    log.info(f"Generating {steps}-step forecast with look_back={look_back}, normalization='{normalization}'")
+
+    scaled_history = preprocessor.transform(history_df)
+    if isinstance(scaled_history, csr_matrix):
+        scaled_history = scaled_history.toarray()
+    n_features_out = scaled_history.shape[1]
+    log.debug(f"Preprocessed history: {len(history_df)} rows, {n_features_out} features after transformation")
+
+    input_seq = scaled_history[-look_back:].reshape(1, look_back, n_features_out)
+
+    target_scaler = preprocessor.named_transformers_['numeric'].named_steps['scaler']
+    target_column_indices = preprocessor.output_indices_['numeric']
+    if isinstance(target_column_indices, slice):
+        target_column_index = target_column_indices.start
+    else:
+        target_column_index = target_column_indices[0]
+
+    predictions_scaled = []
+    for step_idx in range(steps):
+        pred_scaled = keras_model.predict(input_seq, verbose=0)
+        predictions_scaled.append(pred_scaled[0, 0])
+        log.debug(f"  Step {step_idx+1}/{steps}: predicted scaled value = {pred_scaled[0, 0]:.4f}")
+
+        next_input_step_scaled = np.zeros((1, 1, n_features_out))
+        next_input_step_scaled[0, 0, target_column_index] = pred_scaled[0, 0]
+
+        last_known_scaled_features = input_seq[0, -1, :]
+        for i in range(n_features_out):
+            if i != target_column_index:
+                next_input_step_scaled[0, 0, i] = last_known_scaled_features[i]
+
+        input_seq = np.append(input_seq[:, 1:, :], next_input_step_scaled, axis=1)
+
+    n_numeric_features = target_scaler.n_features_in_
+    dummy_array = np.zeros((len(predictions_scaled), n_numeric_features))
+    dummy_array[:, 0] = predictions_scaled
+    unscaled_predictions = target_scaler.inverse_transform(dummy_array)[:, 0]
+
+    log.info(f"Generated {len(unscaled_predictions)} predictions after inverse transform")
+
+    return unscaled_predictions.flatten().tolist(), std_dev_residuals
+
+
 # ---------- predict ----------
 def predict(
     model_path: str,
@@ -95,62 +159,108 @@ def predict(
         state["keras_model"] = keras_load_model(keras_model_path)
         log.debug(f"Loaded Keras model from {keras_model_path}")
 
-    keras_model = state["keras_model"]
-    preprocessor = state["preprocessor"]
-    look_back = state["look_back"]
-    history_df = state["history_df"]
-    std_dev_residuals = state.get("std_dev_residuals", 0.0)
-    normalization = state.get("normalization", 'minmax') # Retrieve normalization method
+    return _forecast_from_state(state, steps)
 
-    log.info(f"Generating {steps}-step forecast with look_back={look_back}, normalization='{normalization}'")
 
-    # The preprocessor expects a DataFrame, so we work with it
-    scaled_history = preprocessor.transform(history_df)
-    n_features_out = scaled_history.shape[1]
-    log.debug(f"Preprocessed history: {len(history_df)} rows, {n_features_out} features after transformation")
+def _infer_feature_types(parsed_data: ParsedData) -> Dict[str, str]:
+    feature_types: Dict[str, str] = {}
+    time_key = parsed_data.time_key or ''
 
-    # Use the last part of the history as the initial input
-    input_seq = scaled_history[-look_back:].reshape(1, look_back, n_features_out)
+    for col in parsed_data.df.columns:
+        if col == parsed_data.target_key or col == time_key:
+            continue
+        if pd.api.types.is_numeric_dtype(parsed_data.df[col]):
+            feature_types[col] = 'numeric'
+        else:
+            feature_types[col] = 'categorical'
 
-    # Get the scaler for the target variable to perform inverse transform later
-    target_scaler = preprocessor.named_transformers_['numeric'].named_steps['scaler']
-    target_column_indices = preprocessor.output_indices_['numeric']
-    if isinstance(target_column_indices, slice):
-        target_column_index = target_column_indices.start
+    feature_types[parsed_data.target_key] = 'numeric'
+    return feature_types
+
+
+def _fit_model(
+    parsed_data: ParsedData,
+    feature_types: Dict[str, str],
+    train_range: range,
+    look_back: int,
+    epochs: int,
+    normalization: str,
+):
+    from tensorflow.keras.layers import LSTM as KerasLSTM
+    from tensorflow.keras.layers import Dense
+    from tensorflow.keras.models import Sequential
+    from tensorflow.keras.optimizers import Adam
+    from tensorflow.keras.callbacks import LearningRateScheduler
+
+    df = parsed_data.df
+    target_key = parsed_data.target_key
+    numeric_features = [k for k, v in feature_types.items() if v == 'numeric' and k != target_key]
+    categorical_features = [k for k, v in feature_types.items() if v == 'categorical']
+
+    log.debug(f"Target: '{target_key}', Numeric features: {numeric_features}, Categorical features: {categorical_features}")
+
+    if normalization == 'zscore':
+        scaler = StandardScaler()
+        log.info("Using StandardScaler (z-score normalization)")
+    elif normalization == 'minmax':
+        scaler = MinMaxScaler(feature_range=(0, 1))
+        log.info("Using MinMaxScaler (0-1 normalization)")
     else:
-        target_column_index = target_column_indices[0]
+        raise ValueError(f"Unknown normalization method: {normalization}")
 
+    numeric_transformer = Pipeline(steps=[('scaler', scaler)])
+    categorical_transformer = Pipeline(steps=[('onehot', OneHotEncoder(handle_unknown='ignore'))])
 
-    predictions_scaled = []
-    for step_idx in range(steps):
-        pred_scaled = keras_model.predict(input_seq, verbose=0)
-        predictions_scaled.append(pred_scaled[0, 0])
-        log.debug(f"  Step {step_idx+1}/{steps}: predicted scaled value = {pred_scaled[0, 0]:.4f}")
+    preprocessor = ColumnTransformer(
+        transformers=[
+            ('numeric', numeric_transformer, [target_key] + numeric_features),
+            ('categorical', categorical_transformer, categorical_features)
+        ],
+        remainder='drop'
+    )
 
-        # Create the next input step (as a scaled vector)
-        next_input_step_scaled = np.zeros((1, 1, n_features_out))
-        next_input_step_scaled[0, 0, target_column_index] = pred_scaled[0, 0]
+    log.info("Fitting preprocessor on TRAINING data only...")
+    train_df = df.iloc[train_range]
+    preprocessor.fit(train_df)
 
-        # For other features, assume they stay constant at the last known value
-        last_known_scaled_features = input_seq[0, -1, :]
-        for i in range(n_features_out):
-            if i != target_column_index:
-                next_input_step_scaled[0, 0, i] = last_known_scaled_features[i]
+    scaled_series = preprocessor.transform(df)
+    if isinstance(scaled_series, csr_matrix):
+        scaled_series = scaled_series.toarray()
 
-        # Update the input sequence for the next prediction
-        input_seq = np.append(input_seq[:, 1:, :], next_input_step_scaled, axis=1)
+    n_features_out = scaled_series.shape[1]
+    log.info(f"Preprocessed data shape: {scaled_series.shape} (features after encoding: {n_features_out})")
 
-    # Inverse transform the predictions
-    # Create a dummy array with the same shape as the scaler expects
-    n_numeric_features = target_scaler.n_features_in_
+    train_data = scaled_series[train_range]
+    log.info(f"Creating LSTM dataset with look_back={look_back}...")
+    trainX, trainY = _create_dataset(train_data, look_back)
+    log.info(f"Training dataset created: X shape={trainX.shape}, Y shape={trainY.shape}")
 
-    dummy_array = np.zeros((len(predictions_scaled), n_numeric_features))
-    dummy_array[:, 0] = predictions_scaled
-    unscaled_predictions = target_scaler.inverse_transform(dummy_array)[:, 0]
+    log.info(f"Building LSTM model: 3 layers, 288 units each, input_shape=({look_back}, {n_features_out})")
+    model = Sequential()
+    model.add(KerasLSTM(288, input_shape=(look_back, n_features_out), return_sequences=True))
+    model.add(KerasLSTM(288, return_sequences=True))
+    model.add(KerasLSTM(288))
+    model.add(Dense(1))
 
-    log.info(f"Generated {len(unscaled_predictions)} predictions after inverse transform")
+    initial_learning_rate = 0.01
+    decay_rate = 0.99
+    optimizer = Adam(learning_rate=initial_learning_rate)
+    model.compile(loss="mean_squared_error", optimizer=optimizer)
 
-    return unscaled_predictions.flatten().tolist(), std_dev_residuals
+    def lr_schedule(epoch):
+        return initial_learning_rate * (decay_rate ** epoch)
+
+    lr_scheduler = LearningRateScheduler(lr_schedule, verbose=0)
+
+    log.info(f"Training LSTM model for {epochs} epochs with batch_size=6...")
+    log.info(f"Initial learning rate: {initial_learning_rate}, decay rate: {decay_rate}")
+    model.fit(trainX, trainY, epochs=epochs, batch_size=6, verbose=0, callbacks=[lr_scheduler])
+    log.info("Model training completed")
+
+    history_df_for_saving = df.iloc[train_range.stop - look_back : train_range.stop].copy()
+    log.debug(f"Saved history for future predictions: {len(history_df_for_saving)} rows")
+
+    return model, preprocessor, history_df_for_saving
 
 
 # ---------- train and evaluate ----------
@@ -169,131 +279,48 @@ def train_and_evaluate(
     """
     log.info(f"Starting LSTM train_and_evaluate: look_back={look_back}, epochs={epochs}, normalization='{normalization}', train_range={train_range}, eval_range={eval_range}")
 
-    from tensorflow.keras.layers import LSTM as KerasLSTM
-    from tensorflow.keras.layers import Dense
-    from tensorflow.keras.models import Sequential
-
     df = parsed_data.df
     target_key = parsed_data.target_key
+    train_target_values = df[target_key].values[train_range]
 
     log.debug(f"Total series length: {len(df)}")
     log.debug(f"Training data range: [{train_range.start}, {train_range.stop-1}], count={train_range.stop - train_range.start}")
     log.debug(f"Evaluation data range: [{eval_range.start}, {eval_range.stop-1}], count={eval_range.stop - eval_range.start}")
 
-    # Separate features by type
-    numeric_features = [k for k, v in feature_types.items() if v == 'numeric' and k != target_key]
-    categorical_features = [k for k, v in feature_types.items() if v == 'categorical']
-
-    log.debug(f"Target: '{target_key}', Numeric features: {numeric_features}, Categorical features: {categorical_features}")
-
-    # Choose the scaler based on the normalization parameter
-    if normalization == 'zscore':
-        scaler = StandardScaler()
-        log.info("Using StandardScaler (z-score normalization)")
-    elif normalization == 'minmax':
-        scaler = MinMaxScaler(feature_range=(0, 1))
-        log.info("Using MinMaxScaler (0-1 normalization)")
-    else:
-        raise ValueError(f"Unknown normalization method: {normalization}")
-
-    # Create the preprocessing pipelines for numeric and categorical features
-    numeric_transformer = Pipeline(steps=[('scaler', scaler)])
-    categorical_transformer = Pipeline(steps=[('onehot', OneHotEncoder(handle_unknown='ignore'))])
-
-    # Create a column transformer to apply different transformations to different columns
-    preprocessor = ColumnTransformer(
-        transformers=[
-            ('numeric', numeric_transformer, [target_key] + numeric_features),
-            ('categorical', categorical_transformer, categorical_features)
-        ],
-        remainder='drop'
+    model, preprocessor, history_df_for_saving = _fit_model(
+        parsed_data,
+        feature_types,
+        train_range,
+        look_back,
+        epochs,
+        normalization,
     )
-
-    # Fit the preprocessor ONLY on training data to avoid data leakage
-    log.info("Fitting preprocessor on TRAINING data only...")
-    train_df = df.iloc[train_range]
-    preprocessor.fit(train_df)
-
-    # Transform the entire dataset
-    scaled_series = preprocessor.transform(df)
-    if isinstance(scaled_series, csr_matrix): # OneHotEncoder can return sparse matrix
-        scaled_series = scaled_series.toarray()
-
-    n_features_out = scaled_series.shape[1]
-    log.info(f"Preprocessed data shape: {scaled_series.shape} (features after encoding: {n_features_out})")
-
-    # Split into train and test sets
-    train_data = scaled_series[train_range]
-
-    # Create dataset for training
-    log.info(f"Creating LSTM dataset with look_back={look_back}...")
-    trainX, trainY = _create_dataset(train_data, look_back)
-    log.info(f"Training dataset created: X shape={trainX.shape}, Y shape={trainY.shape}")
-
-    # Build and train the LSTM model (3 layers, 288 units each)
-    log.info(f"Building LSTM model: 3 layers, 288 units each, input_shape=({look_back}, {n_features_out})")
-    model = Sequential()
-    # First LSTM layer (returns sequences for next LSTM layer)
-    model.add(KerasLSTM(288, input_shape=(look_back, n_features_out), return_sequences=True))
-    # Second LSTM layer (returns sequences for next LSTM layer)
-    model.add(KerasLSTM(288, return_sequences=True))
-    # Third LSTM layer (returns only last output)
-    model.add(KerasLSTM(288))
-    # Fully connected layer for final prediction
-    model.add(Dense(1))
-
-    # Configure Adam optimizer with custom learning rate and decay
-    from tensorflow.keras.optimizers import Adam
-    from tensorflow.keras.callbacks import LearningRateScheduler
-
-    initial_learning_rate = 0.01
-    decay_rate = 0.99
-
-    optimizer = Adam(learning_rate=initial_learning_rate)
-    model.compile(loss="mean_squared_error", optimizer=optimizer)
-
-    # Learning rate decay scheduler
-    def lr_schedule(epoch):
-        """
-        Learning rate decay schedule: lr = initial_lr * (decay_rate ^ epoch)
-        """
-        return initial_learning_rate * (decay_rate ** epoch)
-
-    lr_scheduler = LearningRateScheduler(lr_schedule, verbose=0)
-
-    log.info(f"Training LSTM model for {epochs} epochs with batch_size=6...")
-    log.info(f"Initial learning rate: {initial_learning_rate}, decay rate: {decay_rate}")
-    model.fit(trainX, trainY, epochs=epochs, batch_size=6, verbose=0, callbacks=[lr_scheduler])
-    log.info("Model training completed")
 
     # Make predictions for evaluation
     if not list(eval_range):
         log.warning("Empty evaluation range, returning empty metrics")
-        return {}, model, preprocessor, [], [], 0.0, pd.DataFrame()
-
-    eval_input_start = eval_range.start - look_back
-    if eval_input_start < 0:
-        raise ValueError("Not enough data before evaluation range to form input.")
+        return {}, model, preprocessor, [], [], _estimate_std_dev([], train_target_values), history_df_for_saving
 
     log.info(f"Generating predictions for evaluation range...")
-    eval_input_data = scaled_series[eval_input_start : eval_range.stop]
-    evalX, _ = _create_dataset(eval_input_data, look_back)
-    log.debug(f"Evaluation dataset created: X shape={evalX.shape}")
-
-    preds_scaled = model.predict(evalX, verbose=0)
-    log.debug(f"Generated {len(preds_scaled)} scaled predictions")
-
-    # Inverse transform predictions
-    target_scaler = preprocessor.named_transformers_['numeric'].named_steps['scaler']
-    dummy_preds = np.zeros((len(preds_scaled), len(numeric_features) + 1))
-    dummy_preds[:, 0] = preds_scaled.flatten()
-    y_pred = target_scaler.inverse_transform(dummy_preds)[:, 0]
+    steps_to_eval_end = eval_range.stop - train_range.stop
+    forecast_offset = eval_range.start - train_range.stop
+    state_for_eval = {
+        "keras_model": model,
+        "preprocessor": preprocessor,
+        "look_back": look_back,
+        "history_df": history_df_for_saving,
+        "normalization": normalization,
+    }
+    full_forecast, _ = _forecast_from_state(state_for_eval, steps_to_eval_end)
+    y_pred = full_forecast[forecast_offset: forecast_offset + len(eval_range)]
+    if len(y_pred) != len(eval_range):
+        raise ValueError("[VALIDATION] 无法为完整评估区间生成 LSTM 预测。")
 
     y_true = df[target_key].values[eval_range]
     log.info(f"Generated {len(y_pred)} predictions after inverse transform")
 
     residuals = y_true - y_pred
-    std_dev_residuals = float(np.std(residuals, ddof=1)) if len(residuals) > 1 else 0.0
+    std_dev_residuals = _estimate_std_dev(residuals, train_target_values)
     log.info(f"Calculated residuals: mean={np.mean(residuals):.4f}, std_dev={std_dev_residuals:.4f}")
 
     metrics = {
@@ -310,10 +337,7 @@ def train_and_evaluate(
 
     log.info(f"Evaluation metrics computed: RMSE={metrics['rmse']:.4f}, MAE={metrics['mae']:.4f}, MAPE={metrics['mape']:.4f}, R²={metrics['r2']:.4f}")
 
-    history_df_for_saving = df.iloc[train_range.stop - look_back : train_range.stop]
-    log.debug(f"Saved history for future predictions: {len(history_df_for_saving)} rows")
-
-    return metrics, model, preprocessor, y_true.tolist(), y_pred.tolist(), std_dev_residuals, history_df_for_saving
+    return metrics, model, preprocessor, y_true.tolist(), list(y_pred), std_dev_residuals, history_df_for_saving
 
 
 # ---------- public entry ----------
@@ -330,6 +354,84 @@ def run(args) -> None:
     pretty: bool = bool(getattr(args, "pretty", False))
     save_path = getattr(args, "save_model", None)
     load_path = getattr(args, "load_model", None)
+
+    if getattr(args, "fit_only", False):
+        if not hasattr(args, "data") or not args.data:
+            raise ValueError("[VALIDATION] --data is required for fit-only mode.")
+        if not save_path:
+            raise ValueError("[VALIDATION] --save-model is required for fit-only mode.")
+        if not load_path:
+            raise ValueError("[VALIDATION] --load-model is required for fit-only mode.")
+
+        state = _load_state(load_path)
+        parsed_data = load_data_from_json(
+            args.data,
+            target_key=state.get("target_key"),
+            feature_keys=state.get("feature_keys"),
+        )
+
+        ts, te = int(args.train_start), int(args.train_end)
+        look_back = int(state["look_back"])
+        epochs = int(state.get("epochs", 20))
+        normalization = state.get("normalization", 'minmax')
+        _validate_fit_args(parsed_data, ts, te, look_back)
+
+        feature_types = _infer_feature_types(parsed_data)
+        model, preprocessor, history_df = _fit_model(
+            parsed_data,
+            feature_types,
+            range(ts, te + 1),
+            look_back,
+            epochs,
+            normalization,
+        )
+
+        keras_model_path = os.path.splitext(save_path)[0] + "_keras_model.h5"
+        temp_keras_model_path = os.path.splitext(save_path)[0] + f"_keras_model.tmp-{os.getpid()}.h5"
+        try:
+            model.save(temp_keras_model_path)
+            os.replace(temp_keras_model_path, keras_model_path)
+        finally:
+            if os.path.exists(temp_keras_model_path):
+                try:
+                    os.remove(temp_keras_model_path)
+                except OSError:
+                    pass
+
+        std_dev_residuals = float(
+            state.get(
+                "std_dev_residuals",
+                _estimate_std_dev([], parsed_data.df[parsed_data.target_key].values[ts : te + 1]),
+            )
+        )
+        next_state = {
+            "model_type": MODEL_TYPE,
+            "look_back": look_back,
+            "epochs": epochs,
+            "normalization": normalization,
+            "train_end_index": te,
+            "preprocessor": preprocessor,
+            "history_df": history_df,
+            "target_key": parsed_data.target_key,
+            "feature_keys": parsed_data.feature_keys,
+            "keras_model_path": keras_model_path,
+            "std_dev_residuals": std_dev_residuals,
+        }
+        dump_model(next_state, save_path)
+
+        out: Dict[str, Any] = {
+            "mode": "lstm_fit_only",
+            "look_back": look_back,
+            "epochs": epochs,
+            "normalization": normalization,
+            "train_end_index": te,
+            "target_key": parsed_data.target_key,
+            "feature_keys": parsed_data.feature_keys,
+            "saved_model": save_path,
+        }
+        out["logs"] = get_log_contents()
+        print(json.dumps(out, ensure_ascii=False, indent=2 if pretty else None))
+        return
 
     if load_path:
         log.info(f"Entering prediction mode with model: {load_path}")
@@ -384,16 +486,9 @@ def run(args) -> None:
         # If feature_types is empty, infer from dataframe dtypes
         if not feature_types:
             log.info("No feature_types provided, inferring from DataFrame.")
-            for col in parsed_data.df.columns:
-                time_key = parsed_data.time_key or '' 
-                if col == parsed_data.target_key or col == time_key:
-                    continue
-                if pd.api.types.is_numeric_dtype(parsed_data.df[col]):
-                    feature_types[col] = 'numeric'
-                else:
-                    feature_types[col] = 'categorical'
+            feature_types = _infer_feature_types(parsed_data)
             log.info(f"Inferred feature_types: {feature_types}")
-        
+
         if parsed_data.target_key not in feature_types:
             feature_types[parsed_data.target_key] = 'numeric'
             log.debug(f"Ensured target_key '{parsed_data.target_key}' is in feature_types.")
@@ -488,6 +583,19 @@ def run(args) -> None:
     except (ValueError, TypeError, json.JSONDecodeError, KeyError, FileNotFoundError) as e:
         log.error(f"An error occurred during data processing or training: {e}", exc_info=True)
         raise ValueError(f"[DATA] Failed to parse or process --data: {e}")
+
+
+def _validate_fit_args(
+    parsed_data: ParsedData, ts: int, te: int, look_back: int
+) -> None:
+    n = parsed_data.n_obs
+
+    if not (0 <= ts <= te < n):
+        raise ValueError(f"[VALIDATION] Invalid train range: [{ts},{te}], must be within [0, {n-1}]")
+    if look_back < 1:
+        raise ValueError("[VALIDATION] look_back must be >= 1.")
+    if te - ts + 1 <= look_back:
+        raise ValueError("[VALIDATION] Training range must be larger than look_back.")
 
 
 def _validate_training_args(

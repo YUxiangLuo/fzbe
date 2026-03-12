@@ -74,6 +74,8 @@ CREATE TABLE IF NOT EXISTS `experiment_status` (
   `selected_industry` VARCHAR(255) DEFAULT NULL,
   `selected_company` VARCHAR(255) DEFAULT NULL,
   `selected_product` VARCHAR(255) DEFAULT NULL,
+  `selected_base_models` JSON DEFAULT NULL,
+  `selected_ensemble_models` JSON DEFAULT NULL,
 
   `data_window_train_start_index` INT UNSIGNED DEFAULT NULL,
   `data_window_train_end_index` INT UNSIGNED DEFAULT NULL,

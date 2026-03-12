@@ -73,6 +73,7 @@ const optionalJson = z.preprocess(jsonPreprocess, z.union([z.array(z.any()), z.r
 const optionalFields: Record<string, z.ZodTypeAny> = {
   highest_completed_step: optionalInt(0, 7),
   selected_industry: optionalString, selected_company: optionalString, selected_product: optionalString,
+  selected_base_models: optionalJson, selected_ensemble_models: optionalJson,
   data_window_train_start_index: optionalInt(0), data_window_train_end_index: optionalInt(0),
   data_window_evaluate_start_index: optionalInt(0), data_window_evaluate_end_index: optionalInt(0),
   moving_average_completed: optionalBoolean, moving_average_window: optionalInt(1),

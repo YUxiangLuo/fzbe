@@ -1,22 +1,12 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Forward Stagewise Additive Ensemble for Heterogeneous Time Series Models.
+Residual Boosting Ensemble for Heterogeneous Time Series Models.
 
-Implements a greedy model selection approach with learning rate shrinkage.
-Each model in the chain is independently trained on original data; the subprocess
-architecture (eval_start > train_end) prevents in-sample residual computation,
-so true gradient-boosted residual learning is not feasible.
-
-Algorithm (compromise for subprocess architecture):
-1. Train all candidate models on original y
-2. Select the model that best reduces ensemble RMSE on a held-out validation set
-3. Add it to the chain with learning rate shrinkage
-4. Repeat until no improvement or max_rounds reached
-5. Final prediction = model_0 + learning_rate * model_1 + learning_rate * model_2 + ...
-
-All models independently predict original y; the learning rate controls each
-subsequent model's contribution to the ensemble.
+Stage 0 fits the original target. Subsequent stages fit the residuals left by the
+current ensemble. Stage selection is performed on a held-out validation window,
+while each selected stage is retrained on the full train_range for final eval and
+artifact persistence.
 
 Uses subprocess to call base models for consistency with API behavior.
 """
@@ -27,55 +17,281 @@ import tempfile
 from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
+from scipy.sparse import csr_matrix
 
-# Import shared utilities
-from data_utils import (
-    ParsedData,
-    build_numeric_subprocess_records,
-    build_subprocess_records,
-    infer_feature_types,
-    load_data_from_json,
+from data_utils import ParsedData, infer_feature_types, load_data_from_json
+from ensemble_utils import (
+    build_ensemble_subprocess_data,
+    get_member_model_path,
+    parse_base_model_files_arg,
+    persist_member_model_artifact,
+    remove_member_model_artifact,
 )
 from metrics import mae, mape, r2, rmse
 from serialization import dump_model, load_model
-from subprocess_utils import run_base_model_subprocess, run_base_model_predict_subprocess, extract_predictions_from_result
+from subprocess_utils import (
+    extract_predictions_from_result,
+    run_base_model_fit_subprocess,
+    run_base_model_predict_subprocess,
+    run_base_model_subprocess,
+)
 
 MODEL_TYPE = "boosting"
+SUPPORTED_BASE_MODELS = ["ma", "es", "arima", "lstm"]
 
 
 # ---------- utilities ----------
 def _format_predictions(preds: List[float], std_dev: float = 0.0) -> List[Dict[str, float]]:
-    """Format predictions with standard deviation for JSON output."""
     return [{"prediction": float(p), "std_dev": float(std_dev)} for p in preds]
 
 
 def _compute_phase1_train_size(train_size: int) -> int:
-    """Compute the Phase 1 internal training split size (boost_train).
-
-    Shared between validation and train_and_evaluate to keep them in sync.
-    """
     if train_size <= 15:
         return max(train_size - 3, int(train_size * 0.85))
     return max(3, int(train_size * 0.8))
 
 
 def _load_state(model_path: str) -> Dict[str, Any]:
-    """Load and validate a saved Boosting model state."""
     state = load_model(model_path)
     if not isinstance(state, dict) or state.get("model_type") != MODEL_TYPE:
         raise ValueError("[VALIDATION] Invalid Boosting model file.")
     return state
 
 
-def _validate_training_args(
-    parsed_data: ParsedData, ts: int, te: int, es: int, ee: int,
-    models_to_use: List[str], model_params: Dict[str, Any]
-) -> None:
-    """Validate training and evaluation parameters for Boosting."""
-    n = parsed_data.n_obs
+def _is_residual_boosting_state(state: Dict[str, Any]) -> bool:
+    return state.get("boosting_variant") == "residual"
 
-    # Supported base models
-    SUPPORTED_BASE_MODELS = ["ma", "es", "arima", "lstm"]
+
+def _get_stage_coefficients(model_chain: List[str], state: Dict[str, Any]) -> List[float]:
+    explicit_coefficients = state.get("stage_coefficients")
+    if isinstance(explicit_coefficients, list) and len(explicit_coefficients) == len(model_chain):
+        return [float(coef) for coef in explicit_coefficients]
+
+    learning_rate = float(state.get("learning_rate", 0.3))
+    return [1.0 if idx == 0 else learning_rate for idx in range(len(model_chain))]
+
+
+def _iter_stage_models(state: Dict[str, Any]):
+    model_chain = state.get("model_chain")
+    base_model_states = state.get("base_model_states")
+    if not isinstance(model_chain, list) or len(model_chain) == 0:
+        raise ValueError("[VALIDATION] Saved Boosting model is missing a valid model_chain.")
+    if not isinstance(base_model_states, dict):
+        raise ValueError("[VALIDATION] Saved Boosting model is missing base_model_states.")
+
+    stage_coefficients = _get_stage_coefficients(model_chain, state)
+    usage_counts: Dict[str, int] = {}
+
+    for stage_idx, model_name in enumerate(model_chain):
+        model_info = base_model_states.get(model_name)
+        if not isinstance(model_info, dict):
+            raise ValueError(f"[VALIDATION] Missing saved state for base model: {model_name}")
+
+        models = model_info.get("models")
+        if not isinstance(models, list):
+            raise ValueError(f"[VALIDATION] Missing saved rounds for base model: {model_name}")
+
+        usage_idx = usage_counts.get(model_name, 0)
+        if usage_idx >= len(models):
+            raise ValueError(f"[VALIDATION] Missing saved round {usage_idx} for base model: {model_name}")
+
+        usage_counts[model_name] = usage_idx + 1
+        yield stage_idx, model_name, float(stage_coefficients[stage_idx]), models[usage_idx]
+
+
+def _build_residual_parsed_data(
+    parsed_data: ParsedData,
+    train_range: range,
+    train_target_values: np.ndarray,
+) -> ParsedData:
+    df = parsed_data.df.copy().astype({parsed_data.target_key: float})
+    target_col_idx = df.columns.get_loc(parsed_data.target_key)
+    df.iloc[list(train_range), target_col_idx] = train_target_values
+    return ParsedData(
+        df=df,
+        target_key=parsed_data.target_key,
+        time_key=parsed_data.time_key,
+        feature_keys=parsed_data.feature_keys,
+    )
+
+
+def _normalize_fitted_values(values: Any, expected_length: int) -> np.ndarray:
+    arr = np.asarray(values, dtype=float).reshape(-1)
+    arr = np.nan_to_num(arr, nan=0.0, posinf=0.0, neginf=0.0)
+    if arr.size < expected_length:
+        arr = np.concatenate([np.zeros(expected_length - arr.size), arr])
+    elif arr.size > expected_length:
+        arr = arr[-expected_length:]
+    return arr
+
+
+def _compute_ma_in_sample_fitted(train_target: np.ndarray, window: int) -> np.ndarray:
+    fitted = np.zeros(len(train_target), dtype=float)
+    for idx in range(1, len(train_target)):
+        history_start = max(0, idx - window)
+        history = train_target[history_start:idx]
+        fitted[idx] = float(np.mean(history)) if history.size > 0 else 0.0
+    return fitted
+
+
+def _compute_lstm_in_sample_fitted(
+    model_file: str,
+    parsed_data: ParsedData,
+    train_range: range,
+) -> np.ndarray:
+    from models import lstm as lstm_model
+
+    state = lstm_model._load_state(model_file)
+    train_df = parsed_data.df.iloc[list(train_range)]
+    preprocessor = state["preprocessor"]
+    scaled_train = preprocessor.transform(train_df)
+    if isinstance(scaled_train, csr_matrix):
+        scaled_train = scaled_train.toarray()
+
+    look_back = int(state["look_back"])
+    trainX, _ = lstm_model._create_dataset(scaled_train, look_back)
+    fitted = np.zeros(len(train_df), dtype=float)
+    if len(trainX) == 0:
+        return fitted
+
+    pred_scaled = state["keras_model"].predict(trainX, verbose=0).reshape(-1)
+    target_scaler = preprocessor.named_transformers_["numeric"].named_steps["scaler"]
+    n_numeric_features = target_scaler.n_features_in_
+    dummy_array = np.zeros((len(pred_scaled), n_numeric_features))
+    dummy_array[:, 0] = pred_scaled
+    unscaled_predictions = target_scaler.inverse_transform(dummy_array)[:, 0]
+    fitted[look_back: look_back + len(unscaled_predictions)] = unscaled_predictions
+    return fitted
+
+
+def _compute_in_sample_fitted_predictions(
+    model_name: str,
+    model_file: str,
+    parsed_data: ParsedData,
+    train_range: range,
+) -> np.ndarray:
+    train_target = np.asarray(parsed_data.y[train_range], dtype=float)
+
+    if model_name == "ma":
+        from models import ma as ma_model
+
+        state = ma_model._load_state(model_file)
+        return _compute_ma_in_sample_fitted(train_target, int(state["window"]))
+
+    if model_name == "es":
+        from models import es as es_model
+
+        state = es_model._load_state(model_file)
+        fitted = getattr(state["model"], "fittedvalues", [])
+        return _normalize_fitted_values(fitted, len(train_target))
+
+    if model_name == "arima":
+        from models import arima as arima_model
+
+        state = arima_model._load_state(model_file)
+        model = state["model"]
+        if hasattr(model, "predict_in_sample"):
+            fitted = model.predict_in_sample()
+        elif hasattr(model, "arima_res_") and hasattr(model.arima_res_, "fittedvalues"):
+            fitted = model.arima_res_.fittedvalues
+        else:
+            fitted = []
+        return _normalize_fitted_values(fitted, len(train_target))
+
+    if model_name == "lstm":
+        return _compute_lstm_in_sample_fitted(model_file, parsed_data, train_range)
+
+    raise ValueError(f"[VALIDATION] Unsupported boosting base model: {model_name}")
+
+
+def _predict_eval_segment(
+    model_name: str,
+    model_file: str,
+    train_range: range,
+    eval_range: range,
+    timeout: int,
+) -> np.ndarray:
+    forecast_steps = eval_range.stop - train_range.stop
+    forecast_offset = eval_range.start - train_range.stop
+    result = run_base_model_predict_subprocess(
+        model_type=model_name,
+        model_file=model_file,
+        forecast_steps=forecast_steps,
+        timeout=timeout,
+    )
+    preds = np.asarray(extract_predictions_from_result(result), dtype=float)
+    eval_preds = preds[forecast_offset: forecast_offset + len(eval_range)]
+    if len(eval_preds) != len(eval_range):
+        raise ValueError("[VALIDATION] Unable to generate full eval_range predictions for boosting stage.")
+    return eval_preds
+
+
+def _make_temp_model_path(prefix: str) -> str:
+    fd, temp_path = tempfile.mkstemp(prefix=prefix, suffix=".pkl")
+    os.close(fd)
+    os.remove(temp_path)
+    return temp_path
+
+
+def _build_round_records(
+    round_parsed_data: ParsedData,
+    model_name: str,
+    model_params: Dict[str, Any],
+) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    return build_ensemble_subprocess_data(round_parsed_data, [model_name], {model_name: model_params})
+
+
+def _get_model_timeout(model_name: str, params: Dict[str, Any]) -> int:
+    if model_name == "lstm":
+        return max(120, int(params.get("epochs", 20)) * 10)
+    return 120
+
+
+def _train_stage_model(
+    model_name: str,
+    round_numeric_records: List[Dict[str, Any]],
+    round_lstm_records: List[Dict[str, Any]],
+    train_range: range,
+    eval_range: range,
+    params: Dict[str, Any],
+    timeout: int,
+) -> Tuple[str, np.ndarray]:
+    temp_model_file = _make_temp_model_path(f"boosting_stage_{model_name}_")
+    params_with_save = params.copy()
+    params_with_save["save_model"] = temp_model_file
+
+    result = run_base_model_subprocess(
+        model_type=model_name,
+        data=round_lstm_records if model_name == "lstm" else round_numeric_records,
+        train_start=train_range.start,
+        train_end=train_range.stop - 1,
+        eval_start=eval_range.start,
+        eval_end=eval_range.stop - 1,
+        model_params=params_with_save,
+        timeout=timeout,
+    )
+    eval_predictions = np.asarray(extract_predictions_from_result(result), dtype=float)
+    return temp_model_file, eval_predictions
+
+
+def _validate_fit_args(parsed_data: ParsedData, ts: int, te: int, state: Dict[str, Any]) -> None:
+    n = parsed_data.n_obs
+    if not (0 <= ts <= te < n):
+        raise ValueError(f"[VALIDATION] Invalid train range: [{ts},{te}], n_obs={n}")
+
+    list(_iter_stage_models(state))
+
+
+def _validate_training_args(
+    parsed_data: ParsedData,
+    ts: int,
+    te: int,
+    es: int,
+    ee: int,
+    models_to_use: List[str],
+    model_params: Dict[str, Any],
+) -> None:
+    n = parsed_data.n_obs
 
     if not models_to_use:
         raise ValueError("[VALIDATION] models_to_use cannot be empty.")
@@ -91,32 +307,26 @@ def _validate_training_args(
     if es <= te:
         raise ValueError("[VALIDATION] eval_start must be > train_end.")
 
-    # Validate each model has required parameters
     for model_name in models_to_use:
         if model_name not in model_params:
             raise ValueError(f"[VALIDATION] Missing parameters for model: {model_name}")
 
         params = model_params[model_name]
-
-        # Model-specific validation
         if model_name == "arima":
             if "d" not in params:
                 raise ValueError("[VALIDATION] ARIMA requires 'd' parameter.")
             if params["d"] < 0:
                 raise ValueError("[VALIDATION] ARIMA d must be >= 0.")
-
         elif model_name == "es":
             if "alpha" not in params:
                 raise ValueError("[VALIDATION] ES requires 'alpha' parameter.")
             if not (0 < params["alpha"] <= 1):
                 raise ValueError("[VALIDATION] ES alpha must be in (0, 1].")
-
         elif model_name == "ma":
             if "window" not in params:
                 raise ValueError("[VALIDATION] MA requires 'window' parameter.")
             if params["window"] < 1:
                 raise ValueError("[VALIDATION] MA window must be >= 1.")
-
         elif model_name == "lstm":
             if "look_back" not in params:
                 raise ValueError("[VALIDATION] LSTM requires 'look_back' parameter.")
@@ -128,7 +338,6 @@ def _validate_training_args(
                 raise ValueError("[VALIDATION] LSTM epochs must be >= 1.")
             if te - ts + 1 <= params["look_back"]:
                 raise ValueError("[VALIDATION] Training range must be larger than LSTM look_back.")
-            # Also validate against the Phase 1 sub-range (boost_train) which is smaller
             train_size = te - ts + 1
             boost_train_size = _compute_phase1_train_size(train_size)
             if boost_train_size <= params["look_back"]:
@@ -141,94 +350,53 @@ def _validate_training_args(
 
 # ---------- predict ----------
 def predict(
-    model_path: str, steps: int, state: Optional[Dict[str, Any]] = None
+    model_path: str,
+    steps: int,
+    state: Optional[Dict[str, Any]] = None,
 ) -> Tuple[List[float], float]:
-    """Forecast using a saved Boosting model with subprocess calls.
-
-    All models in the chain independently predict original y. The ensemble
-    combination uses the first model directly, plus subsequent models scaled
-    by the learning rate: final = model_0 + lr * model_1 + lr * model_2 + ...
-    """
     if steps <= 0:
         raise ValueError("[VALIDATION] steps must be > 0 for forecasting.")
 
     state = state or _load_state(model_path)
-    model_chain = state["model_chain"]
-    base_model_states = state["base_model_states"]
-    learning_rate = state["learning_rate"]
-    std_dev_residuals = state.get("std_dev_residuals", 0.0)
+    std_dev_residuals = float(state.get("std_dev_residuals", 0.0))
 
-    # First model predicts y
-    first_model = model_chain[0]
-    first_state = base_model_states[first_model]["models"][0]
-    first_file = first_state["model_file"]
-
-    result = run_base_model_predict_subprocess(
-        model_type=first_model,
-        model_file=first_file,
-        forecast_steps=steps,
-        timeout=60,
-    )
-    final_predictions = np.array(extract_predictions_from_result(result))
-
-    # Subsequent models: add with learning rate shrinkage
-    for i in range(1, len(model_chain)):
-        model_name = model_chain[i]
-        # Each model is only selected once, so models list has only one element at index 0
-        model_state = base_model_states[model_name]["models"][0]
+    final_predictions: Optional[np.ndarray] = None
+    for _stage_idx, model_name, coefficient, model_state in _iter_stage_models(state):
         model_file = model_state["model_file"]
-
         result = run_base_model_predict_subprocess(
             model_type=model_name,
             model_file=model_file,
             forecast_steps=steps,
             timeout=60,
         )
+        stage_predictions = np.asarray(extract_predictions_from_result(result), dtype=float)
+        if final_predictions is None:
+            final_predictions = coefficient * stage_predictions
+        else:
+            final_predictions += coefficient * stage_predictions
 
-        stage_pred = np.array(extract_predictions_from_result(result))
-        final_predictions += learning_rate * stage_pred
+    if final_predictions is None:
+        raise ValueError("[VALIDATION] Saved Boosting model is empty.")
 
     return final_predictions.tolist(), std_dev_residuals
 
 
 # ---------- train and evaluate ----------
 def train_and_evaluate(
-    parsed_data: ParsedData, train_range: range, eval_range: range,
-    models_to_use: List[str], model_params: Dict[str, Any], learning_rate: float,
-    max_rounds: int
-) -> Tuple[Dict[str, Any], List[str], Dict[str, Any], List[float], List[float], float, Dict[str, Any]]:
-    """
-    Trains and evaluates the Boosting model using forward stagewise additive approach.
-
-    Algorithm (adapted for subprocess architecture):
-    1. Split train_range into boost_train (80-85%) and boost_val (20-15%)
-    2. Phase 1 - Greedy model selection:
-       - Train all candidate models on original y (boost_train → boost_val)
-       - Select model that best reduces ensemble RMSE on boost_val
-       - Add with learning rate shrinkage: ensemble += lr * model_pred (or direct for round 0)
-       - Early stopping when no improvement
-    3. Phase 2 - Retrain on full data:
-       - Retrain selected models on full train_range
-       - Combine: final = model_0 + lr * model_1 + lr * model_2 + ...
-    4. Evaluate on independent eval_range
-
-    Note: True gradient boosting requires in-sample residual computation, which
-    is not feasible with the subprocess architecture (eval_start > train_end).
-    This approach trains all models on original y and combines with shrinkage.
-
-    Args:
-        learning_rate: Shrinkage parameter (0 < lr <= 1), typically 0.1-0.5
-        max_rounds: Maximum number of models in chain
-    """
-
-    # === Step 1: Split train_range into boost_train and boost_val ===
+    parsed_data: ParsedData,
+    train_range: range,
+    eval_range: range,
+    models_to_use: List[str],
+    model_params: Dict[str, Any],
+    learning_rate: float,
+    max_rounds: int,
+    base_model_files: Optional[Dict[str, str]] = None,
+) -> Tuple[Dict[str, Any], List[str], List[float], Dict[str, Any], List[float], List[float], float, Dict[str, Any]]:
     train_len = len(train_range)
     if train_len < 8:
         raise ValueError("[VALIDATION] train_range too small for boosting (需要至少8个点，推荐≥12点)")
 
-    # For small datasets, use 85% for boost_train to ensure sufficient training data
     boost_split = _compute_phase1_train_size(train_len)
-
     boost_train_range = range(train_range.start, train_range.start + boost_split)
     boost_val_range = range(train_range.start + boost_split, train_range.stop)
 
@@ -239,199 +407,174 @@ def train_and_evaluate(
     print(f"  Learning Rate: {learning_rate}", file=sys.stderr)
     print(f"  Max Rounds: {max_rounds}", file=sys.stderr)
 
-    # Non-LSTM base models keep numeric-only rows; LSTM can use categorical features.
-    numeric_data_dicts, _ = build_numeric_subprocess_records(parsed_data)
-    lstm_data_dicts = numeric_data_dicts
-    if "lstm" in models_to_use:
-        lstm_feature_types = model_params.get("lstm", {}).get("feature_types", {})
-        lstm_feature_keys = [k for k in lstm_feature_types.keys() if k != parsed_data.target_key]
-        lstm_data_dicts, _ = build_subprocess_records(parsed_data, feature_keys=lstm_feature_keys)
+    y_true_val = np.asarray(parsed_data.y[boost_val_range], dtype=float)
+    residual_train = np.asarray(parsed_data.y[boost_train_range], dtype=float).copy()
+    residual_val = y_true_val.copy()
 
-    y_true_val = parsed_data.y[boost_val_range]
-    ensemble_pred_val = np.zeros(len(boost_val_range))
+    model_chain: List[str] = []
+    stage_coefficients: List[float] = []
+    search_summary: Dict[str, Any] = {
+        "algorithm": "residual_boosting",
+        "learning_rate": learning_rate,
+        "stages": [],
+    }
 
-    model_chain = []
-    chain_predictions_val = []  # Store each model's prediction for debugging
-    search_summary = {"stages": [], "learning_rate": learning_rate}
-    best_overall_rmse = float('inf')
+    for round_idx in range(max_rounds):
+        coefficient = 1.0 if round_idx == 0 else learning_rate
+        current_rmse = float("inf") if round_idx == 0 else rmse(np.zeros_like(residual_val), residual_val)
+        round_parsed_data = _build_residual_parsed_data(parsed_data, boost_train_range, residual_train)
 
-    # Calculate dynamic timeout for LSTM models
-    base_timeout = 120
-    if "lstm" in models_to_use:
-        lstm_epochs = model_params["lstm"].get("epochs", 20)
-        base_timeout = max(120, lstm_epochs * 10)
-
-    # === Step 2: Greedy Boosting Rounds ===
-    # NOTE: Due to the subprocess architecture (eval_start > train_end constraint),
-    # we cannot compute in-sample training residuals. Instead, all candidate models
-    # are trained on original y data. The greedy selection evaluates how each model's
-    # prediction, when added with learning rate shrinkage, reduces ensemble RMSE on
-    # the held-out validation set. This is a forward stagewise additive approach
-    # rather than true gradient boosting with residual targets.
-    print(f"\n[Boosting Phase 1] Forward stagewise model selection", file=sys.stderr)
-
-    for round_num in range(max_rounds):
-        print(f"\n--- Round {round_num + 1}/{max_rounds} ---", file=sys.stderr)
-
-        print(f"  Current RMSE on val: {rmse(y_true_val, ensemble_pred_val) if round_num > 0 else 'N/A'}", file=sys.stderr)
-
-        # Train all candidate models on original data
-        stage_results = []
-        available_models = [m for m in models_to_use if m not in model_chain]
-
-        if not available_models:
-            print(f"  ⚠️  No more candidate models available", file=sys.stderr)
-            break
-
-        for model_name in available_models:
+        stage_results: List[Dict[str, Any]] = []
+        for model_name in models_to_use:
             params = model_params[model_name]
-
-            # All models train on original y (subprocess architecture compromise)
-            result = run_base_model_subprocess(
-                model_type=model_name,
-                data=lstm_data_dicts if model_name == "lstm" else numeric_data_dicts,
-                train_start=boost_train_range.start,
-                train_end=boost_train_range.stop - 1,
-                eval_start=boost_val_range.start,
-                eval_end=boost_val_range.stop - 1,
-                model_params=params,
-                timeout=base_timeout,
+            timeout = _get_model_timeout(model_name, params)
+            round_numeric_records, round_lstm_records = _build_round_records(
+                round_parsed_data,
+                model_name,
+                params,
             )
-
-            y_pred_val = np.array(extract_predictions_from_result(result))
-
-            # Calculate what the new ensemble would predict
-            if round_num == 0:
-                temp_ensemble_pred = y_pred_val
-            else:
-                temp_ensemble_pred = ensemble_pred_val + learning_rate * y_pred_val
-
-            # Calculate RMSE
-            temp_rmse = rmse(y_true_val, temp_ensemble_pred)
-
+            temp_model_file, stage_predictions = _train_stage_model(
+                model_name,
+                round_numeric_records,
+                round_lstm_records,
+                boost_train_range,
+                boost_val_range,
+                params,
+                timeout,
+            )
+            fitted_train_predictions = _compute_in_sample_fitted_predictions(
+                model_name,
+                temp_model_file,
+                round_parsed_data,
+                boost_train_range,
+            )
+            next_residual_val = residual_val - coefficient * stage_predictions
+            next_rmse = rmse(np.zeros_like(next_residual_val), next_residual_val)
             stage_results.append({
                 "model_name": model_name,
-                "rmse": temp_rmse,
-                "predictions": y_pred_val,
-                "ensemble_pred": temp_ensemble_pred
+                "coefficient": coefficient,
+                "rmse": next_rmse,
+                "temp_model_file": temp_model_file,
+                "fitted_train_predictions": fitted_train_predictions,
+                "next_residual_val": next_residual_val,
             })
+            print(f"  Round {round_idx + 1} candidate {model_name}: residual RMSE={next_rmse:.4f}", file=sys.stderr)
 
-            print(f"  {model_name}: RMSE={temp_rmse:.4f}", file=sys.stderr)
+        best_result = min(stage_results, key=lambda result: result["rmse"])
+        improvement = float("inf") if current_rmse == float("inf") else current_rmse - best_result["rmse"]
+        stage_summary = {
+            "round": round_idx + 1,
+            "objective": "validation_residual_rmse",
+            "coefficient": coefficient,
+            "previous_rmse": None if current_rmse == float("inf") else current_rmse,
+            "candidates": {result["model_name"]: result["rmse"] for result in stage_results},
+            "winner": best_result["model_name"],
+            "winner_rmse": best_result["rmse"],
+            "improvement": None if improvement == float("inf") else improvement,
+        }
 
-        # Select best model
-        best_result = min(stage_results, key=lambda x: x["rmse"])
-        winner_name = best_result["model_name"]
-        winner_rmse = best_result["rmse"]
-        winner_pred = best_result["predictions"]
-        winner_ensemble_pred = best_result["ensemble_pred"]
-
-        # Greedy selection: only add if it improves
-        if winner_rmse < best_overall_rmse:
-            # Improvement! Add to chain
-            model_chain.append(winner_name)
-            chain_predictions_val.append(winner_pred)
-            ensemble_pred_val = winner_ensemble_pred
-
-            improvement = best_overall_rmse - winner_rmse if best_overall_rmse != float('inf') else 0
-            best_overall_rmse = winner_rmse
-
-            stage_summary = {
-                "round": round_num + 1,
-                "candidates": {r["model_name"]: r["rmse"] for r in stage_results},
-                "winner": winner_name,
-                "winner_rmse": winner_rmse,
-                "improvement": improvement,
-                "action": "✅ Model Added",
-                "chain": model_chain.copy()
-            }
-
-            print(f"  ✅ Added {winner_name} to chain (RMSE: {winner_rmse:.4f}, improvement: {improvement:.4f})", file=sys.stderr)
+        if best_result["rmse"] < current_rmse - 1e-12:
+            model_chain.append(best_result["model_name"])
+            stage_coefficients.append(coefficient)
+            residual_train = residual_train - coefficient * best_result["fitted_train_predictions"]
+            residual_val = best_result["next_residual_val"]
+            stage_summary["action"] = "selected"
+            print(
+                f"  ✓ Selected {best_result['model_name']} (residual RMSE: {best_result['rmse']:.4f})",
+                file=sys.stderr,
+            )
         else:
-            # No improvement, early stopping
-            stage_summary = {
-                "round": round_num + 1,
-                "candidates": {r["model_name"]: r["rmse"] for r in stage_results},
-                "winner": winner_name,
-                "winner_rmse": winner_rmse,
-                "current_best_rmse": best_overall_rmse,
-                "action": "🛑 Early Stopping (no improvement)",
-                "chain": model_chain.copy()
-            }
-
-            print(f"  🛑 Early stopping: {winner_name} (RMSE: {winner_rmse:.4f}) does not improve {best_overall_rmse:.4f}", file=sys.stderr)
+            stage_summary["action"] = "early_stop"
+            print(
+                f"  🛑 Early stopping: no candidate improves residual RMSE {current_rmse:.4f}",
+                file=sys.stderr,
+            )
             search_summary["stages"].append(stage_summary)
+            for result in stage_results:
+                remove_member_model_artifact(result["model_name"], result["temp_model_file"])
             break
 
         search_summary["stages"].append(stage_summary)
-
-    # === Step 3: Retrain final chain on full train_range ===
-    print(f"\n[Boosting Phase 2] Retraining {len(model_chain)} models on full train_range", file=sys.stderr)
+        for result in stage_results:
+            remove_member_model_artifact(result["model_name"], result["temp_model_file"])
 
     if not model_chain:
-        # No models were added
-        y_true_eval = parsed_data.y[eval_range]
+        y_true_eval = np.asarray(parsed_data.y[eval_range], dtype=float)
         timestamps = parsed_data.timestamps
         metrics = {
-            "rmse": float('inf'), "mae": float('inf'), "mape": float('inf'), "r2": float('-inf'),
+            "rmse": float("inf"),
+            "mae": float("inf"),
+            "mape": float("inf"),
+            "r2": float("-inf"),
             "evaluate_indices": list(eval_range),
             "evaluate_months": [timestamps[i] for i in eval_range] if timestamps else [],
         }
-        return metrics, [], {}, y_true_eval.tolist(), [0.0] * len(y_true_eval), 0.0, search_summary
+        return metrics, [], [], {}, y_true_eval.tolist(), [0.0] * len(y_true_eval), 0.0, search_summary
 
-    base_model_states = {}
-    final_eval_preds = np.zeros(len(eval_range))
+    final_eval_preds = np.zeros(len(eval_range), dtype=float)
+    residual_full_train = np.asarray(parsed_data.y[train_range], dtype=float).copy()
+    y_true_eval = np.asarray(parsed_data.y[eval_range], dtype=float)
+    timestamps = parsed_data.timestamps
+    base_model_states: Dict[str, Any] = {}
 
-    for round_idx, model_name in enumerate(model_chain):
+    for stage_idx, model_name in enumerate(model_chain):
+        coefficient = stage_coefficients[stage_idx]
         params = model_params[model_name]
-        temp_model_file = os.path.join(
-            tempfile.gettempdir(),
-            f"boosting_base_{model_name}_round{round_idx}_{os.getpid()}.pkl"
-        )
-        params_with_save = params.copy()
-        params_with_save["save_model"] = temp_model_file
+        timeout = _get_model_timeout(model_name, params)
+        round_parsed_data = _build_residual_parsed_data(parsed_data, train_range, residual_full_train)
+        artifact_origin = "temporary_training"
 
-        # All models train on original y (subprocess architecture compromise).
-        # The ensemble combination with learning rate shrinkage is applied after
-        # extracting each model's independent predictions.
-        print(f"  Round {round_idx + 1}: Training {model_name} on original y", file=sys.stderr)
-        result = run_base_model_subprocess(
-            model_type=model_name,
-            data=lstm_data_dicts if model_name == "lstm" else numeric_data_dicts,
-            train_start=train_range.start,
-            train_end=train_range.stop - 1,
-            eval_start=eval_range.start,
-            eval_end=eval_range.stop - 1,
-            model_params=params_with_save,
-            timeout=base_timeout,
-        )
-
-        y_pred_eval = np.array(extract_predictions_from_result(result))
-
-        if round_idx == 0:
-            # First model's prediction is used directly (no learning rate)
-            final_eval_preds = y_pred_eval
+        if stage_idx == 0 and base_model_files and model_name in base_model_files and os.path.exists(base_model_files[model_name]):
+            stage_model_file = base_model_files[model_name]
+            stage_eval_predictions = _predict_eval_segment(
+                model_name,
+                stage_model_file,
+                train_range,
+                eval_range,
+                timeout,
+            )
+            artifact_origin = "standalone_base"
         else:
-            # Subsequent models are added with learning rate shrinkage
-            final_eval_preds += learning_rate * y_pred_eval
+            round_numeric_records, round_lstm_records = _build_round_records(
+                round_parsed_data,
+                model_name,
+                params,
+            )
+            stage_model_file, stage_eval_predictions = _train_stage_model(
+                model_name,
+                round_numeric_records,
+                round_lstm_records,
+                train_range,
+                eval_range,
+                params,
+                timeout,
+            )
 
-        # Store model state
-        if model_name not in base_model_states:
-            base_model_states[model_name] = {"models": []}
+        fitted_train_predictions = _compute_in_sample_fitted_predictions(
+            model_name,
+            stage_model_file,
+            round_parsed_data,
+            train_range,
+        )
+        final_eval_preds += coefficient * stage_eval_predictions
+        residual_full_train = residual_full_train - coefficient * fitted_train_predictions
 
-        base_model_states[model_name]["models"].append({
+        base_model_states.setdefault(model_name, {"models": []})["models"].append({
             "model_type": model_name,
-            "model_file": temp_model_file,
+            "model_file": stage_model_file,
             "params": params,
-            "round": round_idx,
+            "round": stage_idx,
+            "coefficient": coefficient,
+            "artifact_origin": artifact_origin,
         })
 
-        print(f"    ✓ RMSE on eval: {rmse(parsed_data.y[eval_range], final_eval_preds):.4f}", file=sys.stderr)
+        print(
+            f"  Stage {stage_idx + 1}: {model_name} coefficient={coefficient:.4f}, eval RMSE={rmse(y_true_eval, final_eval_preds):.4f}",
+            file=sys.stderr,
+        )
 
-    # === Step 4: Final evaluation ===
-    print(f"\n[Boosting Phase 3] Final evaluation on eval_range", file=sys.stderr)
-    y_true_eval = parsed_data.y[eval_range]
-
-    timestamps = parsed_data.timestamps
+    final_residuals = y_true_eval - final_eval_preds
+    std_dev_residuals = float(np.std(final_residuals, ddof=1)) if len(final_residuals) > 1 else 0.0
     metrics = {
         "rmse": rmse(y_true_eval, final_eval_preds),
         "mae": mae(y_true_eval, final_eval_preds),
@@ -441,21 +584,129 @@ def train_and_evaluate(
         "evaluate_months": [timestamps[i] for i in eval_range] if timestamps else [],
     }
 
-    final_residuals = y_true_eval - final_eval_preds
-    std_dev_residuals = float(np.std(final_residuals, ddof=1)) if len(final_residuals) > 1 else 0.0
-
     print(f"  ✓ Final RMSE: {metrics['rmse']:.4f}, R²: {metrics['r2']:.4f}", file=sys.stderr)
     print(f"  ✓ Model chain: {' → '.join(model_chain)}", file=sys.stderr)
 
-    return metrics, model_chain, base_model_states, y_true_eval.tolist(), final_eval_preds.tolist(), std_dev_residuals, search_summary
+    return (
+        metrics,
+        model_chain,
+        stage_coefficients,
+        base_model_states,
+        y_true_eval.tolist(),
+        final_eval_preds.tolist(),
+        std_dev_residuals,
+        search_summary,
+    )
 
 
 # ---------- public entry ----------
 def run(args) -> None:
-    """Main entry point for the Boosting model."""
     pretty: bool = bool(getattr(args, "pretty", False))
     save_path = getattr(args, "save_model", None)
     load_path = getattr(args, "load_model", None)
+
+    if getattr(args, "fit_only", False):
+        if not hasattr(args, "data") or not args.data:
+            raise ValueError("[VALIDATION] --data is required for fit-only mode.")
+        if not save_path:
+            raise ValueError("[VALIDATION] --save-model is required for fit-only mode.")
+        if not load_path:
+            raise ValueError("[VALIDATION] --load-model is required for fit-only mode.")
+
+        state = _load_state(load_path)
+        parsed_data = load_data_from_json(args.data)
+        ts, te = int(args.train_start), int(args.train_end)
+        train_range = range(ts, te + 1)
+        _validate_fit_args(parsed_data, ts, te, state)
+
+        next_base_model_states: Dict[str, Any] = {}
+        if _is_residual_boosting_state(state):
+            residual_train = np.asarray(parsed_data.y[train_range], dtype=float).copy()
+
+            for stage_idx, model_name, coefficient, previous_model_state in _iter_stage_models(state):
+                params = previous_model_state.get("params", {})
+                timeout = _get_model_timeout(model_name, params)
+                round_parsed_data = _build_residual_parsed_data(parsed_data, train_range, residual_train)
+                round_numeric_records, round_lstm_records = _build_round_records(
+                    round_parsed_data,
+                    model_name,
+                    params,
+                )
+                member_save_path = get_member_model_path(save_path, model_name, stage_idx)
+                run_base_model_fit_subprocess(
+                    model_type=model_name,
+                    data=round_lstm_records if model_name == "lstm" else round_numeric_records,
+                    train_start=ts,
+                    train_end=te,
+                    source_model_file=previous_model_state["model_file"],
+                    save_model_file=member_save_path,
+                    timeout=timeout,
+                )
+                fitted_train_predictions = _compute_in_sample_fitted_predictions(
+                    model_name,
+                    member_save_path,
+                    round_parsed_data,
+                    train_range,
+                )
+                residual_train = residual_train - coefficient * fitted_train_predictions
+                next_base_model_states.setdefault(model_name, {"models": []})["models"].append({
+                    "model_type": model_name,
+                    "model_file": member_save_path,
+                    "params": params,
+                    "round": stage_idx,
+                    "coefficient": coefficient,
+                })
+        else:
+            stage_model_params: Dict[str, Dict[str, Any]] = {}
+            for _stage_idx, model_name, _coefficient, previous_model_state in _iter_stage_models(state):
+                stage_model_params.setdefault(model_name, previous_model_state.get("params", {}))
+
+            base_models_in_order = list(stage_model_params.keys())
+            numeric_data_dicts, lstm_data_dicts = build_ensemble_subprocess_data(
+                parsed_data,
+                base_models_in_order,
+                stage_model_params,
+            )
+
+            for stage_idx, model_name, coefficient, previous_model_state in _iter_stage_models(state):
+                params = previous_model_state.get("params", {})
+                timeout = _get_model_timeout(model_name, params)
+                member_save_path = get_member_model_path(save_path, model_name, stage_idx)
+                run_base_model_fit_subprocess(
+                    model_type=model_name,
+                    data=lstm_data_dicts if model_name == "lstm" else numeric_data_dicts,
+                    train_start=ts,
+                    train_end=te,
+                    source_model_file=previous_model_state["model_file"],
+                    save_model_file=member_save_path,
+                    timeout=timeout,
+                )
+                next_base_model_states.setdefault(model_name, {"models": []})["models"].append({
+                    "model_type": model_name,
+                    "model_file": member_save_path,
+                    "params": params,
+                    "round": stage_idx,
+                    "coefficient": coefficient,
+                })
+
+        next_state = {
+            "model_type": MODEL_TYPE,
+            "boosting_variant": state.get("boosting_variant", "legacy"),
+            "model_chain": state["model_chain"],
+            "stage_coefficients": _get_stage_coefficients(state["model_chain"], state),
+            "base_model_states": next_base_model_states,
+            "learning_rate": float(state.get("learning_rate", 0.3)),
+            "std_dev_residuals": float(state.get("std_dev_residuals", 0.0)),
+        }
+        dump_model(next_state, save_path)
+
+        out = {
+            "mode": "boosting_fit_only",
+            "model_chain": state["model_chain"],
+            "saved_model": save_path,
+        }
+        print(json.dumps(out, ensure_ascii=False, indent=2 if pretty else None))
+        return
 
     if load_path:
         steps = int(getattr(args, "forecast_steps", 0))
@@ -463,23 +714,22 @@ def run(args) -> None:
         out = {
             "mode": "boosting_loaded_predict",
             "forecast_steps": steps,
-            "predictions": _format_predictions(preds, std_dev)
+            "predictions": _format_predictions(preds, std_dev),
         }
         print(json.dumps(out, ensure_ascii=False, indent=2 if pretty else None))
         return
 
-    # Training Mode
     if not hasattr(args, "data") or not args.data:
         raise ValueError("[VALIDATION] --data is required for training mode.")
 
     parsed_data = load_data_from_json(args.data)
     ts, te = int(args.train_start), int(args.train_end)
     es, ee = int(args.eval_start), int(args.eval_end)
-    models_to_use = [model.strip() for model in args.models.split(',')]
+    train_range = range(ts, te + 1)
+    eval_range = range(es, ee + 1)
+    models_to_use = [model.strip() for model in args.models.split(',') if model.strip()]
 
-    # Boosting-specific parameters
     def get_arg(name, default, cast_type=None):
-        """Safely get argument with default value"""
         val = getattr(args, name.replace("-", "_"), None)
         if val is None:
             return default
@@ -489,38 +739,31 @@ def run(args) -> None:
 
     learning_rate = get_arg("learning_rate", 0.3, float)
     max_rounds = get_arg("max_rounds", len(models_to_use), int)
-
-    # Validate learning_rate
     if not (0 < learning_rate <= 1):
         raise ValueError("[VALIDATION] learning_rate must be in (0, 1]")
     if max_rounds < 1:
         raise ValueError("[VALIDATION] max_rounds must be >= 1")
 
-    # Auto-select conservative defaults based on boost_train size
-    # Align with individual model auto-selection logic
     train_size = te - ts + 1
     boost_train_size = max(3, int(train_size * 0.85)) if train_size <= 15 else int(train_size * 0.8)
-
     auto_window = max(3, min(12, boost_train_size // 4))
     auto_look_back = max(3, min(12, boost_train_size // 4))
-
-    # ARIMA: use tiered approach like in arima.py
     if boost_train_size <= 12:
         auto_max_pq = 1
     elif boost_train_size <= 20:
         auto_max_pq = 2
     else:
         auto_max_pq = max(1, min(5, boost_train_size // 6))
-
     auto_epochs = 20 if train_size <= 15 else 30
 
-    model_params = {}
+    model_params: Dict[str, Dict[str, Any]] = {}
+    base_model_files = parse_base_model_files_arg(get_arg("base_model_files", None))
 
     if "arima" in models_to_use:
         model_params["arima"] = {
             "d": get_arg("d", 0, int),
             "max_p": get_arg("max_p", auto_max_pq, int),
-            "max_q": get_arg("max_q", auto_max_pq, int)
+            "max_q": get_arg("max_q", auto_max_pq, int),
         }
 
     if "es" in models_to_use:
@@ -562,20 +805,35 @@ def run(args) -> None:
         }
         if lstm_features_str:
             lstm_params["lstm_features"] = lstm_features_str
-
         model_params["lstm"] = lstm_params
 
     _validate_training_args(parsed_data, ts, te, es, ee, models_to_use, model_params)
 
-    metrics, chain, states, y_true, y_pred, std_dev, summary = train_and_evaluate(
-        parsed_data, range(ts, te + 1), range(es, ee + 1), models_to_use, model_params,
-        learning_rate, max_rounds
+    (
+        metrics,
+        model_chain,
+        stage_coefficients,
+        base_model_states,
+        y_true,
+        y_pred,
+        std_dev,
+        summary,
+    ) = train_and_evaluate(
+        parsed_data,
+        train_range,
+        eval_range,
+        models_to_use,
+        model_params,
+        learning_rate,
+        max_rounds,
+        base_model_files,
     )
 
     out = {
         "mode": "boosting_residual_learning",
         "models": models_to_use,
-        "model_chain": chain,
+        "model_chain": model_chain,
+        "stage_coefficients": stage_coefficients,
         "learning_rate": learning_rate,
         "metrics": metrics,
         "search_summary": summary,
@@ -584,45 +842,27 @@ def run(args) -> None:
     }
 
     if save_path:
-        import shutil
-
-        # Move base model files from temp to permanent location
-        base_dir = os.path.dirname(save_path)
-        base_name = os.path.splitext(os.path.basename(save_path))[0]
-
-        for model_name, model_info in states.items():
+        for model_name, model_info in base_model_states.items():
             for idx, model_state in enumerate(model_info["models"]):
-                temp_file = model_state["model_file"]
-
-                # Define permanent location with round number
-                perm_file = os.path.join(base_dir, f"{base_name}_base_{model_name}_round{idx}.pkl")
-
-                # Move file from temp to permanent
-                if os.path.exists(temp_file):
-                    shutil.move(temp_file, perm_file)
-
-                    # Also move LSTM Keras model and update internal path
-                    if model_name == "lstm":
-                        lstm_pkl = load_model(perm_file)
-                        temp_keras = lstm_pkl.get("keras_model_path")
-                        if not temp_keras or not os.path.exists(temp_keras):
-                            raise FileNotFoundError(
-                                f"LSTM Keras model file not found at {temp_keras}"
-                            )
-                        perm_keras = os.path.join(base_dir, f"{base_name}_base_{model_name}_round{idx}_keras.h5")
-                        shutil.move(temp_keras, perm_keras)
-                        lstm_pkl["keras_model_path"] = perm_keras
-                        dump_model(lstm_pkl, perm_file)
-
-                # Update state with permanent path
+                source_file = model_state["model_file"]
+                perm_file = get_member_model_path(save_path, model_name, int(model_state.get("round", idx)))
+                persist_member_model_artifact(
+                    model_name,
+                    source_file,
+                    perm_file,
+                    move_source=model_state.get("artifact_origin") == "temporary_training",
+                )
                 model_state["model_file"] = perm_file
+                model_state.pop("artifact_origin", None)
 
         state = {
             "model_type": MODEL_TYPE,
-            "model_chain": chain,
-            "base_model_states": states,
+            "boosting_variant": "residual",
+            "model_chain": model_chain,
+            "stage_coefficients": stage_coefficients,
+            "base_model_states": base_model_states,
             "learning_rate": learning_rate,
-            "std_dev_residuals": std_dev
+            "std_dev_residuals": std_dev,
         }
         dump_model(state, save_path)
         out["saved_model"] = save_path

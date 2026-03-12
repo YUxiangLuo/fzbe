@@ -1,0 +1,208 @@
+#!/usr/bin/env python3
+import csv
+import json
+import math
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+
+
+PY_ROOT = Path(__file__).resolve().parents[1]
+RUN_MODEL = PY_ROOT / "run_model.py"
+CSV_FIXTURE = Path(__file__).resolve().parent / "fixtures" / "lstm_rich_smoke.csv"
+FEATURE_KEYS = [
+    "价格指数",
+    "促销投入",
+    "库存水平",
+    "搜索热度",
+    "竞争对手价格",
+    "节假日强度",
+    "渠道类型",
+    "区域",
+    "天气类型",
+]
+FEATURE_TYPES = {
+    "销售数量": "numeric",
+    "价格指数": "numeric",
+    "促销投入": "numeric",
+    "库存水平": "numeric",
+    "搜索热度": "numeric",
+    "竞争对手价格": "numeric",
+    "节假日强度": "numeric",
+    "渠道类型": "categorical",
+    "区域": "categorical",
+    "天气类型": "categorical",
+}
+
+
+def load_csv_records(csv_path: Path) -> list[dict[str, str]]:
+    with csv_path.open("r", encoding="utf-8", newline="") as handle:
+        return list(csv.DictReader(handle))
+
+
+def invoke_lstm(data_json: str, *extra_args: str) -> dict:
+    completed = subprocess.run(
+        [sys.executable, str(RUN_MODEL), "lstm", "--data", data_json, *extra_args],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if completed.returncode != 0:
+        raise RuntimeError(
+            "lstm CLI execution failed\n"
+            f"stdout:\n{completed.stdout}\n"
+            f"stderr:\n{completed.stderr}"
+        )
+    return json.loads(completed.stdout)
+
+
+def extract_predictions(payload: dict) -> list[float]:
+    return [float(item["prediction"]) for item in payload["predictions"]]
+
+
+def extract_std_devs(payload: dict) -> list[float]:
+    return [float(item["std_dev"]) for item in payload["predictions"]]
+
+
+def assert_all_finite(values: list[float], label: str) -> None:
+    for index, value in enumerate(values):
+        if not math.isfinite(value):
+            raise AssertionError(f"{label}[{index}] is not finite: {value}")
+
+
+def assert_series_close(actual: list[float], expected: list[float], tol: float = 1e-9) -> None:
+    if len(actual) != len(expected):
+        raise AssertionError(f"length mismatch: actual={len(actual)}, expected={len(expected)}")
+    for index, (actual_value, expected_value) in enumerate(zip(actual, expected)):
+        if not math.isclose(actual_value, expected_value, rel_tol=tol, abs_tol=tol):
+            raise AssertionError(
+                f"value[{index}] mismatch: actual={actual_value}, expected={expected_value}"
+            )
+
+
+def main() -> None:
+    records = load_csv_records(CSV_FIXTURE)
+    data_json = json.dumps(records, ensure_ascii=False)
+    timestamps = [f"{int(row['年份']):04d}-{int(row['月份']):02d}" for row in records]
+
+    with tempfile.TemporaryDirectory(prefix="fangzhen-lstm-csv-") as temp_dir:
+        temp_path = Path(temp_dir)
+        backtest_model = temp_path / "lstm-backtest.pkl"
+        production_model = temp_path / "lstm-production.pkl"
+
+        train_output = invoke_lstm(
+            data_json,
+            "--train-start",
+            "0",
+            "--train-end",
+            "27",
+            "--eval-start",
+            "28",
+            "--eval-end",
+            "35",
+            "--look-back",
+            "4",
+            "--epochs",
+            "2",
+            "--normalization",
+            "minmax",
+            "--lstm-target-feature",
+            "销售数量",
+            "--lstm-features",
+            ",".join(FEATURE_KEYS),
+            "--feature-types",
+            json.dumps(FEATURE_TYPES, ensure_ascii=False),
+            "--save-model",
+            str(backtest_model),
+            "--pretty",
+        )
+
+        train_predictions = extract_predictions(train_output)
+        train_std_devs = extract_std_devs(train_output)
+        assert train_output["mode"] == "lstm_train_eval"
+        assert train_output["data_points"] == len(records)
+        assert train_output["target_key"] == "销售数量"
+        assert train_output["feature_types"] == FEATURE_TYPES
+        assert train_output["look_back"] == 4
+        assert train_output["epochs"] == 2
+        assert train_output["normalization"] == "minmax"
+        assert train_output["metrics"]["evaluate_months"] == timestamps[28:36]
+        assert len(train_output["eval_y_true"]) == 8
+        assert len(train_predictions) == 8
+        assert len(FEATURE_KEYS) == 9
+        assert_all_finite(train_predictions, "train_predictions")
+        assert_all_finite(train_std_devs, "train_std_devs")
+        if not all(std_dev > 0 for std_dev in train_std_devs):
+            raise AssertionError(f"expected positive std_dev values, got {train_std_devs}")
+
+        fit_output = invoke_lstm(
+            data_json,
+            "--train-start",
+            "0",
+            "--train-end",
+            "35",
+            "--load-model",
+            str(backtest_model),
+            "--save-model",
+            str(production_model),
+            "--fit-only",
+            "--pretty",
+        )
+        assert fit_output["mode"] == "lstm_fit_only"
+        assert fit_output["look_back"] == 4
+        assert fit_output["epochs"] == 2
+        assert fit_output["normalization"] == "minmax"
+        assert fit_output["target_key"] == "销售数量"
+        assert fit_output["feature_keys"] == FEATURE_KEYS
+        assert fit_output["saved_model"] == str(production_model)
+
+        predict_output_one = invoke_lstm(
+            data_json,
+            "--load-model",
+            str(production_model),
+            "--forecast-steps",
+            "3",
+            "--pretty",
+        )
+        predict_output_two = invoke_lstm(
+            data_json,
+            "--load-model",
+            str(production_model),
+            "--forecast-steps",
+            "3",
+            "--pretty",
+        )
+
+        future_predictions_one = extract_predictions(predict_output_one)
+        future_predictions_two = extract_predictions(predict_output_two)
+        future_std_devs_one = extract_std_devs(predict_output_one)
+        future_std_devs_two = extract_std_devs(predict_output_two)
+        assert predict_output_one["mode"] == "lstm_loaded_predict"
+        assert predict_output_one["forecast_steps"] == 3
+        assert predict_output_one["train_end_index"] == 35
+        assert predict_output_one["target_key"] == "销售数量"
+        assert predict_output_one["feature_keys"] == FEATURE_KEYS
+        assert len(future_predictions_one) == 3
+        assert_all_finite(future_predictions_one, "future_predictions")
+        assert_all_finite(future_std_devs_one, "future_std_devs")
+        assert_series_close(future_predictions_one, future_predictions_two)
+        assert_series_close(future_std_devs_one, future_std_devs_two)
+
+    print(
+        json.dumps(
+            {
+                "fixture": str(CSV_FIXTURE),
+                "checked_modes": ["training", "fit_only", "loaded_predict"],
+                "feature_count": len(FEATURE_KEYS),
+                "model": "lstm",
+                "status": "ok",
+            },
+            ensure_ascii=False,
+            indent=2,
+        )
+    )
+
+
+if __name__ == "__main__":
+    main()
