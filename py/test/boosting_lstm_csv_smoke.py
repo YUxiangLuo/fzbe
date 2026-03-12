@@ -30,12 +30,16 @@ def load_csv_records(csv_path: Path) -> list[dict[str, str]]:
         return list(csv.DictReader(handle))
 
 
-def run_command(*args: str, data_json: str | None = None) -> subprocess.CompletedProcess[str]:
-    command = [sys.executable, str(RUN_MODEL), "boosting"]
+def run_model_command(model_type: str, *args: str, data_json: str | None = None) -> subprocess.CompletedProcess[str]:
+    command = [sys.executable, str(RUN_MODEL), model_type]
     if data_json is not None:
         command.extend(["--data", data_json])
     command.extend(args)
     return subprocess.run(command, capture_output=True, text=True, check=False)
+
+
+def run_command(*args: str, data_json: str | None = None) -> subprocess.CompletedProcess[str]:
+    return run_model_command("boosting", *args, data_json=data_json)
 
 
 def invoke_model(data_json: str | None, *extra_args: str) -> dict:
@@ -43,6 +47,17 @@ def invoke_model(data_json: str | None, *extra_args: str) -> dict:
     if completed.returncode != 0:
         raise RuntimeError(
             "boosting CLI execution failed\n"
+            f"stdout:\n{completed.stdout}\n"
+            f"stderr:\n{completed.stderr}"
+        )
+    return json.loads(completed.stdout)
+
+
+def invoke_base_model(model_type: str, data_json: str | None, *extra_args: str) -> dict:
+    completed = run_model_command(model_type, *extra_args, data_json=data_json)
+    if completed.returncode != 0:
+        raise RuntimeError(
+            f"{model_type} CLI execution failed\n"
             f"stdout:\n{completed.stdout}\n"
             f"stderr:\n{completed.stderr}"
         )
@@ -152,6 +167,10 @@ def assert_error(completed: subprocess.CompletedProcess[str], expected_substring
 def main() -> None:
     records = load_csv_records(CSV_FIXTURE)
     data_json = json.dumps(records, ensure_ascii=False)
+    trimmed_feature_data_json = json.dumps(
+        [{key: value for key, value in row.items() if key != "库存水平"} for row in records],
+        ensure_ascii=False,
+    )
     timestamps = [f"{int(row['年份']):04d}-{int(row['月份']):02d}" for row in records]
     sales = [float(row["销售数量"]) for row in records]
     train_start = 0
@@ -164,6 +183,33 @@ def main() -> None:
         temp_path = Path(temp_dir)
         backtest_model = temp_path / "boosting-lstm-backtest.pkl"
         production_model = temp_path / "boosting-lstm-production.pkl"
+        short_horizon_lstm_source = temp_path / "boosting-short-source-lstm.pkl"
+
+        invoke_base_model(
+            "lstm",
+            data_json,
+            "--train-start",
+            "0",
+            "--train-end",
+            "27",
+            "--eval-start",
+            "28",
+            "--eval-end",
+            "29",
+            "--look-back",
+            "4",
+            "--epochs",
+            "2",
+            "--normalization",
+            "minmax",
+            "--lstm-target-feature",
+            "销售数量",
+            "--lstm-features",
+            ",".join(LSTM_FEATURE_KEYS),
+            "--save-model",
+            str(short_horizon_lstm_source),
+            "--pretty",
+        )
 
         train_output = invoke_model(
             data_json,
@@ -298,6 +344,32 @@ def main() -> None:
             "[VALIDATION] LSTM feature columns not found in dataset: ['不存在字段']",
         )
 
+        oversized_look_back_result = run_command(
+            "--train-start",
+            "0",
+            "--train-end",
+            "11",
+            "--eval-start",
+            "12",
+            "--eval-end",
+            "15",
+            "--models",
+            "lstm",
+            "--look-back",
+            "9",
+            "--epochs",
+            "2",
+            "--lstm-target-feature",
+            "销售数量",
+            "--lstm-features",
+            "价格指数,促销投入,库存水平,搜索热度",
+            data_json=data_json,
+        )
+        assert_error(
+            oversized_look_back_result,
+            "[VALIDATION] LSTM look_back (9) is too large for the boosting internal training split (10 points) and validation horizon (2 points).",
+        )
+
         short_fit_result = run_command(
             "--train-start",
             "0",
@@ -316,13 +388,81 @@ def main() -> None:
             "[VALIDATION] Boosting fit-only stage 1 (lstm) cannot be refit: Training range must be larger than look_back.",
         )
 
+        missing_feature_fit_result = run_command(
+            "--train-start",
+            "0",
+            "--train-end",
+            "35",
+            "--load-model",
+            str(backtest_model),
+            "--save-model",
+            str(temp_path / "boosting-lstm-missing-feature-fit.pkl"),
+            "--fit-only",
+            "--pretty",
+            data_json=trimmed_feature_data_json,
+        )
+        assert_error(
+            missing_feature_fit_result,
+            "[VALIDATION] Boosting fit-only stage 1 (lstm) is missing feature columns: ['库存水平']",
+        )
+
+        reused_short_source_model = temp_path / "boosting-lstm-reuse-short-source.pkl"
+        reused_short_source_output = invoke_model(
+            data_json,
+            "--train-start",
+            "0",
+            "--train-end",
+            "30",
+            "--eval-start",
+            "31",
+            "--eval-end",
+            "35",
+            "--models",
+            "lstm",
+            "--look-back",
+            "9",
+            "--epochs",
+            "2",
+            "--normalization",
+            "minmax",
+            "--lstm-target-feature",
+            "销售数量",
+            "--lstm-features",
+            "价格指数",
+            "--max-rounds",
+            "1",
+            "--base-model-files",
+            json.dumps({"lstm": str(short_horizon_lstm_source)}, ensure_ascii=False),
+            "--save-model",
+            str(reused_short_source_model),
+            "--pretty",
+        )
+        reused_short_source_state = load_pickled_state(reused_short_source_model)
+        reused_short_source_predictions = extract_predictions(reused_short_source_output)
+        assert reused_short_source_output["mode"] == "boosting_residual_learning"
+        assert reused_short_source_output["model_chain"] == ["lstm"]
+        assert len(reused_short_source_predictions) == 5
+        assert_all_finite(reused_short_source_predictions, "reused_short_source_predictions")
+        reused_short_source_member = Path(
+            reused_short_source_state["base_model_states"]["lstm"]["models"][0]["model_file"]
+        )
+        reused_short_source_member_state = load_pickled_state(reused_short_source_member)
+        assert reused_short_source_member_state["look_back"] == 4
+        assert reused_short_source_member_state["forecast_horizon"] == future_steps
+
     print(
         json.dumps(
             {
                 "fixture": str(CSV_FIXTURE),
                 "checked_modes": ["training", "fit_only", "loaded_predict"],
                 "model": "boosting",
-                "edge_cases": ["missing_lstm_feature", "fit_only_short_window"],
+                "edge_cases": [
+                    "missing_lstm_feature",
+                    "oversized_look_back",
+                    "fit_only_short_window",
+                    "fit_only_missing_saved_feature",
+                    "reused_short_horizon_source",
+                ],
                 "status": "ok",
             },
             ensure_ascii=False,

@@ -149,6 +149,32 @@ def train_base_model_artifacts(
         )
 
 
+def train_lstm_source_artifact(
+    data_json: str,
+    model_path: Path,
+    train_start: int,
+    train_end: int,
+    eval_start: int,
+    eval_end: int,
+) -> None:
+    invoke_model(
+        "lstm",
+        data_json,
+        "--train-start",
+        str(train_start),
+        "--train-end",
+        str(train_end),
+        "--eval-start",
+        str(eval_start),
+        "--eval-end",
+        str(eval_end),
+        *BASE_MODEL_TRAIN_ARGS["lstm"],
+        "--save-model",
+        str(model_path),
+        "--pretty",
+    )
+
+
 def combine_weighted_predictions(state: dict, forecast_steps: int) -> list[float]:
     weights = {name: float(weight) for name, weight in state["weights"].items()}
     combined = [0.0] * forecast_steps
@@ -198,6 +224,15 @@ def main() -> None:
             train_end,
             eval_start,
             eval_end,
+        )
+        short_horizon_lstm_source = temp_path / "lstm-short-source.pkl"
+        train_lstm_source_artifact(
+            data_json,
+            short_horizon_lstm_source,
+            train_start=0,
+            train_end=27,
+            eval_start=28,
+            eval_end=29,
         )
         assert (temp_path / "lstm-backtest_keras_model.h5").exists()
 
@@ -417,6 +452,50 @@ def main() -> None:
             "[VALIDATION] Weighted Average fit-only member lstm is missing feature columns: ['库存水平']",
         )
 
+        reused_short_source_model = temp_path / "weighted-avg-lstm-reuse-short-source.pkl"
+        reused_short_source_output = invoke_model(
+            "weighted_avg",
+            data_json,
+            "--train-start",
+            "0",
+            "--train-end",
+            "30",
+            "--eval-start",
+            "31",
+            "--eval-end",
+            "35",
+            "--models",
+            "ma,lstm",
+            "--window",
+            "3",
+            "--look-back",
+            "9",
+            "--epochs",
+            "2",
+            "--normalization",
+            "minmax",
+            "--lstm-target-feature",
+            "销售数量",
+            "--lstm-features",
+            "价格指数",
+            "--base-model-files",
+            json.dumps({"lstm": str(short_horizon_lstm_source)}, ensure_ascii=False),
+            "--save-model",
+            str(reused_short_source_model),
+            "--pretty",
+        )
+        reused_short_source_state = load_pickled_state(reused_short_source_model)
+        reused_short_source_predictions = extract_predictions(reused_short_source_output)
+        assert reused_short_source_output["mode"] == "weighted_avg_train_eval"
+        assert len(reused_short_source_predictions) == 5
+        assert_all_finite(reused_short_source_predictions, "reused_short_source_predictions")
+        reused_short_source_member = Path(
+            reused_short_source_state["base_model_states"]["lstm"]["model_file"]
+        )
+        reused_short_source_member_state = load_pickled_state(reused_short_source_member)
+        assert reused_short_source_member_state["look_back"] == 4
+        assert reused_short_source_member_state["forecast_horizon"] == future_steps
+
     print(
         json.dumps(
             {
@@ -431,6 +510,7 @@ def main() -> None:
                     "oversized_look_back",
                     "fit_only_short_window",
                     "fit_only_missing_saved_feature",
+                    "reused_short_horizon_source",
                 ],
                 "status": "ok",
             },

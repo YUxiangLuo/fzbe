@@ -51,6 +51,117 @@ def _parse_feature_name_list(raw_value: Any) -> List[str]:
     return []
 
 
+def _load_lstm_source_state(model_file: str, context: str) -> Dict[str, Any]:
+    source_model_state = load_model(model_file)
+    if not isinstance(source_model_state, dict) or source_model_state.get("model_type") != "lstm":
+        raise ValueError(f"[VALIDATION] {context} is invalid.")
+    return source_model_state
+
+
+def _build_lstm_params_from_source_state(
+    parsed_data: ParsedData,
+    source_model_state: Dict[str, Any],
+    fallback_params: Dict[str, Any],
+) -> Dict[str, Any]:
+    target_feature = str(
+        source_model_state.get("target_key")
+        or fallback_params.get("lstm_target_feature")
+        or parsed_data.target_key
+    )
+    feature_keys = [
+        feature_name
+        for feature_name in source_model_state.get("feature_keys", []) or []
+        if feature_name and feature_name != target_feature
+    ]
+    raw_feature_types = source_model_state.get("feature_types")
+    if isinstance(raw_feature_types, dict) and raw_feature_types:
+        feature_types = {
+            str(key): value
+            for key, value in raw_feature_types.items()
+            if key == target_feature or key in feature_keys
+        }
+    else:
+        feature_types = infer_feature_types(
+            parsed_data=parsed_data,
+            target_key=target_feature,
+            feature_keys=feature_keys,
+        )
+    feature_types[target_feature] = "numeric"
+
+    params = {
+        "look_back": int(source_model_state["look_back"]),
+        "epochs": int(source_model_state.get("epochs", fallback_params.get("epochs", 20))),
+        "feature_types": feature_types,
+        "normalization": source_model_state.get(
+            "normalization",
+            fallback_params.get("normalization", "minmax"),
+        ),
+        "lstm_target_feature": target_feature,
+    }
+    if feature_keys:
+        params["lstm_features"] = ",".join(feature_keys)
+    return params
+
+
+def _get_lstm_source_forecast_strategy(source_model_state: Dict[str, Any]) -> str:
+    from models import lstm as lstm_model
+
+    if source_model_state.get("forecast_strategy"):
+        return str(source_model_state["forecast_strategy"])
+    if int(source_model_state.get("forecast_horizon", 0) or 0) > 0:
+        return lstm_model.DIRECT_FORECAST_STRATEGY
+    return lstm_model.LEGACY_FORECAST_STRATEGY
+
+
+def _resolve_lstm_reuse_production_horizon(
+    source_model_state: Dict[str, Any],
+    requested_steps: int = 0,
+) -> int:
+    from models import lstm as lstm_model
+
+    forecast_strategy = _get_lstm_source_forecast_strategy(source_model_state)
+    if forecast_strategy != lstm_model.DIRECT_FORECAST_STRATEGY:
+        return 0
+
+    saved_eval_horizon = int(source_model_state.get("forecast_horizon", 0) or 0)
+    current_required_horizon = lstm_model._resolve_production_forecast_horizon(
+        state=source_model_state,
+        eval_forecast_horizon=saved_eval_horizon,
+    )
+    return max(current_required_horizon, int(requested_steps or 0))
+
+
+def _prepare_lstm_source_model_for_requested_steps(
+    source_model_file: str,
+    source_model_state: Dict[str, Any],
+    requested_steps: int,
+) -> Tuple[str, Optional[str]]:
+    current_required_horizon = _resolve_lstm_reuse_production_horizon(source_model_state)
+    requested_required_horizon = _resolve_lstm_reuse_production_horizon(
+        source_model_state,
+        requested_steps=requested_steps,
+    )
+    if requested_required_horizon <= current_required_horizon:
+        return source_model_file, None
+
+    adjusted_state = dict(source_model_state)
+    adjusted_state["production_forecast_horizon"] = requested_required_horizon
+    fd, adjusted_source_model_file = tempfile.mkstemp(
+        prefix=f"boosting_lstm_source_{os.getpid()}_",
+        suffix=".pkl",
+    )
+    os.close(fd)
+    try:
+        dump_model(adjusted_state, adjusted_source_model_file)
+    except Exception:
+        try:
+            os.remove(adjusted_source_model_file)
+        except OSError:
+            pass
+        raise
+    return adjusted_source_model_file, adjusted_source_model_file
+
+
 def _format_predictions(preds: List[float], std_dev: float = 0.0) -> List[Dict[str, float]]:
     return [{"prediction": float(p), "std_dev": float(std_dev)} for p in preds]
 
@@ -311,10 +422,24 @@ def _validate_fit_args(parsed_data: ParsedData, ts: int, te: int, state: Dict[st
 
         from models import lstm as lstm_model
 
-        source_model_state = load_model(previous_model_state["model_file"])
-        if not isinstance(source_model_state, dict) or source_model_state.get("model_type") != "lstm":
+        source_model_state = _load_lstm_source_state(
+            previous_model_state["model_file"],
+            f"Boosting fit-only stage {stage_idx + 1} LSTM source model",
+        )
+
+        target_feature = str(source_model_state.get("target_key") or parsed_data.target_key)
+        if target_feature not in parsed_data.df.columns:
             raise ValueError(
-                f"[VALIDATION] Boosting fit-only stage {stage_idx + 1} has an invalid LSTM source model."
+                f"[VALIDATION] Boosting fit-only stage {stage_idx + 1} (lstm) is missing target column: {target_feature}"
+            )
+        missing_feature_names = [
+            feature_name
+            for feature_name in source_model_state.get("feature_keys", []) or []
+            if feature_name not in parsed_data.df.columns
+        ]
+        if missing_feature_names:
+            raise ValueError(
+                f"[VALIDATION] Boosting fit-only stage {stage_idx + 1} (lstm) is missing feature columns: {missing_feature_names}"
             )
 
         look_back = int(source_model_state["look_back"])
@@ -365,6 +490,7 @@ def _validate_training_args(
     ee: int,
     models_to_use: List[str],
     model_params: Dict[str, Any],
+    base_model_files: Optional[Dict[str, str]] = None,
 ) -> None:
     n = parsed_data.n_obs
 
@@ -403,6 +529,13 @@ def _validate_training_args(
             if params["window"] < 1:
                 raise ValueError("[VALIDATION] MA window must be >= 1.")
         elif model_name == "lstm":
+            source_model_file = (base_model_files or {}).get(model_name)
+            source_model_state = None
+            if source_model_file and os.path.exists(source_model_file):
+                source_model_state = _load_lstm_source_state(
+                    source_model_file,
+                    "Saved Boosting LSTM base model",
+                )
             if "look_back" not in params:
                 raise ValueError("[VALIDATION] LSTM requires 'look_back' parameter.")
             if "epochs" not in params:
@@ -415,11 +548,19 @@ def _validate_training_args(
                 raise ValueError("[VALIDATION] Training range must be larger than LSTM look_back.")
             train_size = te - ts + 1
             boost_train_size = _compute_phase1_train_size(train_size)
+            boost_val_size = train_size - boost_train_size
             if boost_train_size <= params["look_back"]:
                 raise ValueError(
                     f"[VALIDATION] LSTM look_back ({params['look_back']}) is too large for "
                     f"the boosting internal training split ({boost_train_size} points). "
                     f"Please reduce look_back or increase training data."
+                )
+            if boost_train_size < params["look_back"] + boost_val_size:
+                raise ValueError(
+                    f"[VALIDATION] LSTM look_back ({params['look_back']}) is too large for "
+                    f"the boosting internal training split ({boost_train_size} points) "
+                    f"and validation horizon ({boost_val_size} points). Please reduce look_back "
+                    f"or increase training data."
                 )
             target_feature = str(params.get("lstm_target_feature", parsed_data.target_key) or parsed_data.target_key)
             if target_feature not in parsed_data.df.columns:
@@ -433,6 +574,44 @@ def _validate_training_args(
                 raise ValueError(
                     f"[VALIDATION] LSTM feature columns not found in dataset: {missing_feature_names}"
                 )
+            if source_model_state is None:
+                continue
+
+            from models import lstm as lstm_model
+
+            forecast_strategy = _get_lstm_source_forecast_strategy(source_model_state)
+            fit_forecast_horizon = _resolve_lstm_reuse_production_horizon(
+                source_model_state,
+                requested_steps=ee - te,
+            )
+            effective_forecast_strategy = forecast_strategy
+
+            if forecast_strategy == lstm_model.DIRECT_FORECAST_STRATEGY:
+                if fit_forecast_horizon > 0 and not lstm_model._can_fit_direct_forecast(
+                    train_size,
+                    params["look_back"],
+                    fit_forecast_horizon,
+                ):
+                    effective_forecast_strategy = lstm_model.LEGACY_FORECAST_STRATEGY
+                    fit_forecast_horizon = 0
+
+            try:
+                lstm_model._validate_fit_args(
+                    parsed_data,
+                    ts,
+                    te,
+                    params["look_back"],
+                    fit_forecast_horizon,
+                    effective_forecast_strategy,
+                )
+            except ValueError as exc:
+                message = str(exc)
+                if message.startswith("[VALIDATION] "):
+                    message = message[len("[VALIDATION] "):]
+                raise ValueError(
+                    "[VALIDATION] Reused LSTM base model cannot be refit for the boosting final "
+                    f"evaluation stage: {message}"
+                ) from exc
 
 
 # ---------- predict ----------
@@ -612,15 +791,71 @@ def train_and_evaluate(
         artifact_origin = "temporary_training"
 
         if stage_idx == 0 and base_model_files and model_name in base_model_files and os.path.exists(base_model_files[model_name]):
-            stage_model_file = base_model_files[model_name]
-            stage_eval_predictions = _predict_eval_segment(
-                model_name,
-                stage_model_file,
-                train_range,
-                eval_range,
-                timeout,
-            )
-            artifact_origin = "standalone_base"
+            source_model_file = base_model_files[model_name]
+            if model_name == "lstm":
+                source_model_state = _load_lstm_source_state(
+                    source_model_file,
+                    "Saved Boosting LSTM base model",
+                )
+                source_forecast_strategy = _get_lstm_source_forecast_strategy(source_model_state)
+                source_forecast_horizon = int(source_model_state.get("forecast_horizon", 0) or 0)
+                if (
+                    source_forecast_strategy == "direct_multi_horizon"
+                    and (eval_range.stop - train_range.stop) > source_forecast_horizon
+                ):
+                    adjusted_source_model_file = source_model_file
+                    temp_source_model_file = None
+                    stage_model_file = _make_temp_model_path(f"boosting_stage_{model_name}_")
+                    round_numeric_records, round_lstm_records = _build_round_records(
+                        round_parsed_data,
+                        model_name,
+                        params,
+                    )
+                    try:
+                        adjusted_source_model_file, temp_source_model_file = _prepare_lstm_source_model_for_requested_steps(
+                            source_model_file,
+                            source_model_state,
+                            requested_steps=eval_range.stop - train_range.stop,
+                        )
+                        run_base_model_fit_subprocess(
+                            model_type=model_name,
+                            data=round_lstm_records,
+                            train_start=train_range.start,
+                            train_end=train_range.stop - 1,
+                            source_model_file=adjusted_source_model_file,
+                            save_model_file=stage_model_file,
+                            timeout=timeout,
+                        )
+                    finally:
+                        if temp_source_model_file and os.path.exists(temp_source_model_file):
+                            os.remove(temp_source_model_file)
+                    stage_eval_predictions = _predict_eval_segment(
+                        model_name,
+                        stage_model_file,
+                        train_range,
+                        eval_range,
+                        timeout,
+                    )
+                else:
+                    stage_model_file = source_model_file
+                    stage_eval_predictions = _predict_eval_segment(
+                        model_name,
+                        stage_model_file,
+                        train_range,
+                        eval_range,
+                        timeout,
+                    )
+                    artifact_origin = "standalone_base"
+            else:
+                stage_model_file = source_model_file
+                stage_eval_predictions = _predict_eval_segment(
+                    model_name,
+                    stage_model_file,
+                    train_range,
+                    eval_range,
+                    timeout,
+                )
+                artifact_origin = "standalone_base"
         else:
             round_numeric_records, round_lstm_records = _build_round_records(
                 round_parsed_data,
@@ -892,9 +1127,21 @@ def run(args) -> None:
         }
         if lstm_features_str:
             lstm_params["lstm_features"] = lstm_features_str
+
+        source_lstm_file = base_model_files.get("lstm")
+        if source_lstm_file and os.path.exists(source_lstm_file):
+            source_lstm_state = _load_lstm_source_state(
+                source_lstm_file,
+                "Saved Boosting LSTM base model",
+            )
+            lstm_params = _build_lstm_params_from_source_state(
+                parsed_data,
+                source_lstm_state,
+                lstm_params,
+            )
         model_params["lstm"] = lstm_params
 
-    _validate_training_args(parsed_data, ts, te, es, ee, models_to_use, model_params)
+    _validate_training_args(parsed_data, ts, te, es, ee, models_to_use, model_params, base_model_files)
 
     (
         metrics,
