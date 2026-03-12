@@ -71,6 +71,19 @@ def invoke_model(model_type: str, data_json: str | None, *extra_args: str) -> di
     return json.loads(completed.stdout)
 
 
+def run_command(model_type: str, data_json: str | None, *extra_args: str) -> subprocess.CompletedProcess[str]:
+    command = [sys.executable, str(RUN_MODEL), model_type]
+    if data_json is not None:
+        command.extend(["--data", data_json])
+    command.extend(extra_args)
+    return subprocess.run(
+        command,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+
 def extract_predictions(payload: dict) -> list[float]:
     return [float(item["prediction"]) for item in payload["predictions"]]
 
@@ -93,6 +106,17 @@ def assert_all_finite(values: list[float], label: str) -> None:
     for index, value in enumerate(values):
         if not math.isfinite(value):
             raise AssertionError(f"{label}[{index}] is not finite: {value}")
+
+
+def assert_error(completed: subprocess.CompletedProcess[str], expected_substring: str) -> None:
+    if completed.returncode == 0:
+        raise AssertionError(f"expected failure containing {expected_substring!r}, got success")
+    if expected_substring not in completed.stderr:
+        raise AssertionError(
+            f"missing expected error substring {expected_substring!r}\n"
+            f"stdout:\n{completed.stdout}\n"
+            f"stderr:\n{completed.stderr}"
+        )
 
 
 def load_pickled_state(model_path: Path) -> dict:
@@ -172,6 +196,10 @@ def assert_predictions_within_member_envelope(
 def main() -> None:
     records = load_csv_records(CSV_FIXTURE)
     data_json = json.dumps(records, ensure_ascii=False)
+    trimmed_feature_data_json = json.dumps(
+        [{key: value for key, value in row.items() if key != "库存水平"} for row in records],
+        ensure_ascii=False,
+    )
     timestamps = [f"{int(row['年份']):04d}-{int(row['月份']):02d}" for row in records]
     sales = [float(row["销售数量"]) for row in records]
     train_start = 0
@@ -324,6 +352,239 @@ def main() -> None:
         assert_all_finite(future_std_devs_one, "future_std_devs")
         assert_predictions_within_member_envelope(BASE_MODELS, production_member_predictions, future_predictions_one)
 
+        missing_feature_result = run_command(
+            "stacking",
+            data_json,
+            "--train-start",
+            "0",
+            "--train-end",
+            "27",
+            "--eval-start",
+            "28",
+            "--eval-end",
+            "30",
+            "--models",
+            "ma,lstm",
+            "--window",
+            "3",
+            "--look-back",
+            "4",
+            "--epochs",
+            "2",
+            "--lstm-target-feature",
+            "销售数量",
+            "--lstm-features",
+            "价格指数,不存在字段,促销投入",
+        )
+        assert_error(
+            missing_feature_result,
+            "[VALIDATION] LSTM feature columns not found in dataset: ['不存在字段']",
+        )
+
+        oversized_look_back_result = run_command(
+            "stacking",
+            data_json,
+            "--train-start",
+            "0",
+            "--train-end",
+            "11",
+            "--eval-start",
+            "12",
+            "--eval-end",
+            "15",
+            "--models",
+            "ma,lstm",
+            "--window",
+            "3",
+            "--look-back",
+            "9",
+            "--epochs",
+            "2",
+            "--lstm-target-feature",
+            "销售数量",
+            "--lstm-features",
+            "价格指数,促销投入,库存水平,搜索热度",
+        )
+        assert_error(
+            oversized_look_back_result,
+            "[VALIDATION] LSTM look_back (9) is too large for the stacking internal training split (10 points) and level1 horizon (2 points).",
+        )
+
+        short_fit_result = run_command(
+            "stacking",
+            data_json,
+            "--train-start",
+            "0",
+            "--train-end",
+            "3",
+            "--load-model",
+            str(stacking_model_backtest),
+            "--save-model",
+            str(temp_path / "stacking-lstm-short-fit.pkl"),
+            "--fit-only",
+            "--pretty",
+        )
+        assert_error(
+            short_fit_result,
+            "[VALIDATION] Stacking fit-only member lstm cannot be refit: Training range must be larger than look_back.",
+        )
+
+        missing_saved_feature_fit_result = run_command(
+            "stacking",
+            trimmed_feature_data_json,
+            "--train-start",
+            "0",
+            "--train-end",
+            "35",
+            "--load-model",
+            str(stacking_model_backtest),
+            "--save-model",
+            str(temp_path / "stacking-lstm-missing-feature-fit.pkl"),
+            "--fit-only",
+            "--pretty",
+        )
+        assert_error(
+            missing_saved_feature_fit_result,
+            "[VALIDATION] Stacking fit-only member lstm is missing feature columns: ['库存水平']",
+        )
+
+        reused_lstm_source = temp_path / "lstm-reuse-mismatch.pkl"
+        invoke_model(
+            "lstm",
+            data_json,
+            "--train-start",
+            "0",
+            "--train-end",
+            "11",
+            "--eval-start",
+            "12",
+            "--eval-end",
+            "15",
+            "--look-back",
+            "4",
+            "--epochs",
+            "2",
+            "--normalization",
+            "minmax",
+            "--lstm-target-feature",
+            "销售数量",
+            "--lstm-features",
+            ",".join(LSTM_FEATURE_KEYS),
+            "--save-model",
+            str(reused_lstm_source),
+            "--pretty",
+        )
+
+        reuse_param_mismatch_model = temp_path / "stacking-lstm-reuse-mismatch.pkl"
+        reuse_param_mismatch_output = invoke_model(
+            "stacking",
+            data_json,
+            "--train-start",
+            "0",
+            "--train-end",
+            "11",
+            "--eval-start",
+            "12",
+            "--eval-end",
+            "15",
+            "--models",
+            "ma,lstm",
+            "--window",
+            "3",
+            "--look-back",
+            "9",
+            "--epochs",
+            "2",
+            "--lstm-target-feature",
+            "销售数量",
+            "--lstm-features",
+            "价格指数,不存在字段,促销投入",
+            "--base-model-files",
+            json.dumps({"lstm": str(reused_lstm_source)}, ensure_ascii=False),
+            "--save-model",
+            str(reuse_param_mismatch_model),
+            "--pretty",
+        )
+        assert reuse_param_mismatch_output["mode"] == "stacking_train_eval"
+        assert reuse_param_mismatch_output["models"] == ["ma", "lstm"]
+        assert len(reuse_param_mismatch_output["predictions"]) == 4
+        reuse_param_mismatch_state = load_pickled_state(reuse_param_mismatch_model)
+        reused_saved_lstm_member = Path(reuse_param_mismatch_state["base_model_states"]["lstm"]["model_file"])
+        if not reused_saved_lstm_member.exists():
+            raise AssertionError(f"reused stacking LSTM member artifact missing: {reused_saved_lstm_member}")
+        assert reuse_param_mismatch_state["base_model_states"]["lstm"]["params"]["look_back"] == 4
+        assert (
+            reuse_param_mismatch_state["base_model_states"]["lstm"]["params"]["lstm_features"]
+            == ",".join(LSTM_FEATURE_KEYS)
+        )
+
+        short_horizon_lstm_source = temp_path / "lstm-reuse-short-horizon.pkl"
+        invoke_model(
+            "lstm",
+            data_json,
+            "--train-start",
+            "0",
+            "--train-end",
+            "27",
+            "--eval-start",
+            "28",
+            "--eval-end",
+            "29",
+            "--look-back",
+            "4",
+            "--epochs",
+            "2",
+            "--normalization",
+            "minmax",
+            "--lstm-target-feature",
+            "销售数量",
+            "--lstm-features",
+            ",".join(LSTM_FEATURE_KEYS),
+            "--save-model",
+            str(short_horizon_lstm_source),
+            "--pretty",
+        )
+
+        reuse_short_horizon_model = temp_path / "stacking-lstm-reuse-short-horizon.pkl"
+        reuse_short_horizon_output = invoke_model(
+            "stacking",
+            data_json,
+            "--train-start",
+            "0",
+            "--train-end",
+            "30",
+            "--eval-start",
+            "31",
+            "--eval-end",
+            "35",
+            "--models",
+            "ma,lstm",
+            "--window",
+            "3",
+            "--look-back",
+            "4",
+            "--epochs",
+            "2",
+            "--lstm-target-feature",
+            "销售数量",
+            "--lstm-features",
+            ",".join(LSTM_FEATURE_KEYS),
+            "--base-model-files",
+            json.dumps({"lstm": str(short_horizon_lstm_source)}, ensure_ascii=False),
+            "--save-model",
+            str(reuse_short_horizon_model),
+            "--pretty",
+        )
+        assert reuse_short_horizon_output["mode"] == "stacking_train_eval"
+        assert reuse_short_horizon_output["models"] == ["ma", "lstm"]
+        assert len(reuse_short_horizon_output["predictions"]) == 5
+        reuse_short_horizon_state = load_pickled_state(reuse_short_horizon_model)
+        reuse_short_horizon_member = Path(reuse_short_horizon_state["base_model_states"]["lstm"]["model_file"])
+        if not reuse_short_horizon_member.exists():
+            raise AssertionError(f"short-horizon reused stacking LSTM member artifact missing: {reuse_short_horizon_member}")
+        reuse_short_horizon_member_state = load_pickled_state(reuse_short_horizon_member)
+        assert reuse_short_horizon_member_state["forecast_horizon"] >= 5
+
     print(
         json.dumps(
             {
@@ -333,6 +594,14 @@ def main() -> None:
                 "model": "stacking_lstm",
                 "self_trained_base_models": BASE_MODELS,
                 "reused_base_models": BASE_MODELS,
+                "edge_cases": [
+                    "missing_lstm_feature",
+                    "oversized_look_back",
+                    "fit_only_short_window",
+                    "fit_only_missing_saved_feature",
+                    "reused_lstm_source_param_mismatch",
+                    "reused_lstm_source_short_horizon",
+                ],
                 "status": "ok",
             },
             ensure_ascii=False,

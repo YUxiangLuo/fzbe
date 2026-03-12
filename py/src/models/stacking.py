@@ -41,6 +41,127 @@ MODEL_TYPE = "stacking"
 
 
 # ---------- utilities ----------
+def _parse_feature_name_list(raw_value: Any) -> List[str]:
+    if raw_value is None:
+        return []
+    if isinstance(raw_value, str):
+        return [item.strip() for item in raw_value.split(",") if item.strip()]
+    if isinstance(raw_value, list):
+        return [str(item).strip() for item in raw_value if str(item).strip()]
+    return []
+
+
+def _load_lstm_source_state(model_file: str, context: str) -> Dict[str, Any]:
+    source_model_state = load_model(model_file)
+    if not isinstance(source_model_state, dict) or source_model_state.get("model_type") != "lstm":
+        raise ValueError(f"[VALIDATION] {context} is invalid.")
+    return source_model_state
+
+
+def _build_lstm_params_from_source_state(
+    parsed_data: ParsedData,
+    source_model_state: Dict[str, Any],
+    fallback_params: Dict[str, Any],
+) -> Dict[str, Any]:
+    target_feature = str(
+        source_model_state.get("target_key")
+        or fallback_params.get("lstm_target_feature")
+        or parsed_data.target_key
+    )
+    feature_keys = [
+        feature_name
+        for feature_name in source_model_state.get("feature_keys", []) or []
+        if feature_name and feature_name != target_feature
+    ]
+    raw_feature_types = source_model_state.get("feature_types")
+    if isinstance(raw_feature_types, dict) and raw_feature_types:
+        feature_types = {
+            str(key): value
+            for key, value in raw_feature_types.items()
+            if key == target_feature or key in feature_keys
+        }
+    else:
+        feature_types = infer_feature_types(
+            parsed_data=parsed_data,
+            target_key=target_feature,
+            feature_keys=feature_keys,
+        )
+    feature_types[target_feature] = "numeric"
+
+    params = {
+        "look_back": int(source_model_state["look_back"]),
+        "epochs": int(source_model_state.get("epochs", fallback_params.get("epochs", 20))),
+        "feature_types": feature_types,
+        "normalization": source_model_state.get(
+            "normalization",
+            fallback_params.get("normalization", "minmax"),
+        ),
+        "lstm_target_feature": target_feature,
+    }
+    if feature_keys:
+        params["lstm_features"] = ",".join(feature_keys)
+    return params
+
+
+def _get_lstm_source_forecast_strategy(source_model_state: Dict[str, Any]) -> str:
+    from models import lstm as lstm_model
+
+    if source_model_state.get("forecast_strategy"):
+        return str(source_model_state["forecast_strategy"])
+    if int(source_model_state.get("forecast_horizon", 0) or 0) > 0:
+        return lstm_model.DIRECT_FORECAST_STRATEGY
+    return lstm_model.LEGACY_FORECAST_STRATEGY
+
+
+def _resolve_lstm_reuse_production_horizon(
+    source_model_state: Dict[str, Any],
+    requested_steps: int = 0,
+) -> int:
+    from models import lstm as lstm_model
+
+    forecast_strategy = _get_lstm_source_forecast_strategy(source_model_state)
+    if forecast_strategy != lstm_model.DIRECT_FORECAST_STRATEGY:
+        return 0
+
+    saved_eval_horizon = int(source_model_state.get("forecast_horizon", 0) or 0)
+    current_required_horizon = lstm_model._resolve_production_forecast_horizon(
+        state=source_model_state,
+        eval_forecast_horizon=saved_eval_horizon,
+    )
+    return max(current_required_horizon, int(requested_steps or 0))
+
+
+def _prepare_lstm_source_model_for_requested_steps(
+    source_model_file: str,
+    source_model_state: Dict[str, Any],
+    requested_steps: int,
+) -> Tuple[str, Optional[str]]:
+    current_required_horizon = _resolve_lstm_reuse_production_horizon(source_model_state)
+    requested_required_horizon = _resolve_lstm_reuse_production_horizon(
+        source_model_state,
+        requested_steps=requested_steps,
+    )
+    if requested_required_horizon <= current_required_horizon:
+        return source_model_file, None
+
+    adjusted_state = dict(source_model_state)
+    adjusted_state["production_forecast_horizon"] = requested_required_horizon
+    fd, adjusted_source_model_file = tempfile.mkstemp(
+        prefix=f"stacking_lstm_source_{os.getpid()}_",
+        suffix=".pkl",
+    )
+    os.close(fd)
+    try:
+        dump_model(adjusted_state, adjusted_source_model_file)
+    except Exception:
+        try:
+            os.remove(adjusted_source_model_file)
+        except OSError:
+            pass
+        raise
+    return adjusted_source_model_file, adjusted_source_model_file
+
+
 def _format_predictions(preds: List[float], std_dev: float = 0.0) -> List[Dict[str, float]]:
     """Format predictions with standard deviation for JSON output."""
     return [{"prediction": float(p), "std_dev": float(std_dev)} for p in preds]
@@ -185,6 +306,70 @@ def _validate_fit_args(parsed_data: ParsedData, ts: int, te: int, state: Dict[st
         if not isinstance(model_state, dict) or not isinstance(model_state.get("model_file"), str):
             raise ValueError(f"[VALIDATION] Missing saved state for base model: {model_name}")
 
+        if model_name != "lstm":
+            continue
+
+        from models import lstm as lstm_model
+
+        source_model_state = _load_lstm_source_state(
+            model_state["model_file"],
+            "Saved Stacking LSTM member",
+        )
+
+        target_feature = str(source_model_state.get("target_key") or parsed_data.target_key)
+        if target_feature not in parsed_data.df.columns:
+            raise ValueError(
+                f"[VALIDATION] Stacking fit-only member lstm is missing target column: {target_feature}"
+            )
+        missing_feature_names = [
+            feature_name
+            for feature_name in source_model_state.get("feature_keys", []) or []
+            if feature_name not in parsed_data.df.columns
+        ]
+        if missing_feature_names:
+            raise ValueError(
+                f"[VALIDATION] Stacking fit-only member lstm is missing feature columns: {missing_feature_names}"
+            )
+
+        look_back = int(source_model_state["look_back"])
+        forecast_strategy = source_model_state.get(
+            "forecast_strategy",
+            lstm_model.LEGACY_FORECAST_STRATEGY,
+        )
+        saved_eval_horizon = int(source_model_state.get("forecast_horizon", 0) or 0)
+        fit_forecast_horizon = saved_eval_horizon
+        effective_forecast_strategy = forecast_strategy
+
+        if forecast_strategy == lstm_model.DIRECT_FORECAST_STRATEGY:
+            desired_production_horizon = lstm_model._resolve_production_forecast_horizon(
+                state=source_model_state,
+                eval_forecast_horizon=saved_eval_horizon,
+            )
+            train_size = te - ts + 1
+            if desired_production_horizon > fit_forecast_horizon:
+                if lstm_model._can_fit_direct_forecast(train_size, look_back, desired_production_horizon):
+                    fit_forecast_horizon = desired_production_horizon
+                else:
+                    effective_forecast_strategy = lstm_model.LEGACY_FORECAST_STRATEGY
+                    fit_forecast_horizon = 0
+
+        try:
+            lstm_model._validate_fit_args(
+                parsed_data,
+                ts,
+                te,
+                look_back,
+                fit_forecast_horizon,
+                effective_forecast_strategy,
+            )
+        except ValueError as exc:
+            message = str(exc)
+            if message.startswith("[VALIDATION] "):
+                message = message[len("[VALIDATION] "):]
+            raise ValueError(
+                f"[VALIDATION] Stacking fit-only member lstm cannot be refit: {message}"
+            ) from exc
+
 
 def _validate_training_args(
     parsed_data: ParsedData,
@@ -194,6 +379,7 @@ def _validate_training_args(
     ee: int,
     models_to_use: List[str],
     model_params: Dict[str, Any],
+    base_model_files: Optional[Dict[str, str]] = None,
 ) -> None:
     """Validate training and evaluation parameters for Stacking."""
     n = parsed_data.n_obs
@@ -252,6 +438,14 @@ def _validate_training_args(
                 raise ValueError("[VALIDATION] MA window must be >= 1.")
 
         elif model_name == "lstm":
+            source_model_file = (base_model_files or {}).get(model_name)
+            source_model_state = None
+            if source_model_file and os.path.exists(source_model_file):
+                source_model_state = _load_lstm_source_state(
+                    source_model_file,
+                    "Saved Stacking LSTM base model",
+                )
+
             if "look_back" not in params:
                 raise ValueError("[VALIDATION] LSTM requires 'look_back' parameter.")
             if "epochs" not in params:
@@ -262,15 +456,74 @@ def _validate_training_args(
                 raise ValueError("[VALIDATION] LSTM epochs must be >= 1.")
             if te - ts + 1 <= params["look_back"]:
                 raise ValueError("[VALIDATION] Training range must be larger than LSTM look_back.")
-            # Also validate against the Phase 1 sub-range (level0) which is smaller
             train_size = te - ts + 1
             level0_size = _compute_phase1_train_size(train_size)
+            level1_size = train_size - level0_size
             if level0_size <= params["look_back"]:
                 raise ValueError(
                     f"[VALIDATION] LSTM look_back ({params['look_back']}) is too large for "
                     f"the stacking internal training split ({level0_size} points). "
                     f"Please reduce look_back or increase training data."
                 )
+            target_feature = str(params.get("lstm_target_feature", parsed_data.target_key) or parsed_data.target_key)
+            if target_feature not in parsed_data.df.columns:
+                raise ValueError(f"[VALIDATION] LSTM target feature not found in dataset: {target_feature}")
+            missing_feature_names = [
+                feature_name
+                for feature_name in _parse_feature_name_list(params.get("lstm_features"))
+                if feature_name not in parsed_data.df.columns
+            ]
+            if missing_feature_names:
+                raise ValueError(
+                    f"[VALIDATION] LSTM feature columns not found in dataset: {missing_feature_names}"
+                )
+
+            if source_model_state is None:
+                if level0_size < params["look_back"] + level1_size:
+                    raise ValueError(
+                        f"[VALIDATION] LSTM look_back ({params['look_back']}) is too large for "
+                        f"the stacking internal training split ({level0_size} points) "
+                        f"and level1 horizon ({level1_size} points). Please reduce look_back "
+                        f"or increase training data."
+                    )
+                continue
+
+            from models import lstm as lstm_model
+
+            forecast_strategy = _get_lstm_source_forecast_strategy(source_model_state)
+            reuse_required_steps = max(level1_size, ee - te)
+            fit_forecast_horizon = _resolve_lstm_reuse_production_horizon(
+                source_model_state,
+                requested_steps=reuse_required_steps,
+            )
+            effective_forecast_strategy = forecast_strategy
+
+            if forecast_strategy == lstm_model.DIRECT_FORECAST_STRATEGY:
+                if fit_forecast_horizon > 0 and not lstm_model._can_fit_direct_forecast(
+                    level0_size,
+                    params["look_back"],
+                    fit_forecast_horizon,
+                ):
+                    effective_forecast_strategy = lstm_model.LEGACY_FORECAST_STRATEGY
+                    fit_forecast_horizon = 0
+
+            try:
+                lstm_model._validate_fit_args(
+                    parsed_data,
+                    ts,
+                    ts + level0_size - 1,
+                    params["look_back"],
+                    fit_forecast_horizon,
+                    effective_forecast_strategy,
+                )
+            except ValueError as exc:
+                message = str(exc)
+                if message.startswith("[VALIDATION] "):
+                    message = message[len("[VALIDATION] "):]
+                raise ValueError(
+                    "[VALIDATION] Reused LSTM base model cannot be refit on the stacking "
+                    f"level0 split: {message}"
+                ) from exc
 
 
 # ---------- predict ----------
@@ -380,15 +633,31 @@ def train_and_evaluate(
 
         print(f"  训练 {model_name} 在 level0，预测 level1...", file=sys.stderr)
         if source_model_file and os.path.exists(source_model_file):
-            y_pred_level1 = fit_and_predict_from_source_model(
-                model_name=model_name,
-                source_model_file=source_model_file,
-                data=lstm_data_dicts if model_name == "lstm" else numeric_data_dicts,
-                train_start=level0_train_range.start,
-                train_end=level0_train_range.stop - 1,
-                forecast_steps=len(level1_train_range),
-                timeout=base_timeout,
-            )
+            adjusted_source_model_file = source_model_file
+            temp_source_model_file = None
+            try:
+                if model_name == "lstm":
+                    source_model_state = _load_lstm_source_state(
+                        source_model_file,
+                        "Saved Stacking LSTM base model",
+                    )
+                    adjusted_source_model_file, temp_source_model_file = _prepare_lstm_source_model_for_requested_steps(
+                        source_model_file,
+                        source_model_state,
+                        requested_steps=len(level1_train_range),
+                    )
+                y_pred_level1 = fit_and_predict_from_source_model(
+                    model_name=model_name,
+                    source_model_file=adjusted_source_model_file,
+                    data=lstm_data_dicts if model_name == "lstm" else numeric_data_dicts,
+                    train_start=level0_train_range.start,
+                    train_end=level0_train_range.stop - 1,
+                    forecast_steps=len(level1_train_range),
+                    timeout=base_timeout,
+                )
+            finally:
+                if temp_source_model_file and os.path.exists(temp_source_model_file):
+                    os.remove(temp_source_model_file)
         else:
             result = run_base_model_subprocess(
                 model_type=model_name,
@@ -436,6 +705,61 @@ def train_and_evaluate(
         source_model_file = (base_model_files or {}).get(model_name)
 
         if source_model_file and os.path.exists(source_model_file):
+            if model_name == "lstm":
+                source_model_state = _load_lstm_source_state(
+                    source_model_file,
+                    "Saved Stacking LSTM base model",
+                )
+                source_forecast_strategy = _get_lstm_source_forecast_strategy(source_model_state)
+                source_forecast_horizon = int(source_model_state.get("forecast_horizon", 0) or 0)
+                if (
+                    source_forecast_strategy == "direct_multi_horizon"
+                    and eval_forecast_steps > source_forecast_horizon
+                ):
+                    adjusted_source_model_file = source_model_file
+                    temp_source_model_file = None
+                    temp_model_file = os.path.join(
+                        tempfile.gettempdir(),
+                        f"stacking_base_{model_name}_{os.getpid()}.pkl"
+                    )
+                    try:
+                        adjusted_source_model_file, temp_source_model_file = _prepare_lstm_source_model_for_requested_steps(
+                            source_model_file,
+                            source_model_state,
+                            requested_steps=eval_forecast_steps,
+                        )
+                        run_base_model_fit_subprocess(
+                            model_type=model_name,
+                            data=lstm_data_dicts,
+                            train_start=train_range.start,
+                            train_end=train_range.stop - 1,
+                            source_model_file=adjusted_source_model_file,
+                            save_model_file=temp_model_file,
+                            timeout=base_timeout,
+                        )
+                    finally:
+                        if temp_source_model_file and os.path.exists(temp_source_model_file):
+                            os.remove(temp_source_model_file)
+
+                    result = run_base_model_predict_subprocess(
+                        model_type=model_name,
+                        model_file=temp_model_file,
+                        forecast_steps=eval_forecast_steps,
+                        timeout=base_timeout,
+                    )
+                    y_pred_eval = extract_predictions_from_result(result)[
+                        eval_forecast_offset: eval_forecast_offset + len(eval_range)
+                    ]
+                    eval_predictions.append(y_pred_eval)
+                    base_model_states[model_name] = {
+                        "model_type": model_name,
+                        "model_file": temp_model_file,
+                        "params": params,
+                        "artifact_origin": "temporary_training",
+                    }
+                    print(f"    ✓ 扩展horizon后生成 {len(y_pred_eval)} 个eval预测", file=sys.stderr)
+                    continue
+
             print(f"  复用已完成的 {model_name} 基础模型产物，预测eval_range...", file=sys.stderr)
             result = run_base_model_predict_subprocess(
                 model_type=model_name,
@@ -693,10 +1017,22 @@ def run(args) -> None:
         if lstm_features_str:
             lstm_params["lstm_features"] = lstm_features_str
 
+        source_lstm_file = base_model_files.get("lstm")
+        if source_lstm_file and os.path.exists(source_lstm_file):
+            source_lstm_state = _load_lstm_source_state(
+                source_lstm_file,
+                "Saved Stacking LSTM base model",
+            )
+            lstm_params = _build_lstm_params_from_source_state(
+                parsed_data,
+                source_lstm_state,
+                lstm_params,
+            )
+
         model_params["lstm"] = lstm_params
 
     # Validate all parameters
-    _validate_training_args(parsed_data, ts, te, es, ee, models_to_use, model_params)
+    _validate_training_args(parsed_data, ts, te, es, ee, models_to_use, model_params, base_model_files)
 
     metrics, base_model_states, meta_model, y_true, y_pred, std_dev = train_and_evaluate(
         parsed_data,
