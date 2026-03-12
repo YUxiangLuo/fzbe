@@ -388,6 +388,100 @@ const hasSavedModelArtifact = (modelType: ModelType, modelPath: string) => {
   return true;
 };
 
+const ENSEMBLE_ARTIFACT_VALIDATION_SCRIPT = `
+import json
+import os
+import pickle
+import sys
+
+def artifact_exists(model_type, model_file):
+    if not isinstance(model_file, str) or not os.path.exists(model_file):
+        return False
+    if model_type == "lstm":
+        return os.path.exists(os.path.splitext(model_file)[0] + "_keras_model.h5")
+    return True
+
+def iter_model_states(base_model_states):
+    if not isinstance(base_model_states, dict):
+        return []
+
+    flattened = []
+    for outer_name, model_state in base_model_states.items():
+        if isinstance(model_state, dict) and isinstance(model_state.get("models"), list):
+            candidate_states = model_state.get("models", [])
+        else:
+            candidate_states = [model_state]
+
+        for candidate_state in candidate_states:
+            if not isinstance(candidate_state, dict):
+                return None
+            flattened.append((candidate_state.get("model_type") or outer_name, candidate_state.get("model_file")))
+
+    return flattened
+
+try:
+    with open(sys.argv[1], "rb") as handle:
+        state = pickle.load(handle)
+
+    flattened_states = iter_model_states(state.get("base_model_states"))
+    is_valid = flattened_states is not None and len(flattened_states) > 0 and all(
+        artifact_exists(model_type, model_file)
+        for model_type, model_file in flattened_states
+    )
+    print(json.dumps({"valid": bool(is_valid)}))
+except Exception:
+    print(json.dumps({"valid": False}))
+`;
+
+const hasCompleteEnsembleArtifact = async (modelPath: string) => {
+  try {
+    const pythonExec = resolvePythonExecutable();
+    const proc = Bun.spawn([
+      pythonExec,
+      "-c",
+      ENSEMBLE_ARTIFACT_VALIDATION_SCRIPT,
+      modelPath,
+    ], {
+      cwd: PY_DIR,
+      stdout: "pipe",
+      stderr: "pipe",
+      env: {
+        ...process.env,
+        PATH: `${path.dirname(pythonExec)}${path.delimiter}${process.env.PATH ?? ""}`,
+      },
+    });
+
+    const [stdout, stderr] = await Promise.all([
+      new Response(proc.stdout).text(),
+      new Response(proc.stderr).text(),
+    ]);
+    await proc.exited;
+
+    if (proc.exitCode !== 0) {
+      logger.warn({ modelPath, stderr: stderr.slice(0, 1000) }, "校验融合模型产物完整性失败");
+      return false;
+    }
+
+    const payload = JSON.parse(stdout) as { valid?: unknown };
+    return payload.valid === true;
+  } catch (error) {
+    logger.warn({ err: error, modelPath }, "解析融合模型产物校验结果失败");
+    return false;
+  }
+};
+
+const hasReusableSavedModelArtifact = async (modelType: ModelType, modelPath: string) => {
+  if (!hasSavedModelArtifact(modelType, modelPath)) {
+    return false;
+  }
+
+  if (!isEnsembleModelType(modelType)) {
+    return true;
+  }
+
+  return await hasCompleteEnsembleArtifact(modelPath);
+};
+
 const normalizeBooleanFlag = (value: number | boolean | null | undefined): boolean => {
   return value === true || value === 1;
 };
@@ -1003,7 +1097,7 @@ export async function prepareExperimentModelForProduction(
   const trainingConfig = getExperimentTrainingConfig(experiment);
 
   const productionModelPath = getProductionModelPath(experimentId, studentId, modelType);
-  if (hasSavedModelArtifact(modelType, productionModelPath)) {
+  if (await hasReusableSavedModelArtifact(modelType, productionModelPath)) {
     return {
       status: "success",
       results: {
@@ -1028,6 +1122,8 @@ export async function prepareExperimentModelForProduction(
   if (trainingConfig.data_window_evaluate_end_index >= allData.length) {
     throw new ModelValidationError("数据窗口索引超出范围", { dataset_size: allData.length });
   }
+
+  invalidateProductionArtifact(experimentId, studentId, modelType);
 
   const pythonParams: Record<string, unknown> = {
     data: JSON.stringify(allData),
@@ -1061,11 +1157,11 @@ export async function predictExperimentModel(
   assertModelReadyForProduction(experiment, modelType);
 
   const productionModelPath = getProductionModelPath(experimentId, studentId, modelType);
-  if (!hasSavedModelArtifact(modelType, productionModelPath)) {
+  if (!await hasReusableSavedModelArtifact(modelType, productionModelPath)) {
     await prepareExperimentModelForProduction(modelType, studentId, experimentId);
   }
 
-  if (!hasSavedModelArtifact(modelType, productionModelPath)) {
+  if (!await hasReusableSavedModelArtifact(modelType, productionModelPath)) {
     throw new ModelNotFoundError(`未找到该实验的 ${modelType.toUpperCase()} 生产预测模型`);
   }
 

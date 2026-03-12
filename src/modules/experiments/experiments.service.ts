@@ -43,12 +43,20 @@ function normalizeSelectionArray<TSelection extends string>(
   allowedOrder: readonly TSelection[],
   aliases: Record<string, TSelection>,
 ) {
-  if (!Array.isArray(value)) {
+  let items: unknown[];
+  if (Array.isArray(value)) {
+    items = value;
+  } else if (typeof value === "string") {
+    items = value
+      .split(/[\s,]+/)
+      .map((item) => item.trim())
+      .filter((item) => item.length > 0);
+  } else {
     return [];
   }
 
   const selected = new Set<TSelection>();
-  for (const item of value) {
+  for (const item of items) {
     if (typeof item !== "string") {
       continue;
     }

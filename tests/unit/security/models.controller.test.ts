@@ -366,6 +366,21 @@ describe("models controller", () => {
     expect(data).toEqual({ error: "未找到该实验的已训练 MA 模型" });
   });
 
+  test("maps ModelValidationError from prediction to 400", async () => {
+    predictExperimentModel.mockRejectedValueOnce(
+      new ModelValidationError("移动平均基础模型尚未完成训练，无法准备生产预测模型"),
+    );
+
+    const response = await requestJson("/api/v1/models/ma/predict", {
+      experiment_id: 990002,
+      forecast_steps: 6,
+    });
+    const data = await response.json();
+
+    expect(response.status).toBe(400);
+    expect(data).toEqual({ error: "移动平均基础模型尚未完成训练，无法准备生产预测模型" });
+  });
+
   test("returns localized field errors for missing prediction params", async () => {
     const response = await requestJson("/api/v1/models/ma/predict", {
       experiment_id: 990002,

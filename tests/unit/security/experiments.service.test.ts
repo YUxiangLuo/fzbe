@@ -23,6 +23,15 @@ const getConnection = mock(async () => ({
 const poolQuery = mock(async () => [[]]);
 
 mock.module(configModulePath, () => ({
+  env: {
+    DB_HOST: process.env.DB_HOST ?? "127.0.0.1",
+    DB_USER: process.env.DB_USER ?? "test",
+    DB_PASSWORD: process.env.DB_PASSWORD ?? "test",
+    DB_DATABASE: process.env.DB_DATABASE ?? "test",
+    JWT_SECRET: process.env.JWT_SECRET ?? "test-jwt-secret",
+    PORT: Number(process.env.PORT ?? "3001"),
+    DEFAULT_PASSWORD_HASH: process.env.DEFAULT_PASSWORD_HASH ?? "test-default-hash",
+  },
   pool: {
     getConnection,
     query: poolQuery,
@@ -125,6 +134,28 @@ describe("experiments service", () => {
     ]);
   });
 
+  test("normalizes legacy string model selections in experiment rows", () => {
+    const normalized = normalizeExperimentRow({
+      selected_base_models: "ma, exp lstm",
+      selected_ensemble_models: "ensemble_weighted stacking",
+      ensemble_weighted_base_models: "ma,es",
+    } as any);
+
+    expect(normalized.selected_base_models).toEqual([
+      "moving_average",
+      "exponential_smoothing",
+      "lstm",
+    ]);
+    expect(normalized.selected_ensemble_models).toEqual([
+      "weighted_ensemble",
+      "stacking_ensemble",
+    ]);
+    expect(normalized.ensemble_weighted_base_models).toEqual([
+      "moving_average",
+      "exponential_smoothing",
+    ]);
+  });
+
   test("canonicalizes legacy model identifiers before saving experiment updates", async () => {
     connectionQuery
       .mockResolvedValueOnce([
@@ -172,5 +203,40 @@ describe("experiments service", () => {
         ensemble_weighted_base_models: ["moving_average", "exponential_smoothing"],
       }),
     });
+  });
+
+  test("canonicalizes legacy string model selections before saving experiment updates", async () => {
+    connectionQuery
+      .mockResolvedValueOnce([
+        [{
+          experiment_id: 990002,
+          student_id: 20240002,
+          status: "In Progress",
+          start_time: "2026-03-08T09:00:00.000Z",
+          last_activity_at: "2026-03-08T09:30:00.000Z",
+          total_active_duration_seconds: 120,
+        }],
+      ])
+      .mockResolvedValueOnce([{ affectedRows: 1 }])
+      .mockResolvedValueOnce([
+        [{
+          experiment_id: 990002,
+          student_id: 20240002,
+          status: "In Progress",
+          selected_base_models: JSON.stringify(["moving_average", "lstm"]),
+          selected_ensemble_models: JSON.stringify(["weighted_ensemble"]),
+        }],
+      ]);
+
+    await updateExperiment(990002, 20240002, {
+      selected_base_models: "ma lstm" as never,
+      selected_ensemble_models: "ensemble_weighted" as never,
+    });
+
+    const updateCall = connectionQuery.mock.calls[1];
+    expect(updateCall?.[1]).toEqual(expect.arrayContaining([
+      JSON.stringify(["moving_average", "lstm"]),
+      JSON.stringify(["weighted_ensemble"]),
+    ]));
   });
 });

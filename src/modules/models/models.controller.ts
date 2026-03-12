@@ -238,6 +238,9 @@ modelsController.post(
       if (error instanceof ModelNotFoundError) {
         return c.json({ error: error.message }, 404);
       }
+      if (error instanceof ModelValidationError) {
+        return c.json({ error: error.message, ...error.details }, 400);
+      }
       const err = error as Error;
       if (err.message?.includes("timed out") || err.message?.includes("超时")) {
         const timeoutSeconds = Math.ceil(TIMEOUTS.MODEL_PREDICTION / 1000);
