@@ -149,16 +149,30 @@ def _compute_lstm_in_sample_fitted(
         scaled_train = scaled_train.toarray()
 
     look_back = int(state["look_back"])
-    trainX, _ = lstm_model._create_dataset(scaled_train, look_back)
     fitted = np.zeros(len(train_df), dtype=float)
-    if len(trainX) == 0:
+    if len(train_df) <= look_back:
         return fitted
 
-    pred_scaled = state["keras_model"].predict(trainX, verbose=0).reshape(-1)
+    forecast_strategy = state.get("forecast_strategy", lstm_model.LEGACY_FORECAST_STRATEGY)
+    if forecast_strategy == lstm_model.DIRECT_FORECAST_STRATEGY and int(state.get("forecast_horizon", 0) or 0) > 0:
+        windows = np.asarray(
+            [scaled_train[idx - look_back : idx, :] for idx in range(look_back, len(train_df))],
+            dtype=float,
+        )
+        pred_scaled = state["keras_model"].predict(windows, verbose=0)
+        if pred_scaled.ndim == 1:
+            pred_scaled = pred_scaled.reshape(-1, 1)
+        next_step_scaled = pred_scaled[:, 0]
+    else:
+        trainX, _ = lstm_model._create_autoregressive_dataset(scaled_train, look_back)
+        if len(trainX) == 0:
+            return fitted
+        next_step_scaled = state["keras_model"].predict(trainX, verbose=0).reshape(-1)
+
     target_scaler = preprocessor.named_transformers_["numeric"].named_steps["scaler"]
     n_numeric_features = target_scaler.n_features_in_
-    dummy_array = np.zeros((len(pred_scaled), n_numeric_features))
-    dummy_array[:, 0] = pred_scaled
+    dummy_array = np.zeros((len(next_step_scaled), n_numeric_features))
+    dummy_array[:, 0] = next_step_scaled
     unscaled_predictions = target_scaler.inverse_transform(dummy_array)[:, 0]
     fitted[look_back: look_back + len(unscaled_predictions)] = unscaled_predictions
     return fitted

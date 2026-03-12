@@ -7,6 +7,7 @@ Centralized data parsing and preparation utilities for all time series models.
 from __future__ import annotations
 
 import json
+import re
 from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
@@ -170,13 +171,153 @@ def build_subprocess_records(
     return data_dicts, selected_feature_keys
 
 
+_CATEGORICAL_NAME_HINTS = (
+    "区域",
+    "代码",
+    "分类",
+    "分组",
+    "品类",
+    "地区",
+    "天气",
+    "属性",
+    "序号",
+    "形态",
+    "渠道",
+    "类型",
+    "编号",
+    "编码",
+    "类别",
+    "等级",
+    "组别",
+)
+
+_CATEGORICAL_TOKEN_HINTS = (
+    "category",
+    "class",
+    "code",
+    "flag",
+    "group",
+    "id",
+    "label",
+    "region",
+    "segment",
+    "channel",
+    "type",
+    "weather",
+)
+
+_CALENDAR_CATEGORICAL_NAME_HINTS = (
+    "星期",
+    "月份",
+    "季度",
+    "周次",
+)
+
+_CALENDAR_CATEGORICAL_TOKEN_HINTS = (
+    "dayofweek",
+    "dow",
+    "month",
+    "quarter",
+    "weekday",
+    "weekofyear",
+)
+
+_NUMERIC_NAME_HINTS = (
+    "价格",
+    "促销",
+    "利用率",
+    "搜索",
+    "指数",
+    "年份",
+    "库存",
+    "强度",
+    "投入",
+    "数量",
+    "销量",
+    "销售",
+)
+
+_NUMERIC_TOKEN_HINTS = (
+    "year",
+    "price",
+    "sales",
+    "inventory",
+    "stock",
+    "trend",
+    "utilization",
+    "value",
+    "volume",
+    "yearly",
+)
+
+
+def _normalize_feature_name(name: str) -> str:
+    return "".join(ch for ch in name.lower() if ch.isalnum() or "\u4e00" <= ch <= "\u9fff")
+
+
+def _tokenize_feature_name(name: str) -> List[str]:
+    normalized = re.sub(r"([a-z0-9])([A-Z])", r"\1 \2", name)
+    tokens = re.findall(r"[A-Za-z0-9]+|[\u4e00-\u9fff]+", normalized.lower())
+    return [token for token in tokens if token]
+
+
+def _is_integer_like(series: pd.Series) -> bool:
+    numeric = pd.to_numeric(series, errors="coerce")
+    finite = numeric[np.isfinite(numeric)]
+    if finite.empty:
+        return False
+    return bool(np.all(np.isclose(finite, np.round(finite), atol=1e-9)))
+
+
+def _infer_single_feature_type(feature_name: str, series: pd.Series) -> str:
+    if pd.api.types.is_bool_dtype(series):
+        return "categorical"
+
+    normalized_name = _normalize_feature_name(feature_name)
+    name_tokens = set(_tokenize_feature_name(feature_name))
+    numeric_series = series
+    if not pd.api.types.is_numeric_dtype(series):
+        numeric_series = pd.to_numeric(series, errors="coerce")
+        if not numeric_series.notna().all():
+            return "categorical"
+
+    non_null = pd.Series(numeric_series).dropna()
+    if non_null.empty:
+        return "numeric"
+
+    unique_count = int(non_null.nunique(dropna=True))
+    unique_ratio = unique_count / len(non_null)
+    integer_like = _is_integer_like(non_null)
+
+    if any(hint in normalized_name for hint in _NUMERIC_NAME_HINTS) or any(
+        hint in name_tokens for hint in _NUMERIC_TOKEN_HINTS
+    ):
+        return "numeric"
+
+    if any(hint in normalized_name for hint in _CALENDAR_CATEGORICAL_NAME_HINTS) or any(
+        hint in name_tokens for hint in _CALENDAR_CATEGORICAL_TOKEN_HINTS
+    ):
+        return "categorical" if integer_like and unique_count <= 31 else "numeric"
+
+    if any(hint in normalized_name for hint in _CATEGORICAL_NAME_HINTS) or any(
+        hint in name_tokens for hint in _CATEGORICAL_TOKEN_HINTS
+    ):
+        return "categorical"
+
+    low_cardinality_threshold = max(4, min(12, int(np.sqrt(len(non_null))) + 1))
+    if integer_like and unique_count <= low_cardinality_threshold and unique_ratio <= 0.3:
+        return "categorical"
+
+    return "numeric"
+
+
 def infer_feature_types(
     parsed_data: "ParsedData",
     target_key: Optional[str] = None,
     feature_keys: Optional[List[str]] = None,
 ) -> Dict[str, str]:
     """
-    Infer feature_types mapping for LSTM from dataframe dtypes.
+    Infer feature types from both observed values and feature-name heuristics.
 
     Numeric-like string columns are treated as numeric after coercion.
     """
@@ -196,16 +337,11 @@ def infer_feature_types(
             continue
 
         series = parsed_data.df[feat_key]
-        if pd.api.types.is_numeric_dtype(series):
-            inferred[feat_key] = "numeric"
-            continue
-
-        converted = pd.to_numeric(series, errors="coerce")
-        if converted.notna().all():
+        inferred_type = _infer_single_feature_type(feat_key, series)
+        if inferred_type == "numeric" and not pd.api.types.is_numeric_dtype(series):
+            converted = pd.to_numeric(series, errors="coerce")
             parsed_data.df[feat_key] = converted
-            inferred[feat_key] = "numeric"
-        else:
-            inferred[feat_key] = "categorical"
+        inferred[feat_key] = inferred_type
 
     return inferred
 

@@ -5,6 +5,7 @@ LSTM (Long Short-Term Memory) model for time series forecasting.
 """
 import json
 import os
+import random
 from typing import Any, Dict, List, Optional, Tuple, Union
 
 import numpy as np
@@ -15,12 +16,15 @@ from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import MinMaxScaler, OneHotEncoder, StandardScaler
 
 # Import shared utilities
-from data_utils import ParsedData, load_data_from_json
+from data_utils import ParsedData, infer_feature_types as infer_parsed_feature_types, load_data_from_json
 from logger import log, get_log_contents
 from metrics import mae, mape, r2, rmse
 from serialization import dump_model, load_model
 
 MODEL_TYPE = "lstm"
+DIRECT_FORECAST_STRATEGY = "direct_multi_horizon"
+LEGACY_FORECAST_STRATEGY = "autoregressive"
+DEFAULT_PRODUCTION_FORECAST_HORIZON = 6
 
 # Type alias for input flexibility
 ArrayLike = Union[List[float], np.ndarray]
@@ -47,17 +51,24 @@ def _load_state(model_path: str) -> Dict[str, Any]:
     keras_model_path = state.get("keras_model_path")
     if not keras_model_path or not os.path.exists(keras_model_path):
         raise FileNotFoundError(f"Keras model file not found at {keras_model_path}")
-    state["keras_model"] = keras_load_model(keras_model_path)
+    state["keras_model"] = keras_load_model(keras_model_path, compile=False)
     
     # Ensure normalization is loaded for predict function
     if "normalization" not in state:
         state["normalization"] = 'minmax' # Default to minmax if not found (for older models)
+    if "forecast_strategy" not in state:
+        state["forecast_strategy"] = (
+            DIRECT_FORECAST_STRATEGY
+            if int(state.get("forecast_horizon", 0) or 0) > 0
+            else LEGACY_FORECAST_STRATEGY
+        )
 
     return state
 
 
-def _create_dataset(
-    dataset: np.ndarray, look_back: int = 1
+def _create_autoregressive_dataset(
+    dataset: np.ndarray,
+    look_back: int = 1,
 ) -> Tuple[np.ndarray, np.ndarray]:
     """
     Create input and output datasets for LSTM.
@@ -68,6 +79,40 @@ def _create_dataset(
         a = dataset[i : (i + look_back), :]
         dataX.append(a)
         dataY.append(dataset[i + look_back, 0]) # Target is the first column
+    return np.array(dataX), np.array(dataY)
+
+
+def _create_dataset(
+    dataset: np.ndarray,
+    look_back: int = 1,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Backward-compatible alias for legacy callers that expect one-step targets.
+    """
+    return _create_autoregressive_dataset(dataset, look_back)
+
+
+def _create_direct_dataset(
+    dataset: np.ndarray,
+    look_back: int,
+    forecast_horizon: int,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Create multi-horizon training samples.
+
+    X uses the past `look_back` rows of the full multivariate history.
+    Y is the next `forecast_horizon` target values.
+    """
+    if forecast_horizon < 1:
+        raise ValueError("[VALIDATION] forecast_horizon must be >= 1.")
+
+    dataX, dataY = [], []
+    max_start = len(dataset) - look_back - forecast_horizon + 1
+    for start_idx in range(max_start):
+        end_history = start_idx + look_back
+        end_target = end_history + forecast_horizon
+        dataX.append(dataset[start_idx:end_history, :])
+        dataY.append(dataset[end_history:end_target, 0])
     return np.array(dataX), np.array(dataY)
 
 
@@ -84,7 +129,135 @@ def _estimate_std_dev(residuals: ArrayLike, reference_series: ArrayLike) -> floa
     return float(max(baseline * 0.05, 1.0))
 
 
-def _forecast_from_state(state: Dict[str, Any], steps: int) -> Tuple[List[float], float]:
+def _set_random_seed(seed: int = 42) -> None:
+    random.seed(seed)
+    np.random.seed(seed)
+
+
+def _resolve_production_forecast_horizon(
+    state: Optional[Dict[str, Any]] = None,
+    eval_forecast_horizon: int = 0,
+) -> int:
+    configured_horizon = DEFAULT_PRODUCTION_FORECAST_HORIZON
+    if state is not None:
+        configured_horizon = int(
+            state.get(
+                "production_forecast_horizon",
+                state.get("forecast_horizon", DEFAULT_PRODUCTION_FORECAST_HORIZON),
+            )
+            or DEFAULT_PRODUCTION_FORECAST_HORIZON
+        )
+    return max(int(eval_forecast_horizon or 0), configured_horizon)
+
+
+def _can_fit_direct_forecast(train_size: int, look_back: int, forecast_horizon: int) -> bool:
+    return forecast_horizon > 0 and train_size >= look_back + forecast_horizon
+
+
+def _build_preprocessor(
+    parsed_data: ParsedData,
+    feature_types: Dict[str, str],
+    train_range: range,
+    normalization: str,
+) -> Tuple[Any, np.ndarray]:
+    df = parsed_data.df
+    target_key = parsed_data.target_key
+    feature_order = [key for key in parsed_data.feature_keys if key in df.columns and key != target_key]
+    numeric_features = [key for key in feature_order if feature_types.get(key) == "numeric"]
+    categorical_features = [key for key in feature_order if feature_types.get(key) == "categorical"]
+
+    log.debug(
+        "Target: '%s', Numeric features: %s, Categorical features: %s",
+        target_key,
+        numeric_features,
+        categorical_features,
+    )
+
+    if normalization == 'zscore':
+        scaler = StandardScaler()
+        log.info("Using StandardScaler (z-score normalization)")
+    elif normalization == 'minmax':
+        scaler = MinMaxScaler(feature_range=(0, 1))
+        log.info("Using MinMaxScaler (0-1 normalization)")
+    else:
+        raise ValueError(f"[VALIDATION] Unknown normalization method: {normalization}")
+
+    numeric_transformer = Pipeline(steps=[('scaler', scaler)])
+    categorical_transformer = Pipeline(steps=[('onehot', OneHotEncoder(handle_unknown='ignore'))])
+
+    preprocessor = ColumnTransformer(
+        transformers=[
+            ('numeric', numeric_transformer, [target_key] + numeric_features),
+            ('categorical', categorical_transformer, categorical_features),
+        ],
+        remainder='drop',
+    )
+
+    log.info("Fitting preprocessor on TRAINING data only...")
+    train_df = df.iloc[train_range]
+    preprocessor.fit(train_df)
+
+    scaled_series = preprocessor.transform(df)
+    if isinstance(scaled_series, csr_matrix):
+        scaled_series = scaled_series.toarray()
+
+    log.info(
+        "Preprocessed data shape: %s (features after encoding: %s)",
+        scaled_series.shape,
+        scaled_series.shape[1],
+    )
+    return preprocessor, np.asarray(scaled_series, dtype=float)
+
+
+def _inverse_transform_target_values(preprocessor: Any, scaled_values: np.ndarray) -> np.ndarray:
+    target_scaler = preprocessor.named_transformers_['numeric'].named_steps['scaler']
+    flat_values = np.asarray(scaled_values, dtype=float).reshape(-1)
+    n_numeric_features = target_scaler.n_features_in_
+    dummy_array = np.zeros((len(flat_values), n_numeric_features))
+    dummy_array[:, 0] = flat_values
+    return target_scaler.inverse_transform(dummy_array)[:, 0]
+
+
+def _forecast_direct_from_state(state: Dict[str, Any], steps: int) -> Tuple[List[float], float]:
+    keras_model = state["keras_model"]
+    preprocessor = state["preprocessor"]
+    look_back = state["look_back"]
+    history_df = state["history_df"]
+    std_dev_residuals = float(state.get("std_dev_residuals", 0.0))
+    forecast_horizon = int(state.get("forecast_horizon", 0))
+
+    if forecast_horizon < 1:
+        raise ValueError("[VALIDATION] Saved LSTM model is missing forecast_horizon.")
+    if steps > forecast_horizon:
+        raise ValueError(
+            f"[VALIDATION] Requested forecast_steps ({steps}) exceeds the saved LSTM horizon ({forecast_horizon})."
+        )
+
+    log.info(
+        "Generating %s-step direct forecast with look_back=%s, saved_horizon=%s",
+        steps,
+        look_back,
+        forecast_horizon,
+    )
+
+    scaled_history = preprocessor.transform(history_df)
+    if isinstance(scaled_history, csr_matrix):
+        scaled_history = scaled_history.toarray()
+    n_features_out = scaled_history.shape[1]
+    if len(history_df) < look_back:
+        raise ValueError("[VALIDATION] Saved history is shorter than look_back.")
+
+    log.debug(f"Preprocessed history: {len(history_df)} rows, {n_features_out} features after transformation")
+
+    input_seq = scaled_history[-look_back:].reshape(1, look_back, n_features_out)
+    predictions_scaled = keras_model.predict(input_seq, verbose=0)[0]
+    unscaled_predictions = _inverse_transform_target_values(preprocessor, predictions_scaled)
+
+    log.info(f"Generated {len(unscaled_predictions)} predictions after inverse transform")
+    return unscaled_predictions[:steps].flatten().tolist(), std_dev_residuals
+
+
+def _forecast_autoregressive_from_state(state: Dict[str, Any], steps: int) -> Tuple[List[float], float]:
     keras_model = state["keras_model"]
     preprocessor = state["preprocessor"]
     look_back = state["look_back"]
@@ -92,7 +265,7 @@ def _forecast_from_state(state: Dict[str, Any], steps: int) -> Tuple[List[float]
     std_dev_residuals = float(state.get("std_dev_residuals", 0.0))
     normalization = state.get("normalization", 'minmax')
 
-    log.info(f"Generating {steps}-step forecast with look_back={look_back}, normalization='{normalization}'")
+    log.info(f"Generating {steps}-step autoregressive forecast with look_back={look_back}, normalization='{normalization}'")
 
     scaled_history = preprocessor.transform(history_df)
     if isinstance(scaled_history, csr_matrix):
@@ -102,7 +275,6 @@ def _forecast_from_state(state: Dict[str, Any], steps: int) -> Tuple[List[float]
 
     input_seq = scaled_history[-look_back:].reshape(1, look_back, n_features_out)
 
-    target_scaler = preprocessor.named_transformers_['numeric'].named_steps['scaler']
     target_column_indices = preprocessor.output_indices_['numeric']
     if isinstance(target_column_indices, slice):
         target_column_index = target_column_indices.start
@@ -125,14 +297,18 @@ def _forecast_from_state(state: Dict[str, Any], steps: int) -> Tuple[List[float]
 
         input_seq = np.append(input_seq[:, 1:, :], next_input_step_scaled, axis=1)
 
-    n_numeric_features = target_scaler.n_features_in_
-    dummy_array = np.zeros((len(predictions_scaled), n_numeric_features))
-    dummy_array[:, 0] = predictions_scaled
-    unscaled_predictions = target_scaler.inverse_transform(dummy_array)[:, 0]
+    unscaled_predictions = _inverse_transform_target_values(preprocessor, np.asarray(predictions_scaled, dtype=float))
 
     log.info(f"Generated {len(unscaled_predictions)} predictions after inverse transform")
 
     return unscaled_predictions.flatten().tolist(), std_dev_residuals
+
+
+def _forecast_from_state(state: Dict[str, Any], steps: int) -> Tuple[List[float], float]:
+    strategy = state.get("forecast_strategy", LEGACY_FORECAST_STRATEGY)
+    if strategy == DIRECT_FORECAST_STRATEGY:
+        return _forecast_direct_from_state(state, steps)
+    return _forecast_autoregressive_from_state(state, steps)
 
 
 # ---------- predict ----------
@@ -156,29 +332,102 @@ def predict(
         keras_model_path = state.get("keras_model_path")
         if not keras_model_path or not os.path.exists(keras_model_path):
             raise FileNotFoundError(f"Keras model file not found at {keras_model_path}")
-        state["keras_model"] = keras_load_model(keras_model_path)
+        state["keras_model"] = keras_load_model(keras_model_path, compile=False)
         log.debug(f"Loaded Keras model from {keras_model_path}")
 
     return _forecast_from_state(state, steps)
 
 
-def _infer_feature_types(parsed_data: ParsedData) -> Dict[str, str]:
-    feature_types: Dict[str, str] = {}
-    time_key = parsed_data.time_key or ''
+def _fit_direct_model(
+    parsed_data: ParsedData,
+    feature_types: Dict[str, str],
+    train_range: range,
+    look_back: int,
+    epochs: int,
+    normalization: str,
+    forecast_horizon: int,
+):
+    from tensorflow.keras.layers import LSTM as KerasLSTM
+    from tensorflow.keras.layers import Dense
+    from tensorflow.keras.layers import Input
+    from tensorflow.keras.callbacks import EarlyStopping, LearningRateScheduler
+    from tensorflow.keras.models import Sequential
+    from tensorflow.keras.optimizers import Adam
 
-    for col in parsed_data.df.columns:
-        if col == parsed_data.target_key or col == time_key:
-            continue
-        if pd.api.types.is_numeric_dtype(parsed_data.df[col]):
-            feature_types[col] = 'numeric'
-        else:
-            feature_types[col] = 'categorical'
+    df = parsed_data.df
+    preprocessor, scaled_series = _build_preprocessor(parsed_data, feature_types, train_range, normalization)
+    n_features_out = scaled_series.shape[1]
 
-    feature_types[parsed_data.target_key] = 'numeric'
-    return feature_types
+    train_data = scaled_series[train_range]
+    log.info(
+        "Creating direct LSTM dataset with look_back=%s, forecast_horizon=%s...",
+        look_back,
+        forecast_horizon,
+    )
+    trainX, trainY = _create_direct_dataset(train_data, look_back, forecast_horizon)
+    if trainX.size == 0:
+        raise ValueError(
+            "[VALIDATION] Training range is too short for the requested LSTM look_back and forecast horizon."
+        )
+    log.info(f"Training dataset created: X shape={trainX.shape}, Y shape={trainY.shape}")
+
+    base_units = max(16, min(64, n_features_out * 4, max(16, len(trainX) * 4)))
+    secondary_units = max(8, base_units // 2)
+    dense_units = max(8, secondary_units)
+    log.info(
+        "Building direct LSTM model: units=(%s,%s), dense=%s, horizon=%s, input_shape=(%s, %s)",
+        base_units,
+        secondary_units,
+        dense_units,
+        forecast_horizon,
+        look_back,
+        n_features_out,
+    )
+
+    model = Sequential([
+        Input(shape=(look_back, n_features_out)),
+        KerasLSTM(base_units, return_sequences=True),
+        KerasLSTM(secondary_units),
+        Dense(dense_units, activation="relu"),
+        Dense(forecast_horizon),
+    ])
+
+    initial_learning_rate = 0.001
+    decay_rate = 0.98
+    optimizer = Adam(learning_rate=initial_learning_rate, clipnorm=1.0)
+    model.compile(loss="mean_squared_error", optimizer=optimizer)
+
+    def lr_schedule(epoch):
+        return initial_learning_rate * (decay_rate ** epoch)
+
+    lr_scheduler = LearningRateScheduler(lr_schedule, verbose=0)
+    early_stopping = EarlyStopping(
+        monitor="loss",
+        patience=max(2, min(6, epochs // 4 or 2)),
+        restore_best_weights=True,
+    )
+    batch_size = max(1, min(8, len(trainX)))
+
+    log.info(f"Training direct LSTM model for {epochs} epochs with batch_size={batch_size}...")
+    log.info(f"Initial learning rate: {initial_learning_rate}, decay rate: {decay_rate}")
+    model.fit(
+        trainX,
+        trainY,
+        epochs=epochs,
+        batch_size=batch_size,
+        verbose=0,
+        callbacks=[lr_scheduler, early_stopping],
+        shuffle=False,
+    )
+    log.info("Model training completed")
+
+    history_df_for_saving = df.iloc[train_range.stop - look_back : train_range.stop].copy()
+    log.debug(f"Saved history for future predictions: {len(history_df_for_saving)} rows")
+
+    return model, preprocessor, history_df_for_saving
 
 
-def _fit_model(
+def _fit_autoregressive_model(
     parsed_data: ParsedData,
     feature_types: Dict[str, str],
     train_range: range,
@@ -188,73 +437,68 @@ def _fit_model(
 ):
     from tensorflow.keras.layers import LSTM as KerasLSTM
     from tensorflow.keras.layers import Dense
+    from tensorflow.keras.layers import Input
+    from tensorflow.keras.callbacks import EarlyStopping, LearningRateScheduler
     from tensorflow.keras.models import Sequential
     from tensorflow.keras.optimizers import Adam
-    from tensorflow.keras.callbacks import LearningRateScheduler
 
     df = parsed_data.df
-    target_key = parsed_data.target_key
-    numeric_features = [k for k, v in feature_types.items() if v == 'numeric' and k != target_key]
-    categorical_features = [k for k, v in feature_types.items() if v == 'categorical']
-
-    log.debug(f"Target: '{target_key}', Numeric features: {numeric_features}, Categorical features: {categorical_features}")
-
-    if normalization == 'zscore':
-        scaler = StandardScaler()
-        log.info("Using StandardScaler (z-score normalization)")
-    elif normalization == 'minmax':
-        scaler = MinMaxScaler(feature_range=(0, 1))
-        log.info("Using MinMaxScaler (0-1 normalization)")
-    else:
-        raise ValueError(f"Unknown normalization method: {normalization}")
-
-    numeric_transformer = Pipeline(steps=[('scaler', scaler)])
-    categorical_transformer = Pipeline(steps=[('onehot', OneHotEncoder(handle_unknown='ignore'))])
-
-    preprocessor = ColumnTransformer(
-        transformers=[
-            ('numeric', numeric_transformer, [target_key] + numeric_features),
-            ('categorical', categorical_transformer, categorical_features)
-        ],
-        remainder='drop'
-    )
-
-    log.info("Fitting preprocessor on TRAINING data only...")
-    train_df = df.iloc[train_range]
-    preprocessor.fit(train_df)
-
-    scaled_series = preprocessor.transform(df)
-    if isinstance(scaled_series, csr_matrix):
-        scaled_series = scaled_series.toarray()
-
+    preprocessor, scaled_series = _build_preprocessor(parsed_data, feature_types, train_range, normalization)
     n_features_out = scaled_series.shape[1]
-    log.info(f"Preprocessed data shape: {scaled_series.shape} (features after encoding: {n_features_out})")
 
     train_data = scaled_series[train_range]
-    log.info(f"Creating LSTM dataset with look_back={look_back}...")
-    trainX, trainY = _create_dataset(train_data, look_back)
+    log.info(f"Creating autoregressive LSTM dataset with look_back={look_back}...")
+    trainX, trainY = _create_autoregressive_dataset(train_data, look_back)
+    if trainX.size == 0:
+        raise ValueError("[VALIDATION] Training range is too short for autoregressive LSTM.")
     log.info(f"Training dataset created: X shape={trainX.shape}, Y shape={trainY.shape}")
 
-    log.info(f"Building LSTM model: 3 layers, 288 units each, input_shape=({look_back}, {n_features_out})")
-    model = Sequential()
-    model.add(KerasLSTM(288, input_shape=(look_back, n_features_out), return_sequences=True))
-    model.add(KerasLSTM(288, return_sequences=True))
-    model.add(KerasLSTM(288))
-    model.add(Dense(1))
+    base_units = max(16, min(64, n_features_out * 4, max(16, len(trainX) * 4)))
+    secondary_units = max(8, base_units // 2)
+    dense_units = max(8, secondary_units)
+    log.info(
+        "Building autoregressive LSTM model: units=(%s,%s), dense=%s, input_shape=(%s, %s)",
+        base_units,
+        secondary_units,
+        dense_units,
+        look_back,
+        n_features_out,
+    )
 
-    initial_learning_rate = 0.01
-    decay_rate = 0.99
-    optimizer = Adam(learning_rate=initial_learning_rate)
+    model = Sequential([
+        Input(shape=(look_back, n_features_out)),
+        KerasLSTM(base_units, return_sequences=True),
+        KerasLSTM(secondary_units),
+        Dense(dense_units, activation="relu"),
+        Dense(1),
+    ])
+
+    initial_learning_rate = 0.001
+    decay_rate = 0.98
+    optimizer = Adam(learning_rate=initial_learning_rate, clipnorm=1.0)
     model.compile(loss="mean_squared_error", optimizer=optimizer)
 
     def lr_schedule(epoch):
         return initial_learning_rate * (decay_rate ** epoch)
 
     lr_scheduler = LearningRateScheduler(lr_schedule, verbose=0)
+    early_stopping = EarlyStopping(
+        monitor="loss",
+        patience=max(2, min(6, epochs // 4 or 2)),
+        restore_best_weights=True,
+    )
+    batch_size = max(1, min(8, len(trainX)))
 
-    log.info(f"Training LSTM model for {epochs} epochs with batch_size=6...")
-    log.info(f"Initial learning rate: {initial_learning_rate}, decay rate: {decay_rate}")
-    model.fit(trainX, trainY, epochs=epochs, batch_size=6, verbose=0, callbacks=[lr_scheduler])
+    log.info(f"Training autoregressive LSTM model for {epochs} epochs with batch_size={batch_size}...")
+    model.fit(
+        trainX,
+        trainY,
+        epochs=epochs,
+        batch_size=batch_size,
+        verbose=0,
+        callbacks=[lr_scheduler, early_stopping],
+        shuffle=False,
+    )
     log.info("Model training completed")
 
     history_df_for_saving = df.iloc[train_range.stop - look_back : train_range.stop].copy()
@@ -282,18 +526,22 @@ def train_and_evaluate(
     df = parsed_data.df
     target_key = parsed_data.target_key
     train_target_values = df[target_key].values[train_range]
+    steps_to_eval_end = eval_range.stop - train_range.stop
+    forecast_offset = eval_range.start - train_range.stop
+    forecast_horizon = steps_to_eval_end
 
     log.debug(f"Total series length: {len(df)}")
     log.debug(f"Training data range: [{train_range.start}, {train_range.stop-1}], count={train_range.stop - train_range.start}")
     log.debug(f"Evaluation data range: [{eval_range.start}, {eval_range.stop-1}], count={eval_range.stop - eval_range.start}")
 
-    model, preprocessor, history_df_for_saving = _fit_model(
+    model, preprocessor, history_df_for_saving = _fit_direct_model(
         parsed_data,
         feature_types,
         train_range,
         look_back,
         epochs,
         normalization,
+        forecast_horizon,
     )
 
     # Make predictions for evaluation
@@ -302,16 +550,16 @@ def train_and_evaluate(
         return {}, model, preprocessor, [], [], _estimate_std_dev([], train_target_values), history_df_for_saving
 
     log.info(f"Generating predictions for evaluation range...")
-    steps_to_eval_end = eval_range.stop - train_range.stop
-    forecast_offset = eval_range.start - train_range.stop
     state_for_eval = {
         "keras_model": model,
         "preprocessor": preprocessor,
         "look_back": look_back,
+        "forecast_horizon": forecast_horizon,
+        "forecast_strategy": DIRECT_FORECAST_STRATEGY,
         "history_df": history_df_for_saving,
         "normalization": normalization,
     }
-    full_forecast, _ = _forecast_from_state(state_for_eval, steps_to_eval_end)
+    full_forecast, _ = _forecast_from_state(state_for_eval, forecast_horizon)
     y_pred = full_forecast[forecast_offset: forecast_offset + len(eval_range)]
     if len(y_pred) != len(eval_range):
         raise ValueError("[VALIDATION] 无法为完整评估区间生成 LSTM 预测。")
@@ -330,6 +578,7 @@ def train_and_evaluate(
         "r2": r2(y_true, y_pred),
         "look_back": look_back,
         "epochs": epochs,
+        "forecast_horizon": forecast_horizon,
         "evaluated_points": len(y_true),
         "evaluate_indices": list(eval_range),
         "evaluate_months": [timestamps[i] for i in eval_range] if timestamps else [],
@@ -348,6 +597,8 @@ def run(args) -> None:
     os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
     import tensorflow as tf
     tf.get_logger().setLevel('ERROR')
+    tf.keras.utils.set_random_seed(42)
+    _set_random_seed(42)
 
     log.info(f"LSTM run started with args: {vars(args)}")
 
@@ -374,17 +625,62 @@ def run(args) -> None:
         look_back = int(state["look_back"])
         epochs = int(state.get("epochs", 20))
         normalization = state.get("normalization", 'minmax')
-        _validate_fit_args(parsed_data, ts, te, look_back)
-
-        feature_types = _infer_feature_types(parsed_data)
-        model, preprocessor, history_df = _fit_model(
-            parsed_data,
-            feature_types,
-            range(ts, te + 1),
-            look_back,
-            epochs,
-            normalization,
+        forecast_strategy = state.get("forecast_strategy", LEGACY_FORECAST_STRATEGY)
+        train_size = te - ts + 1
+        desired_forecast_horizon = (
+            _resolve_production_forecast_horizon(state=state)
+            if forecast_strategy == DIRECT_FORECAST_STRATEGY
+            else 0
         )
+        effective_forecast_strategy = forecast_strategy
+        fit_forecast_horizon = desired_forecast_horizon
+        if (
+            forecast_strategy == DIRECT_FORECAST_STRATEGY
+            and desired_forecast_horizon > 0
+            and not _can_fit_direct_forecast(train_size, look_back, desired_forecast_horizon)
+        ):
+            log.warning(
+                "Falling back to autoregressive production LSTM because train_size=%s is insufficient for look_back=%s and desired_horizon=%s",
+                train_size,
+                look_back,
+                desired_forecast_horizon,
+            )
+            effective_forecast_strategy = LEGACY_FORECAST_STRATEGY
+            fit_forecast_horizon = 0
+
+        _validate_fit_args(
+            parsed_data,
+            ts,
+            te,
+            look_back,
+            fit_forecast_horizon,
+            effective_forecast_strategy,
+        )
+
+        feature_types = state.get("feature_types") or infer_parsed_feature_types(
+            parsed_data,
+            target_key=parsed_data.target_key,
+            feature_keys=parsed_data.feature_keys,
+        )
+        if effective_forecast_strategy == DIRECT_FORECAST_STRATEGY and fit_forecast_horizon > 0:
+            model, preprocessor, history_df = _fit_direct_model(
+                parsed_data,
+                feature_types,
+                range(ts, te + 1),
+                look_back,
+                epochs,
+                normalization,
+                fit_forecast_horizon,
+            )
+        else:
+            model, preprocessor, history_df = _fit_autoregressive_model(
+                parsed_data,
+                feature_types,
+                range(ts, te + 1),
+                look_back,
+                epochs,
+                normalization,
+            )
 
         keras_model_path = os.path.splitext(save_path)[0] + "_keras_model.h5"
         temp_keras_model_path = os.path.splitext(save_path)[0] + f"_keras_model.tmp-{os.getpid()}.h5"
@@ -414,7 +710,15 @@ def run(args) -> None:
             "history_df": history_df,
             "target_key": parsed_data.target_key,
             "feature_keys": parsed_data.feature_keys,
+            "feature_types": feature_types,
             "keras_model_path": keras_model_path,
+            "forecast_horizon": (
+                fit_forecast_horizon
+                if effective_forecast_strategy == DIRECT_FORECAST_STRATEGY and fit_forecast_horizon > 0
+                else 0
+            ),
+            "forecast_strategy": effective_forecast_strategy,
+            "production_forecast_horizon": desired_forecast_horizon,
             "std_dev_residuals": std_dev_residuals,
         }
         dump_model(next_state, save_path)
@@ -427,8 +731,11 @@ def run(args) -> None:
             "train_end_index": te,
             "target_key": parsed_data.target_key,
             "feature_keys": parsed_data.feature_keys,
+            "feature_types": feature_types,
             "saved_model": save_path,
         }
+        if fit_forecast_horizon > 0:
+            out["forecast_horizon"] = fit_forecast_horizon
         out["logs"] = get_log_contents()
         print(json.dumps(out, ensure_ascii=False, indent=2 if pretty else None))
         return
@@ -475,8 +782,8 @@ def run(args) -> None:
 
     try:
         feature_types_str = getattr(args, "feature_types", None) or "{}"
-        feature_types = json.loads(feature_types_str)
-        log.debug(f"Received feature_types: {feature_types}")
+        feature_types_override = json.loads(feature_types_str)
+        log.debug(f"Received feature_types override: {feature_types_override}")
 
         parsed_data = load_data_from_json(
             args.data, target_key=target_key, feature_keys=feature_keys_list
@@ -484,9 +791,16 @@ def run(args) -> None:
         months = parsed_data.timestamps or [str(i) for i in range(parsed_data.n_obs)]
 
         # If feature_types is empty, infer from dataframe dtypes
-        if not feature_types:
+        if feature_types_override:
+            feature_types = dict(feature_types_override)
+            log.info("Using provided feature_types override.")
+        else:
             log.info("No feature_types provided, inferring from DataFrame.")
-            feature_types = _infer_feature_types(parsed_data)
+            feature_types = infer_parsed_feature_types(
+                parsed_data,
+                target_key=parsed_data.target_key,
+                feature_keys=parsed_data.feature_keys,
+            )
             log.info(f"Inferred feature_types: {feature_types}")
 
         if parsed_data.target_key not in feature_types:
@@ -535,6 +849,7 @@ def run(args) -> None:
             "look_back": look_back,
             "epochs": epochs,
             "normalization": normalization,
+            "forecast_horizon": metrics.get("forecast_horizon"),
             "train_range": {"start_index": ts, "end_index": te},
             "evaluate_range": {"start_index": es, "end_index": ee},
             "metrics": metrics,
@@ -567,7 +882,13 @@ def run(args) -> None:
                 "history_df": history_df,
                 "target_key": parsed_data.target_key,
                 "feature_keys": parsed_data.feature_keys,
+                "feature_types": feature_types,
                 "keras_model_path": keras_model_path,
+                "forecast_horizon": int(metrics.get("forecast_horizon", len(range(es, ee + 1)))),
+                "forecast_strategy": DIRECT_FORECAST_STRATEGY,
+                "production_forecast_horizon": _resolve_production_forecast_horizon(
+                    eval_forecast_horizon=int(metrics.get("forecast_horizon", 0) or 0)
+                ),
                 "std_dev_residuals": std_dev_residuals,
             }
             dump_model(state, save_path)
@@ -581,12 +902,19 @@ def run(args) -> None:
         print(json.dumps(out, ensure_ascii=False, indent=2 if pretty else None))
 
     except (ValueError, TypeError, json.JSONDecodeError, KeyError, FileNotFoundError) as e:
+        if str(e).startswith("[VALIDATION]") or str(e).startswith("[DATA]"):
+            raise
         log.error(f"An error occurred during data processing or training: {e}", exc_info=True)
         raise ValueError(f"[DATA] Failed to parse or process --data: {e}")
 
 
 def _validate_fit_args(
-    parsed_data: ParsedData, ts: int, te: int, look_back: int
+    parsed_data: ParsedData,
+    ts: int,
+    te: int,
+    look_back: int,
+    forecast_horizon: int = 0,
+    forecast_strategy: str = DIRECT_FORECAST_STRATEGY,
 ) -> None:
     n = parsed_data.n_obs
 
@@ -596,6 +924,11 @@ def _validate_fit_args(
         raise ValueError("[VALIDATION] look_back must be >= 1.")
     if te - ts + 1 <= look_back:
         raise ValueError("[VALIDATION] Training range must be larger than look_back.")
+    if forecast_strategy == DIRECT_FORECAST_STRATEGY and forecast_horizon > 0:
+        if te - ts + 1 < look_back + forecast_horizon:
+            raise ValueError(
+                "[VALIDATION] Training range is too short for the saved LSTM direct forecast horizon."
+            )
 
 
 def _validate_training_args(
@@ -623,8 +956,25 @@ def _validate_training_args(
     if te - ts + 1 <= look_back:
         log.error(f"Training range size {te - ts + 1} must be larger than look_back {look_back}")
         raise ValueError("[VALIDATION] Training range must be larger than look_back.")
+    forecast_horizon = ee - te
+    if te - ts + 1 < look_back + forecast_horizon:
+        log.error(
+            "Training range size %s is too short for look_back=%s and forecast_horizon=%s",
+            te - ts + 1,
+            look_back,
+            forecast_horizon,
+        )
+        raise ValueError(
+            "[VALIDATION] Training range must contain at least look_back + forecast horizon points."
+        )
 
     # Additional helpful validations
     train_size = te - ts + 1
     eval_size = ee - es + 1
-    log.info(f"Validation passed: train_size={train_size}, eval_size={eval_size}, look_back={look_back}")
+    log.info(
+        "Validation passed: train_size=%s, eval_size=%s, look_back=%s, forecast_horizon=%s",
+        train_size,
+        eval_size,
+        look_back,
+        forecast_horizon,
+    )

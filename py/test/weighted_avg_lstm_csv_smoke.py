@@ -24,18 +24,6 @@ LSTM_FEATURE_KEYS = [
     "区域",
     "天气类型",
 ]
-LSTM_FEATURE_TYPES = {
-    "销售数量": "numeric",
-    "价格指数": "numeric",
-    "促销投入": "numeric",
-    "库存水平": "numeric",
-    "搜索热度": "numeric",
-    "竞争对手价格": "numeric",
-    "节假日强度": "numeric",
-    "渠道类型": "categorical",
-    "区域": "categorical",
-    "天气类型": "categorical",
-}
 BASE_MODEL_TRAIN_ARGS = {
     "ma": ("--window", "3"),
     "es": ("--alpha", "0.4"),
@@ -51,8 +39,6 @@ BASE_MODEL_TRAIN_ARGS = {
         "销售数量",
         "--lstm-features",
         ",".join(LSTM_FEATURE_KEYS),
-        "--feature-types",
-        json.dumps(LSTM_FEATURE_TYPES, ensure_ascii=False),
     ),
 }
 
@@ -170,8 +156,8 @@ def main() -> None:
     train_start = 0
     train_end = 27
     eval_start = 28
-    eval_end = 35
-    future_steps = 3
+    eval_end = 30
+    future_steps = 6
 
     with tempfile.TemporaryDirectory(prefix="fangzhen-weighted-avg-lstm-csv-") as temp_dir:
         temp_path = Path(temp_dir)
@@ -222,12 +208,12 @@ def main() -> None:
         train_state = load_pickled_state(weighted_model_backtest)
         actual_eval_predictions = extract_predictions(train_output)
         actual_eval_std_devs = extract_std_devs(train_output)
-        expected_eval_predictions = combine_weighted_predictions(train_state, forecast_steps=8)
+        expected_eval_predictions = combine_weighted_predictions(train_state, forecast_steps=3)
         actual_weights = {name: float(train_output["weights"][name]) for name in BASE_MODELS}
         assert train_output["mode"] == "weighted_avg_train_eval"
         assert train_output["models"] == BASE_MODELS
-        assert train_output["metrics"]["evaluate_months"] == timestamps[28:36]
-        assert train_output["eval_y_true"] == sales[28:36]
+        assert train_output["metrics"]["evaluate_months"] == timestamps[28:31]
+        assert train_output["eval_y_true"] == sales[28:31]
         assert_series_close([sum(actual_weights.values())], [1.0])
         assert set(actual_weights.keys()) == set(BASE_MODELS)
         assert all(weight >= 0 for weight in actual_weights.values())
@@ -237,6 +223,9 @@ def main() -> None:
         saved_lstm_member = Path(train_state["base_model_states"]["lstm"]["model_file"])
         if not saved_lstm_member.exists():
             raise AssertionError(f"saved weighted_avg LSTM member artifact missing: {saved_lstm_member}")
+        saved_lstm_state = load_pickled_state(saved_lstm_member)
+        assert saved_lstm_state["forecast_strategy"] == "direct_multi_horizon"
+        assert saved_lstm_state["forecast_horizon"] == 3
         saved_lstm_keras = saved_lstm_member.with_name(f"{saved_lstm_member.stem}_keras_model.h5")
         if not saved_lstm_keras.exists():
             raise AssertionError(f"saved weighted_avg LSTM keras artifact missing: {saved_lstm_keras}")
@@ -266,6 +255,10 @@ def main() -> None:
         production_lstm_member = Path(production_state["base_model_states"]["lstm"]["model_file"])
         if not production_lstm_member.exists():
             raise AssertionError(f"production weighted_avg LSTM member artifact missing: {production_lstm_member}")
+        production_lstm_state = load_pickled_state(production_lstm_member)
+        assert production_lstm_state["forecast_strategy"] == "direct_multi_horizon"
+        assert production_lstm_state["forecast_horizon"] == future_steps
+        assert production_lstm_state["production_forecast_horizon"] == future_steps
         production_lstm_keras = production_lstm_member.with_name(f"{production_lstm_member.stem}_keras_model.h5")
         if not production_lstm_keras.exists():
             raise AssertionError(f"production weighted_avg LSTM keras artifact missing: {production_lstm_keras}")
