@@ -1,4 +1,7 @@
+import { describe, expect, mock, test } from "bun:test";
 import { sign } from "hono/jwt";
+
+mock.restore();
 
 type AppLike = {
   fetch: (request: Request) => Promise<Response>;
@@ -7,13 +10,13 @@ type AppLike = {
 type UserRole = "Student" | "Teacher" | "Assistant" | "Admin";
 
 const ensureTestEnv = () => {
-  process.env.DB_HOST ??= "127.0.0.1";
-  process.env.DB_USER ??= "test";
-  process.env.DB_PASSWORD ??= "test";
-  process.env.DB_DATABASE ??= "test";
-  process.env.JWT_SECRET ??= "test-jwt-secret";
-  process.env.PORT ??= "3001";
-  process.env.DEFAULT_PASSWORD_HASH ??= "test-default-hash";
+  process.env.DB_HOST = "127.0.0.1";
+  process.env.DB_USER = "test";
+  process.env.DB_PASSWORD = "test";
+  process.env.DB_DATABASE = "test";
+  process.env.JWT_SECRET = "test-jwt-secret";
+  process.env.PORT = "3001";
+  process.env.DEFAULT_PASSWORD_HASH = "test-default-hash";
 };
 
 let appPromise: Promise<AppLike> | null = null;
@@ -21,7 +24,7 @@ let appPromise: Promise<AppLike> | null = null;
 const getApp = async (): Promise<AppLike> => {
   if (!appPromise) {
     ensureTestEnv();
-    appPromise = import("../../../src/index").then((module) => module.app as AppLike);
+    appPromise = import("../../../src/index?permissions-test").then((module) => module.app as AppLike);
   }
   return appPromise;
 };

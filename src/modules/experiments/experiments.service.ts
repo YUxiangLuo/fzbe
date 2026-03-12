@@ -4,10 +4,97 @@ import type { CreateExperimentInput, UpdateExperimentInput, ExperimentEventInput
 import { prepareStudentExperimentUpdate } from "./experiment-update-policy";
 
 const BOOLEAN_FIELDS = new Set(["moving_average_completed", "exponential_smoothing_completed", "arima_completed", "lstm_completed", "ensemble_weighted_completed", "ensemble_boosting_completed", "ensemble_stacking_completed", "quiz_about_model_completed", "quiz_about_plan_completed", "production_plan_completed"]);
-const JSON_FIELDS = new Set(["arima_adf_stationarity", "lstm_features", "ensemble_weighted_base_models", "ensemble_boosting_base_models", "ensemble_stacking_base_models", "production_mps_table", "production_forecast_results"]);
+const JSON_FIELDS = new Set(["selected_base_models", "selected_ensemble_models", "arima_adf_stationarity", "lstm_features", "ensemble_weighted_base_models", "ensemble_boosting_base_models", "ensemble_stacking_base_models", "production_mps_table", "production_forecast_results"]);
 const INTEGER_FIELDS = new Set(["experiment_id", "student_id", "highest_completed_step", "current_step", "data_window_train_start_index", "data_window_train_end_index", "data_window_evaluate_start_index", "data_window_evaluate_end_index", "moving_average_window", "arima_p", "arima_d", "arima_q", "production_forecast_periods", "production_capacity", "production_custom_capacity", "total_active_duration_seconds"]);
 const FLOAT_FIELDS = new Set(["moving_average_metrics_rmse", "moving_average_metrics_mae", "moving_average_metrics_r2", "exponential_smoothing_alpha", "exponential_smoothing_metrics_rmse", "exponential_smoothing_metrics_mae", "exponential_smoothing_metrics_r2", "arima_metrics_rmse", "arima_metrics_mae", "arima_metrics_r2", "lstm_metrics_rmse", "lstm_metrics_mae", "lstm_metrics_r2", "ensemble_weighted_metrics_rmse", "ensemble_weighted_metrics_mae", "ensemble_weighted_metrics_r2", "ensemble_boosting_metrics_rmse", "ensemble_boosting_metrics_mae", "ensemble_boosting_metrics_r2", "ensemble_stacking_metrics_rmse", "ensemble_stacking_metrics_mae", "ensemble_stacking_metrics_r2", "production_initial_inventory", "production_target_service_level", "production_safety_stock_z_score"]);
 const datetimeFields = new Set(["start_time", "last_activity_at", "completion_time"]);
+const BASE_MODEL_SELECTION_ORDER = ["moving_average", "exponential_smoothing", "arima", "lstm"] as const;
+const ENSEMBLE_MODEL_SELECTION_ORDER = ["weighted_ensemble", "boosting_ensemble", "stacking_ensemble"] as const;
+const BASE_MODEL_SELECTION_ALIASES: Record<string, (typeof BASE_MODEL_SELECTION_ORDER)[number]> = {
+  moving_average: "moving_average",
+  ma: "moving_average",
+  exponential_smoothing: "exponential_smoothing",
+  exp: "exponential_smoothing",
+  es: "exponential_smoothing",
+  arima: "arima",
+  lstm: "lstm",
+};
+const ENSEMBLE_MODEL_SELECTION_ALIASES: Record<string, (typeof ENSEMBLE_MODEL_SELECTION_ORDER)[number]> = {
+  weighted_ensemble: "weighted_ensemble",
+  ensemble_weighted: "weighted_ensemble",
+  weighted_avg: "weighted_ensemble",
+  boosting_ensemble: "boosting_ensemble",
+  ensemble_boosting: "boosting_ensemble",
+  boosting: "boosting_ensemble",
+  stacking_ensemble: "stacking_ensemble",
+  ensemble_stacking: "stacking_ensemble",
+  stacking: "stacking_ensemble",
+};
+const MODEL_SELECTION_JSON_FIELDS = new Set([
+  "selected_base_models",
+  "selected_ensemble_models",
+  "ensemble_weighted_base_models",
+  "ensemble_boosting_base_models",
+  "ensemble_stacking_base_models",
+]);
+
+function normalizeSelectionArray<TSelection extends string>(
+  value: unknown,
+  allowedOrder: readonly TSelection[],
+  aliases: Record<string, TSelection>,
+) {
+  if (!Array.isArray(value)) {
+    return [];
+  }
+
+  const selected = new Set<TSelection>();
+  for (const item of value) {
+    if (typeof item !== "string") {
+      continue;
+    }
+
+    const normalizedItem = aliases[item];
+    if (normalizedItem) {
+      selected.add(normalizedItem);
+    }
+  }
+
+  return allowedOrder.filter((item) => selected.has(item));
+}
+
+function normalizeModelSelectionField(key: string, value: unknown) {
+  if (key === "selected_ensemble_models") {
+    return normalizeSelectionArray(
+      value,
+      ENSEMBLE_MODEL_SELECTION_ORDER,
+      ENSEMBLE_MODEL_SELECTION_ALIASES,
+    );
+  }
+
+  return normalizeSelectionArray(
+    value,
+    BASE_MODEL_SELECTION_ORDER,
+    BASE_MODEL_SELECTION_ALIASES,
+  );
+}
+
+function prepareJsonFieldForDb(key: string, rawValue: unknown) {
+  if (MODEL_SELECTION_JSON_FIELDS.has(key)) {
+    let parsedValue = rawValue;
+
+    if (typeof rawValue === "string") {
+      try {
+        parsedValue = JSON.parse(rawValue);
+      } catch {
+        parsedValue = rawValue;
+      }
+    }
+
+    return JSON.stringify(normalizeModelSelectionField(key, parsedValue));
+  }
+
+  return typeof rawValue === "string" ? rawValue : JSON.stringify(rawValue);
+}
 
 function sanitizeForDb(data: Record<string, unknown>) {
   const sanitized: Record<string, unknown> = {};
@@ -15,7 +102,7 @@ function sanitizeForDb(data: Record<string, unknown>) {
     if (rawValue === undefined) continue;
     if (rawValue === null) { sanitized[key] = null; continue; }
     if (BOOLEAN_FIELDS.has(key)) { sanitized[key] = rawValue === true || rawValue === 1 ? 1 : 0; continue; }
-    if (JSON_FIELDS.has(key)) { sanitized[key] = typeof rawValue === "string" ? rawValue : JSON.stringify(rawValue); continue; }
+    if (JSON_FIELDS.has(key)) { sanitized[key] = prepareJsonFieldForDb(key, rawValue); continue; }
     if (datetimeFields.has(key)) {
       if (rawValue instanceof Date) { sanitized[key] = rawValue; continue; }
       if (typeof rawValue === "string") {
@@ -64,7 +151,13 @@ function normalizeNumeric(value: unknown) {
 export function normalizeExperimentRow(row: RowDataPacket) {
   const result: Record<string, unknown> = {};
   for (const [key, value] of Object.entries(row)) {
-    if (JSON_FIELDS.has(key)) { result[key] = parseJsonField(value); continue; }
+    if (JSON_FIELDS.has(key)) {
+      const parsedValue = parseJsonField(value);
+      result[key] = MODEL_SELECTION_JSON_FIELDS.has(key)
+        ? normalizeModelSelectionField(key, parsedValue)
+        : parsedValue;
+      continue;
+    }
     if (BOOLEAN_FIELDS.has(key)) { result[key] = normalizeBoolean(value); continue; }
     if (INTEGER_FIELDS.has(key) || FLOAT_FIELDS.has(key)) { result[key] = normalizeNumeric(value); continue; }
     if (datetimeFields.has(key) && value instanceof Date) { result[key] = value.toISOString(); continue; }

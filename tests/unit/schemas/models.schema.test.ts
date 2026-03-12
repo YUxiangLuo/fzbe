@@ -2,6 +2,7 @@ import { describe, test, expect } from "bun:test";
 import {
   trainSchema,
   predictSchema,
+  prepareProductionSchema,
   ALL_MODELS,
   isModelType,
   getTrainSchemaForModel,
@@ -128,6 +129,22 @@ describe("Models Schemas", () => {
       const result = predictSchema.safeParse({
         experiment_id: 12,
         forecast_steps: 6,
+      });
+
+      expect(result.success).toBe(true);
+    });
+  });
+
+  describe("prepareProductionSchema", () => {
+    test("should require experiment_id for production preparation requests", () => {
+      const result = prepareProductionSchema.safeParse({});
+
+      expect(result.success).toBe(false);
+    });
+
+    test("should accept a valid production preparation payload", () => {
+      const result = prepareProductionSchema.safeParse({
+        experiment_id: 12,
       });
 
       expect(result.success).toBe(true);

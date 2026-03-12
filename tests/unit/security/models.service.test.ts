@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
 import path from "node:path";
+import { Readable } from "node:stream";
 
 mock.restore();
 
@@ -56,6 +57,7 @@ mock.module(pythonModulePath, () => ({
 
 const {
   trainModel,
+  prepareExperimentModelForProduction,
   predictExperimentModel,
   ModelAccessError,
   ModelNotFoundError,
@@ -81,6 +83,12 @@ const buildExperimentContextRow = (overrides: Record<string, unknown> = {}) => (
   lstm_normalization: "minmax",
   lstm_features: JSON.stringify(["价格指数", "产能利用率"]),
   lstm_target_field: "销售数量",
+  ensemble_weighted_completed: 1,
+  ensemble_weighted_base_models: JSON.stringify(["ma", "lstm"]),
+  ensemble_boosting_completed: 1,
+  ensemble_boosting_base_models: JSON.stringify(["ma", "arima"]),
+  ensemble_stacking_completed: 1,
+  ensemble_stacking_base_models: JSON.stringify(["ma", "lstm"]),
   ...overrides,
 });
 
@@ -167,6 +175,124 @@ describe("models service", () => {
     expect(createReadStream).not.toHaveBeenCalled();
   });
 
+  test("rejects production preparation when an ensemble is incomplete", async () => {
+    poolQuery.mockResolvedValueOnce([
+      [buildExperimentContextRow({ ensemble_weighted_completed: 0 })],
+    ]);
+
+    await expect(
+      prepareExperimentModelForProduction("weighted_avg", 20240002, 990002),
+    ).rejects.toMatchObject({
+      message: "加权平均融合模型尚未完成训练，无法准备生产预测模型",
+    });
+
+    expect(spawnMock).not.toHaveBeenCalled();
+  });
+
+  test("fits an ensemble production artifact from the backtest model with fit-only parameters", async () => {
+    poolQuery.mockReset();
+    poolQuery
+      .mockResolvedValueOnce([[
+        buildExperimentContextRow({
+          data_window_train_end_index: 0,
+          data_window_evaluate_start_index: 1,
+          data_window_evaluate_end_index: 1,
+        }),
+      ]])
+      .mockResolvedValueOnce([[{ file_path: "/tmp/dataset.csv" }]]);
+
+    existsSync.mockImplementation((filePath: string) => !filePath.includes("-weighted_avg-production.pkl"));
+    createReadStream.mockImplementation(() =>
+      Readable.from([
+        "月份,销售数量,价格指数,产能利用率\n2024-01,100,1.2,0.8\n2024-02,110,1.3,0.9\n",
+      ]) as unknown as ReturnType<typeof createReadStream>
+    );
+
+    const result = await prepareExperimentModelForProduction("weighted_avg", 20240002, 990002);
+
+    expect(result).toEqual({
+      status: "success",
+      results: {
+        saved_model: "/tmp/fangzhen-py/trained_models/exp990002-student20240002-weighted_avg-production.pkl",
+        artifact_phase: "production",
+        reused_existing: false,
+      },
+    });
+
+    const [command] = spawnMock.mock.calls[0] ?? [];
+    expect(command).toContain("weighted_avg");
+    expect(command).toContain("--fit-only");
+    expect(command).toContain("--load-model");
+    expect(command).toContain("/tmp/fangzhen-py/trained_models/exp990002-student20240002-weighted_avg.pkl");
+    expect(command).toContain("--save-model");
+    expect(command).toContain("/tmp/fangzhen-py/trained_models/exp990002-student20240002-weighted_avg-production.pkl");
+    expect(command).toContain("--train-end");
+    expect(command).toContain("1");
+  });
+
+  test("reuses an existing production artifact without invoking python", async () => {
+    existsSync.mockImplementation((filePath: string) => filePath.includes("-ma-production.pkl"));
+
+    const result = await prepareExperimentModelForProduction("ma", 20240002, 990002);
+
+    expect(result).toEqual({
+      status: "success",
+      results: {
+        saved_model: "/tmp/fangzhen-py/trained_models/exp990002-student20240002-ma-production.pkl",
+        artifact_phase: "production",
+        reused_existing: true,
+      },
+    });
+    expect(spawnMock).not.toHaveBeenCalled();
+    expect(createReadStream).not.toHaveBeenCalled();
+  });
+
+  test("fits a production artifact from the backtest model with fit-only parameters", async () => {
+    poolQuery.mockReset();
+    poolQuery
+      .mockResolvedValueOnce([[
+        buildExperimentContextRow({
+          data_window_train_end_index: 0,
+          data_window_evaluate_start_index: 1,
+          data_window_evaluate_end_index: 1,
+        }),
+      ]])
+      .mockResolvedValueOnce([[{ file_path: "/tmp/dataset.csv" }]]);
+
+    existsSync.mockImplementation((filePath: string) => !filePath.includes("-ma-production.pkl"));
+    createReadStream.mockImplementation(() =>
+      Readable.from([
+        "月份,销售数量,价格指数,产能利用率\n2024-01,100,1.2,0.8\n2024-02,110,1.3,0.9\n",
+      ]) as unknown as ReturnType<typeof createReadStream>
+    );
+
+    const result = await prepareExperimentModelForProduction("ma", 20240002, 990002);
+
+    expect(result).toEqual({
+      status: "success",
+      results: {
+        saved_model: "/tmp/fangzhen-py/trained_models/exp990002-student20240002-ma-production.pkl",
+        artifact_phase: "production",
+        reused_existing: false,
+      },
+    });
+
+    const [command, options] = spawnMock.mock.calls[0] ?? [];
+    expect(command).toContain("ma");
+    expect(command).toContain("--fit-only");
+    expect(command).toContain("--load-model");
+    expect(command).toContain("/tmp/fangzhen-py/trained_models/exp990002-student20240002-ma.pkl");
+    expect(command).toContain("--save-model");
+    expect(command).toContain("/tmp/fangzhen-py/trained_models/exp990002-student20240002-ma-production.pkl");
+    expect(command).toContain("--train-end");
+    expect(command).toContain("1");
+    expect(options).toMatchObject({
+      cwd: "/tmp/fangzhen-py",
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+  });
+
   test("rejects prediction when the experiment belongs to another student", async () => {
     poolQuery.mockResolvedValueOnce([
       [buildExperimentContextRow({ student_id: 99999999 })],
@@ -200,6 +326,109 @@ describe("models service", () => {
     expect(existsSync).toHaveBeenCalledWith(
       expect.stringContaining("exp990002-student20240002-ma.pkl"),
     );
+  });
+
+  test("rejects prediction when the model is not ready for production", async () => {
+    poolQuery.mockResolvedValueOnce([
+      [buildExperimentContextRow({ moving_average_completed: 0 })],
+    ]);
+
+    await expect(
+      predictExperimentModel("ma", 20240002, 990002, 6),
+    ).rejects.toMatchObject({
+      message: "移动平均基础模型尚未完成训练，无法准备生产预测模型",
+    });
+
+    expect(spawnMock).not.toHaveBeenCalled();
+    expect(createReadStream).not.toHaveBeenCalled();
+  });
+
+  test("prepares a missing production artifact before prediction", async () => {
+    poolQuery.mockReset();
+    poolQuery
+      .mockResolvedValueOnce([[
+        buildExperimentContextRow({
+          data_window_train_end_index: 0,
+          data_window_evaluate_start_index: 1,
+          data_window_evaluate_end_index: 1,
+        }),
+      ]])
+      .mockResolvedValueOnce([[
+        buildExperimentContextRow({
+          data_window_train_end_index: 0,
+          data_window_evaluate_start_index: 1,
+          data_window_evaluate_end_index: 1,
+        }),
+      ]])
+      .mockResolvedValueOnce([[{ file_path: "/tmp/dataset.csv" }]]);
+
+    let productionArtifactPrepared = false;
+    existsSync.mockImplementation((filePath: string) => (
+      filePath.endsWith("/run_model.py")
+      || (filePath.includes("-ma.pkl") && !filePath.includes("-production"))
+      || (productionArtifactPrepared && filePath.includes("-ma-production.pkl"))
+    ));
+    createReadStream.mockImplementation(() =>
+      Readable.from([
+        "月份,销售数量,价格指数,产能利用率\n2024-01,100,1.2,0.8\n2024-02,110,1.3,0.9\n",
+      ]) as unknown as ReturnType<typeof createReadStream>
+    );
+    spawnMock
+      .mockImplementationOnce(() => ({
+        stdout: new ReadableStream({
+          start(controller) {
+            productionArtifactPrepared = true;
+            controller.enqueue(new TextEncoder().encode('{"saved_model":"/tmp/fangzhen-py/trained_models/exp990002-student20240002-ma-production.pkl"}'));
+            controller.close();
+          },
+        }),
+        stderr: new ReadableStream({
+          start(controller) {
+            controller.close();
+          },
+        }),
+        exited: Promise.resolve(0),
+        exitCode: 0,
+        killed: false,
+        pid: 4321,
+        kill: mock(() => {}),
+      }))
+      .mockImplementationOnce(() => ({
+        stdout: new ReadableStream({
+          start(controller) {
+            controller.enqueue(new TextEncoder().encode('{"predictions":[{"prediction":101.2},{"prediction":98.4}]}'));
+            controller.close();
+          },
+        }),
+        stderr: new ReadableStream({
+          start(controller) {
+            controller.close();
+          },
+        }),
+        exited: Promise.resolve(0),
+        exitCode: 0,
+        killed: false,
+        pid: 4321,
+        kill: mock(() => {}),
+      }));
+
+    const result = await predictExperimentModel("ma", 20240002, 990002, 6);
+
+    expect(result).toEqual({
+      status: "success",
+      results: {
+        predictions: [{ prediction: 101.2 }, { prediction: 98.4 }],
+      },
+    });
+    expect(spawnMock).toHaveBeenCalledTimes(2);
+
+    const [prepareCommand] = spawnMock.mock.calls[0] ?? [];
+    expect(prepareCommand).toContain("--fit-only");
+    expect(prepareCommand.some((arg) => arg.includes("exp990002-student20240002-ma-production.pkl"))).toBe(true);
+
+    const [predictCommand] = spawnMock.mock.calls[1] ?? [];
+    expect(predictCommand).toContain("--forecast-steps");
+    expect(predictCommand.some((arg) => arg.includes("exp990002-student20240002-ma-production.pkl"))).toBe(true);
   });
 
   test("runs prediction with the experiment-scoped model artifact and returns python predictions", async () => {
@@ -239,11 +468,74 @@ describe("models service", () => {
     expect(command).toContain("6");
     expect(command).toContain("--pretty");
     expect(command).toContain("/tmp/fangzhen-py/run_model.py");
-    expect(command.some((arg) => arg.includes("exp990002-student20240002-ma.pkl"))).toBe(true);
+    expect(command.some((arg) => arg.includes("exp990002-student20240002-ma-production.pkl"))).toBe(true);
     expect(options).toMatchObject({
       cwd: "/tmp/fangzhen-py",
       stdout: "pipe",
       stderr: "pipe",
+    });
+  });
+
+  test("passes available base model artifacts through to ensemble training", async () => {
+    poolQuery.mockReset();
+    poolQuery
+      .mockResolvedValueOnce([[buildExperimentContextRow()]])
+      .mockResolvedValueOnce([[{ file_path: "/tmp/dataset.csv" }]]);
+
+    existsSync.mockImplementation((filePath: string) => (
+      filePath.endsWith("/run_model.py")
+      || filePath.includes("-ma.pkl")
+      || filePath.includes("-lstm.pkl")
+      || filePath.includes("-lstm_keras_model.h5")
+    ));
+    createReadStream.mockImplementation(() =>
+      Readable.from([
+        "月份,销售数量,价格指数,产能利用率\n2024-01,100,1.2,0.8\n2024-02,110,1.3,0.9\n2024-03,120,1.4,1.0\n2024-04,130,1.5,1.1\n2024-05,140,1.6,1.2\n2024-06,150,1.7,1.3\n2024-07,160,1.8,1.4\n2024-08,170,1.9,1.5\n2024-09,180,2.0,1.6\n2024-10,190,2.1,1.7\n2024-11,200,2.2,1.8\n2024-12,210,2.3,1.9\n2025-01,220,2.4,2.0\n2025-02,230,2.5,2.1\n2025-03,240,2.6,2.2\n2025-04,250,2.7,2.3\n2025-05,260,2.8,2.4\n2025-06,270,2.9,2.5\n",
+      ]) as unknown as ReturnType<typeof createReadStream>
+    );
+    spawnMock.mockImplementationOnce(() => ({
+      stdout: new ReadableStream({
+        start(controller) {
+          controller.enqueue(new TextEncoder().encode('{"metrics":{"rmse":1,"mae":1,"r2":0.9},"models":["ma","lstm"],"weights":{"ma":0.4,"lstm":0.6},"eval_y_true":[],"predictions":[]}'));
+          controller.close();
+        },
+      }),
+      stderr: new ReadableStream({
+        start(controller) {
+          controller.close();
+        },
+      }),
+      exited: Promise.resolve(0),
+      exitCode: 0,
+      killed: false,
+      pid: 4321,
+      kill: mock(() => {}),
+    }));
+
+    await trainModel("weighted_avg", 20240002, {
+      experiment_id: 990002,
+      selected_industry: "制造业",
+      selected_company: "样本企业",
+      selected_product: "样本产品",
+      data_window_train_start_index: 0,
+      data_window_train_end_index: 11,
+      data_window_evaluate_start_index: 12,
+      data_window_evaluate_end_index: 17,
+      models: "ma,lstm",
+      moving_average_window: 4,
+      lstmNormalization: "minmax",
+      lstmTargetFeature: "销售数量",
+      lstmFeatures: "价格指数,产能利用率",
+    });
+
+    const [command] = spawnMock.mock.calls[0] ?? [];
+    const baseModelFilesArgIndex = command.indexOf("--base-model-files");
+    expect(baseModelFilesArgIndex).toBeGreaterThan(-1);
+
+    const encodedBaseModelFiles = command[baseModelFilesArgIndex + 1];
+    expect(JSON.parse(encodedBaseModelFiles)).toEqual({
+      ma: "/tmp/fangzhen-py/trained_models/exp990002-student20240002-ma.pkl",
+      lstm: "/tmp/fangzhen-py/trained_models/exp990002-student20240002-lstm.pkl",
     });
   });
 

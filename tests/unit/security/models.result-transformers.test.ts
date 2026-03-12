@@ -127,17 +127,18 @@ describe("model training result transformers", () => {
     });
   });
 
-  test("maps boosting model chain to model_names and preserves search summary", () => {
+  test("maps boosting model chain to model_names and preserves repeated stages", () => {
     const transformed = transformTrainingResult("boosting", {
       metrics: { rmse: 8.8, mae: 6.9, r2: 0.92 },
       eval_y_true: [71, 73],
       predictions: [{ prediction: 70 }, { prediction: 74 }],
-      model_chain: ["ma", "es", "lstm"],
+      model_chain: ["ma", "es", "ma"],
+      stage_coefficients: [1, 0.3, 0.3],
       search_summary: { rounds: 12 },
     });
 
     expect(transformed.results).toMatchObject({
-      model_names: ["ma", "es", "lstm"],
+      model_names: ["ma", "es", "ma"],
       search_summary: { rounds: 12 },
       eval_predictions: [70, 74],
     });

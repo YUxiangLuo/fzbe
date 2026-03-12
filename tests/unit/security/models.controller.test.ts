@@ -1,19 +1,25 @@
-process.env.DB_HOST ??= "127.0.0.1";
-process.env.DB_USER ??= "test";
-process.env.DB_PASSWORD ??= "test";
-process.env.DB_DATABASE ??= "test";
-process.env.JWT_SECRET ??= "test-jwt-secret";
-process.env.PORT ??= "3001";
-process.env.DEFAULT_PASSWORD_HASH ??= "test-default-hash";
+process.env.DB_HOST = "127.0.0.1";
+process.env.DB_USER = "test";
+process.env.DB_PASSWORD = "test";
+process.env.DB_DATABASE = "test";
+process.env.JWT_SECRET = "test-jwt-secret";
+process.env.PORT = "3001";
+process.env.DEFAULT_PASSWORD_HASH = "test-default-hash";
 
 import { beforeEach, describe, expect, mock, test } from "bun:test";
 import { Hono } from "hono";
 import { sign } from "hono/jwt";
 import type { ModelType, TrainInput } from "../../../src/modules/models/models.schema";
 
+mock.restore();
+
 const trainModel = mock(async () => ({
   status: "success",
   results: { metrics: { rmse: 1, mae: 1, r2: 0.9 } },
+}));
+const prepareExperimentModelForProduction = mock(async () => ({
+  status: "success",
+  results: { saved_model: "/tmp/fangzhen-py/trained_models/example-production.pkl" },
 }));
 const predictExperimentModel = mock(async () => ({
   status: "success",
@@ -40,6 +46,7 @@ class ModelAccessError extends Error {
 
 mock.module("../../../src/modules/models/models.service", () => ({
   trainModel,
+  prepareExperimentModelForProduction,
   predictExperimentModel,
   acquireModelSlot,
   releaseModelSlot,
@@ -99,6 +106,12 @@ describe("models controller", () => {
     trainModel.mockResolvedValue({
       status: "success",
       results: { metrics: { rmse: 1, mae: 1, r2: 0.9 } },
+    });
+
+    prepareExperimentModelForProduction.mockReset();
+    prepareExperimentModelForProduction.mockResolvedValue({
+      status: "success",
+      results: { saved_model: "/tmp/fangzhen-py/trained_models/example-production.pkl" },
     });
 
     predictExperimentModel.mockReset();
@@ -286,6 +299,58 @@ describe("models controller", () => {
     expect(response.status).toBe(500);
     expect(releaseModelExecutionLock).toHaveBeenCalledWith(executionLock);
     expect(releaseModelSlot).toHaveBeenCalledWith(null);
+  });
+
+  test("prepares a base model for production prediction", async () => {
+    const response = await requestJson("/api/v1/models/ma/prepare-production", {
+      experiment_id: 990002,
+    });
+    const data = await response.json();
+
+    expect(response.status).toBe(200);
+    expect(data).toEqual({
+      status: "success",
+      results: { saved_model: "/tmp/fangzhen-py/trained_models/example-production.pkl" },
+    });
+    expect(prepareExperimentModelForProduction).toHaveBeenCalledWith("ma", 20240002, 990002);
+  });
+
+  test("prepares an ensemble model for production prediction", async () => {
+    const response = await requestJson("/api/v1/models/weighted_avg/prepare-production", {
+      experiment_id: 990002,
+    });
+    const data = await response.json();
+
+    expect(response.status).toBe(200);
+    expect(data).toEqual({
+      status: "success",
+      results: { saved_model: "/tmp/fangzhen-py/trained_models/example-production.pkl" },
+    });
+    expect(prepareExperimentModelForProduction).toHaveBeenCalledWith("weighted_avg", 20240002, 990002);
+  });
+
+  test("rejects invalid production preparation payloads before invoking the service layer", async () => {
+    const response = await requestJson("/api/v1/models/ma/prepare-production", {});
+    const data = await response.json();
+
+    expect(response.status).toBe(400);
+    expect(data).toEqual({ error: "生产预测准备请求参数无效" });
+    expect(prepareExperimentModelForProduction).not.toHaveBeenCalled();
+    expect(acquireModelExecutionLock).not.toHaveBeenCalled();
+  });
+
+  test("maps ModelNotFoundError from production preparation to 404", async () => {
+    prepareExperimentModelForProduction.mockRejectedValueOnce(
+      new ModelNotFoundError("未找到该实验的已训练 MA 回测模型"),
+    );
+
+    const response = await requestJson("/api/v1/models/ma/prepare-production", {
+      experiment_id: 990002,
+    });
+    const data = await response.json();
+
+    expect(response.status).toBe(404);
+    expect(data).toEqual({ error: "未找到该实验的已训练 MA 回测模型" });
   });
 
   test("maps ModelNotFoundError from prediction to 404", async () => {

@@ -253,6 +253,11 @@ def train_and_evaluate(
     return metrics, best_model, best_order, search_summary, y_true, y_pred.tolist(), conf_int.tolist()
 
 
+def _validate_fit_args(y: np.ndarray, ts: int, te: int) -> None:
+    if not (0 <= ts <= te < len(y)):
+        raise ValueError(f"[VALIDATION] Invalid train range: [{ts},{te}], must be within [0, {len(y)-1}]")
+
+
 # ---------- public entry ----------
 def run(args) -> None:
     """
@@ -262,6 +267,47 @@ def run(args) -> None:
     pretty: bool = bool(getattr(args, "pretty", False))
     save_path = getattr(args, "save_model", None)
     load_path = getattr(args, "load_model", None)
+
+    if getattr(args, "fit_only", False):
+        if not hasattr(args, "data") or not args.data:
+            raise ValueError("[VALIDATION] --data is required for fit-only mode.")
+        if not save_path:
+            raise ValueError("[VALIDATION] --save-model is required for fit-only mode.")
+        if not load_path:
+            raise ValueError("[VALIDATION] --load-model is required for fit-only mode.")
+
+        state = _load_state(load_path)
+        parsed_data = load_data_from_json(args.data)
+        y = parsed_data.y
+        ts, te = int(args.train_start), int(args.train_end)
+        _validate_fit_args(y, ts, te)
+
+        order_info = state.get("order", {})
+        order = (
+            int(order_info.get("p", 0)),
+            int(order_info.get("d", state.get("d", 0))),
+            int(order_info.get("q", 0)),
+        )
+        fitted_model = pm.ARIMA(order=order, seasonal=False, suppress_warnings=True)
+        fitted_model.fit(y[ts : te + 1])
+
+        next_state = {
+            "model_type": MODEL_TYPE,
+            "model": fitted_model,
+            "order": {"p": order[0], "d": order[1], "q": order[2]},
+            "d": order[1],
+        }
+        dump_model(next_state, save_path)
+
+        out: Dict[str, Any] = {
+            "mode": "arima_fit_only",
+            "order": next_state["order"],
+            "train_end_index": te,
+            "saved_model": save_path,
+        }
+        out["logs"] = get_log_contents()
+        print(json.dumps(out, ensure_ascii=False, indent=2 if pretty else None))
+        return
 
     if load_path:
         log.info(f"Entering prediction mode with model: {load_path}")

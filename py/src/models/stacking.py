@@ -18,14 +18,24 @@ from sklearn.linear_model import LinearRegression
 # Import shared utilities
 from data_utils import (
     ParsedData,
-    build_numeric_subprocess_records,
-    build_subprocess_records,
     infer_feature_types,
     load_data_from_json,
 )
+from ensemble_utils import (
+    build_ensemble_subprocess_data,
+    fit_and_predict_from_source_model,
+    get_member_model_path,
+    parse_base_model_files_arg,
+    persist_member_model_artifact,
+)
 from metrics import mae, mape, r2, rmse
 from serialization import dump_model, load_model
-from subprocess_utils import run_base_model_subprocess, run_base_model_predict_subprocess, extract_predictions_from_result
+from subprocess_utils import (
+    extract_predictions_from_result,
+    run_base_model_fit_subprocess,
+    run_base_model_predict_subprocess,
+    run_base_model_subprocess,
+)
 
 MODEL_TYPE = "stacking"
 
@@ -52,6 +62,28 @@ def _load_state(model_path: str) -> Dict[str, Any]:
     if not isinstance(state, dict) or state.get("model_type") != MODEL_TYPE:
         raise ValueError("[VALIDATION] Invalid Stacking model file.")
     return state
+
+
+def _validate_fit_args(parsed_data: ParsedData, ts: int, te: int, state: Dict[str, Any]) -> None:
+    n = parsed_data.n_obs
+    if not (0 <= ts <= te < n):
+        raise ValueError(f"[VALIDATION] Invalid train range: [{ts},{te}], n_obs={n}")
+
+    models_to_use = state.get("models")
+    if not isinstance(models_to_use, list) or len(models_to_use) < 2:
+        raise ValueError("[VALIDATION] Saved Stacking model is missing valid base models.")
+
+    base_model_states = state.get("base_model_states")
+    if not isinstance(base_model_states, dict):
+        raise ValueError("[VALIDATION] Saved Stacking model is missing base model states.")
+
+    if "meta_model" not in state:
+        raise ValueError("[VALIDATION] Saved Stacking model is missing meta model state.")
+
+    for model_name in models_to_use:
+        model_state = base_model_states.get(model_name)
+        if not isinstance(model_state, dict) or not isinstance(model_state.get("model_file"), str):
+            raise ValueError(f"[VALIDATION] Missing saved state for base model: {model_name}")
 
 
 def _validate_training_args(
@@ -187,6 +219,7 @@ def train_and_evaluate(
     eval_range: range,
     models_to_use: List[str],
     model_params: Dict[str, Any],
+    base_model_files: Optional[Dict[str, str]] = None,
 ) -> Tuple[Dict[str, Any], Dict[str, Any], Any, List[float], List[float], float]:
     """Trains and evaluates the Stacking model using the correct hold-out approach.
 
@@ -225,12 +258,11 @@ def train_and_evaluate(
     print(f"  评估集: {eval_range} ({len(eval_range)} points)", file=sys.stderr)
 
     # Non-LSTM base models keep numeric-only rows; LSTM can use categorical features.
-    numeric_data_dicts, _ = build_numeric_subprocess_records(parsed_data)
-    lstm_data_dicts = numeric_data_dicts
-    if "lstm" in models_to_use:
-        lstm_feature_types = model_params.get("lstm", {}).get("feature_types", {})
-        lstm_feature_keys = [k for k in lstm_feature_types.keys() if k != parsed_data.target_key]
-        lstm_data_dicts, _ = build_subprocess_records(parsed_data, feature_keys=lstm_feature_keys)
+    numeric_data_dicts, lstm_data_dicts = build_ensemble_subprocess_data(
+        parsed_data,
+        models_to_use,
+        model_params,
+    )
 
     # === Step 2: Phase 1 - Train base models on level0, predict on level1 ===
     print(f"\n[Stacking Phase 1] 训练基础模型（level0）并生成level1预测", file=sys.stderr)
@@ -244,24 +276,32 @@ def train_and_evaluate(
 
     for model_name in models_to_use:
         params = model_params[model_name]
-
-        # We don't save models from phase 1 (temporary training)
-        params_phase1 = params.copy()
-        # Don't save phase1 models
+        source_model_file = (base_model_files or {}).get(model_name)
 
         print(f"  训练 {model_name} 在 level0，预测 level1...", file=sys.stderr)
-        result = run_base_model_subprocess(
-            model_type=model_name,
-            data=lstm_data_dicts if model_name == "lstm" else numeric_data_dicts,
-            train_start=level0_train_range.start,
-            train_end=level0_train_range.stop - 1,
-            eval_start=level1_train_range.start,  # ✅ 在level1上预测（out-of-fold）
-            eval_end=level1_train_range.stop - 1,
-            model_params=params_phase1,
-            timeout=base_timeout,
-        )
+        if source_model_file and os.path.exists(source_model_file):
+            y_pred_level1 = fit_and_predict_from_source_model(
+                model_name=model_name,
+                source_model_file=source_model_file,
+                data=lstm_data_dicts if model_name == "lstm" else numeric_data_dicts,
+                train_start=level0_train_range.start,
+                train_end=level0_train_range.stop - 1,
+                forecast_steps=len(level1_train_range),
+                timeout=base_timeout,
+            )
+        else:
+            result = run_base_model_subprocess(
+                model_type=model_name,
+                data=lstm_data_dicts if model_name == "lstm" else numeric_data_dicts,
+                train_start=level0_train_range.start,
+                train_end=level0_train_range.stop - 1,
+                eval_start=level1_train_range.start,
+                eval_end=level1_train_range.stop - 1,
+                model_params=params.copy(),
+                timeout=base_timeout,
+            )
 
-        y_pred_level1 = extract_predictions_from_result(result)
+            y_pred_level1 = extract_predictions_from_result(result)
         level1_predictions.append(y_pred_level1)
         print(f"    ✓ 生成 {len(y_pred_level1)} 个level1预测", file=sys.stderr)
 
@@ -280,42 +320,62 @@ def train_and_evaluate(
     print(f"\n[Stacking Phase 3] 在完整训练集上重新训练基础模型", file=sys.stderr)
     eval_predictions = []
     base_model_states = {}
+    eval_forecast_steps = eval_range.stop - train_range.stop
+    eval_forecast_offset = eval_range.start - train_range.stop
 
     for model_name in models_to_use:
         params = model_params[model_name]
+        source_model_file = (base_model_files or {}).get(model_name)
 
-        # Create a temporary file for this base model
-        # Note: The file will be moved to proper location in run() if stacking model is saved
+        if source_model_file and os.path.exists(source_model_file):
+            print(f"  复用已完成的 {model_name} 基础模型产物，预测eval_range...", file=sys.stderr)
+            result = run_base_model_predict_subprocess(
+                model_type=model_name,
+                model_file=source_model_file,
+                forecast_steps=eval_forecast_steps,
+                timeout=base_timeout,
+            )
+            y_pred_eval = extract_predictions_from_result(result)[
+                eval_forecast_offset: eval_forecast_offset + len(eval_range)
+            ]
+            eval_predictions.append(y_pred_eval)
+            base_model_states[model_name] = {
+                "model_type": model_name,
+                "model_file": source_model_file,
+                "params": params,
+                "artifact_origin": "standalone_base",
+            }
+            print(f"    ✓ 生成 {len(y_pred_eval)} 个eval预测", file=sys.stderr)
+            continue
+
         temp_model_file = os.path.join(
             tempfile.gettempdir(),
             f"stacking_base_{model_name}_{os.getpid()}.pkl"
         )
 
-        # Add save_model to params for subprocess
         params_with_save = params.copy()
         params_with_save["save_model"] = temp_model_file
 
         print(f"  重新训练 {model_name} 在完整train_range，预测eval_range...", file=sys.stderr)
-        # Run base model in subprocess on FULL train_range
         result = run_base_model_subprocess(
             model_type=model_name,
             data=lstm_data_dicts if model_name == "lstm" else numeric_data_dicts,
-            train_start=train_range.start,  # ✅ 完整训练集
+            train_start=train_range.start,
             train_end=train_range.stop - 1,
-            eval_start=eval_range.start,  # ✅ 独立评估集
+            eval_start=eval_range.start,
             eval_end=eval_range.stop - 1,
             model_params=params_with_save,
-            timeout=base_timeout,  # Use dynamic timeout
+            timeout=base_timeout,
         )
 
         y_pred_eval = extract_predictions_from_result(result)
         eval_predictions.append(y_pred_eval)
 
-        # Store the model file path and parameters
         base_model_states[model_name] = {
             "model_type": model_name,
-            "model_file": temp_model_file,  # Will be relocated in run() if saved
+            "model_file": temp_model_file,
             "params": params,
+            "artifact_origin": "temporary_training",
         }
         print(f"    ✓ 生成 {len(y_pred_eval)} 个eval预测", file=sys.stderr)
 
@@ -351,6 +411,73 @@ def run(args) -> None:
     pretty: bool = bool(getattr(args, "pretty", False))
     save_path = getattr(args, "save_model", None)
     load_path = getattr(args, "load_model", None)
+
+    if getattr(args, "fit_only", False):
+        if not hasattr(args, "data") or not args.data:
+            raise ValueError("[VALIDATION] --data is required for fit-only mode.")
+        if not save_path:
+            raise ValueError("[VALIDATION] --save-model is required for fit-only mode.")
+        if not load_path:
+            raise ValueError("[VALIDATION] --load-model is required for fit-only mode.")
+
+        state = _load_state(load_path)
+        parsed_data = load_data_from_json(args.data)
+        ts, te = int(args.train_start), int(args.train_end)
+        _validate_fit_args(parsed_data, ts, te, state)
+
+        models_to_use = state["models"]
+        previous_base_model_states = state["base_model_states"]
+        model_params = {
+            model_name: previous_base_model_states[model_name].get("params", {})
+            for model_name in models_to_use
+        }
+        numeric_data_dicts, lstm_data_dicts = build_ensemble_subprocess_data(
+            parsed_data,
+            models_to_use,
+            model_params,
+        )
+
+        next_base_model_states = {}
+        for model_name in models_to_use:
+            previous_model_state = previous_base_model_states[model_name]
+            previous_model_file = previous_model_state["model_file"]
+            member_save_path = get_member_model_path(save_path, model_name)
+            model_timeout = 120
+            if model_name == "lstm":
+                model_timeout = max(120, int(model_params.get("lstm", {}).get("epochs", 20)) * 10)
+
+            run_base_model_fit_subprocess(
+                model_type=model_name,
+                data=lstm_data_dicts if model_name == "lstm" else numeric_data_dicts,
+                train_start=ts,
+                train_end=te,
+                source_model_file=previous_model_file,
+                save_model_file=member_save_path,
+                timeout=model_timeout,
+            )
+
+            next_base_model_states[model_name] = {
+                "model_type": model_name,
+                "model_file": member_save_path,
+                "params": model_params.get(model_name, {}),
+            }
+
+        next_state = {
+            "model_type": MODEL_TYPE,
+            "models": models_to_use,
+            "base_model_states": next_base_model_states,
+            "meta_model": state["meta_model"],
+            "std_dev_residuals": float(state.get("std_dev_residuals", 0.0)),
+        }
+        dump_model(next_state, save_path)
+
+        out = {
+            "mode": "stacking_fit_only",
+            "models": models_to_use,
+            "saved_model": save_path,
+        }
+        print(json.dumps(out, ensure_ascii=False, indent=2 if pretty else None))
+        return
 
     if load_path:
         steps = int(getattr(args, "forecast_steps", 0))
@@ -409,6 +536,7 @@ def run(args) -> None:
     auto_epochs = 20 if train_size <= 15 else 30  # Conservative for ensemble base models
 
     model_params = {}
+    base_model_files = parse_base_model_files_arg(get_arg("base_model_files", None))
 
     if "arima" in models_to_use:
         model_params["arima"] = {
@@ -463,7 +591,12 @@ def run(args) -> None:
     _validate_training_args(parsed_data, ts, te, es, ee, models_to_use, model_params)
 
     metrics, base_model_states, meta_model, y_true, y_pred, std_dev = train_and_evaluate(
-        parsed_data, range(ts, te + 1), range(es, ee + 1), models_to_use, model_params
+        parsed_data,
+        range(ts, te + 1),
+        range(es, ee + 1),
+        models_to_use,
+        model_params,
+        base_model_files,
     )
 
     predictions_with_std = _format_predictions(y_pred, std_dev)
@@ -477,37 +610,17 @@ def run(args) -> None:
     }
 
     if save_path:
-        import shutil
-
-        # Move base model files from temp to permanent location
-        base_dir = os.path.dirname(save_path)
-        base_name = os.path.splitext(os.path.basename(save_path))[0]
-
         for model_name, model_state in base_model_states.items():
-            temp_file = model_state["model_file"]
-
-            # Define permanent location
-            perm_file = os.path.join(base_dir, f"{base_name}_base_{model_name}.pkl")
-
-            # Move file from temp to permanent
-            if os.path.exists(temp_file):
-                shutil.move(temp_file, perm_file)
-
-                # Also move LSTM Keras model and update internal path
-                if model_name == "lstm":
-                    lstm_pkl = load_model(perm_file)
-                    temp_keras = lstm_pkl.get("keras_model_path")
-                    if not temp_keras or not os.path.exists(temp_keras):
-                        raise FileNotFoundError(
-                            f"LSTM Keras model file not found at {temp_keras}"
-                        )
-                    perm_keras = os.path.join(base_dir, f"{base_name}_base_{model_name}_keras.h5")
-                    shutil.move(temp_keras, perm_keras)
-                    lstm_pkl["keras_model_path"] = perm_keras
-                    dump_model(lstm_pkl, perm_file)
-
-            # Update state with permanent path
+            source_file = model_state["model_file"]
+            perm_file = get_member_model_path(save_path, model_name)
+            persist_member_model_artifact(
+                model_name,
+                source_file,
+                perm_file,
+                move_source=model_state.get("artifact_origin") == "temporary_training",
+            )
             model_state["model_file"] = perm_file
+            model_state.pop("artifact_origin", None)
 
         state = {
             "model_type": MODEL_TYPE,

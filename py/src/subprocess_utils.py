@@ -132,6 +132,71 @@ def run_base_model_subprocess(
         )
 
 
+def run_base_model_fit_subprocess(
+    model_type: str,
+    data: List[Dict[str, Any]],
+    train_start: int,
+    train_end: int,
+    source_model_file: str,
+    save_model_file: str,
+    timeout: Optional[int] = 60,
+) -> Dict[str, Any]:
+    """Refit a base model from an existing artifact using fit-only mode."""
+    py_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    python_exec = get_python_executable()
+    run_model_script = os.path.join(py_dir, "run_model.py")
+
+    if not os.path.exists(run_model_script):
+        raise FileNotFoundError(f"run_model.py not found at {run_model_script}")
+
+    args = [
+        python_exec,
+        run_model_script,
+        model_type,
+        "--data", json.dumps(data, ensure_ascii=False),
+        "--train-start", str(train_start),
+        "--train-end", str(train_end),
+        "--load-model", source_model_file,
+        "--save-model", save_model_file,
+        "--fit-only",
+        "--pretty",
+    ]
+
+    try:
+        result = subprocess.run(
+            args,
+            cwd=py_dir,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            env={**os.environ, "PATH": f"{os.path.join(py_dir, 'venv', 'bin')}:{os.environ.get('PATH', '')}"}
+        )
+
+        if result.returncode != 0:
+            raise RuntimeError(
+                f"Base model {model_type} fit-only failed with exit code {result.returncode}.\n"
+                f"stderr: {result.stderr}\n"
+                f"stdout: {result.stdout}"
+            )
+
+        output = result.stdout.strip()
+        json_start = output.find('{')
+        if json_start == -1:
+            raise ValueError(f"No JSON output found from {model_type} fit-only. stdout: {output}")
+
+        json_output = output[json_start:]
+        return json.loads(json_output)
+
+    except subprocess.TimeoutExpired:
+        raise TimeoutError(f"Base model {model_type} fit-only timed out after {timeout}s")
+    except json.JSONDecodeError as e:
+        raise ValueError(
+            f"Failed to parse JSON from {model_type} fit-only.\n"
+            f"Error: {e}\n"
+            f"stdout: {result.stdout}"
+        )
+
+
 def run_base_model_predict_subprocess(
     model_type: str,
     model_file: str,

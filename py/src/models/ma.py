@@ -84,16 +84,35 @@ def _forecast_future(
     if steps <= 0:
         raise ValueError("[VALIDATION] steps must be > 0 for forecasting.")
 
-    # Use the last 'window' points to calculate the projected level
-    initial_history = history[-window:] if window > 0 else list(history)
-    if not initial_history:
+    if window <= 0:
+        raise ValueError("[VALIDATION] Moving average window must be greater than 0.")
+
+    initial_history = list(history)[-window:]
+    if len(initial_history) < window:
         raise ValueError("[DATA] History is empty; cannot forecast.")
 
-    # Calculate the moving average once (the "Level")
-    avg = float(np.mean(initial_history))
+    history_buffer: deque[float] = deque(initial_history, maxlen=window)
+    preds: List[float] = []
 
-    # Return this constant level for all future steps
-    return [avg] * steps
+    for _ in range(steps):
+        avg = float(np.mean(history_buffer))
+        preds.append(avg)
+        history_buffer.append(avg)
+
+    return preds
+
+
+def _estimate_std_dev(residuals: ArrayLike, reference_series: ArrayLike) -> float:
+    residuals_array = np.asarray(residuals, dtype=float)
+    if residuals_array.size > 1:
+        return float(np.std(residuals_array, ddof=1))
+
+    reference_array = np.asarray(reference_series, dtype=float)
+    if reference_array.size > 1:
+        return float(np.std(reference_array, ddof=1))
+
+    baseline = abs(float(np.mean(reference_array))) if reference_array.size else 0.0
+    return float(max(baseline * 0.05, 1.0))
 
 
 # ---------- predict (for ensemble / CLI load) ----------
@@ -130,32 +149,30 @@ def train_and_evaluate(
     log.debug(f"Training data range: [{train_range.start}, {train_range.stop-1}], count={train_range.stop - train_range.start}")
     log.debug(f"Evaluation data range: [{eval_range.start}, {eval_range.stop-1}], count={eval_range.stop - eval_range.start}")
 
-    # Validate that evaluation range has sufficient history
-    # First possible prediction point needs at least 'window' points of history
     eval_list = list(eval_range)
-    if eval_list:
-        first_possible_eval_point = train_range.start + window
-        log.debug(f"First possible evaluation point (requires {window} history): {first_possible_eval_point}")
-        if max(eval_list) < first_possible_eval_point:
-            raise ValueError(
-                f"[VALIDATION] Insufficient history for all evaluation points. "
-                f"First possible evaluation point is {first_possible_eval_point}."
-            )
-
-    idxs, preds = moving_average_forecast(series, eval_range, window, min_index=train_range.start)
-
-    if not idxs and eval_list:
-        raise ValueError("[VALIDATION] No evaluation points could be generated.")
-
-    # Handle empty eval range gracefully
-    if not idxs:
+    if not eval_list:
         log.warning("Empty evaluation range, returning empty metrics")
         return {}, 0.0, np.array([]), np.array([])
+
+    train_history = series[train_range]
+    if len(train_history) < window:
+        raise ValueError("[VALIDATION] Training range must be at least as large as the moving average window.")
+
+    history_start = max(train_range.start, train_range.stop - window)
+    forecast_steps = eval_range.stop - train_range.stop
+    forecast_offset = eval_range.start - train_range.stop
+    history = series[history_start:train_range.stop].tolist()
+    all_forecasts = _forecast_future(history, window, forecast_steps)
+    preds = all_forecasts[forecast_offset: forecast_offset + len(eval_list)]
+    idxs = eval_list
+
+    if len(preds) != len(idxs):
+        raise ValueError("[VALIDATION] 无法为全部评估区间生成移动平均预测。")
 
     y_true = series[idxs]
     y_pred = np.array(preds)
     residuals = y_true - y_pred
-    std_dev_residuals = float(np.std(residuals, ddof=1)) if len(residuals) > 1 else 0.0
+    std_dev_residuals = _estimate_std_dev(residuals, train_history)
 
     log.info(f"Calculated residuals: mean={np.mean(residuals):.4f}, std_dev={std_dev_residuals:.4f}")
 
@@ -182,6 +199,43 @@ def run(args) -> None:
     pretty: bool = bool(getattr(args, "pretty", False))
     save_path = getattr(args, "save_model", None)
     load_path = getattr(args, "load_model", None)
+
+    if getattr(args, "fit_only", False):
+        if not hasattr(args, "data") or not args.data:
+            raise ValueError("[VALIDATION] --data is required for fit-only mode.")
+        if not save_path:
+            raise ValueError("[VALIDATION] --save-model is required for fit-only mode.")
+
+        state = _load_state(load_path) if load_path else {}
+        parsed_data = load_data_from_json(args.data)
+        y = parsed_data.y
+
+        ts, te = int(args.train_start), int(args.train_end)
+        window = int(state.get("window") if state else getattr(args, "window", 0))
+        _validate_fit_args(y, ts, te, window)
+
+        history_start = max(ts, te - window + 1)
+        history = y[history_start : te + 1]
+        std_dev_residuals = float(state.get("std_dev_residuals", _estimate_std_dev([], history)))
+
+        next_state = {
+            "model_type": MODEL_TYPE,
+            "window": window,
+            "train_end_index": te,
+            "history": history.tolist(),
+            "std_dev_residuals": std_dev_residuals,
+        }
+        dump_model(next_state, save_path)
+
+        out: Dict[str, Any] = {
+            "mode": "ma_fit_only",
+            "window": window,
+            "train_end_index": te,
+            "saved_model": save_path,
+        }
+        out["logs"] = get_log_contents()
+        print(json.dumps(out, ensure_ascii=False, indent=2 if pretty else None))
+        return
 
     if load_path:
         state = _load_state(load_path)
@@ -266,9 +320,24 @@ def run(args) -> None:
         log.info("Run finished successfully.")
         print(json.dumps(out, ensure_ascii=False, indent=2 if pretty else None))
 
+    except ValueError:
+        raise
     except Exception as e:
         log.error(f"An unexpected error occurred during MA training: {e}", exc_info=True)
         raise ValueError(f"[DATA] Failed to parse or process --data: {e}")
+
+
+def _validate_fit_args(sales: ArrayLike, ts: int, te: int, w: int) -> None:
+    n_total = len(sales)
+
+    if not (0 <= ts <= te < n_total):
+        raise ValueError(f"[VALIDATION] Invalid training range [{ts}, {te}], must be within [0, {n_total-1}]")
+    if w < 1:
+        raise ValueError(f"[VALIDATION] Window must be >= 1, got {w}")
+
+    train_size = te - ts + 1
+    if train_size < w:
+        raise ValueError(f"[VALIDATION] Training range must contain at least {w} points.")
 
 
 def _validate_training_args(sales: ArrayLike, ts: int, te: int, es: int, ee: int, w: int) -> None:
@@ -295,4 +364,7 @@ def _validate_training_args(sales: ArrayLike, ts: int, te: int, es: int, ee: int
     # Additional helpful validations
     train_size = te - ts + 1
     eval_size = ee - es + 1
+    if train_size < w:
+        log.error(f"Training range size {train_size} must be at least window {w}")
+        raise ValueError(f"[VALIDATION] Training range must contain at least {w} points.")
     log.info(f"Validation passed: train_size={train_size}, eval_size={eval_size}, window={w}")

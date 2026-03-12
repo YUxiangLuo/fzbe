@@ -44,6 +44,12 @@ interface ExperimentModelContextRow extends ExperimentOwnershipRow {
   lstm_normalization: "minmax" | "zscore" | null;
   lstm_features: unknown;
   lstm_target_field: string | null;
+  ensemble_weighted_completed: number | boolean | null;
+  ensemble_weighted_base_models: unknown;
+  ensemble_boosting_completed: number | boolean | null;
+  ensemble_boosting_base_models: unknown;
+  ensemble_stacking_completed: number | boolean | null;
+  ensemble_stacking_base_models: unknown;
 }
 
 interface ExperimentTrainingConfig {
@@ -62,7 +68,9 @@ interface TrainingMetricsPayload extends Record<string, unknown> {
 }
 
 type BaseModelType = "ma" | "es" | "arima" | "lstm";
+type EnsembleModelType = Extract<ModelType, "weighted_avg" | "boosting" | "stacking">;
 
+const BASE_MODEL_TYPES = new Set<ModelType>(["ma", "es", "arima", "lstm"]);
 const ENSEMBLE_MODEL_TYPES = new Set<ModelType>(["weighted_avg", "boosting", "stacking"]);
 const ENSEMBLE_DERIVED_BODY_KEYS = new Set([
   "models",
@@ -186,7 +194,9 @@ const allPossiblePythonParams: Record<string, string> = {
   saveModel: "save-model",
   loadModel: "load-model",
   forecastSteps: "forecast-steps",
+  fitOnly: "fit-only",
   pretty: "pretty",
+  baseModelFiles: "base-model-files",
   // 模型参数（从前端 body 透传）
   moving_average_window: "window",
   exponential_smoothing_alpha: "alpha",
@@ -272,7 +282,13 @@ async function assertExperimentModelAccess(experimentId: number, studentId: numb
             lstm_completed,
             lstm_normalization,
             lstm_features,
-            lstm_target_field
+            lstm_target_field,
+            ensemble_weighted_completed,
+            ensemble_weighted_base_models,
+            ensemble_boosting_completed,
+            ensemble_boosting_base_models,
+            ensemble_stacking_completed,
+            ensemble_stacking_base_models
        FROM experiment_status
       WHERE experiment_id = ?
       LIMIT 1`,
@@ -297,8 +313,79 @@ async function assertExperimentModelAccess(experimentId: number, studentId: numb
 
 const hasDefinedValue = <T>(value: T | null | undefined): value is T => value !== null && value !== undefined;
 
+const isBaseModelType = (modelType: ModelType): modelType is BaseModelType => {
+  return BASE_MODEL_TYPES.has(modelType);
+};
+
 const isEnsembleModelType = (modelType: ModelType): modelType is Extract<ModelType, "weighted_avg" | "boosting" | "stacking"> => {
   return ENSEMBLE_MODEL_TYPES.has(modelType);
+};
+
+const getBacktestModelPath = (experimentId: number, studentId: number, modelType: ModelType) =>
+  buildExperimentScopedModelPath(experimentId, studentId, modelType, "backtest");
+
+const getProductionModelPath = (experimentId: number, studentId: number, modelType: ModelType) =>
+  buildExperimentScopedModelPath(experimentId, studentId, modelType, "production");
+
+const getLstmSidecarPath = (modelPath: string) => modelPath.replace(/\.pkl$/, "_keras_model.h5");
+
+const removeFileIfExists = (filePath: string) => {
+  if (!fs.existsSync(filePath)) {
+    return;
+  }
+
+  try {
+    fs.unlinkSync(filePath);
+  } catch (error) {
+    logger.warn({ err: error, filePath }, "删除模型产物失败");
+  }
+};
+
+const removeSiblingArtifactsByPrefix = (modelPath: string) => {
+  const fileSystem = fs as typeof fs & { readdirSync?: (directoryPath: string) => string[] };
+  if (typeof fileSystem.readdirSync !== "function") {
+    return;
+  }
+
+  const directoryPath = path.dirname(modelPath);
+  if (!fs.existsSync(directoryPath)) {
+    return;
+  }
+
+  const baseName = path.basename(modelPath, ".pkl");
+  for (const siblingFile of fileSystem.readdirSync(directoryPath)) {
+    if (!siblingFile.startsWith(`${baseName}_`)) {
+      continue;
+    }
+
+    removeFileIfExists(path.join(directoryPath, siblingFile));
+  }
+};
+
+const invalidateProductionArtifact = (experimentId: number, studentId: number, modelType: ModelType) => {
+  const productionModelPath = getProductionModelPath(experimentId, studentId, modelType);
+  removeFileIfExists(productionModelPath);
+
+  if (modelType === "lstm") {
+    removeFileIfExists(getLstmSidecarPath(productionModelPath));
+    return;
+  }
+
+  if (isEnsembleModelType(modelType)) {
+    removeSiblingArtifactsByPrefix(productionModelPath);
+  }
+};
+
+const hasSavedModelArtifact = (modelType: ModelType, modelPath: string) => {
+  if (!fs.existsSync(modelPath)) {
+    return false;
+  }
+
+  if (modelType === "lstm") {
+    return fs.existsSync(getLstmSidecarPath(modelPath));
+  }
+
+  return true;
 };
 
 const normalizeBooleanFlag = (value: number | boolean | null | undefined): boolean => {
@@ -485,6 +572,24 @@ const buildEnsemblePythonParams = (
   return pythonParams;
 };
 
+const buildAvailableBaseModelArtifactMap = (
+  experimentId: number,
+  studentId: number,
+  modelsValue: string,
+): Partial<Record<BaseModelType, string>> => {
+  const requestedModels = parseRequestedBaseModels(modelsValue);
+  const availableModelFiles: Partial<Record<BaseModelType, string>> = {};
+
+  for (const modelName of requestedModels) {
+    const modelPath = getBacktestModelPath(experimentId, studentId, modelName);
+    if (hasSavedModelArtifact(modelName, modelPath)) {
+      availableModelFiles[modelName] = modelPath;
+    }
+  }
+
+  return availableModelFiles;
+};
+
 const assertTrainingRequestMatchesExperiment = (
   experiment: ExperimentModelContextRow,
   body: TrainInput,
@@ -572,6 +677,83 @@ const getExperimentTrainingConfig = (
     data_window_evaluate_end_index: experiment.data_window_evaluate_end_index,
   };
 }
+
+const assertBaseModelReadyForProduction = (
+  experiment: ExperimentModelContextRow,
+  modelType: BaseModelType,
+) => {
+  switch (modelType) {
+    case "ma":
+      if (!normalizeBooleanFlag(experiment.moving_average_completed) || !hasDefinedValue(experiment.moving_average_window)) {
+        throw new ModelValidationError("移动平均基础模型尚未完成训练，无法准备生产预测模型");
+      }
+      return;
+    case "es":
+      if (!normalizeBooleanFlag(experiment.exponential_smoothing_completed) || !hasDefinedValue(experiment.exponential_smoothing_alpha)) {
+        throw new ModelValidationError("指数平滑基础模型尚未完成训练，无法准备生产预测模型");
+      }
+      return;
+    case "arima":
+      if (!normalizeBooleanFlag(experiment.arima_completed) || !hasDefinedValue(experiment.arima_d)) {
+        throw new ModelValidationError("ARIMA 基础模型尚未完成训练，无法准备生产预测模型");
+      }
+      return;
+    case "lstm": {
+      const lstmFeatures = normalizePersistedStringArray(experiment.lstm_features);
+      if (
+        !normalizeBooleanFlag(experiment.lstm_completed)
+        || !hasDefinedValue(experiment.lstm_normalization)
+        || !hasDefinedValue(experiment.lstm_target_field)
+        || lstmFeatures.length === 0
+      ) {
+        throw new ModelValidationError("LSTM 基础模型尚未完成训练，无法准备生产预测模型");
+      }
+      return;
+    }
+  }
+};
+
+const assertEnsembleModelReadyForProduction = (
+  experiment: ExperimentModelContextRow,
+  modelType: EnsembleModelType,
+) => {
+  const configs = {
+    weighted_avg: {
+      completed: normalizeBooleanFlag(experiment.ensemble_weighted_completed),
+      baseModels: normalizePersistedStringArray(experiment.ensemble_weighted_base_models),
+      errorMessage: "加权平均融合模型尚未完成训练，无法准备生产预测模型",
+    },
+    boosting: {
+      completed: normalizeBooleanFlag(experiment.ensemble_boosting_completed),
+      baseModels: normalizePersistedStringArray(experiment.ensemble_boosting_base_models),
+      errorMessage: "Boosting 融合模型尚未完成训练，无法准备生产预测模型",
+    },
+    stacking: {
+      completed: normalizeBooleanFlag(experiment.ensemble_stacking_completed),
+      baseModels: normalizePersistedStringArray(experiment.ensemble_stacking_base_models),
+      errorMessage: "Stacking 融合模型尚未完成训练，无法准备生产预测模型",
+    },
+  } satisfies Record<EnsembleModelType, { completed: boolean; baseModels: string[]; errorMessage: string }>;
+
+  const config = configs[modelType];
+  if (!config.completed || config.baseModels.length < 2) {
+    throw new ModelValidationError(config.errorMessage);
+  }
+};
+
+const assertModelReadyForProduction = (
+  experiment: ExperimentModelContextRow,
+  modelType: ModelType,
+) => {
+  if (isBaseModelType(modelType)) {
+    assertBaseModelReadyForProduction(experiment, modelType);
+    return;
+  }
+
+  if (isEnsembleModelType(modelType)) {
+    assertEnsembleModelReadyForProduction(experiment, modelType);
+  }
+};
 
 export async function runPythonModel(
   modelType: string,
@@ -757,9 +939,15 @@ export async function trainModel(modelType: ModelType, studentId: number, body: 
   if (modelType === "ma") {
     validateMovingAverageWindow(trainingConfig, body.moving_average_window);
   }
-  const derivedModelParams = isEnsembleModelType(modelType)
+  const derivedModelParams: Record<string, unknown> = isEnsembleModelType(modelType)
     ? buildEnsemblePythonParams(experiment, body)
     : {};
+  if (isEnsembleModelType(modelType) && body.models) {
+    const baseModelArtifactMap = buildAvailableBaseModelArtifactMap(body.experiment_id, studentId, body.models);
+    if (Object.keys(baseModelArtifactMap).length > 0) {
+      derivedModelParams.baseModelFiles = JSON.stringify(baseModelArtifactMap);
+    }
+  }
 
   const allData = await loadDatasetFromDb(
     trainingConfig.selected_industry,
@@ -774,7 +962,7 @@ export async function trainModel(modelType: ModelType, studentId: number, body: 
     throw new ModelValidationError("数据窗口索引超出范围", { dataset_size: allData.length });
   }
 
-  const modelSaveLoc = buildExperimentScopedModelPath(body.experiment_id, studentId, modelType);
+  const modelSaveLoc = getBacktestModelPath(body.experiment_id, studentId, modelType);
 
   const pythonParams: Record<string, unknown> = {
     data: JSON.stringify(allData),
@@ -800,8 +988,67 @@ export async function trainModel(modelType: ModelType, studentId: number, body: 
 
   const timeout = TRAINING_TIMEOUT;
   const result = (await runPythonModel(modelType, pythonParams, timeout)) as Record<string, unknown>;
+  invalidateProductionArtifact(body.experiment_id, studentId, modelType);
 
   return transformTrainingResult(modelType, result);
+}
+
+export async function prepareExperimentModelForProduction(
+  modelType: ModelType,
+  studentId: number,
+  experimentId: number,
+) {
+  const experiment = await assertExperimentModelAccess(experimentId, studentId);
+  assertModelReadyForProduction(experiment, modelType);
+  const trainingConfig = getExperimentTrainingConfig(experiment);
+
+  const productionModelPath = getProductionModelPath(experimentId, studentId, modelType);
+  if (hasSavedModelArtifact(modelType, productionModelPath)) {
+    return {
+      status: "success",
+      results: {
+        saved_model: productionModelPath,
+        artifact_phase: "production",
+        reused_existing: true,
+      },
+    };
+  }
+
+  const backtestModelPath = getBacktestModelPath(experimentId, studentId, modelType);
+  if (!hasSavedModelArtifact(modelType, backtestModelPath)) {
+    throw new ModelNotFoundError(`未找到该实验的已训练 ${modelType.toUpperCase()} 回测模型`);
+  }
+
+  const allData = await loadDatasetFromDb(
+    trainingConfig.selected_industry,
+    trainingConfig.selected_company,
+    trainingConfig.selected_product,
+  );
+
+  if (trainingConfig.data_window_evaluate_end_index >= allData.length) {
+    throw new ModelValidationError("数据窗口索引超出范围", { dataset_size: allData.length });
+  }
+
+  const pythonParams: Record<string, unknown> = {
+    data: JSON.stringify(allData),
+    trainStart: trainingConfig.data_window_train_start_index,
+    trainEnd: trainingConfig.data_window_evaluate_end_index,
+    saveModel: productionModelPath,
+    loadModel: backtestModelPath,
+    fitOnly: true,
+    pretty: true,
+  };
+
+  await runPythonModel(modelType, pythonParams, TRAINING_TIMEOUT);
+
+  return {
+    status: "success",
+    results: {
+      saved_model: productionModelPath,
+      artifact_phase: "production",
+      reused_existing: false,
+    },
+  };
 }
 
 export async function predictExperimentModel(
@@ -810,16 +1057,20 @@ export async function predictExperimentModel(
   experimentId: number,
   forecastSteps: number,
 ) {
-  await assertExperimentModelAccess(experimentId, studentId);
+  const experiment = await assertExperimentModelAccess(experimentId, studentId);
+  assertModelReadyForProduction(experiment, modelType);
 
-  const modelLoadPath = buildExperimentScopedModelPath(experimentId, studentId, modelType);
+  const productionModelPath = getProductionModelPath(experimentId, studentId, modelType);
+  if (!hasSavedModelArtifact(modelType, productionModelPath)) {
+    await prepareExperimentModelForProduction(modelType, studentId, experimentId);
+  }
 
-  if (!fs.existsSync(modelLoadPath)) {
-    throw new ModelNotFoundError(`未找到该实验的已训练 ${modelType.toUpperCase()} 模型`);
+  if (!hasSavedModelArtifact(modelType, productionModelPath)) {
+    throw new ModelNotFoundError(`未找到该实验的 ${modelType.toUpperCase()} 生产预测模型`);
   }
 
   const pythonParams = {
-    loadModel: modelLoadPath,
+    loadModel: productionModelPath,
     forecastSteps,
     pretty: true,
   };

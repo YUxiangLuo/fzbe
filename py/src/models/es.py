@@ -52,6 +52,19 @@ def predict(
     return predictions.tolist(), std_dev_residuals
 
 
+def _estimate_std_dev(residuals: ArrayLike, reference_series: ArrayLike) -> float:
+    residuals_array = np.asarray(residuals, dtype=float)
+    if residuals_array.size > 1:
+        return float(np.std(residuals_array, ddof=1))
+
+    reference_array = np.asarray(reference_series, dtype=float)
+    if reference_array.size > 1:
+        return float(np.std(reference_array, ddof=1))
+
+    baseline = abs(float(np.mean(reference_array))) if reference_array.size else 0.0
+    return float(max(baseline * 0.05, 1.0))
+
+
 def train_and_evaluate(
     y: ArrayLike,
     timestamps: List[str],
@@ -81,7 +94,7 @@ def train_and_evaluate(
     y_true = y_eval.tolist()
 
     residuals = np.array(y_true) - np.array(y_pred)
-    std_dev_residuals = float(np.std(residuals, ddof=1)) if len(residuals) > 1 else 0.0
+    std_dev_residuals = _estimate_std_dev(residuals, y_train)
 
     log.info(f"Calculated residuals: mean={np.mean(residuals):.4f}, std_dev={std_dev_residuals:.4f}")
 
@@ -126,12 +139,60 @@ def _validate_training_args(y: ArrayLike, ts: int, te: int, es: int, ee: int, al
     log.info(f"Validation passed: train_size={train_size}, eval_size={eval_size}, alpha={alpha}")
 
 
+def _validate_fit_args(y: ArrayLike, ts: int, te: int, alpha: float) -> None:
+    n_total = len(y)
+
+    if not (0 <= ts <= te < n_total):
+        raise ValueError(f"[VALIDATION] Invalid training range [{ts}, {te}], must be within [0, {n_total-1}]")
+    if not (0.0 < alpha <= 1.0):
+        raise ValueError(f"[VALIDATION] Alpha must be in (0, 1], got {alpha}")
+
+
 def run(args) -> None:
     """Main entry point for ES model training and prediction."""
     log.info(f"ES run started with args: {vars(args)}")
     pretty: bool = bool(getattr(args, "pretty", False))
     save_path = getattr(args, "save_model", None)
     load_path = getattr(args, "load_model", None)
+
+    if getattr(args, "fit_only", False):
+        if not hasattr(args, "data") or not args.data:
+            raise ValueError("[VALIDATION] --data is required for fit-only mode.")
+        if not save_path:
+            raise ValueError("[VALIDATION] --save-model is required for fit-only mode.")
+
+        state = _load_state(load_path) if load_path else {}
+        parsed_data = load_data_from_json(args.data)
+        y = parsed_data.y
+
+        ts, te = int(args.train_start), int(args.train_end)
+        alpha = float(state.get("alpha") if state else getattr(args, "alpha", 0.5))
+        _validate_fit_args(y, ts, te, alpha)
+
+        y_fit = np.asarray(y)[range(ts, te + 1)]
+        model = SimpleExpSmoothing(y_fit, initialization_method="estimated").fit(
+            smoothing_level=alpha, optimized=False
+        )
+        std_dev_residuals = float(state.get("std_dev_residuals", _estimate_std_dev([], y_fit)))
+
+        next_state = {
+            "model_type": MODEL_TYPE,
+            "alpha": alpha,
+            "train_end_index": te,
+            "model": model,
+            "std_dev_residuals": std_dev_residuals,
+        }
+        dump_model(next_state, save_path)
+
+        out: Dict[str, Any] = {
+            "mode": "es_fit_only",
+            "alpha": alpha,
+            "train_end_index": te,
+            "saved_model": save_path,
+        }
+        out["logs"] = get_log_contents()
+        print(json.dumps(out, ensure_ascii=False, indent=2 if pretty else None))
+        return
 
     if load_path:
         log.info(f"Entering prediction mode with model: {load_path}")
@@ -214,6 +275,8 @@ def run(args) -> None:
         log.info("Run finished successfully.")
         print(json.dumps(out, ensure_ascii=False, indent=2 if pretty else None))
 
+    except ValueError:
+        raise
     except Exception as e:
         log.error(f"An error occurred during data processing or training: {e}", exc_info=True)
         raise ValueError(f"[DATA] Failed to parse or process --data: {e}")
