@@ -36,6 +36,15 @@ def invoke_arima(data_json: str, *extra_args: str) -> dict:
     return json.loads(completed.stdout)
 
 
+def run_arima(data_json: str, *extra_args: str) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        [sys.executable, str(RUN_MODEL), "arima", "--data", data_json, *extra_args],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+
 def select_reference_model(series: list[float], d: int, max_p: int, max_q: int):
     aic_model = pm.auto_arima(
         series,
@@ -123,6 +132,17 @@ def assert_series_close(actual: list[float], expected: list[float], tol: float =
             raise AssertionError(
                 f"value[{index}] mismatch: actual={actual_value}, expected={expected_value}"
             )
+
+
+def assert_error(completed: subprocess.CompletedProcess[str], expected_substring: str) -> None:
+    if completed.returncode == 0:
+        raise AssertionError(f"expected failure containing {expected_substring!r}, got success")
+    if expected_substring not in completed.stderr:
+        raise AssertionError(
+            f"missing expected error substring {expected_substring!r}\n"
+            f"stdout:\n{completed.stdout}\n"
+            f"stderr:\n{completed.stderr}"
+        )
 
 
 def main() -> None:
@@ -225,12 +245,50 @@ def main() -> None:
         assert_series_close(actual_future_predictions, expected_future_predictions.tolist())
         assert_series_close(actual_future_std, expected_future_std)
 
+        short_train_result = run_arima(
+            data_json,
+            "--train-start",
+            "0",
+            "--train-end",
+            "1",
+            "--eval-start",
+            "2",
+            "--eval-end",
+            "3",
+            "--d",
+            "1",
+            "--pretty",
+        )
+        assert_error(
+            short_train_result,
+            "[VALIDATION] Training range must contain at least d + 2 points for ARIMA fitting (got train_size=2, d=1).",
+        )
+
+        short_fit_result = run_arima(
+            data_json,
+            "--train-start",
+            "0",
+            "--train-end",
+            "1",
+            "--load-model",
+            str(backtest_model),
+            "--save-model",
+            str(temp_path / "arima-short-fit.pkl"),
+            "--fit-only",
+            "--pretty",
+        )
+        assert_error(
+            short_fit_result,
+            "[VALIDATION] ARIMA fit-only training range must contain at least d + 2 points for ARIMA fitting (got train_size=2, d=1).",
+        )
+
     print(
         json.dumps(
             {
                 "fixture": str(CSV_FIXTURE),
                 "checked_modes": ["training", "fit_only", "loaded_predict"],
                 "model": "arima",
+                "edge_cases": ["train_short_window", "fit_only_short_window"],
                 "status": "ok",
             },
             ensure_ascii=False,

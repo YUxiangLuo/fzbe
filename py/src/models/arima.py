@@ -38,6 +38,58 @@ def _load_state(model_path: str) -> Dict[str, Any]:
     return state
 
 
+def _validate_arima_train_size(train_size: int, d: int, context: str) -> int:
+    if train_size < 2:
+        raise ValueError(f"[VALIDATION] {context} must contain at least 2 points for ARIMA fitting.")
+
+    effective_train_size = train_size - d
+    if d > 0 and effective_train_size < 2:
+        raise ValueError(
+            f"[VALIDATION] {context} must contain at least d + 2 points for ARIMA fitting "
+            f"(got train_size={train_size}, d={d})."
+        )
+    return effective_train_size
+
+
+def _run_auto_arima_search(
+    y_train: np.ndarray,
+    d: int,
+    max_p: int,
+    max_q: int,
+    criterion: str,
+) -> Any:
+    try:
+        return pm.auto_arima(
+            y_train,
+            d=d,
+            start_p=0,
+            start_q=0,
+            max_p=max_p,
+            max_q=max_q,
+            seasonal=False,
+            stepwise=True,
+            suppress_warnings=True,
+            error_action="ignore",
+            information_criterion=criterion,
+            trace=False,
+        )
+    except Exception as exc:
+        raise ValueError(
+            f"[VALIDATION] ARIMA {criterion.upper()} search failed for the current training range: {exc}"
+        ) from exc
+
+
+def _fit_arima_order(y_train: np.ndarray, order: Tuple[int, int, int], context: str) -> Any:
+    try:
+        fitted_model = pm.ARIMA(order=order, seasonal=False, suppress_warnings=True)
+        fitted_model.fit(y_train)
+        return fitted_model
+    except Exception as exc:
+        raise ValueError(
+            f"[VALIDATION] {context} failed to fit ARIMA order {order}: {exc}"
+        ) from exc
+
+
 # ---------- predict ----------
 def predict(
     model_path: str,
@@ -118,9 +170,14 @@ def train_and_evaluate(
     if len(y_eval) == 0:
         raise ValueError("[VALIDATION] Evaluation range is empty")
 
+    effective_train_size = _validate_arima_train_size(
+        train_size=len(y_train),
+        d=d,
+        context="Training range",
+    )
+
     # Warn about effective sample size reduction due to differencing
     if d > 0:
-        effective_train_size = len(y_train) - d
         log.info(f"After d={d} differencing, effective training size: {len(y_train)} → {effective_train_size}")
         if effective_train_size < 10:
             log.warning(f"Very small effective sample size ({effective_train_size}) after differencing. "
@@ -131,18 +188,22 @@ def train_and_evaluate(
 
     # --- Run auto_arima for both AIC and BIC ---
     log.info(f"Running auto_arima with AIC criterion: searching p in [0, {max_p}], q in [0, {max_q}], d={d}")
-    aic_model = pm.auto_arima(
-        y_train, d=d, start_p=0, start_q=0, max_p=max_p, max_q=max_q,
-        seasonal=False, stepwise=True, suppress_warnings=True,
-        error_action="ignore", information_criterion="aic", trace=False,
+    aic_model = _run_auto_arima_search(
+        y_train=y_train,
+        d=d,
+        max_p=max_p,
+        max_q=max_q,
+        criterion="aic",
     )
     log.debug(f"AIC-optimized model found: order={aic_model.order}")
 
     log.info(f"Running auto_arima with BIC criterion: searching p in [0, {max_p}], q in [0, {max_q}], d={d}")
-    bic_model = pm.auto_arima(
-        y_train, d=d, start_p=0, start_q=0, max_p=max_p, max_q=max_q,
-        seasonal=False, stepwise=True, suppress_warnings=True,
-        error_action="ignore", information_criterion="bic", trace=False,
+    bic_model = _run_auto_arima_search(
+        y_train=y_train,
+        d=d,
+        max_p=max_p,
+        max_q=max_q,
+        criterion="bic",
     )
     log.debug(f"BIC-optimized model found: order={bic_model.order}")
 
@@ -288,8 +349,17 @@ def run(args) -> None:
             int(order_info.get("d", state.get("d", 0))),
             int(order_info.get("q", 0)),
         )
-        fitted_model = pm.ARIMA(order=order, seasonal=False, suppress_warnings=True)
-        fitted_model.fit(y[ts : te + 1])
+        train_size = te - ts + 1
+        _validate_arima_train_size(
+            train_size=train_size,
+            d=order[1],
+            context="ARIMA fit-only training range",
+        )
+        fitted_model = _fit_arima_order(
+            y_train=y[ts : te + 1],
+            order=order,
+            context="ARIMA fit-only",
+        )
 
         next_state = {
             "model_type": MODEL_TYPE,
