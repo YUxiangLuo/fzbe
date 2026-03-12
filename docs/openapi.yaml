@@ -219,6 +219,7 @@ components:
 
     QuestionUpdateRequest:
       type: object
+      minProperties: 1
       properties:
         knowledge_point:
           type: string
@@ -277,17 +278,16 @@ components:
           type: string
           minLength: 1
 
-    ModelTrainRequest:
+    ModelTrainRequestBase:
       type: object
-      required:
-        - selected_industry
-        - selected_company
-        - selected_product
-        - data_window_train_start_index
-        - data_window_train_end_index
-        - data_window_evaluate_start_index
-        - data_window_evaluate_end_index
+      description: |
+        `experiment_id` 为必填。其余数据集与窗口字段是可选的一致性校验字段；
+        如果传入，必须与实验记录中的已保存值一致。
+      required: [experiment_id]
       properties:
+        experiment_id:
+          type: integer
+          minimum: 1
         selected_industry:
           type: string
           minLength: 1
@@ -329,16 +329,95 @@ components:
         models:
           type: string
 
+    MovingAverageTrainRequest:
+      allOf:
+        - $ref: '#/components/schemas/ModelTrainRequestBase'
+        - type: object
+          required: [moving_average_window]
+          properties:
+            moving_average_window:
+              type: integer
+              minimum: 2
+
+    ExponentialSmoothingTrainRequest:
+      allOf:
+        - $ref: '#/components/schemas/ModelTrainRequestBase'
+        - type: object
+          required: [exponential_smoothing_alpha]
+          properties:
+            exponential_smoothing_alpha:
+              type: number
+              minimum: 0
+              exclusiveMinimum: true
+              maximum: 1
+
+    ArimaTrainRequest:
+      allOf:
+        - $ref: '#/components/schemas/ModelTrainRequestBase'
+        - type: object
+          required: [arimaD]
+          properties:
+            arimaD:
+              type: integer
+              minimum: 0
+
+    LstmTrainRequest:
+      allOf:
+        - $ref: '#/components/schemas/ModelTrainRequestBase'
+        - type: object
+          required: [lstmFeatures, lstmTargetFeature, lstmNormalization]
+          properties:
+            lstmFeatures:
+              type: string
+              minLength: 1
+            lstmTargetFeature:
+              type: string
+              minLength: 1
+            lstmNormalization:
+              type: string
+              enum: [minmax, zscore]
+
+    EnsembleTrainRequest:
+      allOf:
+        - $ref: '#/components/schemas/ModelTrainRequestBase'
+        - type: object
+          required: [models]
+          properties:
+            models:
+              type: string
+              minLength: 1
+
+    ModelTrainRequest:
+      description: 请求体要求取决于路径参数 `model_type`。
+      oneOf:
+        - $ref: '#/components/schemas/MovingAverageTrainRequest'
+        - $ref: '#/components/schemas/ExponentialSmoothingTrainRequest'
+        - $ref: '#/components/schemas/ArimaTrainRequest'
+        - $ref: '#/components/schemas/LstmTrainRequest'
+        - $ref: '#/components/schemas/EnsembleTrainRequest'
+
     ModelPredictRequest:
       type: object
-      required: [forecast_steps]
+      required: [experiment_id, forecast_steps]
       properties:
+        experiment_id:
+          type: integer
+          minimum: 1
         forecast_steps:
+          type: integer
+          minimum: 1
+
+    ModelPrepareProductionRequest:
+      type: object
+      required: [experiment_id]
+      properties:
+        experiment_id:
           type: integer
           minimum: 1
 
     ClassUpdateRequest:
       type: object
+      minProperties: 1
       properties:
         class_name:
           type: string
@@ -415,6 +494,22 @@ components:
         selected_product:
           type: string
           nullable: true
+        selected_base_models:
+          oneOf:
+            - type: array
+              items: {}
+            - type: object
+              additionalProperties: true
+            - type: string
+              nullable: true
+        selected_ensemble_models:
+          oneOf:
+            - type: array
+              items: {}
+            - type: object
+              additionalProperties: true
+            - type: string
+              nullable: true
         data_window_train_start_index:
           type: integer
           minimum: 0
@@ -438,12 +533,34 @@ components:
           type: integer
           minimum: 1
           nullable: true
+        moving_average_metrics_rmse:
+          type: number
+          minimum: 0
+          nullable: true
+        moving_average_metrics_mae:
+          type: number
+          minimum: 0
+          nullable: true
+        moving_average_metrics_r2:
+          type: number
+          nullable: true
         exponential_smoothing_completed:
           type: boolean
           nullable: true
         exponential_smoothing_alpha:
           type: number
           minimum: 0
+          nullable: true
+        exponential_smoothing_metrics_rmse:
+          type: number
+          minimum: 0
+          nullable: true
+        exponential_smoothing_metrics_mae:
+          type: number
+          minimum: 0
+          nullable: true
+        exponential_smoothing_metrics_r2:
+          type: number
           nullable: true
         arima_completed:
           type: boolean
@@ -460,6 +577,25 @@ components:
           type: integer
           minimum: 0
           nullable: true
+        arima_metrics_rmse:
+          type: number
+          minimum: 0
+          nullable: true
+        arima_metrics_mae:
+          type: number
+          minimum: 0
+          nullable: true
+        arima_metrics_r2:
+          type: number
+          nullable: true
+        arima_adf_stationarity:
+          oneOf:
+            - type: array
+              items: {}
+            - type: object
+              additionalProperties: true
+            - type: string
+              nullable: true
         lstm_completed:
           type: boolean
           nullable: true
@@ -474,18 +610,86 @@ components:
             - type: object
               additionalProperties: true
             - type: string
-          nullable: true
+              nullable: true
         lstm_target_field:
           type: string
+          nullable: true
+        lstm_metrics_rmse:
+          type: number
+          minimum: 0
+          nullable: true
+        lstm_metrics_mae:
+          type: number
+          minimum: 0
+          nullable: true
+        lstm_metrics_r2:
+          type: number
           nullable: true
         ensemble_weighted_completed:
           type: boolean
           nullable: true
+        ensemble_weighted_base_models:
+          oneOf:
+            - type: array
+              items: {}
+            - type: object
+              additionalProperties: true
+            - type: string
+              nullable: true
+        ensemble_weighted_metrics_rmse:
+          type: number
+          minimum: 0
+          nullable: true
+        ensemble_weighted_metrics_mae:
+          type: number
+          minimum: 0
+          nullable: true
+        ensemble_weighted_metrics_r2:
+          type: number
+          nullable: true
         ensemble_boosting_completed:
           type: boolean
           nullable: true
+        ensemble_boosting_base_models:
+          oneOf:
+            - type: array
+              items: {}
+            - type: object
+              additionalProperties: true
+            - type: string
+              nullable: true
+        ensemble_boosting_metrics_rmse:
+          type: number
+          minimum: 0
+          nullable: true
+        ensemble_boosting_metrics_mae:
+          type: number
+          minimum: 0
+          nullable: true
+        ensemble_boosting_metrics_r2:
+          type: number
+          nullable: true
         ensemble_stacking_completed:
           type: boolean
+          nullable: true
+        ensemble_stacking_base_models:
+          oneOf:
+            - type: array
+              items: {}
+            - type: object
+              additionalProperties: true
+            - type: string
+              nullable: true
+        ensemble_stacking_metrics_rmse:
+          type: number
+          minimum: 0
+          nullable: true
+        ensemble_stacking_metrics_mae:
+          type: number
+          minimum: 0
+          nullable: true
+        ensemble_stacking_metrics_r2:
+          type: number
           nullable: true
         selected_best_model:
           type: string
@@ -512,6 +716,25 @@ components:
           type: number
           minimum: 0
           nullable: true
+        production_safety_stock_z_score:
+          type: number
+          nullable: true
+        production_mps_table:
+          oneOf:
+            - type: array
+              items: {}
+            - type: object
+              additionalProperties: true
+            - type: string
+              nullable: true
+        production_forecast_results:
+          oneOf:
+            - type: array
+              items: {}
+            - type: object
+              additionalProperties: true
+            - type: string
+              nullable: true
         production_capacity_mode:
           type: string
           enum: [scenario, auto, custom]
@@ -742,6 +965,7 @@ components:
 
     UpdateCurrentUserRequest:
       type: object
+      minProperties: 1
       properties:
         full_name:
           type: string
@@ -778,6 +1002,10 @@ components:
         newPassword:
           type: string
           minLength: 6
+        new_password:
+          type: string
+          minLength: 6
+          deprecated: true
 
   parameters:
     classId:
@@ -920,6 +1148,7 @@ paths:
       tags: [Auth]
       summary: 登录
       operationId: createSession
+      security: []
       requestBody:
         required: true
         content:
@@ -1400,6 +1629,24 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/ErrorResponse'
+        '403':
+          description: 权限不足
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '404':
+          description: 实验不存在
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '409':
+          description: 同一实验下该模型已有训练/预测任务在执行
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
         '429':
           description: 模型服务繁忙
           content:
@@ -1408,6 +1655,65 @@ paths:
                 $ref: '#/components/schemas/ErrorResponse'
         '504':
           description: 训练超时
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /api/v1/models/{model_type}/prepare-production:
+    post:
+      tags: [Models]
+      summary: 准备生产预测模型
+      operationId: prepareModelForProduction
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/modelType'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ModelPrepareProductionRequest'
+      responses:
+        '200':
+          description: 准备成功
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DataEnvelope'
+        '400':
+          description: 参数错误或模型尚未满足生产准备条件
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '403':
+          description: 权限不足
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '404':
+          description: 实验或回测模型不存在
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '409':
+          description: 同一实验下该模型已有训练/预测任务在执行
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '429':
+          description: 模型服务繁忙
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '504':
+          description: 准备超时
           content:
             application/json:
               schema:
@@ -1441,14 +1747,32 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/ErrorResponse'
+        '403':
+          description: 权限不足
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
         '404':
           description: 模型不存在
           content:
             application/json:
               schema:
                 $ref: '#/components/schemas/ErrorResponse'
+        '409':
+          description: 同一实验下该模型已有训练/预测任务在执行
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
         '429':
           description: 模型服务繁忙
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '504':
+          description: 预测超时
           content:
             application/json:
               schema:
@@ -2742,6 +3066,7 @@ paths:
       tags: [Users]
       summary: 学生自助注册
       operationId: registerUser
+      security: []
       parameters:
         - $ref: '#/components/parameters/role'
       requestBody:
@@ -3486,6 +3811,7 @@ paths:
       tags: [Files]
       summary: 公开访问前端静态脚本
       operationId: getJsStaticFile
+      security: []
       parameters:
         - $ref: '#/components/parameters/filename'
       responses:
@@ -3502,6 +3828,7 @@ paths:
       tags: [Files]
       summary: 公开访问前端静态图片
       operationId: getImageStaticFile
+      security: []
       parameters:
         - $ref: '#/components/parameters/filename'
       responses:
