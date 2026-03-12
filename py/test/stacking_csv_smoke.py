@@ -8,7 +8,6 @@ import tempfile
 from pathlib import Path
 
 import numpy as np
-from sklearn.linear_model import LinearRegression
 
 
 PY_ROOT = Path(__file__).resolve().parents[1]
@@ -70,6 +69,59 @@ def assert_all_finite(values: list[float], label: str) -> None:
     for index, value in enumerate(values):
         if not math.isfinite(value):
             raise AssertionError(f"{label}[{index}] is not finite: {value}")
+
+
+def compute_expected_stacking_weights(
+    model_names: list[str],
+    level1_predictions: dict[str, list[float]],
+    meta_target: np.ndarray,
+) -> np.ndarray:
+    meta_train = np.column_stack([level1_predictions[name] for name in model_names])
+    n_samples, n_models = meta_train.shape
+
+    try:
+        condition_number = float(np.linalg.cond(meta_train))
+    except np.linalg.LinAlgError:
+        condition_number = float("inf")
+
+    if n_samples <= n_models + 1 or not math.isfinite(condition_number) or condition_number > 1e6:
+        model_mae = np.array(
+            [np.mean(np.abs(meta_target - np.array(level1_predictions[name], dtype=float))) for name in model_names],
+            dtype=float,
+        )
+        inverse_mae = 1.0 / (model_mae + 1e-9)
+        return inverse_mae / np.sum(inverse_mae)
+
+    from sklearn.linear_model import LinearRegression
+
+    regression = LinearRegression(positive=True, fit_intercept=False)
+    regression.fit(meta_train, meta_target)
+    raw_weights = np.clip(np.asarray(regression.coef_, dtype=float), 0.0, None)
+    total = float(np.sum(raw_weights))
+    if total <= 1e-12:
+        return np.full(n_models, 1.0 / n_models, dtype=float)
+    return raw_weights / total
+
+
+def blend_predictions(model_names: list[str], member_predictions: dict[str, list[float]], weights: np.ndarray) -> list[float]:
+    prediction_matrix = np.column_stack([member_predictions[name] for name in model_names])
+    return (prediction_matrix @ weights).tolist()
+
+
+def assert_predictions_within_member_envelope(
+    model_names: list[str],
+    member_predictions: dict[str, list[float]],
+    blended_predictions: list[float],
+    tol: float = 1e-6,
+) -> None:
+    prediction_matrix = np.column_stack([member_predictions[name] for name in model_names])
+    lower = np.min(prediction_matrix, axis=1)
+    upper = np.max(prediction_matrix, axis=1)
+    for index, (value, lo, hi) in enumerate(zip(blended_predictions, lower, upper)):
+        if value < lo - tol or value > hi + tol:
+            raise AssertionError(
+                f"blended prediction[{index}] escaped member envelope: value={value}, lo={lo}, hi={hi}"
+            )
 
 
 def member_model_path(save_path: Path, model_name: str) -> str:
@@ -173,13 +225,13 @@ def main() -> None:
                 )
             )
 
-        meta_train = np.array([level1_predictions[name] for name in BASE_MODELS]).T
         meta_target = np.array(sales[16:20], dtype=float)
-        expected_meta_model = LinearRegression(positive=True)
-        expected_meta_model.fit(meta_train, meta_target)
-        expected_eval_predictions = expected_meta_model.predict(
-            np.array([eval_predictions[name] for name in BASE_MODELS]).T
-        ).tolist()
+        expected_weights = compute_expected_stacking_weights(
+            BASE_MODELS,
+            level1_predictions,
+            meta_target,
+        )
+        expected_eval_predictions = blend_predictions(BASE_MODELS, eval_predictions, expected_weights)
 
         stacking_model_backtest = temp_path / "stacking-backtest.pkl"
         train_output = invoke_model(
@@ -220,6 +272,7 @@ def main() -> None:
         assert train_output["eval_y_true"] == sales[20:24]
         assert_series_close(actual_eval_predictions, expected_eval_predictions)
         assert_all_finite(actual_eval_std_devs, "train_std_devs")
+        assert_predictions_within_member_envelope(BASE_MODELS, eval_predictions, actual_eval_predictions)
 
         stacking_model_production = temp_path / "stacking-production.pkl"
         fit_output = invoke_model(
@@ -254,9 +307,11 @@ def main() -> None:
             )
             for model_name in BASE_MODELS
         }
-        expected_future_predictions = expected_meta_model.predict(
-            np.array([production_member_predictions[name] for name in BASE_MODELS]).T
-        ).tolist()
+        expected_future_predictions = blend_predictions(
+            BASE_MODELS,
+            production_member_predictions,
+            expected_weights,
+        )
 
         predict_output_one = invoke_model(
             "stacking",
@@ -287,6 +342,7 @@ def main() -> None:
         assert_series_close(future_predictions_one, future_predictions_two)
         assert_series_close(future_std_devs_one, future_std_devs_two)
         assert_all_finite(future_std_devs_one, "future_std_devs")
+        assert_predictions_within_member_envelope(BASE_MODELS, production_member_predictions, future_predictions_one)
 
     print(
         json.dumps(

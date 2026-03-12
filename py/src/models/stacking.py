@@ -56,6 +56,106 @@ def _compute_phase1_train_size(train_size: int) -> int:
     return max(3, int(train_size * 0.8))
 
 
+def _normalize_meta_weights(raw_weights: np.ndarray, n_models: int) -> np.ndarray:
+    """Normalize non-negative meta weights and fall back to uniform weights when degenerate."""
+    weights = np.asarray(raw_weights, dtype=float).reshape(-1)
+    if weights.size != n_models:
+        raise ValueError(
+            f"[VALIDATION] Meta-model weight size mismatch: expected {n_models}, got {weights.size}."
+        )
+
+    weights = np.clip(weights, 0.0, None)
+    total = float(np.sum(weights))
+    if not np.isfinite(total) or total <= 1e-12:
+        return np.full(n_models, 1.0 / n_models, dtype=float)
+
+    return weights / total
+
+
+def _compute_inverse_mae_weights(X_meta_train: np.ndarray, y_meta_train: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+    """Compute stable ensemble weights from level1 MAE."""
+    abs_errors = np.abs(X_meta_train - y_meta_train[:, np.newaxis])
+    model_mae = np.mean(abs_errors, axis=0)
+    inverse_mae = 1.0 / (model_mae + 1e-9)
+    return _normalize_meta_weights(inverse_mae, X_meta_train.shape[1]), model_mae
+
+
+def _fit_meta_model(
+    X_meta_train: np.ndarray,
+    y_meta_train: np.ndarray,
+    model_names: List[str],
+) -> Dict[str, Any]:
+    """Fit a stable meta-model for stacking.
+
+    Small level1 samples are common in this project. When the meta feature matrix is
+    underdetermined or strongly collinear, unconstrained linear regression easily
+    produces extreme coefficients and catastrophic forecasts. In those cases we fall
+    back to inverse-MAE weights computed on level1 predictions.
+    """
+    n_samples, n_models = X_meta_train.shape
+    if n_models == 0:
+        raise ValueError("[VALIDATION] Stacking meta-model requires at least one base model.")
+
+    try:
+        condition_number = float(np.linalg.cond(X_meta_train))
+    except np.linalg.LinAlgError:
+        condition_number = float("inf")
+
+    fallback_reason = None
+    if n_samples <= n_models + 1:
+        fallback_reason = (
+            f"meta_samples({n_samples}) <= model_parameters({n_models + 1})"
+        )
+    elif not np.isfinite(condition_number):
+        fallback_reason = "meta_feature_matrix is singular"
+    elif condition_number > 1e6:
+        fallback_reason = f"meta_feature_matrix is ill-conditioned ({condition_number:.2e})"
+
+    if fallback_reason:
+        weights, model_mae = _compute_inverse_mae_weights(X_meta_train, y_meta_train)
+        return {
+            "kind": "weighted_blend",
+            "strategy": "inverse_mae_fallback",
+            "fallback_reason": fallback_reason,
+            "condition_number": condition_number,
+            "model_names": list(model_names),
+            "weights": weights.tolist(),
+            "level1_mae": model_mae.tolist(),
+        }
+
+    regression = LinearRegression(positive=True, fit_intercept=False)
+    regression.fit(X_meta_train, y_meta_train)
+    raw_coefficients = np.asarray(regression.coef_, dtype=float)
+    weights = _normalize_meta_weights(raw_coefficients, n_models)
+
+    return {
+        "kind": "weighted_blend",
+        "strategy": "normalized_positive_regression",
+        "condition_number": condition_number,
+        "model_names": list(model_names),
+        "weights": weights.tolist(),
+        "raw_coefficients": raw_coefficients.tolist(),
+    }
+
+
+def _predict_with_meta_model(meta_model: Any, X_meta: np.ndarray) -> np.ndarray:
+    """Predict with either the new weight-based meta-model or a legacy sklearn model."""
+    X_meta = np.asarray(X_meta, dtype=float)
+
+    if isinstance(meta_model, dict):
+        weights = np.asarray(meta_model.get("weights", []), dtype=float).reshape(-1)
+        if weights.size != X_meta.shape[1]:
+            raise ValueError(
+                "[VALIDATION] Saved Stacking meta-model weights do not match base model count."
+            )
+        return X_meta @ weights
+
+    if hasattr(meta_model, "predict"):
+        return np.asarray(meta_model.predict(X_meta), dtype=float)
+
+    raise ValueError("[VALIDATION] Unsupported Stacking meta-model state.")
+
+
 def _load_state(model_path: str) -> Dict[str, Any]:
     """Load and validate a saved Stacking model state."""
     state = load_model(model_path)
@@ -207,7 +307,7 @@ def predict(
         base_predictions.append(preds)
 
     X_meta_future = np.array(base_predictions).T
-    final_predictions = meta_model.predict(X_meta_future)
+    final_predictions = _predict_with_meta_model(meta_model, X_meta_future)
 
     return final_predictions.tolist(), std_dev_residuals
 
@@ -233,7 +333,7 @@ def train_and_evaluate(
     Returns:
         metrics: Evaluation metrics dictionary
         base_model_states: States of all base models (for saving/loading)
-        meta_model: Trained meta-model (LinearRegression)
+        meta_model: Trained meta-model state
         y_true: True values from eval_range
         y_pred: Predicted values on eval_range
         std_dev_residuals: Standard deviation of residuals
@@ -307,14 +407,22 @@ def train_and_evaluate(
 
     # === Step 3: Train meta-model on level1 predictions ===
     print(f"\n[Stacking Phase 2] 训练元模型（在level1预测上）", file=sys.stderr)
-    X_meta_train = np.array(level1_predictions).T  # ✅ level1的out-of-fold预测
+    X_meta_train = np.column_stack(level1_predictions)  # ✅ level1的out-of-fold预测
     y_meta_train = parsed_data.y[level1_train_range]  # ✅ level1的标签
 
-    # Use positive=True to prevent negative weights and instability due to multicollinearity
-    meta_model = LinearRegression(positive=True)
-    meta_model.fit(X_meta_train, y_meta_train)  # ✅ 在独立的level1集上训练
-    
+    meta_model = _fit_meta_model(X_meta_train, y_meta_train, models_to_use)
+
     print(f"  ✓ 元模型训练完成 (输入维度: {X_meta_train.shape})", file=sys.stderr)
+    if isinstance(meta_model, dict):
+        print(
+            f"  元模型策略: {meta_model['strategy']} "
+            f"(condition={meta_model.get('condition_number', float('nan')):.2e})",
+            file=sys.stderr,
+        )
+        if meta_model.get("fallback_reason"):
+            print(f"  稳定性回退: {meta_model['fallback_reason']}", file=sys.stderr)
+        for model_name, weight in zip(meta_model["model_names"], meta_model["weights"]):
+            print(f"    {model_name}: weight={float(weight):.6f}", file=sys.stderr)
 
     # === Step 4: Phase 2 - Retrain base models on full train_range ===
     print(f"\n[Stacking Phase 3] 在完整训练集上重新训练基础模型", file=sys.stderr)
@@ -381,8 +489,8 @@ def train_and_evaluate(
 
     # === Step 5: Final prediction and evaluation on eval_range ===
     print(f"\n[Stacking Phase 4] 元模型最终预测和评估", file=sys.stderr)
-    X_meta_eval = np.array(eval_predictions).T  # ✅ eval_range的预测
-    y_pred_final = meta_model.predict(X_meta_eval)  # ✅ 元模型在独立测试集上预测
+    X_meta_eval = np.column_stack(eval_predictions)  # ✅ eval_range的预测
+    y_pred_final = _predict_with_meta_model(meta_model, X_meta_eval)  # ✅ 元模型在独立测试集上预测
     y_true_final = parsed_data.y[eval_range]  # ✅ 真实标签
 
     # Calculate residuals and standard deviation
