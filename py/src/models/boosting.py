@@ -41,6 +41,16 @@ SUPPORTED_BASE_MODELS = ["ma", "es", "arima", "lstm"]
 
 
 # ---------- utilities ----------
+def _parse_feature_name_list(raw_value: Any) -> List[str]:
+    if raw_value is None:
+        return []
+    if isinstance(raw_value, str):
+        return [item.strip() for item in raw_value.split(",") if item.strip()]
+    if isinstance(raw_value, list):
+        return [str(item).strip() for item in raw_value if str(item).strip()]
+    return []
+
+
 def _format_predictions(preds: List[float], std_dev: float = 0.0) -> List[Dict[str, float]]:
     return [{"prediction": float(p), "std_dev": float(std_dev)} for p in preds]
 
@@ -293,7 +303,58 @@ def _validate_fit_args(parsed_data: ParsedData, ts: int, te: int, state: Dict[st
     if not (0 <= ts <= te < n):
         raise ValueError(f"[VALIDATION] Invalid train range: [{ts},{te}], n_obs={n}")
 
-    list(_iter_stage_models(state))
+    stages = list(_iter_stage_models(state))
+
+    for stage_idx, model_name, _coefficient, previous_model_state in stages:
+        if model_name != "lstm":
+            continue
+
+        from models import lstm as lstm_model
+
+        source_model_state = load_model(previous_model_state["model_file"])
+        if not isinstance(source_model_state, dict) or source_model_state.get("model_type") != "lstm":
+            raise ValueError(
+                f"[VALIDATION] Boosting fit-only stage {stage_idx + 1} has an invalid LSTM source model."
+            )
+
+        look_back = int(source_model_state["look_back"])
+        forecast_strategy = source_model_state.get(
+            "forecast_strategy",
+            lstm_model.LEGACY_FORECAST_STRATEGY,
+        )
+        saved_eval_horizon = int(source_model_state.get("forecast_horizon", 0) or 0)
+        fit_forecast_horizon = saved_eval_horizon
+        effective_forecast_strategy = forecast_strategy
+
+        if forecast_strategy == lstm_model.DIRECT_FORECAST_STRATEGY:
+            desired_production_horizon = lstm_model._resolve_production_forecast_horizon(
+                state=source_model_state,
+                eval_forecast_horizon=saved_eval_horizon,
+            )
+            train_size = te - ts + 1
+            if desired_production_horizon > fit_forecast_horizon:
+                if lstm_model._can_fit_direct_forecast(train_size, look_back, desired_production_horizon):
+                    fit_forecast_horizon = desired_production_horizon
+                else:
+                    effective_forecast_strategy = lstm_model.LEGACY_FORECAST_STRATEGY
+                    fit_forecast_horizon = 0
+
+        try:
+            lstm_model._validate_fit_args(
+                parsed_data,
+                ts,
+                te,
+                look_back,
+                fit_forecast_horizon,
+                effective_forecast_strategy,
+            )
+        except ValueError as exc:
+            message = str(exc)
+            if message.startswith("[VALIDATION] "):
+                message = message[len("[VALIDATION] "):]
+            raise ValueError(
+                f"[VALIDATION] Boosting fit-only stage {stage_idx + 1} (lstm) cannot be refit: {message}"
+            ) from exc
 
 
 def _validate_training_args(
@@ -359,6 +420,18 @@ def _validate_training_args(
                     f"[VALIDATION] LSTM look_back ({params['look_back']}) is too large for "
                     f"the boosting internal training split ({boost_train_size} points). "
                     f"Please reduce look_back or increase training data."
+                )
+            target_feature = str(params.get("lstm_target_feature", parsed_data.target_key) or parsed_data.target_key)
+            if target_feature not in parsed_data.df.columns:
+                raise ValueError(f"[VALIDATION] LSTM target feature not found in dataset: {target_feature}")
+            missing_feature_names = [
+                feature_name
+                for feature_name in _parse_feature_name_list(params.get("lstm_features"))
+                if feature_name not in parsed_data.df.columns
+            ]
+            if missing_feature_names:
+                raise ValueError(
+                    f"[VALIDATION] LSTM feature columns not found in dataset: {missing_feature_names}"
                 )
 
 
