@@ -40,6 +40,16 @@ MODEL_TYPE = "weighted_avg"
 
 
 # ---------- utilities ----------
+def _parse_feature_name_list(raw_value: Any) -> List[str]:
+    if raw_value is None:
+        return []
+    if isinstance(raw_value, str):
+        return [item.strip() for item in raw_value.split(",") if item.strip()]
+    if isinstance(raw_value, list):
+        return [str(item).strip() for item in raw_value if str(item).strip()]
+    return []
+
+
 def _format_predictions(preds: List[float], std_dev: float = 0.0) -> List[Dict[str, float]]:
     """Format predictions with standard deviation for JSON output."""
     return [{"prediction": float(p), "std_dev": float(std_dev)} for p in preds]
@@ -63,6 +73,36 @@ def _load_state(model_path: str) -> Dict[str, Any]:
     return state
 
 
+def _compute_inverse_variance_weights(
+    y_true: np.ndarray,
+    predictions_by_model: Dict[str, Any],
+) -> Dict[str, float]:
+    """
+    Estimate inverse-variance weights from residuals around the zero-error target.
+
+    Using the residual second moment penalizes systematic bias, unlike centered
+    variance which treats constant-but-wrong residuals as zero variance.
+    """
+    raw_weights: Dict[str, float] = {}
+    total_inverse_variance = 0.0
+
+    for model_name, predictions in predictions_by_model.items():
+        residuals = np.asarray(y_true, dtype=float) - np.asarray(predictions, dtype=float)
+        error_variance = float(np.mean(np.square(residuals)))
+        inverse_variance = 1.0 / (error_variance + 1e-9)
+        raw_weights[model_name] = inverse_variance
+        total_inverse_variance += inverse_variance
+
+    if total_inverse_variance <= 0:
+        uniform_weight = 1.0 / max(1, len(raw_weights))
+        return {model_name: uniform_weight for model_name in raw_weights}
+
+    return {
+        model_name: weight / total_inverse_variance
+        for model_name, weight in raw_weights.items()
+    }
+
+
 def _validate_fit_args(parsed_data: ParsedData, ts: int, te: int, state: Dict[str, Any]) -> None:
     n = parsed_data.n_obs
     if not (0 <= ts <= te < n):
@@ -80,6 +120,69 @@ def _validate_fit_args(parsed_data: ParsedData, ts: int, te: int, state: Dict[st
         model_state = base_model_states.get(model_name)
         if not isinstance(model_state, dict) or not isinstance(model_state.get("model_file"), str):
             raise ValueError(f"[VALIDATION] Missing saved state for base model: {model_name}")
+
+        if model_name != "lstm":
+            continue
+
+        from models import lstm as lstm_model
+
+        source_model_state = load_model(model_state["model_file"])
+        if not isinstance(source_model_state, dict) or source_model_state.get("model_type") != "lstm":
+            raise ValueError("[VALIDATION] Saved Weighted Average LSTM member is invalid.")
+
+        target_feature = str(source_model_state.get("target_key") or parsed_data.target_key)
+        if target_feature not in parsed_data.df.columns:
+            raise ValueError(
+                f"[VALIDATION] Weighted Average fit-only member lstm is missing target column: {target_feature}"
+            )
+        missing_feature_names = [
+            feature_name
+            for feature_name in source_model_state.get("feature_keys", []) or []
+            if feature_name not in parsed_data.df.columns
+        ]
+        if missing_feature_names:
+            raise ValueError(
+                f"[VALIDATION] Weighted Average fit-only member lstm is missing feature columns: {missing_feature_names}"
+            )
+
+        look_back = int(source_model_state["look_back"])
+        forecast_strategy = source_model_state.get(
+            "forecast_strategy",
+            lstm_model.LEGACY_FORECAST_STRATEGY,
+        )
+        saved_eval_horizon = int(source_model_state.get("forecast_horizon", 0) or 0)
+        fit_forecast_horizon = saved_eval_horizon
+        effective_forecast_strategy = forecast_strategy
+
+        if forecast_strategy == lstm_model.DIRECT_FORECAST_STRATEGY:
+            desired_production_horizon = lstm_model._resolve_production_forecast_horizon(
+                state=source_model_state,
+                eval_forecast_horizon=saved_eval_horizon,
+            )
+            train_size = te - ts + 1
+            if desired_production_horizon > fit_forecast_horizon:
+                if lstm_model._can_fit_direct_forecast(train_size, look_back, desired_production_horizon):
+                    fit_forecast_horizon = desired_production_horizon
+                else:
+                    effective_forecast_strategy = lstm_model.LEGACY_FORECAST_STRATEGY
+                    fit_forecast_horizon = 0
+
+        try:
+            lstm_model._validate_fit_args(
+                parsed_data,
+                ts,
+                te,
+                look_back,
+                fit_forecast_horizon,
+                effective_forecast_strategy,
+            )
+        except ValueError as exc:
+            message = str(exc)
+            if message.startswith("[VALIDATION] "):
+                message = message[len("[VALIDATION] "):]
+            raise ValueError(
+                f"[VALIDATION] Weighted Average fit-only member lstm cannot be refit: {message}"
+            ) from exc
 
 
 def _validate_training_args(
@@ -133,14 +236,33 @@ def _validate_training_args(
             if params["look_back"] < 1: raise ValueError("[VALIDATION] LSTM look_back must be >= 1.")
             if params["epochs"] < 1: raise ValueError("[VALIDATION] LSTM epochs must be >= 1.")
             if te - ts + 1 <= params["look_back"]: raise ValueError("[VALIDATION] Training range must be larger than LSTM look_back.")
-            # Also validate against the Phase 1 sub-range (weight_train) which is smaller
             train_size = te - ts + 1
             weight_train_size = _compute_phase1_train_size(train_size)
+            weight_val_size = train_size - weight_train_size
             if weight_train_size <= params["look_back"]:
                 raise ValueError(
                     f"[VALIDATION] LSTM look_back ({params['look_back']}) is too large for "
                     f"the weighted average internal training split ({weight_train_size} points). "
                     f"Please reduce look_back or increase training data."
+                )
+            if weight_train_size < params["look_back"] + weight_val_size:
+                raise ValueError(
+                    f"[VALIDATION] LSTM look_back ({params['look_back']}) is too large for "
+                    f"the weighted average internal training split ({weight_train_size} points) "
+                    f"and validation horizon ({weight_val_size} points). Please reduce look_back "
+                    f"or increase training data."
+                )
+            target_feature = str(params.get("lstm_target_feature", parsed_data.target_key) or parsed_data.target_key)
+            if target_feature not in parsed_data.df.columns:
+                raise ValueError(f"[VALIDATION] LSTM target feature not found in dataset: {target_feature}")
+            missing_feature_names = [
+                feature_name
+                for feature_name in _parse_feature_name_list(params.get("lstm_features"))
+                if feature_name not in parsed_data.df.columns
+            ]
+            if missing_feature_names:
+                raise ValueError(
+                    f"[VALIDATION] LSTM feature columns not found in dataset: {missing_feature_names}"
                 )
 
 
@@ -277,23 +399,15 @@ def train_and_evaluate(
     # === Step 3: Calculate weights using Inverse Variance Weighting ===
     print(f"\n[Weighted Average Phase 2] 计算权重（Inverse Variance Weighting）", file=sys.stderr)
     y_true_val = parsed_data.y[weight_val_range]  # ✅ weight_val的真实值
-    weights = {}
-    total_inverse_variance = 0.0
-
     print(f"  方差计算 (基于weight_val残差):", file=sys.stderr)
+    weights = _compute_inverse_variance_weights(y_true_val, weight_val_predictions)
     for name in models_to_use:
-        # ✅ 使用weight_val的残差计算方差（避免泄露）
-        residuals = y_true_val - np.array(weight_val_predictions[name])
-        variance = np.var(residuals)
-        inverse_variance = 1.0 / (variance + 1e-9)  # ✅ 保持原有算法
-        weights[name] = inverse_variance
-        total_inverse_variance += inverse_variance
-        print(f"    {name}: variance={variance:.6f}, inverse_variance={inverse_variance:.6f}", file=sys.stderr)
-
-    # Normalize weights
+        residuals = y_true_val - np.asarray(weight_val_predictions[name], dtype=float)
+        error_variance = float(np.mean(np.square(residuals)))
+        inverse_variance = 1.0 / (error_variance + 1e-9)
+        print(f"    {name}: error_variance={error_variance:.6f}, inverse_variance={inverse_variance:.6f}", file=sys.stderr)
     print(f"  权重归一化:", file=sys.stderr)
     for name in models_to_use:
-        weights[name] /= total_inverse_variance  # ✅ 保持原有归一化算法
         print(f"    {name}: normalized_weight={weights[name]:.6f}", file=sys.stderr)
 
     # === Step 4: Phase 2 - Retrain on full train_range, predict on eval_range ===

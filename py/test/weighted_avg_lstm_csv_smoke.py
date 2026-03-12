@@ -69,6 +69,19 @@ def invoke_model(model_type: str, data_json: str | None, *extra_args: str) -> di
     return json.loads(completed.stdout)
 
 
+def run_command(model_type: str, data_json: str | None, *extra_args: str) -> subprocess.CompletedProcess[str]:
+    command = [sys.executable, str(RUN_MODEL), model_type]
+    if data_json is not None:
+        command.extend(["--data", data_json])
+    command.extend(extra_args)
+    return subprocess.run(
+        command,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+
 def extract_predictions(payload: dict) -> list[float]:
     return [float(item["prediction"]) for item in payload["predictions"]]
 
@@ -91,6 +104,17 @@ def assert_all_finite(values: list[float], label: str) -> None:
     for index, value in enumerate(values):
         if not math.isfinite(value):
             raise AssertionError(f"{label}[{index}] is not finite: {value}")
+
+
+def assert_error(completed: subprocess.CompletedProcess[str], expected_substring: str) -> None:
+    if completed.returncode == 0:
+        raise AssertionError(f"expected failure containing {expected_substring!r}, got success")
+    if expected_substring not in completed.stderr:
+        raise AssertionError(
+            f"missing expected error substring {expected_substring!r}\n"
+            f"stdout:\n{completed.stdout}\n"
+            f"stderr:\n{completed.stderr}"
+        )
 
 
 def load_pickled_state(model_path: Path) -> dict:
@@ -151,6 +175,10 @@ def combine_weighted_predictions(state: dict, forecast_steps: int) -> list[float
 def main() -> None:
     records = load_csv_records(CSV_FIXTURE)
     data_json = json.dumps(records, ensure_ascii=False)
+    trimmed_feature_data_json = json.dumps(
+        [{key: value for key, value in row.items() if key != "库存水平"} for row in records],
+        ensure_ascii=False,
+    )
     timestamps = [f"{int(row['年份']):04d}-{int(row['月份']):02d}" for row in records]
     sales = [float(row["销售数量"]) for row in records]
     train_start = 0
@@ -293,6 +321,102 @@ def main() -> None:
         assert_series_close(future_std_devs_one, future_std_devs_two)
         assert_all_finite(future_std_devs_one, "future_std_devs")
 
+        missing_feature_result = run_command(
+            "weighted_avg",
+            data_json,
+            "--train-start",
+            "0",
+            "--train-end",
+            "27",
+            "--eval-start",
+            "28",
+            "--eval-end",
+            "30",
+            "--models",
+            "ma,lstm",
+            "--window",
+            "3",
+            "--look-back",
+            "4",
+            "--epochs",
+            "2",
+            "--lstm-target-feature",
+            "销售数量",
+            "--lstm-features",
+            "价格指数,不存在字段,促销投入",
+        )
+        assert_error(
+            missing_feature_result,
+            "[VALIDATION] LSTM feature columns not found in dataset: ['不存在字段']",
+        )
+
+        oversized_look_back_result = run_command(
+            "weighted_avg",
+            data_json,
+            "--train-start",
+            "0",
+            "--train-end",
+            "11",
+            "--eval-start",
+            "12",
+            "--eval-end",
+            "15",
+            "--models",
+            "ma,lstm",
+            "--window",
+            "3",
+            "--look-back",
+            "9",
+            "--epochs",
+            "2",
+            "--lstm-target-feature",
+            "销售数量",
+            "--lstm-features",
+            "价格指数,促销投入,库存水平,搜索热度",
+        )
+        assert_error(
+            oversized_look_back_result,
+            "[VALIDATION] LSTM look_back (9) is too large for the weighted average internal training split (10 points) and validation horizon (2 points).",
+        )
+
+        short_fit_result = run_command(
+            "weighted_avg",
+            data_json,
+            "--train-start",
+            "0",
+            "--train-end",
+            "3",
+            "--load-model",
+            str(weighted_model_backtest),
+            "--save-model",
+            str(temp_path / "weighted-avg-lstm-short-fit.pkl"),
+            "--fit-only",
+            "--pretty",
+        )
+        assert_error(
+            short_fit_result,
+            "[VALIDATION] Weighted Average fit-only member lstm cannot be refit: Training range must be larger than look_back.",
+        )
+
+        missing_feature_fit_result = run_command(
+            "weighted_avg",
+            trimmed_feature_data_json,
+            "--train-start",
+            "0",
+            "--train-end",
+            "35",
+            "--load-model",
+            str(weighted_model_backtest),
+            "--save-model",
+            str(temp_path / "weighted-avg-lstm-missing-feature-fit.pkl"),
+            "--fit-only",
+            "--pretty",
+        )
+        assert_error(
+            missing_feature_fit_result,
+            "[VALIDATION] Weighted Average fit-only member lstm is missing feature columns: ['库存水平']",
+        )
+
     print(
         json.dumps(
             {
@@ -302,6 +426,12 @@ def main() -> None:
                 "model": "weighted_avg_lstm",
                 "self_trained_base_models": BASE_MODELS,
                 "reused_base_models": BASE_MODELS,
+                "edge_cases": [
+                    "missing_lstm_feature",
+                    "oversized_look_back",
+                    "fit_only_short_window",
+                    "fit_only_missing_saved_feature",
+                ],
                 "status": "ok",
             },
             ensure_ascii=False,

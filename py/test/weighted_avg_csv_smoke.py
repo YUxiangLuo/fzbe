@@ -76,9 +76,8 @@ def normalized_inverse_variance_weights(
     total = 0.0
     for model_name, predictions in predictions_by_model.items():
         residuals = [target - prediction for target, prediction in zip(y_true, predictions)]
-        residual_mean = sum(residuals) / len(residuals)
-        variance = sum((value - residual_mean) ** 2 for value in residuals) / len(residuals)
-        inverse_variance = 1.0 / (variance + 1e-9)
+        error_variance = sum(value * value for value in residuals) / len(residuals)
+        inverse_variance = 1.0 / (error_variance + 1e-9)
         raw_weights[model_name] = inverse_variance
         total += inverse_variance
 
@@ -94,6 +93,18 @@ def weighted_sum(predictions_by_model: dict[str, list[float]], weights: dict[str
 
 
 def main() -> None:
+    synthetic_weights = normalized_inverse_variance_weights(
+        {
+            "biased": [100.0, 100.0, 100.0, 100.0],
+            "stable": [0.0, 1.0, 0.0, -1.0],
+        },
+        [0.0, 0.0, 0.0, 0.0],
+    )
+    if synthetic_weights["biased"] >= synthetic_weights["stable"]:
+        raise AssertionError(
+            f"expected constant large bias to receive lower weight, got {synthetic_weights}"
+        )
+
     records = load_csv_records(CSV_FIXTURE)
     data_json = json.dumps(records, ensure_ascii=False)
     sales = [float(row["销售数量"]) for row in records]
