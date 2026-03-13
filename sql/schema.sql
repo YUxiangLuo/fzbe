@@ -365,6 +365,7 @@ CREATE TABLE IF NOT EXISTS `experiment_grade` (
     ON DELETE CASCADE,
 
   INDEX `idx_experiment_grade_experiment_id` (`experiment_id`),
+  UNIQUE KEY `uq_experiment_grade_experiment_student` (`experiment_id`, `student_id`),
   -- Performance optimization: composite index for grade queries
   INDEX `idx_student_experiment` (`student_id`, `experiment_id`)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
