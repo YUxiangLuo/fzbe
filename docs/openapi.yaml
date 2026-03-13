@@ -277,6 +277,29 @@ components:
         report_content:
           type: string
           minLength: 1
+          maxLength: 500000
+          description: 提交前会去除首尾空白；去空白后不能为空。
+
+    SubmitReportResult:
+      type: object
+      required: [message, report_id, pdf_path]
+      properties:
+        message:
+          type: string
+          enum: [报告提交成功, 报告更新成功]
+        report_id:
+          type: integer
+          minimum: 1
+        pdf_path:
+          type: string
+          description: 可通过鉴权文件接口访问的相对路径。
+
+    SubmitReportResponse:
+      type: object
+      required: [data]
+      properties:
+        data:
+          $ref: '#/components/schemas/SubmitReportResult'
 
     ModelTrainRequestBase:
       type: object
@@ -1542,7 +1565,12 @@ paths:
   /api/v1/experiment-runs/{experimentId}/report:
     post:
       tags: [Reports]
-      summary: 提交或更新实验报告
+      summary: 提交实验报告
+      description: |
+        学生提交实验报告并触发 PDF 生成。
+
+        正常流程下，同一实验提交成功后会被标记为已完成，后续重复提交会被拒绝。
+        实现中仍保留兼容性 upsert 分支，因此极少数历史/异常数据场景下可能返回 `200` 表示更新成功。
       operationId: submitReport
       security:
         - bearerAuth: []
@@ -1556,17 +1584,23 @@ paths:
               $ref: '#/components/schemas/SubmitReportRequest'
       responses:
         '200':
-          description: 更新成功
+          description: 兼容性更新成功（正常流程下较少出现）
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/DataEnvelope'
+                $ref: '#/components/schemas/SubmitReportResponse'
         '201':
           description: 提交成功
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/DataEnvelope'
+                $ref: '#/components/schemas/SubmitReportResponse'
+        '401':
+          description: 未授权或 token 无效
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
         '400':
           description: 内容无效
           content:
@@ -1581,6 +1615,12 @@ paths:
                 $ref: '#/components/schemas/ErrorResponse'
         '404':
           description: 实验不存在
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '503':
+          description: PDF 生成服务繁忙，排队等待超时
           content:
             application/json:
               schema:
