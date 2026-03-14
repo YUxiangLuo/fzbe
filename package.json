@@ -16,6 +16,7 @@
     "test": "bun test",
     "test:unit": "bun test tests/unit",
     "db:reset": "bun run scripts/db-reset.ts",
+    "db:reset:live": "bun run scripts/db-reset-live.ts",
     "db:reset:parallel": "bun run scripts/db-reset-parallel.ts",
     "seed:parallel:assets": "bun run scripts/seed-parallel-assets.ts",
     "seed:parallel:scenario": "bun run scripts/seed-parallel-scenarios.ts",
