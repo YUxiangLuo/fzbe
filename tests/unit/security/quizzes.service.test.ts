@@ -205,6 +205,281 @@ describe("quizzes service", () => {
     expect(rollback).not.toHaveBeenCalled();
   });
 
+  test("grades multiple-choice answers correctly regardless of submitted order", async () => {
+    connectionQuery.mockImplementation(async (sql: string, params?: unknown[]) => {
+      if (sql === "SET TRANSACTION ISOLATION LEVEL READ COMMITTED") {
+        return [[]];
+      }
+
+      if (sql.includes("SELECT student_id, status FROM experiment_status")) {
+        return [[{ student_id: 20240008, status: "In Progress" }]];
+      }
+
+      if (sql.includes("SELECT question_id, correct_answers, knowledge_point")) {
+        return [[
+          {
+            question_id: 301,
+            correct_answers: JSON.stringify(["A", "C"]),
+            knowledge_point: "预测模型-模型评估指标",
+          },
+        ]];
+      }
+
+      if (sql.includes("DELETE FROM quiz_answers")) {
+        expect(params).toEqual([990008, 20240008, "quiz_about_model"]);
+        return [[]];
+      }
+
+      if (sql.includes("INSERT INTO quiz_answers")) {
+        expect(params).toBeDefined();
+        return [[]];
+      }
+
+      if (sql.includes("SUM(is_correct) AS correct_count")) {
+        return [[{ correct_count: 1, total_count: 1 }]];
+      }
+
+      if (sql.includes("UPDATE experiment_grade")) {
+        expect(params).toEqual([100, 990008, 20240008]);
+        return [[]];
+      }
+
+      if (sql.includes("UPDATE experiment_status")) {
+        expect(params).toEqual([1, 0, 990008, 20240008]);
+        return [[]];
+      }
+
+      throw new Error(`Unexpected SQL in unordered-multi-choice test: ${sql}`);
+    });
+
+    const result = await submitAnswers(990008, 20240008, [
+      { question_id: 301, submitted_answer: ["C", "A"] },
+    ]);
+
+    expect(result).toEqual({
+      results: [
+        {
+          question_id: 301,
+          is_correct: true,
+          correct_answers: ["A", "C"],
+        },
+      ],
+    });
+    expect(commit).toHaveBeenCalledTimes(1);
+    expect(rollback).not.toHaveBeenCalled();
+  });
+
+  test("marks answers incorrect when a multiple-choice submission is missing a correct option", async () => {
+    connectionQuery.mockImplementation(async (sql: string, params?: unknown[]) => {
+      if (sql === "SET TRANSACTION ISOLATION LEVEL READ COMMITTED") {
+        return [[]];
+      }
+
+      if (sql.includes("SELECT student_id, status FROM experiment_status")) {
+        return [[{ student_id: 20240010, status: "In Progress" }]];
+      }
+
+      if (sql.includes("SELECT question_id, correct_answers, knowledge_point")) {
+        return [[
+          {
+            question_id: 501,
+            correct_answers: JSON.stringify(["A", "C"]),
+            knowledge_point: "预测模型-模型评估指标",
+          },
+        ]];
+      }
+
+      if (sql.includes("DELETE FROM quiz_answers")) {
+        expect(params).toEqual([990010, 20240010, "quiz_about_model"]);
+        return [[]];
+      }
+
+      if (sql.includes("INSERT INTO quiz_answers")) {
+        return [[]];
+      }
+
+      if (sql.includes("SUM(is_correct) AS correct_count")) {
+        return [[{ correct_count: 0, total_count: 1 }]];
+      }
+
+      if (sql.includes("UPDATE experiment_grade")) {
+        expect(params).toEqual([0, 990010, 20240010]);
+        return [[]];
+      }
+
+      if (sql.includes("UPDATE experiment_status")) {
+        expect(params).toEqual([1, 0, 990010, 20240010]);
+        return [[]];
+      }
+
+      throw new Error(`Unexpected SQL in missing-choice grading test: ${sql}`);
+    });
+
+    const result = await submitAnswers(990010, 20240010, [
+      { question_id: 501, submitted_answer: ["A"] },
+    ]);
+
+    expect(result).toEqual({
+      results: [
+        {
+          question_id: 501,
+          is_correct: false,
+          correct_answers: ["A", "C"],
+        },
+      ],
+    });
+    expect(commit).toHaveBeenCalledTimes(1);
+    expect(rollback).not.toHaveBeenCalled();
+  });
+
+  test("marks answers incorrect when a multiple-choice submission includes extra options", async () => {
+    connectionQuery.mockImplementation(async (sql: string, params?: unknown[]) => {
+      if (sql === "SET TRANSACTION ISOLATION LEVEL READ COMMITTED") {
+        return [[]];
+      }
+
+      if (sql.includes("SELECT student_id, status FROM experiment_status")) {
+        return [[{ student_id: 20240011, status: "In Progress" }]];
+      }
+
+      if (sql.includes("SELECT question_id, correct_answers, knowledge_point")) {
+        return [[
+          {
+            question_id: 601,
+            correct_answers: JSON.stringify(["B"]),
+            knowledge_point: "生产计划-库存与缺货",
+          },
+        ]];
+      }
+
+      if (sql.includes("DELETE FROM quiz_answers")) {
+        expect(params).toEqual([990011, 20240011, "quiz_about_plan"]);
+        return [[]];
+      }
+
+      if (sql.includes("INSERT INTO quiz_answers")) {
+        return [[]];
+      }
+
+      if (sql.includes("SUM(is_correct) AS correct_count")) {
+        return [[{ correct_count: 0, total_count: 1 }]];
+      }
+
+      if (sql.includes("UPDATE experiment_grade")) {
+        expect(params).toEqual([0, 990011, 20240011]);
+        return [[]];
+      }
+
+      if (sql.includes("UPDATE experiment_status")) {
+        expect(params).toEqual([0, 1, 990011, 20240011]);
+        return [[]];
+      }
+
+      throw new Error(`Unexpected SQL in extra-choice grading test: ${sql}`);
+    });
+
+    const result = await submitAnswers(990011, 20240011, [
+      { question_id: 601, submitted_answer: ["B", "D"] },
+    ]);
+
+    expect(result).toEqual({
+      results: [
+        {
+          question_id: 601,
+          is_correct: false,
+          correct_answers: ["B"],
+        },
+      ],
+    });
+    expect(commit).toHaveBeenCalledTimes(1);
+    expect(rollback).not.toHaveBeenCalled();
+  });
+
+  test("rounds knowledge score to two decimals when only part of the quiz is correct", async () => {
+    connectionQuery.mockImplementation(async (sql: string, params?: unknown[]) => {
+      if (sql === "SET TRANSACTION ISOLATION LEVEL READ COMMITTED") {
+        return [[]];
+      }
+
+      if (sql.includes("SELECT student_id, status FROM experiment_status")) {
+        return [[{ student_id: 20240009, status: "In Progress" }]];
+      }
+
+      if (sql.includes("SELECT question_id, correct_answers, knowledge_point")) {
+        return [[
+          {
+            question_id: 401,
+            correct_answers: JSON.stringify(["A"]),
+            knowledge_point: "预测模型-ARIMA模型",
+          },
+          {
+            question_id: 402,
+            correct_answers: JSON.stringify(["B"]),
+            knowledge_point: "预测模型-LSTM深度学习",
+          },
+          {
+            question_id: 403,
+            correct_answers: JSON.stringify(["C"]),
+            knowledge_point: "预测模型-模型融合技术",
+          },
+        ]];
+      }
+
+      if (sql.includes("DELETE FROM quiz_answers")) {
+        expect(params).toEqual([990009, 20240009, "quiz_about_model"]);
+        return [[]];
+      }
+
+      if (sql.includes("INSERT INTO quiz_answers")) {
+        return [[]];
+      }
+
+      if (sql.includes("SUM(is_correct) AS correct_count")) {
+        return [[{ correct_count: 2, total_count: 3 }]];
+      }
+
+      if (sql.includes("UPDATE experiment_grade")) {
+        expect(params).toEqual([66.67, 990009, 20240009]);
+        return [[]];
+      }
+
+      if (sql.includes("UPDATE experiment_status")) {
+        expect(params).toEqual([1, 0, 990009, 20240009]);
+        return [[]];
+      }
+
+      throw new Error(`Unexpected SQL in knowledge-score-rounding test: ${sql}`);
+    });
+
+    const result = await submitAnswers(990009, 20240009, [
+      { question_id: 401, submitted_answer: ["A"] },
+      { question_id: 402, submitted_answer: ["B"] },
+      { question_id: 403, submitted_answer: ["D"] },
+    ]);
+
+    expect(result).toEqual({
+      results: [
+        {
+          question_id: 401,
+          is_correct: true,
+          correct_answers: ["A"],
+        },
+        {
+          question_id: 402,
+          is_correct: true,
+          correct_answers: ["B"],
+        },
+        {
+          question_id: 403,
+          is_correct: false,
+          correct_answers: ["C"],
+        },
+      ],
+    });
+    expect(commit).toHaveBeenCalledTimes(1);
+    expect(rollback).not.toHaveBeenCalled();
+  });
+
   test("rejects duplicate question ids before opening a transaction", async () => {
     const result = await submitAnswers(990003, 20240003, [
       { question_id: 1, submitted_answer: ["A"] },

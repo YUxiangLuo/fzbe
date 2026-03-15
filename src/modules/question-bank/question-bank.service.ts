@@ -14,6 +14,9 @@ interface QuestionRow extends RowDataPacket {
   creator_name?: string;
 }
 
+type QuestionType = CreateQuestionInput["question_type"];
+type QuestionOptions = CreateQuestionInput["options"];
+
 function parseJsonField(value: unknown) {
   if (value === null || value === undefined) return value;
   if (typeof value === "string") {
@@ -24,6 +27,40 @@ function parseJsonField(value: unknown) {
     }
   }
   return value;
+}
+
+function normalizeCorrectAnswersForStorage(
+  questionType: QuestionType,
+  options: QuestionOptions,
+  correctAnswers: string[],
+) {
+  const normalizedAnswers = Array.from(
+    new Set(correctAnswers.map((answer) => String(answer).trim()).filter(Boolean)),
+  );
+
+  if (questionType === "True/False") {
+    return normalizedAnswers;
+  }
+
+  if (Array.isArray(options)) {
+    const order = new Map(options.map((option, index) => [String(option).trim(), index]));
+    return [...normalizedAnswers].sort((left, right) => {
+      const leftIndex = order.get(left) ?? Number.MAX_SAFE_INTEGER;
+      const rightIndex = order.get(right) ?? Number.MAX_SAFE_INTEGER;
+      return leftIndex - rightIndex || left.localeCompare(right);
+    });
+  }
+
+  if (options && typeof options === "object") {
+    const order = new Map(Object.keys(options).map((key, index) => [String(key).trim(), index]));
+    return [...normalizedAnswers].sort((left, right) => {
+      const leftIndex = order.get(left) ?? Number.MAX_SAFE_INTEGER;
+      const rightIndex = order.get(right) ?? Number.MAX_SAFE_INTEGER;
+      return leftIndex - rightIndex || left.localeCompare(right);
+    });
+  }
+
+  return normalizedAnswers;
 }
 
 export function normalizeQuestionRow(row: QuestionRow, includeAnswers = true) {
@@ -72,6 +109,11 @@ export async function createQuestion(input: CreateQuestionInput, creatorId: numb
   if (question_type === "True/False" && !optionsToStore) {
     optionsToStore = ["正确", "错误"];
   }
+  const normalizedCorrectAnswers = normalizeCorrectAnswersForStorage(
+    question_type,
+    optionsToStore,
+    correct_answers,
+  );
 
   const [result] = await pool.query<ResultSetHeader>(
     `INSERT INTO question_bank
@@ -82,7 +124,7 @@ export async function createQuestion(input: CreateQuestionInput, creatorId: numb
       question_type,
       question_text,
       optionsToStore ? JSON.stringify(optionsToStore) : null,
-      JSON.stringify(correct_answers),
+      JSON.stringify(normalizedCorrectAnswers),
       creatorId,
     ],
   );
@@ -131,7 +173,11 @@ export async function updateQuestion(
 
   const nextQuestionType = (input.question_type ?? currentQuestion.question_type) as CreateQuestionInput["question_type"];
   const nextOptions = input.options ?? (parseJsonField(currentQuestion.options) as CreateQuestionInput["options"]);
-  const nextCorrectAnswers = input.correct_answers ?? (parseJsonField(currentQuestion.correct_answers) as string[]);
+  const nextCorrectAnswers = normalizeCorrectAnswersForStorage(
+    nextQuestionType,
+    nextOptions,
+    input.correct_answers ?? (parseJsonField(currentQuestion.correct_answers) as string[]),
+  );
 
   if (!hasValidQuestionAnswerMapping({
     question_type: nextQuestionType,
@@ -165,7 +211,7 @@ export async function updateQuestion(
   }
   if (input.correct_answers !== undefined) {
     fields.push("correct_answers = ?");
-    values.push(JSON.stringify(input.correct_answers));
+    values.push(JSON.stringify(nextCorrectAnswers));
   }
 
   if (fields.length === 0) {
