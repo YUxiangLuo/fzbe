@@ -6,13 +6,13 @@ import type { JwtPayload } from "../../types";
 import {
   roleParamSchema, createAssistantSingleSchema, userSearchQuerySchema, createAssistantSchema, createTeacherSchema,
   teacherIdParamSchema, paginationQuerySchema, updateUserSchema, changePasswordSchema, userIdParamSchema,
-  adminChangePasswordSchema, resetPasswordSchema
+  adminChangePasswordSchema, resetPasswordSchema, bulkDeleteUsersSchema
 } from "./users.schema";
 import {
   registerSelfUser, createAssistantSingle, searchUsers, createAssistantWithClasses, createTeacher,
   batchCreateTeachers, batchCreateAssistants, getTeacherAssistants, getAllUsers, getAllAssistants,
   getUnenrolledStudents, getCurrentUser, updateCurrentUser, changePassword, getUserById, adminChangePassword,
-  resetStudentPassword, deleteUser
+  resetStudentPassword, deleteUser, batchDeleteUsers
 } from "./users.service";
 
 const usersController = new Hono();
@@ -274,6 +274,20 @@ usersController.delete("/api/v1/users/:userId", jwtAuth, zValidator("param", use
     }
     return c.json({ message: "用户删除成功", cleanup: result.cleanup });
   } catch (error) { return handleUnexpectedError(c, error, "删除用户失败"); }
+});
+
+usersController.delete("/api/v1/users", jwtAuth, zValidator("json", bulkDeleteUsersSchema), async (c) => {
+  try {
+    const payload = c.get("jwtPayload") as JwtPayload;
+    if (payload.role !== "Admin") return c.json({ error: "权限不足" }, 403);
+    const { userIds } = c.req.valid("json");
+    const result = await batchDeleteUsers(userIds, payload.sub);
+    if ("error" in result) {
+      if (result.error === "self_delete") return c.json({ error: "批量删除中不能包含当前管理员账户" }, 400);
+      if (result.error === "not_found") return c.json({ error: "部分用户不存在", missingUserIds: result.missingUserIds }, 404);
+    }
+    return c.json({ message: "批量删除用户成功", deletedCount: result.deletedCount, cleanup: result.cleanup });
+  } catch (error) { return handleUnexpectedError(c, error, "批量删除用户失败"); }
 });
 
 export default usersController;

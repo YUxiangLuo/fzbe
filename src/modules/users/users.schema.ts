@@ -67,6 +67,11 @@ export const userSearchQuerySchema = z.object({
   limit: z.coerce.number().int().min(1).max(100).optional().default(10),
 });
 
+export const bulkDeleteUsersSchema = z.object({
+  userIds: z.array(z.number().int().positive("用户 ID 必须为正整数")).min(1, "至少选择一个用户").max(100, "单次最多删除 100 个用户")
+    .refine((userIds) => new Set(userIds).size === userIds.length, { message: "用户 ID 不能重复" }),
+});
+
 export const userIdParamSchema = z.object({ userId: z.string().regex(/^\d+$/, { message: "userId 必须是数字" }) });
 export const teacherIdParamSchema = z.object({ teacherId: z.string().regex(/^\d+$/, { message: "teacherId 必须是数字" }) });
 export const paginationQuerySchema = z.object({
@@ -100,6 +105,7 @@ export type CreateAssistantInput = z.infer<typeof createAssistantSchema>;
 export type UpdateUserInput = z.infer<typeof updateUserSchema>;
 export type ChangePasswordInput = z.infer<typeof changePasswordSchema>;
 export type AdminChangePasswordInput = z.infer<typeof adminChangePasswordSchema>;
+export type BulkDeleteUsersInput = z.infer<typeof bulkDeleteUsersSchema>;
 export type ResetPasswordInput = z.infer<typeof resetPasswordSchema>;
 export type UserSearchQuery = z.infer<typeof userSearchQuerySchema>;
 export type PaginationQuery = z.infer<typeof paginationQuerySchema>;

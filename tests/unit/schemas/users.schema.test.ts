@@ -8,6 +8,7 @@ import {
   studentSelfRegisterSchema,
   teacherAssistantSelfRegisterSchema,
   userSearchQuerySchema,
+  bulkDeleteUsersSchema,
   paginationQuerySchema,
   roleParamSchema,
 } from "../../../src/modules/users/users.schema";
@@ -259,6 +260,23 @@ describe("User Schemas", () => {
         q: "test",
         limit: 101,
       });
+      expect(result.success).toBe(false);
+    });
+  });
+
+  describe("bulkDeleteUsersSchema", () => {
+    test("should accept distinct positive user IDs", () => {
+      const result = bulkDeleteUsersSchema.safeParse({ userIds: [1, 2, 3] });
+      expect(result.success).toBe(true);
+    });
+
+    test("should reject duplicate user IDs", () => {
+      const result = bulkDeleteUsersSchema.safeParse({ userIds: [1, 2, 2] });
+      expect(result.success).toBe(false);
+    });
+
+    test("should reject empty selections", () => {
+      const result = bulkDeleteUsersSchema.safeParse({ userIds: [] });
       expect(result.success).toBe(false);
     });
   });

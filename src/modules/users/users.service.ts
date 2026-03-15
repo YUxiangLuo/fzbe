@@ -16,10 +16,70 @@ interface UserRow extends RowDataPacket { user_id: number; username: string; ful
 interface ClassRow extends RowDataPacket { class_id: number; teacher_id: number; }
 interface CountRow extends RowDataPacket { total: number; }
 interface AssignmentRow extends RowDataPacket { class_id: number; }
+interface DeleteUserRow extends RowDataPacket { user_id: number; role: string; }
+
+interface DeleteCleanupSummary {
+  deletedClasses?: number;
+  removedAssistantAssignments?: number;
+  removedEnrollments?: number;
+}
 
 type Queryable = {
   query<T extends RowDataPacket[] | ResultSetHeader>(sql: string, values?: unknown[]): Promise<[T, unknown]>;
 };
+
+type TransactionConnection = Queryable & {
+  beginTransaction(): Promise<void>;
+  commit(): Promise<void>;
+  rollback(): Promise<void>;
+  release(): void;
+};
+
+function accumulateCleanupSummary(target: DeleteCleanupSummary, source: DeleteCleanupSummary) {
+  if (source.deletedClasses) {
+    target.deletedClasses = (target.deletedClasses ?? 0) + source.deletedClasses;
+  }
+  if (source.removedAssistantAssignments) {
+    target.removedAssistantAssignments = (target.removedAssistantAssignments ?? 0) + source.removedAssistantAssignments;
+  }
+  if (source.removedEnrollments) {
+    target.removedEnrollments = (target.removedEnrollments ?? 0) + source.removedEnrollments;
+  }
+}
+
+async function deleteUserWithConnection(connection: Queryable, targetUserId: number, targetRole: string) {
+  const cleanupSummary: DeleteCleanupSummary = {};
+
+  switch (targetRole) {
+    case "Teacher": {
+      const [classRows] = await connection.query<AssignmentRow[]>("SELECT class_id FROM classes WHERE teacher_id = ?", [targetUserId]);
+      if (classRows.length > 0) {
+        await connection.query("DELETE FROM classes WHERE teacher_id = ?", [targetUserId]);
+        cleanupSummary.deletedClasses = classRows.length;
+      }
+      break;
+    }
+    case "Assistant": {
+      const [assignmentRows] = await connection.query<AssignmentRow[]>("SELECT class_id FROM class_assistants WHERE assistant_id = ?", [targetUserId]);
+      if (assignmentRows.length > 0) {
+        await connection.query("DELETE FROM class_assistants WHERE assistant_id = ?", [targetUserId]);
+        cleanupSummary.removedAssistantAssignments = assignmentRows.length;
+      }
+      break;
+    }
+    case "Student": {
+      const [enrollmentRows] = await connection.query<AssignmentRow[]>("SELECT class_id FROM enrollments WHERE student_id = ?", [targetUserId]);
+      if (enrollmentRows.length > 0) {
+        await connection.query("DELETE FROM enrollments WHERE student_id = ?", [targetUserId]);
+        cleanupSummary.removedEnrollments = enrollmentRows.length;
+      }
+      break;
+    }
+  }
+
+  await connection.query("DELETE FROM users WHERE user_id = ?", [targetUserId]);
+  return cleanupSummary;
+}
 
 async function findUserConflict(
   db: Queryable,
@@ -527,31 +587,52 @@ export async function deleteUser(targetUserId: number, requesterId: number) {
   const connection = await pool.getConnection();
   try {
     await connection.beginTransaction();
-    const [[userRecord]] = await connection.query<RowDataPacket[]>("SELECT role FROM users WHERE user_id = ?", [targetUserId]);
+    const [[userRecord]] = await connection.query<DeleteUserRow[]>("SELECT user_id, role FROM users WHERE user_id = ?", [targetUserId]);
     if (!userRecord) { await connection.rollback(); return { error: "not_found" as const }; }
 
-    const cleanupSummary: { deletedClasses?: number; removedAssistantAssignments?: number; removedEnrollments?: number } = {};
-
-    switch (userRecord.role) {
-      case "Teacher": {
-        const [classRows] = await connection.query<AssignmentRow[]>("SELECT class_id FROM classes WHERE teacher_id = ?", [targetUserId]);
-        if (classRows.length > 0) { await connection.query("DELETE FROM classes WHERE teacher_id = ?", [targetUserId]); cleanupSummary.deletedClasses = classRows.length; }
-        break;
-      }
-      case "Assistant": {
-        const [assignmentRows] = await connection.query<AssignmentRow[]>("SELECT class_id FROM class_assistants WHERE assistant_id = ?", [targetUserId]);
-        if (assignmentRows.length > 0) { await connection.query("DELETE FROM class_assistants WHERE assistant_id = ?", [targetUserId]); cleanupSummary.removedAssistantAssignments = assignmentRows.length; }
-        break;
-      }
-      case "Student": {
-        const [enrollmentRows] = await connection.query<AssignmentRow[]>("SELECT class_id FROM enrollments WHERE student_id = ?", [targetUserId]);
-        if (enrollmentRows.length > 0) { await connection.query("DELETE FROM enrollments WHERE student_id = ?", [targetUserId]); cleanupSummary.removedEnrollments = enrollmentRows.length; }
-        break;
-      }
-    }
-
-    await connection.query("DELETE FROM users WHERE user_id = ?", [targetUserId]);
+    const cleanupSummary = await deleteUserWithConnection(connection, targetUserId, userRecord.role);
     await connection.commit();
     return { success: true, cleanup: cleanupSummary };
   } catch (error) { await connection.rollback(); throw error; } finally { connection.release(); }
+}
+
+export async function batchDeleteUsers(targetUserIds: number[], requesterId: number) {
+  if (targetUserIds.includes(requesterId)) return { error: "self_delete" as const };
+
+  const uniqueTargetUserIds = [...new Set(targetUserIds)];
+  if (uniqueTargetUserIds.length === 0) {
+    return { error: "not_found" as const, missingUserIds: [] as number[] };
+  }
+
+  const placeholders = uniqueTargetUserIds.map(() => "?").join(", ");
+  const connection = await pool.getConnection();
+
+  try {
+    await connection.beginTransaction();
+    const [userRows] = await connection.query<DeleteUserRow[]>(
+      `SELECT user_id, role FROM users WHERE user_id IN (${placeholders}) ORDER BY user_id ASC`,
+      uniqueTargetUserIds,
+    );
+
+    const foundUserIds = new Set(userRows.map((row) => row.user_id));
+    const missingUserIds = uniqueTargetUserIds.filter((userId) => !foundUserIds.has(userId));
+    if (missingUserIds.length > 0) {
+      await connection.rollback();
+      return { error: "not_found" as const, missingUserIds };
+    }
+
+    const cleanupSummary: DeleteCleanupSummary = {};
+    for (const userRow of userRows) {
+      const userCleanup = await deleteUserWithConnection(connection, userRow.user_id, userRow.role);
+      accumulateCleanupSummary(cleanupSummary, userCleanup);
+    }
+
+    await connection.commit();
+    return { success: true, deletedCount: userRows.length, cleanup: cleanupSummary };
+  } catch (error) {
+    await connection.rollback();
+    throw error;
+  } finally {
+    connection.release();
+  }
 }

@@ -52,7 +52,7 @@ mock.module(passwordModulePath, () => ({
   verifyPassword,
 }));
 
-const { createTeacher, createAssistantSingle, registerSelfUser, createAssistantWithClasses, updateCurrentUser } = await import(freshUsersServiceModulePath);
+const { createTeacher, createAssistantSingle, registerSelfUser, createAssistantWithClasses, updateCurrentUser, batchDeleteUsers } = await import(freshUsersServiceModulePath);
 
 describe("users service duplicate-key handling", () => {
   beforeEach(() => {
@@ -193,5 +193,71 @@ describe("users service duplicate-key handling", () => {
     });
 
     expect(result).toEqual({ error: "dup_phone" });
+  });
+
+  test("bulk delete rejects self deletion before opening a transaction", async () => {
+    const result = await batchDeleteUsers([1, 2], 1);
+
+    expect(result).toEqual({ error: "self_delete" });
+    expect(getConnection).not.toHaveBeenCalled();
+  });
+
+  test("bulk delete removes multiple users in one transaction and aggregates cleanup counts", async () => {
+    connectionQuery.mockImplementation(async (query: string, values?: unknown[]) => {
+      if (query.includes("SELECT user_id, role FROM users WHERE user_id IN")) {
+        const userIds = values as number[];
+        return [[
+          { user_id: userIds[0], role: "Teacher" },
+          { user_id: userIds[1], role: "Assistant" },
+        ]];
+      }
+      if (query.includes("SELECT class_id FROM classes WHERE teacher_id = ?")) {
+        return [[{ class_id: 11 }, { class_id: 12 }]];
+      }
+      if (query.includes("SELECT class_id FROM class_assistants WHERE assistant_id = ?")) {
+        return [[{ class_id: 21 }]];
+      }
+      return [{ affectedRows: 1 }];
+    });
+
+    const result = await batchDeleteUsers([101, 202], 999);
+
+    expect(result).toEqual({
+      success: true,
+      deletedCount: 2,
+      cleanup: {
+        deletedClasses: 2,
+        removedAssistantAssignments: 1,
+      },
+    });
+    expect(connectionBeginTransaction).toHaveBeenCalledTimes(1);
+    expect(connectionCommit).toHaveBeenCalledTimes(1);
+    expect(connectionRollback).not.toHaveBeenCalled();
+  });
+
+  test("bulk delete removes student enrollments and reports cleanup counts", async () => {
+    connectionQuery.mockImplementation(async (query: string, values?: unknown[]) => {
+      if (query.includes("SELECT user_id, role FROM users WHERE user_id IN")) {
+        const userIds = values as number[];
+        return [[{ user_id: userIds[0], role: "Student" }]];
+      }
+      if (query.includes("SELECT class_id FROM enrollments WHERE student_id = ?")) {
+        return [[{ class_id: 31 }, { class_id: 32 }]];
+      }
+      return [{ affectedRows: 1 }];
+    });
+
+    const result = await batchDeleteUsers([303], 999);
+
+    expect(result).toEqual({
+      success: true,
+      deletedCount: 1,
+      cleanup: {
+        removedEnrollments: 2,
+      },
+    });
+    expect(connectionBeginTransaction).toHaveBeenCalledTimes(1);
+    expect(connectionCommit).toHaveBeenCalledTimes(1);
+    expect(connectionRollback).not.toHaveBeenCalled();
   });
 });
