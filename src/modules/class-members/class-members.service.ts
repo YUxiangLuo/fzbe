@@ -1,9 +1,7 @@
 import type { RowDataPacket, ResultSetHeader, Pool, PoolConnection } from "mysql2/promise";
 import { pool } from "../../config";
-import { getDefaultPasswordHash, hashPassword } from "../../utils/password";
+import { hashPassword } from "../../utils/password";
 import type { CreateStudentInput } from "./class-members.schema";
-
-const DEFAULT_PASSWORD_HASH = getDefaultPasswordHash();
 
 interface ClassRow extends RowDataPacket {
   class_id: number;
@@ -80,7 +78,7 @@ export async function createStudentInClass(classId: number, userId: number, user
     if (input.password) {
       password_hash = await hashPassword(input.password);
     } else {
-      password_hash = DEFAULT_PASSWORD_HASH;
+      password_hash = await hashPassword(input.username);
     }
 
     const studentEmail = input.email || `${input.username}@student.edu`;

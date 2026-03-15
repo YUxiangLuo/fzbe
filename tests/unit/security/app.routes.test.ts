@@ -18,7 +18,6 @@ mock.module("../../../src/config", () => ({
     DB_DATABASE: "test",
     JWT_SECRET: "test-jwt-secret",
     PORT: 3001,
-    DEFAULT_PASSWORD_HASH: "test-default-hash",
   },
   connectionLimit: 64,
   pool: {
@@ -37,7 +36,6 @@ const ensureTestEnv = () => {
   process.env.DB_DATABASE ??= "test";
   process.env.JWT_SECRET ??= "test-jwt-secret";
   process.env.PORT ??= "3001";
-  process.env.DEFAULT_PASSWORD_HASH ??= "test-default-hash";
 };
 
 let appPromise: Promise<AppLike> | null = null;

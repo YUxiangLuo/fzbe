@@ -15,7 +15,6 @@
 CREATE TABLE IF NOT EXISTS `users` (
   `user_id` INT AUTO_INCREMENT PRIMARY KEY,
   `username` VARCHAR(255) NOT NULL UNIQUE,
-  -- All users' passwords are fixed to $2b$10$DVZtxD9Efhm/j8.LSWMFx.hfdpk81iHO4Tv0fUaDr1LlW/mFrgXrG
   `password_hash` VARCHAR(255) NOT NULL,
   `full_name` VARCHAR(255) NOT NULL,
   `email` VARCHAR(255) NOT NULL UNIQUE,

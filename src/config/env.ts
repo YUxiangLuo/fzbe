@@ -7,7 +7,6 @@ const envSchema = z.object({
   DB_DATABASE: z.string().min(1),
   JWT_SECRET: z.string().min(1),
   PORT: z.coerce.number().int().positive().default(4001),
-  DEFAULT_PASSWORD_HASH: z.string().min(1),
 });
 
 function loadEnv() {

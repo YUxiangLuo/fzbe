@@ -30,7 +30,6 @@ mock.module(configModulePath, () => ({
     DB_DATABASE: process.env.DB_DATABASE ?? "test",
     JWT_SECRET: process.env.JWT_SECRET ?? "test-jwt-secret",
     PORT: Number(process.env.PORT ?? "3001"),
-    DEFAULT_PASSWORD_HASH: process.env.DEFAULT_PASSWORD_HASH ?? "test-default-hash",
   },
   pool: {
     getConnection,

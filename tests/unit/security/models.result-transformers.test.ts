@@ -4,7 +4,6 @@ process.env.DB_PASSWORD ??= "test";
 process.env.DB_DATABASE ??= "test";
 process.env.JWT_SECRET ??= "test-jwt-secret";
 process.env.PORT ??= "3001";
-process.env.DEFAULT_PASSWORD_HASH ??= "test-default-hash";
 
 import { describe, expect, test } from "bun:test";
 import path from "node:path";

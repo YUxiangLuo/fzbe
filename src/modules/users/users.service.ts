@@ -4,14 +4,13 @@ import { createReadStream } from "node:fs";
 import csv from "csv-parser";
 import type { RowDataPacket, ResultSetHeader } from "mysql2/promise";
 import { pool } from "../../config";
-import { hashPassword, getDefaultPasswordHash, shouldChangePassword, verifyPassword } from "../../utils/password";
+import { hashPassword, shouldChangePassword, verifyPassword } from "../../utils/password";
 import { logWarning } from "../../utils/error-handler";
 import { USER_CONSTANTS, FILE_SIZE_LIMITS, CSV_LIMITS } from "../../utils/constants";
 import type { CreateTeacherInput, CreateAssistantSingleInput, CreateAssistantInput, UpdateUserInput, ResetPasswordInput, UserSearchQuery, PaginationQuery } from "./users.schema";
 import { studentSelfRegisterSchema, teacherAssistantSelfRegisterSchema } from "./users.schema";
 
 const { TEACHER_EMAIL_DOMAIN, ASSISTANT_EMAIL_DOMAIN, PHONE_REGEX, MIN_NAME_LENGTH } = USER_CONSTANTS;
-const DEFAULT_PASSWORD_HASH = getDefaultPasswordHash();
 
 interface UserRow extends RowDataPacket { user_id: number; username: string; full_name: string; email: string; role: string; phone_number: string | null; password_hash: string; created_at: Date; }
 interface ClassRow extends RowDataPacket { class_id: number; teacher_id: number; }
@@ -115,7 +114,7 @@ export async function createAssistantSingle(input: CreateAssistantSingleInput) {
   const conflict = await findUserConflict(pool, { username, email: assistantEmail, phone: phone ?? null });
   if (conflict) return conflict;
 
-  const password_hash = password ? await hashPassword(password) : DEFAULT_PASSWORD_HASH;
+  const password_hash = await hashPassword(password || phone || username);
 
   try {
     const [result] = await pool.query<ResultSetHeader>("INSERT INTO users (username, password_hash, full_name, email, phone_number, role) VALUES (?, ?, ?, ?, ?, 'Assistant')", [username, password_hash, full_name, assistantEmail, phone || null]);
@@ -199,7 +198,7 @@ export async function createTeacher(input: CreateTeacherInput) {
   const conflict = await findUserConflict(pool, { username, email: teacherEmail, phone: phone ?? null });
   if (conflict) return conflict;
 
-  const password_hash = password ? await hashPassword(password) : DEFAULT_PASSWORD_HASH;
+  const password_hash = await hashPassword(password || phone || username);
 
   try {
     const [result] = await pool.query<ResultSetHeader>("INSERT INTO users (username, password_hash, full_name, email, phone_number, role) VALUES (?, ?, ?, ?, ?, 'Teacher')", [username, password_hash, full_name, teacherEmail, phone || null]);
@@ -504,7 +503,7 @@ export async function adminChangePassword(targetUserId: number, newPassword: str
 }
 
 export async function resetStudentPassword(targetUserId: number, requesterId: number, requesterRole: string, input: ResetPasswordInput) {
-  const [[targetUser]] = await pool.query<RowDataPacket[]>("SELECT role FROM users WHERE user_id = ?", [targetUserId]);
+  const [[targetUser]] = await pool.query<RowDataPacket[]>("SELECT role, username FROM users WHERE user_id = ?", [targetUserId]);
   if (!targetUser) return { error: "not_found" as const };
   if (targetUser.role !== "Student") return { error: "not_student" as const };
 
@@ -516,7 +515,7 @@ export async function resetStudentPassword(targetUserId: number, requesterId: nu
     if (!row) return { error: "not_assigned_student" as const };
   }
 
-  const password_hash = input.newPassword ? await hashPassword(input.newPassword) : DEFAULT_PASSWORD_HASH;
+  const password_hash = input.newPassword ? await hashPassword(input.newPassword) : await hashPassword(targetUser.username);
   const [result] = await pool.query<ResultSetHeader>("UPDATE users SET password_hash = ? WHERE user_id = ?", [password_hash, targetUserId]);
   if (result.affectedRows === 0) return { error: "not_found" as const };
   return { success: true, isCustomPassword: Boolean(input.newPassword) };

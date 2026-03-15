@@ -4,16 +4,8 @@
  */
 
 import { USER_CONSTANTS } from "./constants";
-import { env } from "../config";
 
 const { BCRYPT_COST } = USER_CONSTANTS;
-
-/**
- * 获取默认密码哈希值
- */
-export function getDefaultPasswordHash(): string {
-  return env.DEFAULT_PASSWORD_HASH;
-}
 
 /**
  * 对密码进行哈希
@@ -38,7 +30,7 @@ export async function verifyPassword(password: string, hash: string): Promise<bo
 }
 
 /**
- * 检查密码是否为默认密码或与标识符相同
+ * 检查密码是否与标识符相同
  * 用于判断用户是否需要修改密码
  * @param passwordHash 当前密码哈希
  * @param identifier 用户标识符 (学生的学号，教师/助教的手机号)
@@ -48,13 +40,6 @@ export async function shouldChangePassword(
   passwordHash: string,
   identifier: string | null,
 ): Promise<boolean> {
-  const defaultHash = getDefaultPasswordHash();
-
-  // 检查是否为默认密码
-  if (passwordHash === defaultHash) {
-    return true;
-  }
-
   // 检查密码是否与标识符相同
   if (identifier) {
     try {

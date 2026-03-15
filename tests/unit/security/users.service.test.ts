@@ -36,7 +36,6 @@ const getConnection = mock(async () => ({
   query: connectionQuery,
 }));
 const hashPassword = mock(async (_password: string) => "hashed-password");
-const getDefaultPasswordHash = mock(() => "default-hash");
 const shouldChangePassword = mock(async () => false);
 const verifyPassword = mock(async () => true);
 
@@ -49,7 +48,6 @@ mock.module(configModulePath, () => ({
 
 mock.module(passwordModulePath, () => ({
   hashPassword,
-  getDefaultPasswordHash,
   shouldChangePassword,
   verifyPassword,
 }));
