@@ -16,6 +16,11 @@ function normalizeOptionValues(options: QuestionOptions): string[] {
   return rawValues.map((value) => value.trim()).filter(Boolean);
 }
 
+function normalizeOptionKeys(options: QuestionOptions): string[] {
+  if (!options || Array.isArray(options)) return [];
+  return Object.keys(options).map((key) => key.trim()).filter(Boolean);
+}
+
 export function hasValidQuestionAnswerMapping(input: {
   question_type: QuestionType;
   options?: QuestionOptions;
@@ -27,10 +32,13 @@ export function hasValidQuestionAnswerMapping(input: {
     return answers.every((answer) => TRUE_FALSE_ANSWERS.has(answer));
   }
 
-  const optionValues = new Set(normalizeOptionValues(input.options));
-  if (optionValues.size === 0) return false;
+  const allowedAnswers = new Set([
+    ...normalizeOptionValues(input.options),
+    ...normalizeOptionKeys(input.options),
+  ]);
+  if (allowedAnswers.size === 0) return false;
 
-  return answers.every((answer) => optionValues.has(answer));
+  return answers.every((answer) => allowedAnswers.has(answer));
 }
 
 export const createQuestionSchema = z

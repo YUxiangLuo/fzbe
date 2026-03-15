@@ -42,12 +42,34 @@ describe("Question Bank Schemas", () => {
 
       expect(result.success).toBe(false);
     });
+
+    test("should accept record option keys as correct answers", () => {
+      const result = createQuestionSchema.safeParse({
+        question_text: "键值格式单选题",
+        question_type: "Single Choice",
+        knowledge_point: "预测模型-ARIMA模型",
+        options: { A: "选项甲", B: "选项乙" },
+        correct_answers: ["A"],
+      });
+
+      expect(result.success).toBe(true);
+    });
   });
 
   describe("updateQuestionSchema", () => {
     test("should allow updating options only", () => {
       const result = updateQuestionSchema.safeParse({
         options: ["选项甲", "选项乙"],
+      });
+
+      expect(result.success).toBe(true);
+    });
+
+    test("should allow editing selection answers using option keys", () => {
+      const result = updateQuestionSchema.safeParse({
+        question_type: "Multiple Choice",
+        options: { A: "选项甲", B: "选项乙", C: "选项丙" },
+        correct_answers: ["A", "C"],
       });
 
       expect(result.success).toBe(true);
@@ -67,6 +89,14 @@ describe("Question Bank Schemas", () => {
         question_type: "Single Choice",
         correct_answers: ["选项甲"],
       })).toBe(false);
+    });
+
+    test("should accept record option keys for selection questions", () => {
+      expect(hasValidQuestionAnswerMapping({
+        question_type: "Single Choice",
+        options: { A: "选项甲", B: "选项乙" },
+        correct_answers: ["A"],
+      })).toBe(true);
     });
   });
 });
