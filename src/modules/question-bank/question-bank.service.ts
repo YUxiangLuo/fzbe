@@ -118,7 +118,7 @@ export async function updateQuestion(
   );
   const existing = ownerRows[0];
   if (!existing) return { error: "not_found" as const };
-  if (requesterRole !== "Admin" && existing.creator_id !== requesterId) {
+  if (requesterRole !== "Admin" && requesterRole !== "Teacher" && existing.creator_id !== requesterId) {
     return { error: "forbidden" as const };
   }
 
@@ -212,7 +212,7 @@ export async function deleteQuestion(
   );
   const existing = ownerRows[0];
   if (!existing) return { error: "not_found" as const };
-  if (requesterRole !== "Admin" && existing.creator_id !== requesterId) {
+  if (requesterRole !== "Admin" && requesterRole !== "Teacher" && existing.creator_id !== requesterId) {
     return { error: "forbidden" as const };
   }
 
