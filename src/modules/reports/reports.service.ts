@@ -12,6 +12,7 @@ import {
   buildExperimentFlowGradeValues,
   getReportSubmissionEligibilityError,
 } from "./report-submission-policy";
+import { cleanupExperimentModelArtifacts } from "../models/models.service";
 
 const pdfSemaphore = new Semaphore(CONCURRENCY_LIMITS.MAX_CONCURRENT_PDF_JOBS);
 
@@ -312,6 +313,15 @@ export async function submitReport(
     );
 
     await connection.commit();
+
+    // 异步清理该实验产生的所有模型训练文件，不阻塞响应
+    Promise.resolve().then(() => {
+      try {
+        cleanupExperimentModelArtifacts(experimentId, studentId);
+      } catch (error) {
+        logger.error({ err: error, experimentId, studentId }, "清理实验模型产物失败");
+      }
+    });
 
     let reportId = reportResult.insertId;
     let isUpdate = false;

@@ -1147,6 +1147,34 @@ export async function prepareExperimentModelForProduction(
   };
 }
 
+export function cleanupExperimentModelArtifacts(experimentId: number, studentId: number) {
+  const trainedModelsDir = path.join(PY_DIR, "trained_models");
+  let entries: string[];
+  try {
+    entries = fs.readdirSync(trainedModelsDir);
+  } catch {
+    return;
+  }
+
+  const prefix = `exp${experimentId}-student${studentId}-`;
+  let deleted = 0;
+  for (const entry of entries) {
+    if (!entry.startsWith(prefix)) continue;
+    try {
+      fs.unlinkSync(path.join(trainedModelsDir, entry));
+      deleted++;
+    } catch (error: unknown) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
+        logger.warn({ err: error, file: entry }, "删除模型产物失败");
+      }
+    }
+  }
+
+  if (deleted > 0) {
+    logger.info({ experimentId, studentId, deleted }, "已清理实验模型产物");
+  }
+}
+
 export async function predictExperimentModel(
   modelType: ModelType,
   studentId: number,
