@@ -21,6 +21,13 @@ export interface AdfResultItem {
 
 export type AdfResult = AdfResultItem[];
 
+export class AdfValidationError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "AdfValidationError";
+  }
+}
+
 /**
  * 调用 Python ADF 工具，执行固定 d=0,1,2 三阶差分检验。
  *
@@ -59,7 +66,7 @@ export async function runAdf(data: AdfInputPoint[]): Promise<AdfResult> {
     const validResults = parsed.filter((item) => !item.error);
 
     if (validResults.length === 0) {
-      throw new Error("数据量不足，无法进行 ADF 检测");
+      throw new AdfValidationError("数据量不足，无法进行 ADF 检测");
     }
 
     return validResults;

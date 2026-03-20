@@ -1,5 +1,5 @@
 import path from "path";
-import { mkdir } from "node:fs/promises";
+import { mkdir, rm } from "node:fs/promises";
 import type { RowDataPacket, ResultSetHeader } from "mysql2";
 import { marked } from "marked";
 import puppeteer from "puppeteer-core";
@@ -97,6 +97,16 @@ interface ReportRow extends RowDataPacket {
 function toPublicReportPath(filePath: string | null | undefined): string | null {
   if (!filePath) return null;
   return `reports/${path.basename(filePath)}`;
+}
+
+async function cleanupGeneratedReportPdf(pdfPath: string | null | undefined): Promise<void> {
+  if (!pdfPath) return;
+
+  try {
+    await rm(pdfPath, { force: true });
+  } catch (error) {
+    logger.warn({ err: error, pdfPath }, "清理报告 PDF 失败");
+  }
 }
 
 function getBestModel(experiment: ExperimentRow): ModelType | null {
@@ -209,6 +219,11 @@ export async function submitReport(
     return { error: "权限不足：该实验不属于当前用户", status: 403 };
   }
 
+  const precheckEligibilityError = getReportSubmissionEligibilityError(precheckExperiment);
+  if (precheckEligibilityError) {
+    return { error: precheckEligibilityError, status: 400 };
+  }
+
   const sanitizedReportContent = await markdownToSanitizedHtml(markdownContent);
   const htmlDocument = buildPdfDocument(sanitizedReportContent);
 
@@ -242,12 +257,14 @@ export async function submitReport(
     }
   } catch (error) {
     logger.error({ err: error, experimentId, studentId }, "PDF 生成失败");
+    await cleanupGeneratedReportPdf(pdfPath);
     throw error;
   } finally {
     pdfSemaphore.release();
   }
 
   const connection = await pool.getConnection();
+  let previousPdfPath: string | null = null;
   try {
     await connection.beginTransaction();
 
@@ -258,19 +275,32 @@ export async function submitReport(
 
     if (!experiment) {
       await connection.rollback();
+      await cleanupGeneratedReportPdf(pdfPath);
       return { error: "实验不存在", status: 404 };
     }
 
     if (experiment.student_id !== studentId) {
       await connection.rollback();
+      await cleanupGeneratedReportPdf(pdfPath);
       return { error: "权限不足：该实验不属于当前用户", status: 403 };
     }
 
     const eligibilityError = getReportSubmissionEligibilityError(experiment);
     if (eligibilityError) {
       await connection.rollback();
+      await cleanupGeneratedReportPdf(pdfPath);
       return { error: eligibilityError, status: 400 };
     }
+
+    const [existingReports] = await connection.query<ReportRow[]>(
+      `SELECT report_id, pdf_file_path
+         FROM experiment_reports
+        WHERE experiment_id = ? AND student_id = ?
+        LIMIT 1
+        FOR UPDATE`,
+      [experimentId, studentId],
+    );
+    previousPdfPath = existingReports[0]?.pdf_file_path ?? null;
 
     const [reportResult] = await connection.query<ResultSetHeader>(
       `INSERT INTO experiment_reports (experiment_id, student_id, report_content, pdf_file_path, status, submitted_at)
@@ -314,6 +344,10 @@ export async function submitReport(
 
     await connection.commit();
 
+    if (previousPdfPath && previousPdfPath !== pdfPath) {
+      Promise.resolve().then(() => cleanupGeneratedReportPdf(previousPdfPath));
+    }
+
     // 异步清理该实验产生的所有模型训练文件，不阻塞响应
     Promise.resolve().then(() => {
       try {
@@ -347,6 +381,7 @@ export async function submitReport(
     };
   } catch (error) {
     await connection.rollback();
+    await cleanupGeneratedReportPdf(pdfPath);
     throw error;
   } finally {
     connection.release();
