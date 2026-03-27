@@ -222,6 +222,12 @@ app.use("*", async (c, next) => {
     },
   );
 });
+app.get("/api/v1/runtime-info", (c) =>
+  c.json({
+    app: "fangzhen-be",
+    database: env.DB_DATABASE,
+    port: env.PORT,
+  }));
 app.get("/manuals/:filename", jwtAuth, async (c) => {
   const payload = c.get("jwtPayload") as JwtPayload;
   const filename = c.req.param("filename");
