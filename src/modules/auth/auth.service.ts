@@ -3,6 +3,7 @@ import type { RowDataPacket } from "mysql2";
 import { pool } from "../../config";
 import { env } from "../../config";
 import { verifyPassword } from "../../utils/password";
+import { AUTH_CONSTANTS } from "../../utils/constants";
 import type { User, UserRole } from "../../types";
 import type { LoginInput } from "./auth.schema";
 
@@ -59,7 +60,7 @@ export async function login(input: LoginInput): Promise<LoginResult | LoginError
     sub: user.user_id,
     username: user.username,
     role: user.role,
-    exp: Math.floor(Date.now() / 1000) + 60 * 60 * 24,
+    exp: Math.floor(Date.now() / 1000) + AUTH_CONSTANTS.JWT_EXPIRATION_SECONDS,
   };
 
   const token = await sign(payload, env.JWT_SECRET);

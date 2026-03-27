@@ -8,6 +8,7 @@ import { env, pool, connectionLimit } from "./config";
 import { jwtAuth } from "./middleware";
 import logger from "./utils/logger";
 import { CONCURRENCY_LIMITS } from "./utils/constants";
+import { runStartupEnvironmentChecks } from "./utils/startup-checks";
 import type { JwtPayload, UserRole } from "./types";
 // Import new modular controllers
 import { authController } from "./modules/auth";
@@ -382,7 +383,7 @@ export const serverConfig = {
   },
 };
 
-if (import.meta.main) {
+export async function runServerStartupPreflight() {
   // ---- 启动校验：连接池容量 vs. 并发模型任务 ----
   const minRequired = 2 * CONCURRENCY_LIMITS.MAX_CONCURRENT_MODEL_JOBS;
   if (connectionLimit <= minRequired) {
@@ -392,6 +393,22 @@ if (import.meta.main) {
     );
     process.exit(1);
   }
+
+  try {
+    await runStartupEnvironmentChecks();
+  } catch (error) {
+    logger.fatal(
+      {
+        err: error instanceof Error ? { message: error.message, stack: error.stack } : { message: String(error) },
+      },
+      "启动环境检查未通过，服务退出",
+    );
+    process.exit(1);
+  }
+}
+
+if (import.meta.main) {
+  await runServerStartupPreflight();
 
   process.on("unhandledRejection", (reason) => {
     try {
