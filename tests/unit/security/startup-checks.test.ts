@@ -4,15 +4,18 @@ import { runStartupEnvironmentChecks, type StartupCheckDependencies } from "../.
 const createDeps = (): StartupCheckDependencies & {
   warnings: string[];
   infos: string[];
-  commands: Array<{ command: string[]; cwd?: string; timeoutMs?: number }>;
+  chromiumProbes: Array<{ label?: string; chromiumPath: string; timeoutMs?: number }>;
+  commands: Array<{ label?: string; command: string[]; cwd?: string; timeoutMs?: number }>;
 } => {
   const warnings: string[] = [];
   const infos: string[] = [];
-  const commands: Array<{ command: string[]; cwd?: string; timeoutMs?: number }> = [];
+  const chromiumProbes: Array<{ label?: string; chromiumPath: string; timeoutMs?: number }> = [];
+  const commands: Array<{ label?: string; command: string[]; cwd?: string; timeoutMs?: number }> = [];
 
   return {
     warnings,
     infos,
+    chromiumProbes,
     commands,
     ensureExecutableFile: mock(() => {}),
     ensureWritableDirectory: mock(() => {}),
@@ -25,6 +28,9 @@ const createDeps = (): StartupCheckDependencies & {
     logWarn: (message) => {
       warnings.push(message);
     },
+    probeChromiumRuntime: mock(async (input) => {
+      chromiumProbes.push(input);
+    }),
     queryDatabase: mock(async () => {}),
     resolvePythonExecutable: mock(() => "/tmp/py/venv/bin/python"),
     runCommand: mock(async (input) => {
@@ -50,8 +56,11 @@ describe("startup environment checks", () => {
         command: ["/tmp/py/venv/bin/python", "run_model.py", "--help"],
         cwd: "/tmp/py",
       },
+    ]);
+    expect(deps.chromiumProbes).toEqual([
       {
-        command: ["/usr/bin/chromium", "--version"],
+        label: "Chromium/Puppeteer 自检",
+        chromiumPath: "/usr/bin/chromium",
         timeoutMs: 10_000,
       },
     ]);
@@ -70,5 +79,15 @@ describe("startup environment checks", () => {
 
     await expect(runStartupEnvironmentChecks(deps)).rejects.toThrow("启动环境检查失败");
     expect(deps.warnings).toContain("Python 模型运行时自检失败: No module named tensorflow");
+  });
+
+  test("fails startup when the database runtime probe fails", async () => {
+    const deps = createDeps();
+    deps.queryDatabase = mock(async () => {
+      throw new Error("GET_LOCK permission denied");
+    });
+
+    await expect(runStartupEnvironmentChecks(deps)).rejects.toThrow("启动环境检查失败");
+    expect(deps.warnings).toContain("数据库运行时检查失败: GET_LOCK permission denied");
   });
 });

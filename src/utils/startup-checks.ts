@@ -1,11 +1,14 @@
 import { accessSync, constants as fsConstants, existsSync, mkdirSync } from "node:fs";
 import path from "node:path";
+import type { PoolConnection, RowDataPacket } from "mysql2/promise";
+import puppeteer from "puppeteer-core";
 import { pool } from "../config";
 import { PATHS } from "./constants";
 import logger from "./logger";
 import { PY_DIR, resolvePythonExecutable } from "./python";
 
 const DEFAULT_COMMAND_TIMEOUT_MS = 30_000;
+const STARTUP_CHECK_LOCK_NAME = `startup-check:${process.pid}`;
 
 export interface StartupCheckDependencies {
   ensureExecutableFile: (filePath: string) => void;
@@ -15,6 +18,7 @@ export interface StartupCheckDependencies {
   getPyDir: () => string;
   logInfo: (message: string) => void;
   logWarn: (message: string) => void;
+  probeChromiumRuntime: (input: { chromiumPath: string; timeoutMs?: number }) => Promise<void>;
   queryDatabase: () => Promise<unknown>;
   resolvePythonExecutable: () => string;
   runCommand: (input: { command: string[]; cwd?: string; timeoutMs?: number }) => Promise<void>;
@@ -68,6 +72,43 @@ async function runCommand({
   }
 }
 
+async function probeChromiumRuntime({
+  chromiumPath,
+  timeoutMs = 10_000,
+}: {
+  chromiumPath: string;
+  timeoutMs?: number;
+}): Promise<void> {
+  const browser = await puppeteer.launch({
+    executablePath: chromiumPath,
+    headless: true,
+    args: [
+      "--no-sandbox",
+      "--disable-setuid-sandbox",
+      "--disable-gpu",
+      "--disable-dev-shm-usage",
+    ],
+    timeout: timeoutMs,
+  });
+
+  try {
+    const page = await browser.newPage();
+    await page.setExtraHTTPHeaders({
+      "Content-Security-Policy": "default-src 'none'; style-src 'unsafe-inline';",
+    });
+    await page.setJavaScriptEnabled(false);
+    await page.setContent("<html><body>startup-check</body></html>", {
+      waitUntil: "domcontentloaded",
+      timeout: timeoutMs,
+    });
+    await page.pdf({ format: "A4", printBackground: true, timeout: timeoutMs });
+  } finally {
+    await browser.close().catch(() => {
+      // Ignore teardown failures during health probing.
+    });
+  }
+}
+
 const defaultDependencies: StartupCheckDependencies = {
   ensureExecutableFile,
   ensureWritableDirectory,
@@ -76,8 +117,52 @@ const defaultDependencies: StartupCheckDependencies = {
   getPyDir: () => PY_DIR,
   logInfo: (message) => logger.info(message),
   logWarn: (message) => logger.warn({ check: "startup-environment" }, message),
+  probeChromiumRuntime,
   queryDatabase: async () => {
-    await pool.query("SELECT 1");
+    interface HealthCheckRow extends RowDataPacket {
+      ok?: number;
+      acquired?: 0 | 1 | null;
+    }
+
+    let connection: PoolConnection | null = null;
+    let lockAcquired = false;
+
+    try {
+      connection = await pool.getConnection();
+      await connection.beginTransaction();
+
+      const [probeRows] = await connection.query<HealthCheckRow[]>("SELECT 1 AS ok");
+      if (probeRows[0]?.ok !== 1) {
+        throw new Error("SELECT 1 探针返回异常结果");
+      }
+
+      const [lockRows] = await connection.query<HealthCheckRow[]>(
+        "SELECT GET_LOCK(?, 0) AS acquired",
+        [STARTUP_CHECK_LOCK_NAME],
+      );
+      if (lockRows[0]?.acquired !== 1) {
+        throw new Error("无法获取数据库 advisory lock");
+      }
+      lockAcquired = true;
+    } finally {
+      if (connection) {
+        if (lockAcquired) {
+          try {
+            await connection.query("SELECT RELEASE_LOCK(?)", [STARTUP_CHECK_LOCK_NAME]);
+          } catch (error) {
+            logger.warn({ check: "startup-environment", err: error }, "释放启动检查 advisory lock 失败");
+          }
+        }
+
+        try {
+          await connection.rollback();
+        } catch {
+          // Ignore rollback failures during health probing.
+        }
+
+        connection.release();
+      }
+    }
   },
   resolvePythonExecutable,
   runCommand,
@@ -91,7 +176,7 @@ export async function runStartupEnvironmentChecks(
   try {
     await deps.queryDatabase();
   } catch (error) {
-    failures.push(`数据库连接失败: ${error instanceof Error ? error.message : String(error)}`);
+    failures.push(`数据库运行时检查失败: ${error instanceof Error ? error.message : String(error)}`);
   }
 
   const pyDir = deps.getPyDir();
@@ -148,13 +233,18 @@ export async function runStartupEnvironmentChecks(
   }
 
   if (chromiumExecutableReady) {
+    const chromiumCheck = {
+      label: "Chromium/Puppeteer 自检",
+      chromiumPath,
+      timeoutMs: 10_000,
+    };
+
     try {
-      await deps.runCommand({
-        command: [chromiumPath, "--version"],
-        timeoutMs: 10_000,
-      });
+      await deps.probeChromiumRuntime(chromiumCheck);
     } catch (error) {
-      failures.push(`Chromium 运行时自检失败 (${chromiumPath}): ${error instanceof Error ? error.message : String(error)}`);
+      failures.push(
+        `${chromiumCheck.label}失败 (${chromiumPath}): ${error instanceof Error ? error.message : String(error)}`,
+      );
     }
   }
 
