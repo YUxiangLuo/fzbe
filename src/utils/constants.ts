@@ -58,9 +58,9 @@ export const TIMEOUTS = {
 // ============================================
 export const CONCURRENCY_LIMITS = {
   /** 最大并发模型训练任务 */
-  MAX_CONCURRENT_MODEL_JOBS: 16,
+  MAX_CONCURRENT_MODEL_JOBS: 64,
   /** 最大并发 PDF 生成（Puppeteer）任务 */
-  MAX_CONCURRENT_PDF_JOBS: 3,
+  MAX_CONCURRENT_PDF_JOBS: 8,
 } as const;
 
 // ============================================
