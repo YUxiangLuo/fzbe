@@ -52,7 +52,22 @@ mock.module(passwordModulePath, () => ({
   verifyPassword,
 }));
 
-const { createTeacher, createAssistantSingle, registerSelfUser, createAssistantWithClasses, updateCurrentUser, batchDeleteUsers } = await import(freshUsersServiceModulePath);
+const {
+  createTeacher,
+  createAssistantSingle,
+  registerSelfUser,
+  createAssistantWithClasses,
+  updateCurrentUser,
+  batchCreateTeachers,
+  batchCreateAssistants,
+  batchDeleteUsers,
+} = await import(freshUsersServiceModulePath);
+
+const gbkUserCsv = Buffer.from([
+  0xd0, 0xd5, 0xc3, 0xfb, 0x2c, 0xca, 0xd6, 0xbb, 0xfa, 0xba, 0xc5, 0x0a,
+  0xd5, 0xc5, 0xc8, 0xfd, 0x2c, 0x31, 0x33, 0x38, 0x30, 0x30, 0x31, 0x33,
+  0x38, 0x30, 0x30, 0x30, 0x0a,
+]);
 
 describe("users service duplicate-key handling", () => {
   beforeEach(() => {
@@ -193,6 +208,50 @@ describe("users service duplicate-key handling", () => {
     });
 
     expect(result).toEqual({ error: "dup_phone" });
+  });
+
+  test("batch teacher import accepts Windows Excel CSV encoding", async () => {
+    const result = await batchCreateTeachers(
+      new File([gbkUserCsv], "teachers.csv", { type: "application/vnd.ms-excel" }),
+      undefined,
+    );
+
+    expect(result).toEqual({
+      data: {
+        created: 1,
+        teachers: [{
+          user_id: 1,
+          username: "prof_13800138000",
+          full_name: "张三",
+          phone_number: "13800138000",
+          email: "prof_13800138000@teacher.edu",
+        }],
+      },
+    });
+    expect(hashPassword).toHaveBeenCalledWith("13800138000");
+    expect(connectionCommit).toHaveBeenCalledTimes(1);
+  });
+
+  test("batch assistant import accepts Windows Excel CSV encoding", async () => {
+    const result = await batchCreateAssistants(
+      new File([gbkUserCsv], "assistants.csv", { type: "application/vnd.ms-excel" }),
+      undefined,
+    );
+
+    expect(result).toEqual({
+      data: {
+        created: 1,
+        assistants: [{
+          user_id: 1,
+          username: "ta_13800138000",
+          full_name: "张三",
+          phone_number: "13800138000",
+          email: "ta_13800138000@assistant.edu",
+        }],
+      },
+    });
+    expect(hashPassword).toHaveBeenCalledWith("13800138000");
+    expect(connectionCommit).toHaveBeenCalledTimes(1);
   });
 
   test("bulk delete rejects self deletion before opening a transaction", async () => {

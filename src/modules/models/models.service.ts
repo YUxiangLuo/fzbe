@@ -1,12 +1,12 @@
 import path from "path";
 import fs from "fs";
 import type { PoolConnection, RowDataPacket } from "mysql2/promise";
-import csv from "csv-parser";
 import { pool } from "../../config";
 import logger from "../../utils/logger";
 import type { ModelType, TrainInput } from "./models.schema";
 import { TIMEOUTS, CONCURRENCY_LIMITS } from "../../utils/constants";
 import { PY_DIR, resolvePythonExecutable } from "../../utils/python";
+import { CsvEncodingError, readCsvRows } from "../../utils/csv-processor";
 import {
   buildExperimentScopedModelPath,
   buildModelExecutionLockName,
@@ -250,16 +250,14 @@ export async function loadDatasetFromDb(
     throw new ModelValidationError("未找到数据集分段文件");
   }
 
-  const allData: Record<string, unknown>[] = [];
-  await new Promise<void>((resolve, reject) => {
-    fs.createReadStream(segmentRows[0]!.file_path)
-      .pipe(csv({ mapHeaders: ({ header }) => header.replace(/^\uFEFF/, "").trim() }))
-      .on("data", (row: Record<string, unknown>) => allData.push(row))
-      .on("end", resolve)
-      .on("error", reject);
-  });
-
-  return allData;
+  try {
+    return await readCsvRows(segmentRows[0]!.file_path);
+  } catch (error) {
+    if (error instanceof CsvEncodingError) {
+      throw new ModelValidationError(error.message);
+    }
+    throw error;
+  }
 }
 
 async function assertExperimentModelAccess(experimentId: number, studentId: number) {

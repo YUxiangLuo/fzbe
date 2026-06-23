@@ -1,10 +1,8 @@
 import path from "path";
 import { unlink, mkdir, rm } from "node:fs/promises";
-import { createReadStream } from "node:fs";
 import type { RowDataPacket, ResultSetHeader } from "mysql2/promise";
-import csv from "csv-parser";
 import { pool } from "../../config";
-import { parseCsvSegments, getCsvHeaders } from "../../utils/csv-processor";
+import { CsvEncodingError, parseCsvSegments, getCsvHeaders, readCsvRows } from "../../utils/csv-processor";
 import { validateFile, generateUniqueFilename, FileValidationError } from "../../utils/file-validator";
 import { logWarning } from "../../utils/error-handler";
 import { FILE_SIZE_LIMITS } from "../../utils/constants";
@@ -175,6 +173,15 @@ export async function uploadDataset(file: File, dataName: string, description?: 
     } finally {
       connection.release();
     }
+  } catch (error) {
+    if (error instanceof CsvEncodingError) {
+      return {
+        error: "文件格式错误",
+        status: 400 as const,
+        details: { message: error.message },
+      };
+    }
+    throw error;
   } finally {
     if (tempUploadPath) await unlink(tempUploadPath).catch(() => {});
   }
@@ -243,13 +250,9 @@ export async function getProductFields(industry: string, company: string, produc
   const fileExists = await Bun.file(filePath).exists();
   if (!fileExists) return { error: "file_missing" as const };
 
-  const fields = await new Promise<string[]>((resolve, reject) => {
-    let settled = false;
-    const parser = createReadStream(filePath).pipe(csv({ mapHeaders: ({ header }) => header.replace(/^\uFEFF/, "").trim() }));
-    parser.once("headers", (headers: string[]) => { settled = true; resolve(headers.map((h) => h.trim()).filter((h) => h.length > 0)); parser.destroy(); })
-      .on("end", () => { if (!settled) { settled = true; resolve([]); } })
-      .on("error", (err) => { if (!settled) { settled = true; reject(err); } });
-  });
+  const fields = (await getCsvHeaders(filePath))
+    .map((h) => h.trim())
+    .filter((h) => h.length > 0);
 
   return { data: fields };
 }
@@ -267,28 +270,24 @@ export async function getProductSales(industry: string, company: string, product
   let headers: string[] = [];
   let unit = "";
 
-  await new Promise<void>((resolve, reject) => {
-    const stream = createReadStream(filePath).pipe(csv({ mapHeaders: ({ header }) => header.replace(/^\uFEFF/, "").trim() }));
-    let isFirstRow = true;
+  const rows = await readCsvRows(filePath);
+  for (const row of rows) {
+    if (headers.length === 0) { headers = Object.keys(row); csvData.push(headers); }
+    csvData.push(headers.map((header) => String(row[header] ?? "").trim()));
 
-    stream.on("data", (row: Record<string, unknown>) => {
-      if (isFirstRow) { headers = Object.keys(row); csvData.push(headers); isFirstRow = false; }
-      csvData.push(headers.map((header) => String(row[header] ?? "").trim()));
+    const yearRaw = String(row["年份"] ?? "").trim();
+    const monthRaw = String(row["月份"] ?? "").trim();
+    const year = yearRaw.match(/\d{4}/)?.[0] || yearRaw;
+    const month = (monthRaw.match(/\d+/)?.[0] || monthRaw).padStart(2, "0");
+    if (!year || !month) continue;
 
-      const yearRaw = String(row["年份"] ?? "").trim();
-      const monthRaw = String(row["月份"] ?? "").trim();
-      const year = yearRaw.match(/\d{4}/)?.[0] || yearRaw;
-      const month = (monthRaw.match(/\d+/)?.[0] || monthRaw).padStart(2, "0");
-      if (!year || !month) return;
+    const salesRaw = String(row["销售数量"] ?? "").trim().replace(/,/g, "");
+    const salesValue = Number(salesRaw);
+    if (!Number.isFinite(salesValue)) continue;
 
-      const salesRaw = String(row["销售数量"] ?? "").trim().replace(/,/g, "");
-      const salesValue = Number(salesRaw);
-      if (!Number.isFinite(salesValue)) return;
-
-      if (!unit && row["数量单位"]) unit = String(row["数量单位"]).trim();
-      monthlySales.push({ month: `${year}-${month}`, sales: salesValue });
-    }).on("end", resolve).on("error", reject);
-  });
+    if (!unit && row["数量单位"]) unit = String(row["数量单位"]).trim();
+    monthlySales.push({ month: `${year}-${month}`, sales: salesValue });
+  }
 
   return { data: { meta: { industry, company, product, name: product, description: "", unit }, monthlySales, csvData } };
 }

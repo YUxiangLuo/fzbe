@@ -1,16 +1,26 @@
 import path from "path";
 import { mkdir, unlink } from "node:fs/promises";
-import { createReadStream } from "node:fs";
-import csv from "csv-parser";
 import type { RowDataPacket, ResultSetHeader } from "mysql2/promise";
 import { pool } from "../../config";
 import { hashPassword, shouldChangePassword, verifyPassword } from "../../utils/password";
 import { logWarning } from "../../utils/error-handler";
 import { USER_CONSTANTS, FILE_SIZE_LIMITS, CSV_LIMITS } from "../../utils/constants";
+import { CsvEncodingError, parseCsvFileRows } from "../../utils/csv-processor";
 import type { CreateTeacherInput, CreateAssistantSingleInput, CreateAssistantInput, UpdateUserInput, ResetPasswordInput, UserSearchQuery, PaginationQuery } from "./users.schema";
 import { studentSelfRegisterSchema, teacherAssistantSelfRegisterSchema } from "./users.schema";
 
 const { TEACHER_EMAIL_DOMAIN, ASSISTANT_EMAIL_DOMAIN, PHONE_REGEX, MIN_NAME_LENGTH } = USER_CONSTANTS;
+const BATCH_CSV_MIME_TYPES = new Set([
+  "text/csv",
+  "application/vnd.ms-excel",
+  "text/plain",
+]);
+
+function isAllowedBatchCsvMimeType(mimeType: string): boolean {
+  if (!mimeType) return true;
+  const normalized = mimeType.split(";")[0]?.trim().toLowerCase() ?? "";
+  return BATCH_CSV_MIME_TYPES.has(normalized) || normalized.includes("csv");
+}
 
 interface UserRow extends RowDataPacket { user_id: number; username: string; full_name: string; email: string; role: string; phone_number: string | null; password_hash: string; created_at: Date; }
 interface ClassRow extends RowDataPacket { class_id: number; teacher_id: number; }
@@ -279,7 +289,7 @@ export async function batchCreateTeachers(file: File, password: unknown) {
     normalizedPassword = trimmed;
   }
 
-  if (file.type && file.type !== "text/csv" && !file.type.includes("csv")) return { error: "invalid_file_type" as const };
+  if (!isAllowedBatchCsvMimeType(file.type)) return { error: "invalid_file_type" as const };
   if (file.size > FILE_SIZE_LIMITS.CSV_MAX_SIZE) return { error: "file_too_large" as const };
 
   const tempDir = path.resolve(import.meta.dir, "../../../uploads", "temp");
@@ -293,27 +303,21 @@ export async function batchCreateTeachers(file: File, password: unknown) {
   let rowNumber = 0;
 
   try {
-    await new Promise<void>((resolve, reject) => {
-      createReadStream(tempCsvPath)
-        .pipe(csv({ mapHeaders: ({ header }) => header.replace(/^\uFEFF/, "").trim() }))
-        .on("data", (row: Record<string, string>) => {
-          rowNumber += 1;
-          // 检查行数限制
-          if (rowNumber > CSV_LIMITS.BATCH_IMPORT_MAX_ROWS) {
-            invalidRows.push({ row: rowNumber, reason: `超过最大行数限制 ${CSV_LIMITS.BATCH_IMPORT_MAX_ROWS}` });
-            return;
-          }
-          const fullName = row["姓名"]?.trim() ?? "";
-          const phone = row["手机号"]?.trim() ?? "";
-          if (!fullName || !phone) { invalidRows.push({ row: rowNumber, reason: "姓名或手机号缺失" }); return; }
-          if (fullName.length < MIN_NAME_LENGTH) { invalidRows.push({ row: rowNumber, reason: `姓名长度需至少 ${MIN_NAME_LENGTH} 个字符` }); return; }
-          if (!PHONE_REGEX.test(phone)) { invalidRows.push({ row: rowNumber, reason: `手机号 ${phone} 格式不正确，应为 6-15 位数字` }); return; }
-          if (seenPhones.has(phone)) { invalidRows.push({ row: rowNumber, reason: `CSV 内存在重复手机号 ${phone}` }); return; }
-          seenPhones.add(phone);
-          teacherRows.push({ row: rowNumber, fullName, phone, username: `prof_${phone}`, email: `prof_${phone}@${TEACHER_EMAIL_DOMAIN}` });
-        })
-        .on("end", resolve)
-        .on("error", reject);
+    await parseCsvFileRows(tempCsvPath, (row) => {
+      rowNumber += 1;
+      // 检查行数限制
+      if (rowNumber > CSV_LIMITS.BATCH_IMPORT_MAX_ROWS) {
+        invalidRows.push({ row: rowNumber, reason: `超过最大行数限制 ${CSV_LIMITS.BATCH_IMPORT_MAX_ROWS}` });
+        return;
+      }
+      const fullName = row["姓名"]?.trim() ?? "";
+      const phone = row["手机号"]?.trim() ?? "";
+      if (!fullName || !phone) { invalidRows.push({ row: rowNumber, reason: "姓名或手机号缺失" }); return; }
+      if (fullName.length < MIN_NAME_LENGTH) { invalidRows.push({ row: rowNumber, reason: `姓名长度需至少 ${MIN_NAME_LENGTH} 个字符` }); return; }
+      if (!PHONE_REGEX.test(phone)) { invalidRows.push({ row: rowNumber, reason: `手机号 ${phone} 格式不正确，应为 6-15 位数字` }); return; }
+      if (seenPhones.has(phone)) { invalidRows.push({ row: rowNumber, reason: `CSV 内存在重复手机号 ${phone}` }); return; }
+      seenPhones.add(phone);
+      teacherRows.push({ row: rowNumber, fullName, phone, username: `prof_${phone}`, email: `prof_${phone}@${TEACHER_EMAIL_DOMAIN}` });
     });
 
     if (invalidRows.length > 0) return { error: "invalid_rows" as const, invalid_rows: invalidRows.slice(0, 10) };
@@ -352,6 +356,14 @@ export async function batchCreateTeachers(file: File, password: unknown) {
       await connection.commit();
       return { data: { created: createdTeachers.length, teachers: createdTeachers } };
     } catch (error) { await connection.rollback(); throw error; } finally { connection.release(); }
+  } catch (error) {
+    if (error instanceof CsvEncodingError) {
+      return {
+        error: "invalid_rows" as const,
+        invalid_rows: [{ row: 0, reason: error.message }],
+      };
+    }
+    throw error;
   } finally {
     await unlink(tempCsvPath).catch((err) => logWarning("Failed to cleanup temp teacher CSV", { error: err instanceof Error ? err.message : String(err) }));
   }
@@ -366,7 +378,7 @@ export async function batchCreateAssistants(file: File, password: unknown) {
     normalizedPassword = trimmed;
   }
 
-  if (file.type && file.type !== "text/csv" && !file.type.includes("csv")) return { error: "invalid_file_type" as const };
+  if (!isAllowedBatchCsvMimeType(file.type)) return { error: "invalid_file_type" as const };
   if (file.size > FILE_SIZE_LIMITS.CSV_MAX_SIZE) return { error: "file_too_large" as const };
 
   const tempDir = path.resolve(import.meta.dir, "../../../uploads", "temp");
@@ -380,27 +392,21 @@ export async function batchCreateAssistants(file: File, password: unknown) {
   let rowNumber = 0;
 
   try {
-    await new Promise<void>((resolve, reject) => {
-      createReadStream(tempCsvPath)
-        .pipe(csv({ mapHeaders: ({ header }) => header.replace(/^\uFEFF/, "").trim() }))
-        .on("data", (row: Record<string, string>) => {
-          rowNumber += 1;
-          // 检查行数限制
-          if (rowNumber > CSV_LIMITS.BATCH_IMPORT_MAX_ROWS) {
-            invalidRows.push({ row: rowNumber, reason: `超过最大行数限制 ${CSV_LIMITS.BATCH_IMPORT_MAX_ROWS}` });
-            return;
-          }
-          const fullName = row["姓名"]?.trim() ?? "";
-          const phone = row["手机号"]?.trim() ?? "";
-          if (!fullName || !phone) { invalidRows.push({ row: rowNumber, reason: "姓名或手机号缺失" }); return; }
-          if (fullName.length < MIN_NAME_LENGTH) { invalidRows.push({ row: rowNumber, reason: `姓名长度需至少 ${MIN_NAME_LENGTH} 个字符` }); return; }
-          if (!PHONE_REGEX.test(phone)) { invalidRows.push({ row: rowNumber, reason: `手机号 ${phone} 格式不正确，应为 6-15 位数字` }); return; }
-          if (seenPhones.has(phone)) { invalidRows.push({ row: rowNumber, reason: `CSV 内存在重复手机号 ${phone}` }); return; }
-          seenPhones.add(phone);
-          assistantRows.push({ row: rowNumber, fullName, phone, username: `ta_${phone}`, email: `ta_${phone}@${ASSISTANT_EMAIL_DOMAIN}` });
-        })
-        .on("end", resolve)
-        .on("error", reject);
+    await parseCsvFileRows(tempCsvPath, (row) => {
+      rowNumber += 1;
+      // 检查行数限制
+      if (rowNumber > CSV_LIMITS.BATCH_IMPORT_MAX_ROWS) {
+        invalidRows.push({ row: rowNumber, reason: `超过最大行数限制 ${CSV_LIMITS.BATCH_IMPORT_MAX_ROWS}` });
+        return;
+      }
+      const fullName = row["姓名"]?.trim() ?? "";
+      const phone = row["手机号"]?.trim() ?? "";
+      if (!fullName || !phone) { invalidRows.push({ row: rowNumber, reason: "姓名或手机号缺失" }); return; }
+      if (fullName.length < MIN_NAME_LENGTH) { invalidRows.push({ row: rowNumber, reason: `姓名长度需至少 ${MIN_NAME_LENGTH} 个字符` }); return; }
+      if (!PHONE_REGEX.test(phone)) { invalidRows.push({ row: rowNumber, reason: `手机号 ${phone} 格式不正确，应为 6-15 位数字` }); return; }
+      if (seenPhones.has(phone)) { invalidRows.push({ row: rowNumber, reason: `CSV 内存在重复手机号 ${phone}` }); return; }
+      seenPhones.add(phone);
+      assistantRows.push({ row: rowNumber, fullName, phone, username: `ta_${phone}`, email: `ta_${phone}@${ASSISTANT_EMAIL_DOMAIN}` });
     });
 
     if (invalidRows.length > 0) return { error: "invalid_rows" as const, invalid_rows: invalidRows.slice(0, 10) };
@@ -439,6 +445,14 @@ export async function batchCreateAssistants(file: File, password: unknown) {
       await connection.commit();
       return { data: { created: createdAssistants.length, assistants: createdAssistants } };
     } catch (error) { await connection.rollback(); throw error; } finally { connection.release(); }
+  } catch (error) {
+    if (error instanceof CsvEncodingError) {
+      return {
+        error: "invalid_rows" as const,
+        invalid_rows: [{ row: 0, reason: error.message }],
+      };
+    }
+    throw error;
   } finally {
     await unlink(tempCsvPath).catch((err) => logWarning("Failed to cleanup temp assistant CSV", { error: err instanceof Error ? err.message : String(err) }));
   }

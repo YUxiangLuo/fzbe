@@ -1,13 +1,12 @@
 import path from "path";
-import { createReadStream } from "node:fs";
 import { unlink, mkdir } from "node:fs/promises";
 import type { RowDataPacket, ResultSetHeader } from "mysql2";
-import csv from "csv-parser";
 import { pool } from "../../config";
 import { validateFile, generateUniqueFilename, FileValidationError } from "../../utils/file-validator";
 import { logWarning } from "../../utils/error-handler";
 import { hashPassword } from "../../utils/password";
 import { USER_CONSTANTS, CSV_LIMITS } from "../../utils/constants";
+import { CsvEncodingError, parseCsvFileRows } from "../../utils/csv-processor";
 import type { UpdateClassInput } from "./classes.schema";
 
 interface ClassRow extends RowDataPacket {
@@ -103,40 +102,34 @@ export async function createClass(
       const seenStudentIds = new Set<string>();
       let rowNumber = 0;
 
-      await new Promise<void>((resolve, reject) => {
-        createReadStream(tempCsvPath!)
-          .pipe(csv({ mapHeaders: ({ header }) => header.replace(/^\uFEFF/, "").trim() }))
-          .on("data", (row: Record<string, string>) => {
-            rowNumber += 1;
-            // 检查行数限制
-            if (rowNumber > CSV_LIMITS.BATCH_IMPORT_MAX_ROWS) {
-              invalidRecords.push({ row: rowNumber, reason: `超过最大行数限制 ${CSV_LIMITS.BATCH_IMPORT_MAX_ROWS}` });
-              return;
-            }
-            const studentId = row["学号"]?.trim() ?? "";
-            const fullName = row["姓名"]?.trim() ?? "";
+      await parseCsvFileRows(tempCsvPath, (row) => {
+        rowNumber += 1;
+        // 检查行数限制
+        if (rowNumber > CSV_LIMITS.BATCH_IMPORT_MAX_ROWS) {
+          invalidRecords.push({ row: rowNumber, reason: `超过最大行数限制 ${CSV_LIMITS.BATCH_IMPORT_MAX_ROWS}` });
+          return;
+        }
+        const studentId = row["学号"]?.trim() ?? "";
+        const fullName = row["姓名"]?.trim() ?? "";
 
-            if (!studentId || !fullName) {
-              invalidRecords.push({ row: rowNumber, reason: "学号或姓名缺失" });
-              return;
-            }
-            if (!isValidStudentId(studentId)) {
-              invalidRecords.push({ row: rowNumber, reason: `学号 ${studentId} 不符合格式要求（需为8位及以上数字）` });
-              return;
-            }
-            if (!isValidFullName(fullName)) {
-              invalidRecords.push({ row: rowNumber, reason: `姓名长度需在 ${MIN_NAME_LENGTH}-${MAX_NAME_LENGTH} 个字符之间` });
-              return;
-            }
-            if (seenStudentIds.has(studentId)) {
-              invalidRecords.push({ row: rowNumber, reason: `CSV 内存在重复学号 ${studentId}` });
-              return;
-            }
-            seenStudentIds.add(studentId);
-            studentRecords.push({ row: rowNumber, studentId, fullName, email: `${studentId}@student.edu` });
-          })
-          .on("end", resolve)
-          .on("error", reject);
+        if (!studentId || !fullName) {
+          invalidRecords.push({ row: rowNumber, reason: "学号或姓名缺失" });
+          return;
+        }
+        if (!isValidStudentId(studentId)) {
+          invalidRecords.push({ row: rowNumber, reason: `学号 ${studentId} 不符合格式要求（需为8位及以上数字）` });
+          return;
+        }
+        if (!isValidFullName(fullName)) {
+          invalidRecords.push({ row: rowNumber, reason: `姓名长度需在 ${MIN_NAME_LENGTH}-${MAX_NAME_LENGTH} 个字符之间` });
+          return;
+        }
+        if (seenStudentIds.has(studentId)) {
+          invalidRecords.push({ row: rowNumber, reason: `CSV 内存在重复学号 ${studentId}` });
+          return;
+        }
+        seenStudentIds.add(studentId);
+        studentRecords.push({ row: rowNumber, studentId, fullName, email: `${studentId}@student.edu` });
       });
 
       if (invalidRecords.length > 0) {
@@ -188,6 +181,13 @@ export async function createClass(
     return { data: { class: newClassRows[0]!, students_created: createdStudentsCount, students_enrolled: createdStudents.length, students: createdStudents } };
   } catch (error: unknown) {
     await connection.rollback();
+    if (error instanceof CsvEncodingError) {
+      return {
+        error: "学生名单存在无效记录",
+        status: 400,
+        details: { invalid_rows: [{ row: 0, reason: error.message }] },
+      };
+    }
     const err = error as { code?: string };
     if (err.code === "ER_DUP_ENTRY") {
       return { error: "班级代码已存在", status: 409 };

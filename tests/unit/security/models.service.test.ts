@@ -1,4 +1,5 @@
 import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
+import { unlink, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { Readable } from "node:stream";
 
@@ -9,6 +10,27 @@ const configModulePath = path.join(srcRoot, "config", "index.ts");
 const pythonModulePath = path.join(srcRoot, "utils", "python.ts");
 const modelsServiceModulePath = path.join(srcRoot, "modules", "models", "models.service.ts");
 const freshModelsServiceModulePath = `${modelsServiceModulePath}?models-service-test`;
+const datasetCsvPath = "/tmp/dataset.csv";
+const modelDatasetCsv =
+  "月份,销售数量,价格指数,产能利用率\n" +
+  "2024-01,100,1.2,0.8\n" +
+  "2024-02,110,1.3,0.9\n" +
+  "2024-03,120,1.4,1.0\n" +
+  "2024-04,130,1.5,1.1\n" +
+  "2024-05,140,1.6,1.2\n" +
+  "2024-06,150,1.7,1.3\n" +
+  "2024-07,160,1.8,1.4\n" +
+  "2024-08,170,1.9,1.5\n" +
+  "2024-09,180,2.0,1.6\n" +
+  "2024-10,190,2.1,1.7\n" +
+  "2024-11,200,2.2,1.8\n" +
+  "2024-12,210,2.3,1.9\n" +
+  "2025-01,220,2.4,2.0\n" +
+  "2025-02,230,2.5,2.1\n" +
+  "2025-03,240,2.6,2.2\n" +
+  "2025-04,250,2.7,2.3\n" +
+  "2025-05,260,2.8,2.4\n" +
+  "2025-06,270,2.9,2.5\n";
 
 const poolQuery = mock(async () => [[]]);
 const existsSync = mock((_: string) => false);
@@ -101,7 +123,9 @@ const buildExperimentContextRow = (overrides: Record<string, unknown> = {}) => (
 });
 
 describe("models service", () => {
-  beforeEach(() => {
+  beforeEach(async () => {
+    await writeFile(datasetCsvPath, modelDatasetCsv);
+
     poolQuery.mockReset();
     poolQuery.mockResolvedValue([
       [buildExperimentContextRow()],
@@ -115,8 +139,9 @@ describe("models service", () => {
     (Bun as { spawn: typeof Bun.spawn }).spawn = spawnMock as typeof Bun.spawn;
   });
 
-  afterEach(() => {
+  afterEach(async () => {
     (Bun as { spawn: typeof Bun.spawn }).spawn = originalSpawn;
+    await unlink(datasetCsvPath).catch(() => {});
   });
 
   test("blocks training for completed experiments before loading dataset data", async () => {

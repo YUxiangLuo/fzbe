@@ -3,8 +3,8 @@
  * 统一 CSV 解析逻辑，添加行数限制保护
  */
 
-import { createReadStream } from "node:fs";
-import { mkdir, unlink } from "node:fs/promises";
+import { mkdir, readFile, unlink } from "node:fs/promises";
+import { Readable } from "node:stream";
 import path from "path";
 import csv from "csv-parser";
 import { CSV_LIMITS, FILE_SIZE_LIMITS } from "./constants";
@@ -38,6 +38,65 @@ export interface SegmentData {
   rows: Record<string, string>[]; // All data rows for this segment
 }
 
+export class CsvEncodingError extends Error {
+  constructor() {
+    super("CSV 文件编码不受支持，请使用 UTF-8 或 GB18030 编码");
+    this.name = "CsvEncodingError";
+  }
+}
+
+const CSV_DECODERS = ["utf-8", "gb18030"] as const;
+
+function normalizeCsvHeader(header: string): string {
+  return header.replace(/^\uFEFF/, "").trim();
+}
+
+function createCsvParser(csvText: string) {
+  return Readable.from([csvText]).pipe(
+    csv({ mapHeaders: ({ header }) => normalizeCsvHeader(header) }),
+  );
+}
+
+export function decodeCsvBuffer(buffer: Buffer | Uint8Array): string {
+  for (const encoding of CSV_DECODERS) {
+    try {
+      return new TextDecoder(
+        encoding as unknown as ConstructorParameters<typeof TextDecoder>[0],
+        { fatal: true },
+      ).decode(buffer);
+    } catch {
+      // Try the next supported encoding.
+    }
+  }
+
+  throw new CsvEncodingError();
+}
+
+export async function readCsvText(filePath: string): Promise<string> {
+  const buffer = await readFile(filePath);
+  return decodeCsvBuffer(buffer);
+}
+
+export async function parseCsvFileRows(
+  filePath: string,
+  onRow: (row: Record<string, string>) => void,
+): Promise<void> {
+  const csvText = await readCsvText(filePath);
+
+  await new Promise<void>((resolve, reject) => {
+    createCsvParser(csvText)
+      .on("data", (row: Record<string, string>) => onRow(row))
+      .on("end", resolve)
+      .on("error", reject);
+  });
+}
+
+export async function readCsvRows(filePath: string): Promise<Record<string, string>[]> {
+  const rows: Record<string, string>[] = [];
+  await parseCsvFileRows(filePath, (row) => rows.push(row));
+  return rows;
+}
+
 /**
  * 处理 CSV 文件并进行验证
  * @param filePath CSV 文件路径
@@ -60,52 +119,46 @@ export async function processCsvFile<T>(
   const seenValues = new Set<string>(existingValues || []);
   let rowNumber = 0;
 
-  return new Promise((resolve, reject) => {
-    createReadStream(filePath)
-      .pipe(csv({ mapHeaders: ({ header }) => header.replace(/^\uFEFF/, "").trim() }))
-      .on("data", (row: Record<string, string>) => {
-        rowNumber += 1;
+  await parseCsvFileRows(filePath, (row) => {
+    rowNumber += 1;
 
-        // 检查行数限制
-        if (rowNumber > maxRows) {
-          invalidRows.push({ row: rowNumber, reason: `超过最大行数限制 ${maxRows}` });
-          return;
-        }
+    // 检查行数限制
+    if (rowNumber > maxRows) {
+      invalidRows.push({ row: rowNumber, reason: `超过最大行数限制 ${maxRows}` });
+      return;
+    }
 
-        // 检查重复值
-        if (duplicateCheckField) {
-          const value = row[duplicateCheckField]?.trim();
-          if (value && seenValues.has(value)) {
-            invalidRows.push({ row: rowNumber, reason: `CSV 内存在重复的 ${duplicateCheckField}: ${value}` });
-            return;
-          }
-          if (value) {
-            seenValues.add(value);
-          }
-        }
+    // 检查重复值
+    if (duplicateCheckField) {
+      const value = row[duplicateCheckField]?.trim();
+      if (value && seenValues.has(value)) {
+        invalidRows.push({ row: rowNumber, reason: `CSV 内存在重复的 ${duplicateCheckField}: ${value}` });
+        return;
+      }
+      if (value) {
+        seenValues.add(value);
+      }
+    }
 
-        // 调用验证函数
-        const result = validator(row, rowNumber);
+    // 调用验证函数
+    const result = validator(row, rowNumber);
 
-        if (result === null) {
-          // 跳过该行
-          return;
-        }
+    if (result === null) {
+      // 跳过该行
+      return;
+    }
 
-        if (typeof result === "string") {
-          // 验证失败，记录错误原因
-          invalidRows.push({ row: rowNumber, reason: result });
-          return;
-        }
+    if (typeof result === "string") {
+      // 验证失败，记录错误原因
+      invalidRows.push({ row: rowNumber, reason: result });
+      return;
+    }
 
-        // 验证通过
-        validRows.push(result);
-      })
-      .on("end", () => {
-        resolve({ validRows, invalidRows, totalRows: rowNumber });
-      })
-      .on("error", reject);
+    // 验证通过
+    validRows.push(result);
   });
+
+  return { validRows, invalidRows, totalRows: rowNumber };
 }
 
 /**
@@ -116,49 +169,37 @@ export async function processCsvFile<T>(
  * @param filePath The absolute path to the CSV file.
  * @returns A Promise that resolves to a Map<string, SegmentData>.
  */
-export function parseCsvSegments(
+export async function parseCsvSegments(
   filePath: string,
 ): Promise<Map<string, SegmentData>> {
-  return new Promise((resolve, reject) => {
-    const segments = new Map<string, SegmentData>();
+  const segments = new Map<string, SegmentData>();
 
-    createReadStream(filePath)
-      .pipe(
-        csv({
-          mapHeaders: ({ header }) => header.replace(/^\uFEFF/, "").trim(),
-        }),
-      )
-      .on("data", (row: Record<string, string>) => {
-        const industryName = (row["行业名称"] ?? "").trim();
-        const companyName = (row["公司名称"] ?? "").trim();
-        const productName = (row["产品名称"] ?? "").trim();
+  await parseCsvFileRows(filePath, (row) => {
+    const industryName = (row["行业名称"] ?? "").trim();
+    const companyName = (row["公司名称"] ?? "").trim();
+    const productName = (row["产品名称"] ?? "").trim();
 
-        if (!industryName || !companyName || !productName) {
-          return; // Skip rows that don't have the required identifiers
-        }
+    if (!industryName || !companyName || !productName) {
+      return; // Skip rows that don't have the required identifiers
+    }
 
-        const key = `${industryName}|${companyName}|${productName}`;
-        let segment = segments.get(key);
+    const key = `${industryName}|${companyName}|${productName}`;
+    let segment = segments.get(key);
 
-        if (!segment) {
-          segment = {
-            industryName,
-            companyName,
-            productName,
-            rows: [],
-          };
-          segments.set(key, segment);
-        }
+    if (!segment) {
+      segment = {
+        industryName,
+        companyName,
+        productName,
+        rows: [],
+      };
+      segments.set(key, segment);
+    }
 
-        segment.rows.push(row);
-      })
-      .on("end", () => {
-        resolve(segments);
-      })
-      .on("error", (error) => {
-        reject(error);
-      });
+    segment.rows.push(row);
   });
+
+  return segments;
 }
 
 /**
@@ -166,10 +207,11 @@ export function parseCsvSegments(
  * @param filePath The absolute path to the CSV file.
  * @returns A Promise that resolves to an array of header strings.
  */
-export function getCsvHeaders(filePath: string): Promise<string[]> {
-  return new Promise((resolve, reject) => {
-    const stream = createReadStream(filePath)
-      .pipe(csv({ mapHeaders: ({ header }) => header.replace(/^\uFEFF/, "").trim() }));
+export async function getCsvHeaders(filePath: string): Promise<string[]> {
+  const csvText = await readCsvText(filePath);
+
+  return await new Promise((resolve, reject) => {
+    const stream = createCsvParser(csvText);
 
     let headersEmitted = false;
 
