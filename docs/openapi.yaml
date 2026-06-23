@@ -3845,37 +3845,3 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/ErrorResponse'
-
-  /js/{filename}:
-    get:
-      tags: [Files]
-      summary: 公开访问前端静态脚本
-      operationId: getJsStaticFile
-      security: []
-      parameters:
-        - $ref: '#/components/parameters/filename'
-      responses:
-        '200':
-          description: 静态文件
-          content:
-            application/javascript:
-              schema:
-                type: string
-                format: binary
-
-  /images/{filename}:
-    get:
-      tags: [Files]
-      summary: 公开访问前端静态图片
-      operationId: getImageStaticFile
-      security: []
-      parameters:
-        - $ref: '#/components/parameters/filename'
-      responses:
-        '200':
-          description: 静态文件
-          content:
-            image/*:
-              schema:
-                type: string
-                format: binary

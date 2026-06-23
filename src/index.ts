@@ -1,7 +1,6 @@
 import { Hono } from "hono";
 import { HTTPException } from "hono/http-exception";
 import { cors } from "hono/cors";
-import { serveStatic } from "hono/bun";
 import path from "path";
 import type { RowDataPacket } from "mysql2/promise";
 import { env, pool, connectionLimit } from "./config";
@@ -309,19 +308,6 @@ app.get("/exports/:filename", jwtAuth, async (c) => {
     },
   });
 });
-app.use(
-  "/js/*",
-  serveStatic({
-    root: path.resolve(import.meta.dir, "../cdn"),
-  }),
-);
-app.use(
-  "/images/*",
-  serveStatic({
-    root: path.resolve(import.meta.dir, "../cdn"),
-  }),
-);
-
 // --- Mount Routes ---
 // New modular controllers (no pool/secret injection needed)
 app.route("/", authController);
