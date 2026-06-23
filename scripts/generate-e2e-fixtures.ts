@@ -6,6 +6,7 @@
  * 确保前后端数据定义始终同步。
  * 
  * 运行方式: bun run scripts/generate-e2e-fixtures.ts
+ * 可通过 E2E_FRONTEND_FIXTURES_DIR 覆盖前端 E2E 输出目录。
  */
 
 import fs from "node:fs";
@@ -79,7 +80,7 @@ function generateFixturesContent(): string {
  * E2E Test Fixtures and Constants
  * 
  * ⚠️ 此文件由脚本自动生成，请勿手动修改！
- * 运行 \`bun run be/scripts/generate-e2e-fixtures.ts\` 重新生成
+ * 运行 \`bun run ../fangzhen-be/scripts/generate-e2e-fixtures.ts\` 重新生成
  * 
  * Generated at: ${new Date().toISOString()}
  */
@@ -225,15 +226,18 @@ export const TIMEOUTS = {
 
 function main() {
   const content = generateFixturesContent();
+  const frontendE2EDir = process.env.E2E_FRONTEND_FIXTURES_DIR
+    ? path.resolve(process.env.E2E_FRONTEND_FIXTURES_DIR)
+    : path.resolve(__dirname, "../../fangzhen-bun/tests/e2e");
   
   // 输出到前端目录
-  const outputPath = path.resolve(__dirname, "../../fe/tests/e2e/fixtures.ts");
+  const outputPath = path.resolve(frontendE2EDir, "fixtures.ts");
   
   fs.writeFileSync(outputPath, content, "utf-8");
   console.log(`✅ Generated fixtures at: ${outputPath}`);
   
   // 同时生成 JSON 版本供调试
-  const jsonOutputPath = path.resolve(__dirname, "../../fe/tests/e2e/generated/fixtures.json");
+  const jsonOutputPath = path.resolve(frontendE2EDir, "generated/fixtures.json");
   fs.mkdirSync(path.dirname(jsonOutputPath), { recursive: true });
   
   const jsonContent = {
