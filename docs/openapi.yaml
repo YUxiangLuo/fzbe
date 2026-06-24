@@ -10,10 +10,8 @@ info:
     - 少数已经包含顶层 `data` 的响应（例如 `/api/v1/users`、`/api/v1/users/search`）保持原样，不再二次包装。
     - 错误响应统一为 `{ "error": "..." }`，并可能带扩展字段（`details`、`invalid_rows`、`conflicts`、`current_class` 等）。
 servers:
-  - url: http://localhost:4001
-    description: Local development (current .env)
-  - url: http://localhost:4001
-    description: Local development (env example/default)
+  - url: http://localhost:3001
+    description: Local development
 
 tags:
   - name: Auth
