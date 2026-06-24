@@ -284,6 +284,11 @@ describe("reports service", () => {
       status: 400,
     });
     expect(launch).toHaveBeenCalledTimes(1);
+    expect(pagePdf).toHaveBeenCalledWith(expect.objectContaining({
+      format: "A4",
+      printBackground: true,
+      timeout: 30_000,
+    }));
     expect(beginTransaction).toHaveBeenCalledTimes(1);
     expect(rollback).toHaveBeenCalledTimes(1);
     expect(commit).not.toHaveBeenCalled();

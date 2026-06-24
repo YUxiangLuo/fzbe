@@ -1,6 +1,6 @@
 import { Hono } from "hono";
 import { jwtAuth, requireStudent } from "../../middleware";
-import { predictSchema, prepareProductionSchema, isModelType, getTrainSchemaForModel } from "./models.schema";
+import { predictSchema, prepareProductionSchema, isModelType, getTrainSchemaForModel, type ModelType } from "./models.schema";
 import {
   buildLocalizedPredictValidationDetails,
   buildLocalizedTrainValidationDetails,
@@ -9,6 +9,7 @@ import {
 } from "./models.validation";
 import {
   trainModel,
+  getReusableProductionModelArtifactResult,
   prepareExperimentModelForProduction,
   predictExperimentModel,
   acquireModelSlot,
@@ -24,6 +25,7 @@ import type { JwtPayload } from "../../types";
 import { TIMEOUTS } from "../../utils/constants";
 
 const modelsController = new Hono();
+const SLOT_FREE_REUSABLE_PRODUCTION_MODEL_TYPES = new Set<ModelType>(["ma", "es", "arima", "lstm"]);
 
 modelsController.post(
   "/api/v1/models/:model_type/training",
@@ -136,6 +138,13 @@ modelsController.post(
       executionLock = await acquireModelExecutionLock(body.experiment_id, modelType);
       if (!executionLock) {
         return c.json({ error: "同一模型正在训练或预测，请稍后再试" }, 409);
+      }
+
+      if (SLOT_FREE_REUSABLE_PRODUCTION_MODEL_TYPES.has(modelType)) {
+        const reusableArtifact = await getReusableProductionModelArtifactResult(modelType, payload.sub, body.experiment_id);
+        if (reusableArtifact) {
+          return c.json(reusableArtifact);
+        }
       }
 
       slotLock = await acquireModelSlot();

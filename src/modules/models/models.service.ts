@@ -4,7 +4,7 @@ import type { PoolConnection, RowDataPacket } from "mysql2/promise";
 import { pool } from "../../config";
 import logger from "../../utils/logger";
 import type { ModelType, TrainInput } from "./models.schema";
-import { TIMEOUTS, CONCURRENCY_LIMITS } from "../../utils/constants";
+import { TIMEOUTS, CONCURRENCY_LIMITS, PYTHON_RUNTIME_CONFIG } from "../../utils/constants";
 import { PY_DIR, resolvePythonExecutable } from "../../utils/python";
 import { CsvEncodingError, readCsvRows } from "../../utils/csv-processor";
 import {
@@ -16,6 +16,21 @@ import {
 const TRAINING_TIMEOUT = TIMEOUTS.MODEL_TRAINING;
 const MAX_CONCURRENT_MODEL_JOBS = CONCURRENCY_LIMITS.MAX_CONCURRENT_MODEL_JOBS;
 
+function buildPythonModelProcessEnv(): Record<string, string> {
+  const modelThreads = String(PYTHON_RUNTIME_CONFIG.MODEL_PROCESS_THREADS);
+  const tfInterOpThreads = String(PYTHON_RUNTIME_CONFIG.TF_INTER_OP_THREADS);
+
+  return {
+    OMP_NUM_THREADS: process.env.OMP_NUM_THREADS ?? modelThreads,
+    OPENBLAS_NUM_THREADS: process.env.OPENBLAS_NUM_THREADS ?? modelThreads,
+    MKL_NUM_THREADS: process.env.MKL_NUM_THREADS ?? modelThreads,
+    VECLIB_MAXIMUM_THREADS: process.env.VECLIB_MAXIMUM_THREADS ?? modelThreads,
+    NUMEXPR_NUM_THREADS: process.env.NUMEXPR_NUM_THREADS ?? modelThreads,
+    TF_NUM_INTRAOP_THREADS: process.env.TF_NUM_INTRAOP_THREADS ?? modelThreads,
+    TF_NUM_INTEROP_THREADS: process.env.TF_NUM_INTEROP_THREADS ?? tfInterOpThreads,
+    TF_CPP_MIN_LOG_LEVEL: process.env.TF_CPP_MIN_LOG_LEVEL ?? "3",
+  };
+}
 
 interface AdvisoryLockRow extends RowDataPacket {
   acquired: 0 | 1 | null;
@@ -445,6 +460,7 @@ const hasCompleteEnsembleArtifact = async (modelPath: string) => {
       stderr: "pipe",
       env: {
         ...process.env,
+        ...buildPythonModelProcessEnv(),
         PATH: `${path.dirname(pythonExec)}${path.delimiter}${process.env.PATH ?? ""}`,
       },
     });
@@ -877,6 +893,7 @@ export async function runPythonModel(
     stderr: "pipe",
     env: {
       ...process.env,
+      ...buildPythonModelProcessEnv(),
       PATH: `${path.dirname(pythonExec)}${path.delimiter}${process.env.PATH ?? ""}`,
     },
   });
@@ -1088,27 +1105,44 @@ export async function trainModel(modelType: ModelType, studentId: number, body: 
   return transformTrainingResult(modelType, result);
 }
 
-export async function prepareExperimentModelForProduction(
+export async function getReusableProductionModelArtifactResult(
   modelType: ModelType,
   studentId: number,
   experimentId: number,
 ) {
   const experiment = await assertExperimentModelAccess(experimentId, studentId);
   assertModelReadyForProduction(experiment, modelType);
+
+  const productionModelPath = getProductionModelPath(experimentId, studentId, modelType);
+  if (!await hasReusableSavedModelArtifact(modelType, productionModelPath)) {
+    return null;
+  }
+
+  return {
+    status: "success",
+    results: {
+      saved_model: productionModelPath,
+      artifact_phase: "production",
+      reused_existing: true,
+    },
+  };
+}
+
+export async function prepareExperimentModelForProduction(
+  modelType: ModelType,
+  studentId: number,
+  experimentId: number,
+) {
+  const reusableArtifact = await getReusableProductionModelArtifactResult(modelType, studentId, experimentId);
+  if (reusableArtifact) {
+    return reusableArtifact;
+  }
+
+  const experiment = await assertExperimentModelAccess(experimentId, studentId);
+  assertModelReadyForProduction(experiment, modelType);
   const trainingConfig = getExperimentTrainingConfig(experiment);
 
   const productionModelPath = getProductionModelPath(experimentId, studentId, modelType);
-  if (await hasReusableSavedModelArtifact(modelType, productionModelPath)) {
-    return {
-      status: "success",
-      results: {
-        saved_model: productionModelPath,
-        artifact_phase: "production",
-        reused_existing: true,
-      },
-    };
-  }
-
   const backtestModelPath = getBacktestModelPath(experimentId, studentId, modelType);
   if (!hasSavedModelArtifact(modelType, backtestModelPath)) {
     throw new ModelNotFoundError(`未找到该实验的已训练 ${modelType.toUpperCase()} 回测模型`);

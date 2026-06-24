@@ -6,7 +6,7 @@ import type { RowDataPacket } from "mysql2/promise";
 import { env, pool, connectionLimit } from "./config";
 import { jwtAuth } from "./middleware";
 import logger from "./utils/logger";
-import { CONCURRENCY_LIMITS } from "./utils/constants";
+import { CONCURRENCY_LIMITS, DB_POOL_CONFIG, PYTHON_RUNTIME_CONFIG, TIMEOUTS } from "./utils/constants";
 import { runStartupEnvironmentChecks } from "./utils/startup-checks";
 import type { JwtPayload, UserRole } from "./types";
 // Import new modular controllers
@@ -46,6 +46,11 @@ interface AssignmentRow extends RowDataPacket {
 interface ManualAccessRow extends RowDataPacket {
   manual_id: number;
   is_active: number | boolean;
+}
+
+interface ServerVariableRow extends RowDataPacket {
+  Variable_name: string;
+  Value: string;
 }
 
 function isPlainObject(value: unknown): value is Record<string, unknown> {
@@ -226,6 +231,20 @@ app.get("/api/v1/runtime-info", (c) =>
     app: "fangzhen-be",
     database: env.DB_DATABASE,
     port: env.PORT,
+    concurrency: {
+      systemParallelism: CONCURRENCY_LIMITS.SYSTEM_PARALLELISM,
+      maxConcurrentModelJobs: CONCURRENCY_LIMITS.MAX_CONCURRENT_MODEL_JOBS,
+      maxConcurrentPdfJobs: CONCURRENCY_LIMITS.MAX_CONCURRENT_PDF_JOBS,
+      dbConnectionLimit: connectionLimit,
+      dbLockConnections: DB_POOL_CONFIG.LOCK_CONNECTIONS,
+      dbQueryHeadroom: DB_POOL_CONFIG.QUERY_HEADROOM,
+      pythonModelProcessThreads: PYTHON_RUNTIME_CONFIG.MODEL_PROCESS_THREADS,
+      pythonTensorflowInterOpThreads: PYTHON_RUNTIME_CONFIG.TF_INTER_OP_THREADS,
+    },
+    timeouts: {
+      pdfQueueMs: TIMEOUTS.PDF_QUEUE,
+      pdfGenerationMs: TIMEOUTS.PDF_GENERATION,
+    },
   }));
 app.get("/manuals/:filename", jwtAuth, async (c) => {
   const payload = c.get("jwtPayload") as JwtPayload;
@@ -375,13 +394,47 @@ export const serverConfig = {
   },
 };
 
+async function readDatabaseMaxConnections(): Promise<number | null> {
+  const [rows] = await pool.query<ServerVariableRow[]>("SHOW VARIABLES LIKE 'max_connections'");
+  const rawValue = rows[0]?.Value;
+  if (!rawValue) return null;
+
+  const parsed = Number.parseInt(rawValue, 10);
+  return Number.isFinite(parsed) ? parsed : null;
+}
+
 export async function runServerStartupPreflight() {
   // ---- 启动校验：连接池容量 vs. 并发模型任务 ----
-  const minRequired = 2 * CONCURRENCY_LIMITS.MAX_CONCURRENT_MODEL_JOBS;
-  if (connectionLimit <= minRequired) {
+  const minRequired = DB_POOL_CONFIG.LOCK_CONNECTIONS + DB_POOL_CONFIG.QUERY_HEADROOM;
+  if (connectionLimit < minRequired) {
     logger.fatal(
-      { connectionLimit, maxConcurrentModelJobs: CONCURRENCY_LIMITS.MAX_CONCURRENT_MODEL_JOBS, minRequired },
-      "数据库连接池容量不足：connectionLimit 应大于 2 × MAX_CONCURRENT_MODEL_JOBS，否则并发训练时将死锁",
+      {
+        connectionLimit,
+        maxConcurrentModelJobs: CONCURRENCY_LIMITS.MAX_CONCURRENT_MODEL_JOBS,
+        lockConnections: DB_POOL_CONFIG.LOCK_CONNECTIONS,
+        queryHeadroom: DB_POOL_CONFIG.QUERY_HEADROOM,
+        minRequired,
+      },
+      "数据库连接池容量不足：connectionLimit 应至少为 2 × MAX_CONCURRENT_MODEL_JOBS + DB_QUERY_HEADROOM，否则并发训练时可能死锁或阻塞普通查询",
+    );
+    process.exit(1);
+  }
+
+  try {
+    const databaseMaxConnections = await readDatabaseMaxConnections();
+    if (databaseMaxConnections !== null && databaseMaxConnections < connectionLimit) {
+      logger.fatal(
+        { connectionLimit, databaseMaxConnections, maxConcurrentModelJobs: CONCURRENCY_LIMITS.MAX_CONCURRENT_MODEL_JOBS },
+        "数据库 max_connections 小于后端连接池容量：请提高 MariaDB/MySQL max_connections，或降低 MAX_CONCURRENT_MODEL_JOBS/DB_CONNECTION_LIMIT",
+      );
+      process.exit(1);
+    }
+  } catch (error) {
+    logger.fatal(
+      {
+        err: error instanceof Error ? { message: error.message, stack: error.stack } : { message: String(error) },
+      },
+      "读取数据库 max_connections 失败，服务退出",
     );
     process.exit(1);
   }

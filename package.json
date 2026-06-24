@@ -23,6 +23,7 @@
     "db:reset:parallel": "bun run scripts/db-reset-parallel.ts",
     "seed:parallel:assets": "bun run scripts/seed-parallel-assets.ts",
     "seed:parallel:scenario": "bun run scripts/seed-parallel-scenarios.ts",
+    "seed:parallel:report-burst": "bun run scripts/seed-parallel-report-burst.ts",
     "hash-password": "bun run scripts/hash-password.ts"
   },
   "type": "module",

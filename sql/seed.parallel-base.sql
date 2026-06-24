@@ -6,7 +6,7 @@
 --   admin      parallel_admin      / AdminParallel!123
 --   teacher    parallel_teacher    / TeacherParallel!123
 --   assistant  parallel_assistant  / AssistantParallel!123
---   students   20246001-20246024   / StudentParallel!123
+--   students   20246001-20246050   / StudentParallel!123
 -- --------------------------------------------------------
 
 -- ========================================================
@@ -39,7 +39,33 @@ INSERT INTO `users` (`user_id`, `username`, `password_hash`, `full_name`, `email
 (20246021, '20246021', '$2b$10$YBOx56IP5bmtGA8i6PxHWOI/gLZIQmBrbPvP5X1jwus4lzBuSUkIy', '并发学生21', '20246021@parallel.test.local', NULL, 'Student'),
 (20246022, '20246022', '$2b$10$YBOx56IP5bmtGA8i6PxHWOI/gLZIQmBrbPvP5X1jwus4lzBuSUkIy', '并发学生22', '20246022@parallel.test.local', NULL, 'Student'),
 (20246023, '20246023', '$2b$10$YBOx56IP5bmtGA8i6PxHWOI/gLZIQmBrbPvP5X1jwus4lzBuSUkIy', '并发学生23', '20246023@parallel.test.local', NULL, 'Student'),
-(20246024, '20246024', '$2b$10$YBOx56IP5bmtGA8i6PxHWOI/gLZIQmBrbPvP5X1jwus4lzBuSUkIy', '并发学生24', '20246024@parallel.test.local', NULL, 'Student');
+(20246024, '20246024', '$2b$10$YBOx56IP5bmtGA8i6PxHWOI/gLZIQmBrbPvP5X1jwus4lzBuSUkIy', '并发学生24', '20246024@parallel.test.local', NULL, 'Student'),
+(20246025, '20246025', '$2b$10$YBOx56IP5bmtGA8i6PxHWOI/gLZIQmBrbPvP5X1jwus4lzBuSUkIy', '并发学生25', '20246025@parallel.test.local', NULL, 'Student'),
+(20246026, '20246026', '$2b$10$YBOx56IP5bmtGA8i6PxHWOI/gLZIQmBrbPvP5X1jwus4lzBuSUkIy', '并发学生26', '20246026@parallel.test.local', NULL, 'Student'),
+(20246027, '20246027', '$2b$10$YBOx56IP5bmtGA8i6PxHWOI/gLZIQmBrbPvP5X1jwus4lzBuSUkIy', '并发学生27', '20246027@parallel.test.local', NULL, 'Student'),
+(20246028, '20246028', '$2b$10$YBOx56IP5bmtGA8i6PxHWOI/gLZIQmBrbPvP5X1jwus4lzBuSUkIy', '并发学生28', '20246028@parallel.test.local', NULL, 'Student'),
+(20246029, '20246029', '$2b$10$YBOx56IP5bmtGA8i6PxHWOI/gLZIQmBrbPvP5X1jwus4lzBuSUkIy', '并发学生29', '20246029@parallel.test.local', NULL, 'Student'),
+(20246030, '20246030', '$2b$10$YBOx56IP5bmtGA8i6PxHWOI/gLZIQmBrbPvP5X1jwus4lzBuSUkIy', '并发学生30', '20246030@parallel.test.local', NULL, 'Student'),
+(20246031, '20246031', '$2b$10$YBOx56IP5bmtGA8i6PxHWOI/gLZIQmBrbPvP5X1jwus4lzBuSUkIy', '并发学生31', '20246031@parallel.test.local', NULL, 'Student'),
+(20246032, '20246032', '$2b$10$YBOx56IP5bmtGA8i6PxHWOI/gLZIQmBrbPvP5X1jwus4lzBuSUkIy', '并发学生32', '20246032@parallel.test.local', NULL, 'Student'),
+(20246033, '20246033', '$2b$10$YBOx56IP5bmtGA8i6PxHWOI/gLZIQmBrbPvP5X1jwus4lzBuSUkIy', '并发学生33', '20246033@parallel.test.local', NULL, 'Student'),
+(20246034, '20246034', '$2b$10$YBOx56IP5bmtGA8i6PxHWOI/gLZIQmBrbPvP5X1jwus4lzBuSUkIy', '并发学生34', '20246034@parallel.test.local', NULL, 'Student'),
+(20246035, '20246035', '$2b$10$YBOx56IP5bmtGA8i6PxHWOI/gLZIQmBrbPvP5X1jwus4lzBuSUkIy', '并发学生35', '20246035@parallel.test.local', NULL, 'Student'),
+(20246036, '20246036', '$2b$10$YBOx56IP5bmtGA8i6PxHWOI/gLZIQmBrbPvP5X1jwus4lzBuSUkIy', '并发学生36', '20246036@parallel.test.local', NULL, 'Student'),
+(20246037, '20246037', '$2b$10$YBOx56IP5bmtGA8i6PxHWOI/gLZIQmBrbPvP5X1jwus4lzBuSUkIy', '并发学生37', '20246037@parallel.test.local', NULL, 'Student'),
+(20246038, '20246038', '$2b$10$YBOx56IP5bmtGA8i6PxHWOI/gLZIQmBrbPvP5X1jwus4lzBuSUkIy', '并发学生38', '20246038@parallel.test.local', NULL, 'Student'),
+(20246039, '20246039', '$2b$10$YBOx56IP5bmtGA8i6PxHWOI/gLZIQmBrbPvP5X1jwus4lzBuSUkIy', '并发学生39', '20246039@parallel.test.local', NULL, 'Student'),
+(20246040, '20246040', '$2b$10$YBOx56IP5bmtGA8i6PxHWOI/gLZIQmBrbPvP5X1jwus4lzBuSUkIy', '并发学生40', '20246040@parallel.test.local', NULL, 'Student'),
+(20246041, '20246041', '$2b$10$YBOx56IP5bmtGA8i6PxHWOI/gLZIQmBrbPvP5X1jwus4lzBuSUkIy', '并发学生41', '20246041@parallel.test.local', NULL, 'Student'),
+(20246042, '20246042', '$2b$10$YBOx56IP5bmtGA8i6PxHWOI/gLZIQmBrbPvP5X1jwus4lzBuSUkIy', '并发学生42', '20246042@parallel.test.local', NULL, 'Student'),
+(20246043, '20246043', '$2b$10$YBOx56IP5bmtGA8i6PxHWOI/gLZIQmBrbPvP5X1jwus4lzBuSUkIy', '并发学生43', '20246043@parallel.test.local', NULL, 'Student'),
+(20246044, '20246044', '$2b$10$YBOx56IP5bmtGA8i6PxHWOI/gLZIQmBrbPvP5X1jwus4lzBuSUkIy', '并发学生44', '20246044@parallel.test.local', NULL, 'Student'),
+(20246045, '20246045', '$2b$10$YBOx56IP5bmtGA8i6PxHWOI/gLZIQmBrbPvP5X1jwus4lzBuSUkIy', '并发学生45', '20246045@parallel.test.local', NULL, 'Student'),
+(20246046, '20246046', '$2b$10$YBOx56IP5bmtGA8i6PxHWOI/gLZIQmBrbPvP5X1jwus4lzBuSUkIy', '并发学生46', '20246046@parallel.test.local', NULL, 'Student'),
+(20246047, '20246047', '$2b$10$YBOx56IP5bmtGA8i6PxHWOI/gLZIQmBrbPvP5X1jwus4lzBuSUkIy', '并发学生47', '20246047@parallel.test.local', NULL, 'Student'),
+(20246048, '20246048', '$2b$10$YBOx56IP5bmtGA8i6PxHWOI/gLZIQmBrbPvP5X1jwus4lzBuSUkIy', '并发学生48', '20246048@parallel.test.local', NULL, 'Student'),
+(20246049, '20246049', '$2b$10$YBOx56IP5bmtGA8i6PxHWOI/gLZIQmBrbPvP5X1jwus4lzBuSUkIy', '并发学生49', '20246049@parallel.test.local', NULL, 'Student'),
+(20246050, '20246050', '$2b$10$YBOx56IP5bmtGA8i6PxHWOI/gLZIQmBrbPvP5X1jwus4lzBuSUkIy', '并发学生50', '20246050@parallel.test.local', NULL, 'Student');
 
 -- ========================================================
 -- 2. Class / Enrollment / Grade Weights
@@ -71,7 +97,33 @@ INSERT INTO `enrollments` (`student_id`, `class_id`) VALUES
 (20246021, 8401),
 (20246022, 8401),
 (20246023, 8401),
-(20246024, 8401);
+(20246024, 8401),
+(20246025, 8401),
+(20246026, 8401),
+(20246027, 8401),
+(20246028, 8401),
+(20246029, 8401),
+(20246030, 8401),
+(20246031, 8401),
+(20246032, 8401),
+(20246033, 8401),
+(20246034, 8401),
+(20246035, 8401),
+(20246036, 8401),
+(20246037, 8401),
+(20246038, 8401),
+(20246039, 8401),
+(20246040, 8401),
+(20246041, 8401),
+(20246042, 8401),
+(20246043, 8401),
+(20246044, 8401),
+(20246045, 8401),
+(20246046, 8401),
+(20246047, 8401),
+(20246048, 8401),
+(20246049, 8401),
+(20246050, 8401);
 
 INSERT INTO `class_assistants` (`assistant_id`, `class_id`) VALUES
 (900201, 8401);

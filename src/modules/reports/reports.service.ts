@@ -251,7 +251,12 @@ export async function submitReport(
       await page.setExtraHTTPHeaders({ "Content-Security-Policy": "default-src 'none'; style-src 'unsafe-inline';" });
       await page.setJavaScriptEnabled(false);
       await page.setContent(htmlDocument, { waitUntil: "domcontentloaded", timeout: 10000 });
-      await page.pdf({ path: pdfPath, format: "A4", printBackground: true });
+      await page.pdf({
+        path: pdfPath,
+        format: "A4",
+        printBackground: true,
+        timeout: TIMEOUTS.PDF_GENERATION,
+      });
     } finally {
       await browser.close().catch(() => { /* browser may already be closed or crashed */ });
     }

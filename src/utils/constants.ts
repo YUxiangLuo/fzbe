@@ -3,6 +3,27 @@
  * 统一管理文件大小限制、超时时间、行数限制等
  */
 
+import { availableParallelism } from "node:os";
+
+function parsePositiveIntegerEnv(name: string): number | null {
+  const rawValue = process.env[name]?.trim();
+  if (!rawValue) return null;
+
+  if (!/^[1-9]\d*$/.test(rawValue)) {
+    throw new Error(`${name} must be a positive integer, got: ${rawValue}`);
+  }
+
+  const parsed = Number(rawValue);
+  if (!Number.isSafeInteger(parsed)) {
+    throw new Error(`${name} must be a positive integer, got: ${rawValue}`);
+  }
+  return parsed;
+}
+
+const SYSTEM_PARALLELISM = Math.max(1, availableParallelism());
+const DEFAULT_MODEL_JOB_CAP = 50;
+const DEFAULT_MAX_CONCURRENT_MODEL_JOBS = Math.min(SYSTEM_PARALLELISM, DEFAULT_MODEL_JOB_CAP);
+
 // ============================================
 // 文件大小限制 (bytes)
 // ============================================
@@ -48,19 +69,42 @@ export const TIMEOUTS = {
   /** ADF 平稳性检测超时 */
   ADF: 30000,
   /** PDF 生成超时（Puppeteer 执行） */
-  PDF_GENERATION: 30000,
+  PDF_GENERATION: parsePositiveIntegerEnv("PDF_GENERATION_TIMEOUT_MS") ?? 30000,
   /** PDF 生成排队等待超时 */
-  PDF_QUEUE: 30000,
+  PDF_QUEUE: parsePositiveIntegerEnv("PDF_QUEUE_TIMEOUT_MS") ?? 60000,
 } as const;
 
 // ============================================
 // 并发限制
 // ============================================
+const MAX_CONCURRENT_MODEL_JOBS =
+  parsePositiveIntegerEnv("MAX_CONCURRENT_MODEL_JOBS") ??
+  parsePositiveIntegerEnv("MODEL_CONCURRENCY") ??
+  DEFAULT_MAX_CONCURRENT_MODEL_JOBS;
+const MAX_CONCURRENT_PDF_JOBS =
+  parsePositiveIntegerEnv("MAX_CONCURRENT_PDF_JOBS") ??
+  parsePositiveIntegerEnv("PDF_CONCURRENCY") ??
+  12;
+
 export const CONCURRENCY_LIMITS = {
-  /** 最大并发模型训练任务 */
-  MAX_CONCURRENT_MODEL_JOBS: 64,
+  /** 当前系统可用并行度（通常等于可用 CPU 核/线程数） */
+  SYSTEM_PARALLELISM,
+  /** 默认模型任务上限；按 64 核 / 50 人课堂配置，超过 50 默认仍封顶，可用环境变量覆盖 */
+  DEFAULT_MODEL_JOB_CAP,
+  /** 最大并发模型训练/生产准备/预测任务 */
+  MAX_CONCURRENT_MODEL_JOBS,
   /** 最大并发 PDF 生成（Puppeteer）任务 */
-  MAX_CONCURRENT_PDF_JOBS: 8,
+  MAX_CONCURRENT_PDF_JOBS,
+} as const;
+
+// ============================================
+// Python 模型运行时
+// ============================================
+export const PYTHON_RUNTIME_CONFIG = {
+  /** 每个 Python 模型子进程允许使用的原生计算线程数。默认 1，避免高并发时 BLAS/TF 线程爆炸。 */
+  MODEL_PROCESS_THREADS: parsePositiveIntegerEnv("PYTHON_MODEL_THREADS") ?? 1,
+  /** TensorFlow inter-op 线程数通常保持 1，更适合多进程并发。 */
+  TF_INTER_OP_THREADS: parsePositiveIntegerEnv("TF_NUM_INTEROP_THREADS") ?? 1,
 } as const;
 
 // ============================================
@@ -73,14 +117,20 @@ export const CONCURRENCY_LIMITS = {
  * 占用、锁又要等训练完成——形成循环等待。
  *
  * QUERY_HEADROOM：除了锁连接，其他模块（auth、experiments、reports 等）
- * 也共享同一连接池。留出足够余量让普通查询、事务与锁连接并行。
+ * 也共享同一连接池。默认取 max(40, modelJobs/2)，50 模型并发时连接池为 140。
  */
 const LOCK_CONNECTIONS = 2 * CONCURRENCY_LIMITS.MAX_CONCURRENT_MODEL_JOBS;
-const QUERY_HEADROOM = 18;
+const QUERY_HEADROOM =
+  parsePositiveIntegerEnv("DB_QUERY_HEADROOM") ??
+  Math.max(40, Math.ceil(CONCURRENCY_LIMITS.MAX_CONCURRENT_MODEL_JOBS / 2));
+const CONNECTION_LIMIT =
+  parsePositiveIntegerEnv("DB_CONNECTION_LIMIT") ??
+  LOCK_CONNECTIONS + QUERY_HEADROOM;
+
 export const DB_POOL_CONFIG = {
   LOCK_CONNECTIONS,
   QUERY_HEADROOM,
-  CONNECTION_LIMIT: LOCK_CONNECTIONS + QUERY_HEADROOM,
+  CONNECTION_LIMIT,
 } as const;
 
 // ============================================

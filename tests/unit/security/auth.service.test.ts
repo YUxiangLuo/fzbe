@@ -6,6 +6,7 @@ process.env.JWT_SECRET = "test-jwt-secret";
 process.env.PORT = "3001";
 
 import { beforeEach, describe, expect, mock, test } from "bun:test";
+import { verify } from "hono/jwt";
 import { AUTH_CONSTANTS } from "../../../src/utils/constants";
 
 mock.restore();
@@ -19,7 +20,6 @@ const queryMock = mock(async () => [[
   },
 ]]);
 const verifyPasswordMock = mock(async () => true);
-const signMock = mock(async () => "signed-token");
 
 mock.module("../../../src/config", () => ({
   env: {
@@ -39,11 +39,7 @@ mock.module("../../../src/utils/password", () => ({
   verifyPassword: verifyPasswordMock,
 }));
 
-mock.module("hono/jwt", () => ({
-  sign: signMock,
-}));
-
-const { login } = await import("../../../src/modules/auth/auth.service");
+const { login } = await import("../../../src/modules/auth/auth.service?auth-service-test");
 
 describe("auth service", () => {
   beforeEach(() => {
@@ -58,8 +54,6 @@ describe("auth service", () => {
     ]]);
     verifyPasswordMock.mockClear();
     verifyPasswordMock.mockResolvedValue(true);
-    signMock.mockClear();
-    signMock.mockResolvedValue("signed-token");
   });
 
   test("issues JWTs that expire in two hours", async () => {
@@ -74,15 +68,17 @@ describe("auth service", () => {
     });
 
     const after = Math.floor(Date.now() / 1000);
-    expect(result).toEqual({
-      success: true,
-      token: "signed-token",
-      user: { role: "Student" },
-    });
-    expect(signMock).toHaveBeenCalledTimes(1);
+    expect(result.success).toBe(true);
+    if (!result.success) {
+      throw new Error("Expected login to succeed");
+    }
+    expect(result.user).toEqual({ role: "Student" });
+    expect(typeof result.token).toBe("string");
 
-    const [payload, secret] = signMock.mock.calls[0]!;
-    expect(secret).toBe("test-jwt-secret");
+    const payload = await verify(result.token, "test-jwt-secret");
+    expect(payload.sub).toBe(42);
+    expect(payload.username).toBe("student001");
+    expect(payload.role).toBe("Student");
     expect(payload.exp).toBeGreaterThanOrEqual(before + 60 * 60 * 2);
     expect(payload.exp).toBeLessThanOrEqual(after + 60 * 60 * 2);
   });

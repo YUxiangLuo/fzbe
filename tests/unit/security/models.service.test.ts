@@ -232,6 +232,13 @@ describe("models service", () => {
           data_window_evaluate_end_index: 1,
         }),
       ]])
+      .mockResolvedValueOnce([[
+        buildExperimentContextRow({
+          data_window_train_end_index: 0,
+          data_window_evaluate_start_index: 1,
+          data_window_evaluate_end_index: 1,
+        }),
+      ]])
       .mockResolvedValueOnce([[{ file_path: "/tmp/dataset.csv" }]]);
 
     existsSync.mockImplementation((filePath: string) => !filePath.includes("-weighted_avg-production.pkl"));
@@ -290,6 +297,13 @@ describe("models service", () => {
           data_window_evaluate_end_index: 1,
         }),
       ]])
+      .mockResolvedValueOnce([[
+        buildExperimentContextRow({
+          data_window_train_end_index: 0,
+          data_window_evaluate_start_index: 1,
+          data_window_evaluate_end_index: 1,
+        }),
+      ]])
       .mockResolvedValueOnce([[{ file_path: "/tmp/dataset.csv" }]]);
 
     existsSync.mockImplementation((filePath: string) => !filePath.includes("-ma-production.pkl"));
@@ -323,6 +337,14 @@ describe("models service", () => {
       cwd: "/tmp/fangzhen-py",
       stdout: "pipe",
       stderr: "pipe",
+      env: {
+        OMP_NUM_THREADS: "1",
+        OPENBLAS_NUM_THREADS: "1",
+        MKL_NUM_THREADS: "1",
+        NUMEXPR_NUM_THREADS: "1",
+        TF_NUM_INTRAOP_THREADS: "1",
+        TF_NUM_INTEROP_THREADS: "1",
+      },
     });
   });
 
@@ -379,6 +401,13 @@ describe("models service", () => {
   test("prepares a missing production artifact before prediction", async () => {
     poolQuery.mockReset();
     poolQuery
+      .mockResolvedValueOnce([[
+        buildExperimentContextRow({
+          data_window_train_end_index: 0,
+          data_window_evaluate_start_index: 1,
+          data_window_evaluate_end_index: 1,
+        }),
+      ]])
       .mockResolvedValueOnce([[
         buildExperimentContextRow({
           data_window_train_end_index: 0,

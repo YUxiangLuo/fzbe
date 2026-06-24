@@ -165,16 +165,16 @@ export async function createDbConnection() {
 }
 
 export const PARALLEL_STUDENT_USERNAMES = Array.from(
-  { length: 24 },
+  { length: 50 },
   (_, index) => String(20246001 + index),
 );
 
 export const PARALLEL_STUDENT_GROUPS = {
   all: PARALLEL_STUDENT_USERNAMES,
-  trainingBurst: PARALLEL_STUDENT_USERNAMES.slice(0, 20),
-  mixedStartOnly: PARALLEL_STUDENT_USERNAMES.slice(0, 8),
-  mixedTraining: PARALLEL_STUDENT_USERNAMES.slice(8, 16),
-  mixedProduction: PARALLEL_STUDENT_USERNAMES.slice(16, 24),
+  trainingBurst: PARALLEL_STUDENT_USERNAMES,
+  mixedStartOnly: PARALLEL_STUDENT_USERNAMES.slice(0, 10),
+  mixedTraining: PARALLEL_STUDENT_USERNAMES.slice(10, 30),
+  mixedProduction: PARALLEL_STUDENT_USERNAMES.slice(30, 50),
 } as const;
 
 export function safeFileName(value: string): string {

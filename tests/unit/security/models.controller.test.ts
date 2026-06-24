@@ -20,6 +20,10 @@ const prepareExperimentModelForProduction = mock(async () => ({
   status: "success",
   results: { saved_model: "/tmp/fangzhen-py/trained_models/example-production.pkl" },
 }));
+const getReusableProductionModelArtifactResult = mock(async () => null as null | {
+  status: "success";
+  results: { saved_model: string; artifact_phase: "production"; reused_existing: boolean };
+});
 const predictExperimentModel = mock(async () => ({
   status: "success",
   results: { predictions: [] },
@@ -45,6 +49,7 @@ class ModelAccessError extends Error {
 
 mock.module("../../../src/modules/models/models.service", () => ({
   trainModel,
+  getReusableProductionModelArtifactResult,
   prepareExperimentModelForProduction,
   predictExperimentModel,
   acquireModelSlot,
@@ -112,6 +117,9 @@ describe("models controller", () => {
       status: "success",
       results: { saved_model: "/tmp/fangzhen-py/trained_models/example-production.pkl" },
     });
+
+    getReusableProductionModelArtifactResult.mockReset();
+    getReusableProductionModelArtifactResult.mockResolvedValue(null);
 
     predictExperimentModel.mockReset();
     predictExperimentModel.mockResolvedValue({
@@ -300,6 +308,73 @@ describe("models controller", () => {
     expect(releaseModelSlot).toHaveBeenCalledWith(null);
   });
 
+  test("returns a reusable base production artifact without acquiring a global model slot", async () => {
+    getReusableProductionModelArtifactResult.mockResolvedValueOnce({
+      status: "success",
+      results: {
+        saved_model: "/tmp/fangzhen-py/trained_models/example-production.pkl",
+        artifact_phase: "production",
+        reused_existing: true,
+      },
+    });
+
+    const response = await requestJson("/api/v1/models/ma/prepare-production", {
+      experiment_id: 990002,
+    });
+    const data = await response.json();
+
+    expect(response.status).toBe(200);
+    expect(data).toEqual({
+      status: "success",
+      results: {
+        saved_model: "/tmp/fangzhen-py/trained_models/example-production.pkl",
+        artifact_phase: "production",
+        reused_existing: true,
+      },
+    });
+    expect(getReusableProductionModelArtifactResult).toHaveBeenCalledWith("ma", 20240002, 990002);
+    expect(acquireModelSlot).not.toHaveBeenCalled();
+    expect(prepareExperimentModelForProduction).not.toHaveBeenCalled();
+  });
+
+  test("checks reusable ensemble production artifacts behind the global model slot", async () => {
+    const callOrder: string[] = [];
+    const slotLock = { connection: {} as never, name: "slot:ensemble" };
+    acquireModelSlot.mockImplementationOnce(async () => {
+      callOrder.push("slot");
+      return slotLock;
+    });
+    prepareExperimentModelForProduction.mockImplementationOnce(async () => {
+      callOrder.push("prepare");
+      return {
+        status: "success",
+        results: {
+          saved_model: "/tmp/fangzhen-py/trained_models/example-production.pkl",
+          artifact_phase: "production",
+          reused_existing: true,
+        },
+      };
+    });
+
+    const response = await requestJson("/api/v1/models/weighted_avg/prepare-production", {
+      experiment_id: 990002,
+    });
+    const data = await response.json();
+
+    expect(response.status).toBe(200);
+    expect(data).toEqual({
+      status: "success",
+      results: {
+        saved_model: "/tmp/fangzhen-py/trained_models/example-production.pkl",
+        artifact_phase: "production",
+        reused_existing: true,
+      },
+    });
+    expect(getReusableProductionModelArtifactResult).not.toHaveBeenCalled();
+    expect(callOrder).toEqual(["slot", "prepare"]);
+    expect(releaseModelSlot).toHaveBeenCalledWith(slotLock);
+  });
+
   test("prepares a base model for production prediction", async () => {
     const response = await requestJson("/api/v1/models/ma/prepare-production", {
       experiment_id: 990002,
@@ -311,6 +386,7 @@ describe("models controller", () => {
       status: "success",
       results: { saved_model: "/tmp/fangzhen-py/trained_models/example-production.pkl" },
     });
+    expect(getReusableProductionModelArtifactResult).toHaveBeenCalledWith("ma", 20240002, 990002);
     expect(prepareExperimentModelForProduction).toHaveBeenCalledWith("ma", 20240002, 990002);
   });
 
@@ -325,6 +401,8 @@ describe("models controller", () => {
       status: "success",
       results: { saved_model: "/tmp/fangzhen-py/trained_models/example-production.pkl" },
     });
+    expect(getReusableProductionModelArtifactResult).not.toHaveBeenCalled();
+    expect(acquireModelSlot).toHaveBeenCalledTimes(1);
     expect(prepareExperimentModelForProduction).toHaveBeenCalledWith("weighted_avg", 20240002, 990002);
   });
 
