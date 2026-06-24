@@ -20,6 +20,11 @@ BASE_MODEL_TRAIN_ARGS = {
     "arima": ("--d", "1", "--max-p", "2", "--max-q", "2"),
 }
 
+sys.path.insert(0, str(PY_ROOT / "src"))
+
+from model_metadata_assertions import assert_method_metadata
+from models.stacking import _fit_meta_model
+
 
 def load_csv_records(csv_path: Path) -> list[dict[str, str]]:
     with csv_path.open("r", encoding="utf-8", newline="") as handle:
@@ -156,6 +161,23 @@ def train_base_model_artifacts(
 
 
 def main() -> None:
+    singular_meta_model = _fit_meta_model(
+        np.array(
+            [
+                [0.0, 0.0],
+                [0.0, 0.0],
+                [0.0, 0.0],
+                [0.0, 0.0],
+            ],
+            dtype=float,
+        ),
+        np.array([10.5, 11.5, 12.5, 13.5], dtype=float),
+        ["left", "right"],
+    )
+    assert singular_meta_model["strategy"] == "inverse_mae_fallback"
+    assert singular_meta_model["condition_number"] is None
+    json.dumps(singular_meta_model, allow_nan=False)
+
     records = load_csv_records(CSV_FIXTURE)
     data_json = json.dumps(records, ensure_ascii=False)
     sales = [float(row["销售数量"]) for row in records]
@@ -267,6 +289,7 @@ def main() -> None:
         actual_eval_predictions = extract_predictions(train_output)
         actual_eval_std_devs = extract_std_devs(train_output)
         assert train_output["mode"] == "stacking_train_eval"
+        assert_method_metadata(train_output, "stacking")
         assert train_output["models"] == BASE_MODELS
         assert train_output["metrics"]["evaluate_months"] == timestamps[20:24]
         assert train_output["eval_y_true"] == sales[20:24]
@@ -290,6 +313,7 @@ def main() -> None:
             "--pretty",
         )
         assert fit_output["mode"] == "stacking_fit_only"
+        assert_method_metadata(fit_output, "stacking")
         assert fit_output["models"] == BASE_MODELS
         assert fit_output["saved_model"] == str(stacking_model_production)
 
@@ -337,6 +361,7 @@ def main() -> None:
         future_std_devs_one = extract_std_devs(predict_output_one)
         future_std_devs_two = extract_std_devs(predict_output_two)
         assert predict_output_one["mode"] == "stacking_loaded_predict"
+        assert_method_metadata(predict_output_one, "stacking")
         assert predict_output_one["forecast_steps"] == future_steps
         assert_series_close(future_predictions_one, expected_future_predictions)
         assert_series_close(future_predictions_one, future_predictions_two)

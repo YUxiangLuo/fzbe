@@ -13,6 +13,8 @@ RUN_MODEL = PY_ROOT / "run_model.py"
 CSV_FIXTURE = Path(__file__).resolve().parent / "fixtures" / "core_models_smoke.csv"
 BASE_MODELS = ["ma", "es", "arima"]
 
+from model_metadata_assertions import assert_method_metadata
+
 
 def load_csv_records(csv_path: Path) -> list[dict[str, str]]:
     with csv_path.open("r", encoding="utf-8", newline="") as handle:
@@ -68,7 +70,7 @@ def member_model_path(save_path: Path, model_name: str) -> str:
     return str(save_path.with_name(f"{save_path.stem}_base_{model_name}.pkl"))
 
 
-def normalized_inverse_variance_weights(
+def normalized_inverse_residual_mse_weights(
     predictions_by_model: dict[str, list[float]],
     y_true: list[float],
 ) -> dict[str, float]:
@@ -76,10 +78,10 @@ def normalized_inverse_variance_weights(
     total = 0.0
     for model_name, predictions in predictions_by_model.items():
         residuals = [target - prediction for target, prediction in zip(y_true, predictions)]
-        error_variance = sum(value * value for value in residuals) / len(residuals)
-        inverse_variance = 1.0 / (error_variance + 1e-9)
-        raw_weights[model_name] = inverse_variance
-        total += inverse_variance
+        residual_mse = sum(value * value for value in residuals) / len(residuals)
+        inverse_error = 1.0 / (residual_mse + 1e-9)
+        raw_weights[model_name] = inverse_error
+        total += inverse_error
 
     return {model_name: weight / total for model_name, weight in raw_weights.items()}
 
@@ -93,7 +95,7 @@ def weighted_sum(predictions_by_model: dict[str, list[float]], weights: dict[str
 
 
 def main() -> None:
-    synthetic_weights = normalized_inverse_variance_weights(
+    synthetic_weights = normalized_inverse_residual_mse_weights(
         {
             "biased": [100.0, 100.0, 100.0, 100.0],
             "stable": [0.0, 1.0, 0.0, -1.0],
@@ -221,7 +223,7 @@ def main() -> None:
                 )
             )
 
-        expected_weights = normalized_inverse_variance_weights(weight_val_predictions, sales[16:20])
+        expected_weights = normalized_inverse_residual_mse_weights(weight_val_predictions, sales[16:20])
         expected_eval_predictions = weighted_sum(eval_predictions, expected_weights)
 
         weighted_model_backtest = temp_path / "weighted-avg-backtest.pkl"
@@ -259,6 +261,7 @@ def main() -> None:
         actual_eval_predictions = extract_predictions(train_output)
         actual_eval_std_devs = extract_std_devs(train_output)
         assert train_output["mode"] == "weighted_avg_train_eval"
+        assert_method_metadata(train_output, "weighted_avg")
         assert train_output["models"] == BASE_MODELS
         assert train_output["metrics"]["evaluate_months"] == timestamps[20:24]
         assert train_output["eval_y_true"] == sales[20:24]
@@ -283,6 +286,7 @@ def main() -> None:
             "--pretty",
         )
         assert fit_output["mode"] == "weighted_avg_fit_only"
+        assert_method_metadata(fit_output, "weighted_avg")
         assert fit_output["models"] == BASE_MODELS
         assert fit_output["saved_model"] == str(weighted_model_production)
 
@@ -326,6 +330,7 @@ def main() -> None:
         future_std_devs_one = extract_std_devs(predict_output_one)
         future_std_devs_two = extract_std_devs(predict_output_two)
         assert predict_output_one["mode"] == "weighted_avg_loaded_predict"
+        assert_method_metadata(predict_output_one, "weighted_avg")
         assert predict_output_one["forecast_steps"] == future_steps
         assert_series_close(future_predictions_one, expected_future_predictions)
         assert_series_close(future_predictions_one, future_predictions_two)

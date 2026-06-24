@@ -14,9 +14,16 @@ import pandas as pd
 from data_utils import ParsedData, load_data_from_json
 from logger import log, get_log_contents
 from metrics import mae, mape, r2, rmse
+from model_info import attach_method_metadata, ensure_state_metadata
 from serialization import dump_model, load_model
 
 MODEL_TYPE = "ma"
+METHOD_NAME = "递推移动平均"
+FORECAST_STRATEGY = "recursive_roll_forward"
+IMPLEMENTATION_NOTES = [
+    "教科书移动平均通常用最后一个窗口均值预测下一期。",
+    "本系统预测多期未来销量时，将每期预测值滚入窗口继续递推，避免使用评估集或未来真实值。",
+]
 
 # Type alias for input flexibility
 ArrayLike = Union[List[float], np.ndarray]
@@ -68,7 +75,7 @@ def _load_state(model_path: str) -> Dict[str, Any]:
     state = load_model(model_path)
     if not isinstance(state, dict) or state.get("model_type") != MODEL_TYPE:
         raise ValueError("[VALIDATION] Invalid MA model file.")
-    return state
+    return ensure_state_metadata(state, METHOD_NAME, FORECAST_STRATEGY, IMPLEMENTATION_NOTES)
 
 
 def _forecast_future(
@@ -78,8 +85,8 @@ def _forecast_future(
 ) -> List[float]:
     """
     Generate multi-step-ahead forecasts.
-    Returns a constant forecast based on the mean of the last 'window' historical points.
-    MA models assume the future mean is the same as the current moving average.
+    Each forecast is appended to the rolling window before the next step is
+    generated, so no future or evaluation actuals are used.
     """
     if steps <= 0:
         raise ValueError("[VALIDATION] steps must be > 0 for forecasting.")
@@ -225,6 +232,7 @@ def run(args) -> None:
             "history": history.tolist(),
             "std_dev_residuals": std_dev_residuals,
         }
+        attach_method_metadata(next_state, METHOD_NAME, FORECAST_STRATEGY, IMPLEMENTATION_NOTES)
         dump_model(next_state, save_path)
 
         out: Dict[str, Any] = {
@@ -233,6 +241,7 @@ def run(args) -> None:
             "train_end_index": te,
             "saved_model": save_path,
         }
+        attach_method_metadata(out, METHOD_NAME, FORECAST_STRATEGY, IMPLEMENTATION_NOTES)
         out["logs"] = get_log_contents()
         print(json.dumps(out, ensure_ascii=False, indent=2 if pretty else None))
         return
@@ -255,6 +264,7 @@ def run(args) -> None:
             "forecast_steps": steps,
             "predictions": predictions_with_std,
         }
+        attach_method_metadata(out, METHOD_NAME, FORECAST_STRATEGY, IMPLEMENTATION_NOTES)
         log.info("Prediction finished successfully")
         out["logs"] = get_log_contents()
         print(json.dumps(out, ensure_ascii=False, indent=2 if pretty else None))
@@ -301,6 +311,7 @@ def run(args) -> None:
             "eval_y_true": y_true.tolist(),
             "predictions": predictions_with_std,
         }
+        attach_method_metadata(out, METHOD_NAME, FORECAST_STRATEGY, IMPLEMENTATION_NOTES)
 
         if save_path:
             log.info(f"Saving model to {save_path}")
@@ -312,6 +323,7 @@ def run(args) -> None:
                 "history": history.tolist(),
                 "std_dev_residuals": std_dev_residuals,
             }
+            attach_method_metadata(state, METHOD_NAME, FORECAST_STRATEGY, IMPLEMENTATION_NOTES)
             dump_model(state, save_path)
             log.info(f"Model saved successfully to {save_path}")
             out["saved_model"] = save_path

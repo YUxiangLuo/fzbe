@@ -29,6 +29,7 @@ from ensemble_utils import (
     persist_member_model_artifact,
 )
 from metrics import mae, mape, r2, rmse
+from model_info import attach_method_metadata, ensure_state_metadata
 from serialization import dump_model, load_model
 from subprocess_utils import (
     extract_predictions_from_result,
@@ -38,6 +39,13 @@ from subprocess_utils import (
 )
 
 MODEL_TYPE = "stacking"
+METHOD_NAME = "时间顺序留出 Stacking 融合"
+FORECAST_STRATEGY = "holdout_meta_weighted_blend"
+IMPLEMENTATION_NOTES = [
+    "教科书 Stacking 用基础模型预测作为二级特征，再训练元学习器组合预测。",
+    "本系统按时间顺序将训练区间拆成 Level-0 和 Level-1，避免普通 K 折交叉验证破坏时间序列顺序。",
+    "元模型使用非负线性回归且无截距，并将系数归一化为权重；样本不足或共线性严重时回退为 inverse-MAE 权重。",
+]
 
 
 # ---------- utilities ----------
@@ -201,6 +209,14 @@ def _compute_inverse_mae_weights(X_meta_train: np.ndarray, y_meta_train: np.ndar
     return _normalize_meta_weights(inverse_mae, X_meta_train.shape[1]), model_mae
 
 
+def _json_safe_optional_float(value: float) -> Optional[float]:
+    """Return finite floats for JSON payloads, and None for inf/nan diagnostics."""
+    numeric_value = float(value)
+    if not np.isfinite(numeric_value):
+        return None
+    return numeric_value
+
+
 def _fit_meta_model(
     X_meta_train: np.ndarray,
     y_meta_train: np.ndarray,
@@ -238,7 +254,7 @@ def _fit_meta_model(
             "kind": "weighted_blend",
             "strategy": "inverse_mae_fallback",
             "fallback_reason": fallback_reason,
-            "condition_number": condition_number,
+            "condition_number": _json_safe_optional_float(condition_number),
             "model_names": list(model_names),
             "weights": weights.tolist(),
             "level1_mae": model_mae.tolist(),
@@ -252,7 +268,7 @@ def _fit_meta_model(
     return {
         "kind": "weighted_blend",
         "strategy": "normalized_positive_regression",
-        "condition_number": condition_number,
+        "condition_number": _json_safe_optional_float(condition_number),
         "model_names": list(model_names),
         "weights": weights.tolist(),
         "raw_coefficients": raw_coefficients.tolist(),
@@ -282,7 +298,7 @@ def _load_state(model_path: str) -> Dict[str, Any]:
     state = load_model(model_path)
     if not isinstance(state, dict) or state.get("model_type") != MODEL_TYPE:
         raise ValueError("[VALIDATION] Invalid Stacking model file.")
-    return state
+    return ensure_state_metadata(state, METHOD_NAME, FORECAST_STRATEGY, IMPLEMENTATION_NOTES)
 
 
 def _validate_fit_args(parsed_data: ParsedData, ts: int, te: int, state: Dict[str, Any]) -> None:
@@ -574,12 +590,12 @@ def train_and_evaluate(
     model_params: Dict[str, Any],
     base_model_files: Optional[Dict[str, str]] = None,
 ) -> Tuple[Dict[str, Any], Dict[str, Any], Any, List[float], List[float], float]:
-    """Trains and evaluates the Stacking model using the correct hold-out approach.
+    """Trains and evaluates the Stacking model using a time-ordered hold-out approach.
 
-    Correct Stacking Flow (教科书式):
+    Teaching-practical Stacking Flow:
     1. Split train_range into level0_train (80%) and level1_train (20%)
     2. Train base models on level0_train, predict on level1_train
-    3. Train meta-model on level1_train predictions (out-of-fold)
+    3. Train meta-model on level1_train hold-out predictions
     4. Retrain base models on full train_range
     5. Evaluate on independent eval_range
 
@@ -676,16 +692,18 @@ def train_and_evaluate(
 
     # === Step 3: Train meta-model on level1 predictions ===
     print(f"\n[Stacking Phase 2] 训练元模型（在level1预测上）", file=sys.stderr)
-    X_meta_train = np.column_stack(level1_predictions)  # ✅ level1的out-of-fold预测
+    X_meta_train = np.column_stack(level1_predictions)  # ✅ level1 的时间顺序留出预测
     y_meta_train = parsed_data.y[level1_train_range]  # ✅ level1的标签
 
     meta_model = _fit_meta_model(X_meta_train, y_meta_train, models_to_use)
 
     print(f"  ✓ 元模型训练完成 (输入维度: {X_meta_train.shape})", file=sys.stderr)
     if isinstance(meta_model, dict):
+        condition_number = meta_model.get("condition_number")
+        condition_label = f"{condition_number:.2e}" if condition_number is not None else "n/a"
         print(
             f"  元模型策略: {meta_model['strategy']} "
-            f"(condition={meta_model.get('condition_number', float('nan')):.2e})",
+            f"(condition={condition_label})",
             file=sys.stderr,
         )
         if meta_model.get("fallback_reason"):
@@ -901,6 +919,7 @@ def run(args) -> None:
             "meta_model": state["meta_model"],
             "std_dev_residuals": float(state.get("std_dev_residuals", 0.0)),
         }
+        attach_method_metadata(next_state, METHOD_NAME, FORECAST_STRATEGY, IMPLEMENTATION_NOTES)
         dump_model(next_state, save_path)
 
         out = {
@@ -908,6 +927,7 @@ def run(args) -> None:
             "models": models_to_use,
             "saved_model": save_path,
         }
+        attach_method_metadata(out, METHOD_NAME, FORECAST_STRATEGY, IMPLEMENTATION_NOTES)
         print(json.dumps(out, ensure_ascii=False, indent=2 if pretty else None))
         return
 
@@ -924,6 +944,7 @@ def run(args) -> None:
             "forecast_steps": steps,
             "predictions": predictions_with_std,
         }
+        attach_method_metadata(out, METHOD_NAME, FORECAST_STRATEGY, IMPLEMENTATION_NOTES)
         print(json.dumps(out, ensure_ascii=False, indent=2 if pretty else None))
         return
 
@@ -1048,10 +1069,12 @@ def run(args) -> None:
     out: Dict[str, Any] = {
         "mode": "stacking_train_eval",
         "models": models_to_use,
+        "meta_model": meta_model,
         "metrics": metrics,
         "eval_y_true": y_true,
         "predictions": predictions_with_std,
     }
+    attach_method_metadata(out, METHOD_NAME, FORECAST_STRATEGY, IMPLEMENTATION_NOTES)
 
     if save_path:
         for model_name, model_state in base_model_states.items():
@@ -1073,6 +1096,7 @@ def run(args) -> None:
             "meta_model": meta_model,
             "std_dev_residuals": std_dev,
         }
+        attach_method_metadata(state, METHOD_NAME, FORECAST_STRATEGY, IMPLEMENTATION_NOTES)
         dump_model(state, save_path)
         out["saved_model"] = save_path
 

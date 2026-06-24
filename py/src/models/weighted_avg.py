@@ -1,7 +1,10 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Weighted Average Ensemble Model using Inverse Variance weighting.
+Weighted Average Ensemble Model using inverse validation residual-MSE weighting.
+
+This follows the inverse-variance weighting idea, but uses validation residual
+MSE so systematic forecast bias is penalized as well as residual fluctuation.
 Combines predictions from a flexible set of base models.
 
 Uses subprocess to call base models for consistency with API behavior.
@@ -28,6 +31,7 @@ from ensemble_utils import (
     persist_member_model_artifact,
 )
 from metrics import mae, mape, r2, rmse
+from model_info import attach_method_metadata, ensure_state_metadata
 from serialization import dump_model, load_model
 from subprocess_utils import (
     extract_predictions_from_result,
@@ -37,6 +41,14 @@ from subprocess_utils import (
 )
 
 MODEL_TYPE = "weighted_avg"
+METHOD_NAME = "验证残差MSE倒数加权融合"
+FORECAST_STRATEGY = "validation_residual_mse_weighted_average"
+IMPLEMENTATION_NOTES = [
+    "教科书组合预测常用逆方差或误差方差-协方差思想分配权重；当预测误差近似无偏时，MSE 与方差口径一致。",
+    "本系统先用时间顺序留出的验证段估计各基础模型残差均方误差（MSE），再按其倒数归一化为权重。",
+    "这样既继承误差越小权重越高的逆方差思想，也会惩罚销量预测中常见的系统性高估或低估。",
+    "所有基础模型最终会在完整训练区间重训，再用固定权重组合评估或未来预测。",
+]
 
 
 # ---------- utilities ----------
@@ -181,35 +193,35 @@ def _load_state(model_path: str) -> Dict[str, Any]:
     state = load_model(model_path)
     if not isinstance(state, dict) or state.get("model_type") != MODEL_TYPE:
         raise ValueError("[VALIDATION] Invalid Weighted Average model file.")
-    return state
+    return ensure_state_metadata(state, METHOD_NAME, FORECAST_STRATEGY, IMPLEMENTATION_NOTES)
 
 
-def _compute_inverse_variance_weights(
+def _compute_inverse_residual_mse_weights(
     y_true: np.ndarray,
     predictions_by_model: Dict[str, Any],
 ) -> Dict[str, float]:
     """
-    Estimate inverse-variance weights from residuals around the zero-error target.
+    Estimate inverse-error weights from validation residual MSE.
 
-    Using the residual second moment penalizes systematic bias, unlike centered
-    variance which treats constant-but-wrong residuals as zero variance.
+    This is equivalent to inverse-SSE weighting when every model is evaluated on
+    the same validation segment length, and it penalizes systematic bias.
     """
     raw_weights: Dict[str, float] = {}
-    total_inverse_variance = 0.0
+    total_inverse_error = 0.0
 
     for model_name, predictions in predictions_by_model.items():
         residuals = np.asarray(y_true, dtype=float) - np.asarray(predictions, dtype=float)
-        error_variance = float(np.mean(np.square(residuals)))
-        inverse_variance = 1.0 / (error_variance + 1e-9)
-        raw_weights[model_name] = inverse_variance
-        total_inverse_variance += inverse_variance
+        residual_mse = float(np.mean(np.square(residuals)))
+        inverse_error = 1.0 / (residual_mse + 1e-9)
+        raw_weights[model_name] = inverse_error
+        total_inverse_error += inverse_error
 
-    if total_inverse_variance <= 0:
+    if total_inverse_error <= 0:
         uniform_weight = 1.0 / max(1, len(raw_weights))
         return {model_name: uniform_weight for model_name in raw_weights}
 
     return {
-        model_name: weight / total_inverse_variance
+        model_name: weight / total_inverse_error
         for model_name, weight in raw_weights.items()
     }
 
@@ -473,17 +485,18 @@ def train_and_evaluate(
     model_params: Dict[str, Any],
     base_model_files: Optional[Dict[str, str]] = None,
 ) -> Tuple[Dict[str, Any], Dict[str, Any], Dict[str, float], List[float], List[float], float]:
-    """Trains and evaluates the Weighted Average model using Inverse Variance Weighting.
+    """Trains and evaluates the Weighted Average model using inverse residual-MSE weighting.
 
-    Correct Inverse Variance Weighting Flow (教科书式):
+    Time-ordered error-weighted flow:
     1. Split train_range into weight_train (80%) and weight_val (20%)
     2. Train base models on weight_train, predict on weight_val
-    3. Calculate weights using weight_val residuals: w_i = 1 / (var_i + eps)
+    3. Calculate weights using weight_val residual MSE: w_i = 1 / (mse_i + eps)
     4. Retrain base models on full train_range
     5. Evaluate weighted combination on independent eval_range
 
-    Algorithm: Inverse Variance Weighting
-    - weight_i = 1 / (variance_i + epsilon)
+    Algorithm: inverse validation residual-MSE weighting
+    (an inverse-variance-inspired rule adapted for potentially biased forecasts)
+    - weight_i = 1 / (residual_mse_i + epsilon)
     - normalized_weight_i = weight_i / sum(weight_j)
     - final_prediction = sum(normalized_weight_i * prediction_i)
     """
@@ -570,16 +583,16 @@ def train_and_evaluate(
         weight_val_predictions[model_name] = y_pred_val
         print(f"    ✓ 生成 {len(y_pred_val)} 个weight_val预测", file=sys.stderr)
 
-    # === Step 3: Calculate weights using Inverse Variance Weighting ===
-    print(f"\n[Weighted Average Phase 2] 计算权重（Inverse Variance Weighting）", file=sys.stderr)
+    # === Step 3: Calculate weights using validation residual MSE ===
+    print(f"\n[Weighted Average Phase 2] 计算权重（验证集残差MSE倒数加权）", file=sys.stderr)
     y_true_val = parsed_data.y[weight_val_range]  # ✅ weight_val的真实值
-    print(f"  方差计算 (基于weight_val残差):", file=sys.stderr)
-    weights = _compute_inverse_variance_weights(y_true_val, weight_val_predictions)
+    print(f"  误差计算 (基于weight_val残差MSE):", file=sys.stderr)
+    weights = _compute_inverse_residual_mse_weights(y_true_val, weight_val_predictions)
     for name in models_to_use:
         residuals = y_true_val - np.asarray(weight_val_predictions[name], dtype=float)
-        error_variance = float(np.mean(np.square(residuals)))
-        inverse_variance = 1.0 / (error_variance + 1e-9)
-        print(f"    {name}: error_variance={error_variance:.6f}, inverse_variance={inverse_variance:.6f}", file=sys.stderr)
+        residual_mse = float(np.mean(np.square(residuals)))
+        inverse_error = 1.0 / (residual_mse + 1e-9)
+        print(f"    {name}: residual_mse={residual_mse:.6f}, inverse_error={inverse_error:.6f}", file=sys.stderr)
     print(f"  权重归一化:", file=sys.stderr)
     for name in models_to_use:
         print(f"    {name}: normalized_weight={weights[name]:.6f}", file=sys.stderr)
@@ -792,6 +805,7 @@ def run(args) -> None:
             "weights": state["weights"],
             "std_dev_residuals": float(state.get("std_dev_residuals", 0.0)),
         }
+        attach_method_metadata(next_state, METHOD_NAME, FORECAST_STRATEGY, IMPLEMENTATION_NOTES)
         dump_model(next_state, save_path)
 
         out = {
@@ -799,6 +813,7 @@ def run(args) -> None:
             "models": models_to_use,
             "saved_model": save_path,
         }
+        attach_method_metadata(out, METHOD_NAME, FORECAST_STRATEGY, IMPLEMENTATION_NOTES)
         print(json.dumps(out, ensure_ascii=False, indent=2 if pretty else None))
         return
 
@@ -813,6 +828,7 @@ def run(args) -> None:
             "forecast_steps": steps,
             "predictions": _format_predictions(preds, std_dev),
         }
+        attach_method_metadata(out, METHOD_NAME, FORECAST_STRATEGY, IMPLEMENTATION_NOTES)
         print(json.dumps(out, ensure_ascii=False, indent=2 if pretty else None))
         return
 
@@ -939,6 +955,7 @@ def run(args) -> None:
         "eval_y_true": y_true,
         "predictions": _format_predictions(y_pred, std_dev),
     }
+    attach_method_metadata(out, METHOD_NAME, FORECAST_STRATEGY, IMPLEMENTATION_NOTES)
 
     if save_path:
         for model_name, model_state in base_model_states.items():
@@ -958,6 +975,7 @@ def run(args) -> None:
             "base_model_states": base_model_states, "weights": weights,
             "std_dev_residuals": std_dev,
         }
+        attach_method_metadata(state, METHOD_NAME, FORECAST_STRATEGY, IMPLEMENTATION_NOTES)
         dump_model(state, save_path)
         out["saved_model"] = save_path
 

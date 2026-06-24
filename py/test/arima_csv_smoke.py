@@ -14,6 +14,8 @@ PY_ROOT = Path(__file__).resolve().parents[1]
 RUN_MODEL = PY_ROOT / "run_model.py"
 CSV_FIXTURE = Path(__file__).resolve().parent / "fixtures" / "core_models_smoke.csv"
 
+from model_metadata_assertions import assert_method_metadata
+
 
 def load_csv_records(csv_path: Path) -> list[dict[str, str]]:
     with csv_path.open("r", encoding="utf-8", newline="") as handle:
@@ -193,6 +195,7 @@ def main() -> None:
         }
 
         assert train_output["mode"] == "arima_search_pq_fixed_d"
+        assert_method_metadata(train_output, "arima")
         assert train_output["best_order"] == expected_best_order
         assert train_output["metrics"]["evaluate_months"] == timestamps[20:24]
         assert train_output["eval_y_true"] == sales[20:24]
@@ -214,6 +217,7 @@ def main() -> None:
             "--pretty",
         )
         assert fit_output["mode"] == "arima_fit_only"
+        assert_method_metadata(fit_output, "arima")
         assert fit_output["order"] == expected_best_order
         assert fit_output["train_end_index"] == 23
         assert fit_output["saved_model"] == str(production_model)
@@ -240,6 +244,7 @@ def main() -> None:
         actual_future_predictions = [float(item["prediction"]) for item in predict_output["predictions"]]
         actual_future_std = [float(item["std_dev"]) for item in predict_output["predictions"]]
         assert predict_output["mode"] == "arima_loaded_predict"
+        assert_method_metadata(predict_output, "arima")
         assert predict_output["order"] == expected_best_order
         assert predict_output["forecast_steps"] == 3
         assert_series_close(actual_future_predictions, expected_future_predictions.tolist())

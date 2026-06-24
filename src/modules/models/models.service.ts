@@ -978,7 +978,7 @@ const resultTransformers: Record<ModelType, (result: Record<string, unknown>) =>
       ? { ...(result.diagnostics as object), y_pred_eval: (result.predictions as { prediction: number }[] | undefined)?.map((p) => p.prediction) || [] }
       : undefined,
   }),
-  stacking: (result) => ({ model_names: result.models }),
+  stacking: (result) => ({ model_names: result.models, meta_model: result.meta_model }),
   weighted_avg: (result) => ({
     model_names: result.models,
     weights: (result.models as string[] | undefined)?.map((name) => (result.weights as Record<string, number>)?.[name]),
@@ -1004,6 +1004,9 @@ export function transformTrainingResult(
     eval_predictions: (result.predictions as { prediction: number }[] | undefined)?.map((p) => p.prediction) || [],
     evaluate_indices: normalizeNumericArray(metrics?.evaluate_indices),
     evaluate_months: normalizeStringArray(metrics?.evaluate_months),
+    method_name: result.method_name,
+    forecast_strategy: result.forecast_strategy,
+    implementation_notes: result.implementation_notes,
     notes: result.notes || [],
     saved_model: result.saved_model,
     logs: result.logs,
@@ -1201,6 +1204,11 @@ export async function predictExperimentModel(
 
   return {
     status: "success",
-    results: { predictions: result.predictions || [] },
+    results: {
+      predictions: result.predictions || [],
+      method_name: result.method_name,
+      forecast_strategy: result.forecast_strategy,
+      implementation_notes: result.implementation_notes,
+    },
   };
 }

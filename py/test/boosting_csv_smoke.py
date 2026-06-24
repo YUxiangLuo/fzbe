@@ -19,6 +19,8 @@ BASE_MODEL_TRAIN_ARGS = {
     "arima": ("--d", "1", "--max-p", "2", "--max-q", "2"),
 }
 
+from model_metadata_assertions import assert_method_metadata
+
 
 def load_csv_records(csv_path: Path) -> list[dict[str, str]]:
     with csv_path.open("r", encoding="utf-8", newline="") as handle:
@@ -212,6 +214,7 @@ def main() -> None:
         actual_eval_predictions = extract_predictions(train_output)
         actual_eval_std_devs = extract_std_devs(train_output)
         assert train_output["mode"] == "boosting_residual_learning"
+        assert_method_metadata(train_output, "boosting")
         assert train_output["models"] == BASE_MODELS
         assert train_output["metrics"]["evaluate_months"] == timestamps[20:24]
         assert train_output["eval_y_true"] == sales[20:24]
@@ -266,6 +269,7 @@ def main() -> None:
             "--pretty",
         )
         assert fit_output["mode"] == "boosting_fit_only"
+        assert_method_metadata(fit_output, "boosting")
         assert fit_output["model_chain"] == train_output["model_chain"]
         assert fit_output["saved_model"] == str(boosting_model_production)
 
@@ -298,6 +302,7 @@ def main() -> None:
         future_std_devs_one = extract_std_devs(predict_output_one)
         future_std_devs_two = extract_std_devs(predict_output_two)
         assert predict_output_one["mode"] == "boosting_loaded_predict"
+        assert_method_metadata(predict_output_one, "boosting")
         assert predict_output_one["forecast_steps"] == future_steps
         assert_series_close(future_predictions_one, expected_future_predictions)
         assert_series_close(future_predictions_one, future_predictions_two)

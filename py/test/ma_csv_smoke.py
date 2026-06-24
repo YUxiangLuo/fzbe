@@ -13,6 +13,8 @@ PY_ROOT = Path(__file__).resolve().parents[1]
 RUN_MODEL = PY_ROOT / "run_model.py"
 CSV_FIXTURE = Path(__file__).resolve().parent / "fixtures" / "core_models_smoke.csv"
 
+from model_metadata_assertions import assert_method_metadata
+
 
 def load_csv_records(csv_path: Path) -> list[dict[str, str]]:
     with csv_path.open("r", encoding="utf-8", newline="") as handle:
@@ -90,6 +92,7 @@ def main() -> None:
         expected_eval_predictions = moving_average_roll(sales[17:20], 3, 4)
         actual_eval_predictions = [float(item["prediction"]) for item in train_output["predictions"]]
         assert train_output["mode"] == "fixed_window_only"
+        assert_method_metadata(train_output, "ma")
         assert train_output["metrics"]["window"] == 3
         assert train_output["metrics"]["evaluate_months"] == timestamps[20:24]
         assert train_output["eval_y_true"] == sales[20:24]
@@ -109,6 +112,7 @@ def main() -> None:
             "--pretty",
         )
         assert fit_output["mode"] == "ma_fit_only"
+        assert_method_metadata(fit_output, "ma")
         assert fit_output["saved_model"] == str(production_model)
 
         predict_output = invoke_ma(
@@ -122,6 +126,7 @@ def main() -> None:
         expected_future_predictions = moving_average_roll(sales[21:24], 3, 3)
         actual_future_predictions = [float(item["prediction"]) for item in predict_output["predictions"]]
         assert predict_output["mode"] == "ma_loaded_predict"
+        assert_method_metadata(predict_output, "ma")
         assert predict_output["forecast_steps"] == 3
         assert_series_close(actual_future_predictions, expected_future_predictions)
 

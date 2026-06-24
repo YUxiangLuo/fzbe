@@ -19,18 +19,36 @@ from sklearn.preprocessing import MinMaxScaler, OneHotEncoder, StandardScaler
 from data_utils import ParsedData, infer_feature_types as infer_parsed_feature_types, load_data_from_json
 from logger import log, get_log_contents
 from metrics import mae, mape, r2, rmse
+from model_info import attach_method_metadata, ensure_state_metadata
 from serialization import dump_model, load_model
 
 MODEL_TYPE = "lstm"
 DIRECT_FORECAST_STRATEGY = "direct_multi_horizon"
 LEGACY_FORECAST_STRATEGY = "autoregressive"
 DEFAULT_PRODUCTION_FORECAST_HORIZON = 6
+METHOD_NAME = "LSTM 多变量销量预测"
+DIRECT_IMPLEMENTATION_NOTES = [
+    "教科书 LSTM 定义的是带遗忘门、输入门和输出门的循环神经网络单元。",
+    "本系统采用两层 LSTM 加 Dense 输出层，隐藏单元数随数据维度和样本量动态选择。",
+    "为了服务未来多期销量预测，默认直接多步输出完整预测 horizon，减少递归预测的误差累积。",
+]
+AUTOREGRESSIVE_IMPLEMENTATION_NOTES = [
+    "教科书 LSTM 定义的是带遗忘门、输入门和输出门的循环神经网络单元。",
+    "本系统采用两层 LSTM 加 Dense 输出层，隐藏单元数随数据维度和样本量动态选择。",
+    "当训练数据不足以拟合直接多步输出时，系统回退为一步 LSTM 并递归预测未来多期。",
+]
 
 # Type alias for input flexibility
 ArrayLike = Union[List[float], np.ndarray]
 
 
 # ---------- utilities ----------
+def _metadata_for_strategy(strategy: str) -> Tuple[str, List[str]]:
+    if strategy == DIRECT_FORECAST_STRATEGY:
+        return DIRECT_FORECAST_STRATEGY, DIRECT_IMPLEMENTATION_NOTES
+    return LEGACY_FORECAST_STRATEGY, AUTOREGRESSIVE_IMPLEMENTATION_NOTES
+
+
 def _format_predictions(preds: List[float], std_dev: float) -> List[Dict[str, float]]:
     """
     Format predictions with standard deviation for JSON output.
@@ -62,6 +80,8 @@ def _load_state(model_path: str) -> Dict[str, Any]:
             if int(state.get("forecast_horizon", 0) or 0) > 0
             else LEGACY_FORECAST_STRATEGY
         )
+    forecast_strategy, notes = _metadata_for_strategy(str(state["forecast_strategy"]))
+    ensure_state_metadata(state, METHOD_NAME, forecast_strategy, notes)
 
     return state
 
@@ -207,6 +227,63 @@ def _build_preprocessor(
         scaled_series.shape[1],
     )
     return preprocessor, np.asarray(scaled_series, dtype=float)
+
+
+def _validate_lstm_feature_types(parsed_data: ParsedData, feature_types: Dict[str, str]) -> None:
+    valid_types = {"numeric", "categorical"}
+    invalid_items = [
+        f"{feature_name}={feature_type!r}"
+        for feature_name, feature_type in feature_types.items()
+        if feature_type not in valid_types
+    ]
+    if invalid_items:
+        raise ValueError(
+            "[VALIDATION] LSTM feature_types values must be 'numeric' or 'categorical': "
+            + ", ".join(invalid_items)
+        )
+
+    target_type = feature_types.get(parsed_data.target_key, "numeric")
+    if target_type != "numeric":
+        raise ValueError("[VALIDATION] LSTM target feature must be numeric.")
+    feature_types[parsed_data.target_key] = "numeric"
+
+
+def _validate_lstm_numeric_columns(parsed_data: ParsedData, feature_types: Dict[str, str]) -> None:
+    """
+    Validate and normalize numeric columns before they enter sklearn/Keras.
+
+    MinMaxScaler and StandardScaler preserve NaN values, and Keras can then train
+    a model that emits NaN predictions. Rejecting invalid numeric data here keeps
+    CLI output valid JSON and gives the caller a data-quality error instead.
+    """
+    numeric_columns = [parsed_data.target_key]
+    numeric_columns.extend(
+        feature_name
+        for feature_name in parsed_data.feature_keys
+        if feature_name != parsed_data.target_key and feature_types.get(feature_name) == "numeric"
+    )
+
+    invalid_columns: List[str] = []
+    for column_name in numeric_columns:
+        if column_name not in parsed_data.df.columns:
+            continue
+
+        numeric_values = pd.to_numeric(parsed_data.df[column_name], errors="coerce")
+        numeric_array = numeric_values.to_numpy(dtype=float)
+        invalid_mask = numeric_values.isna().to_numpy() | ~np.isfinite(numeric_array)
+        if invalid_mask.any():
+            invalid_rows = np.flatnonzero(invalid_mask)[:5]
+            row_preview = ",".join(str(int(row_index)) for row_index in invalid_rows)
+            invalid_columns.append(f"{column_name}(rows={row_preview})")
+            continue
+
+        parsed_data.df[column_name] = numeric_values
+
+    if invalid_columns:
+        raise ValueError(
+            "[DATA] LSTM numeric columns contain missing, non-numeric, or non-finite values: "
+            + "; ".join(invalid_columns)
+        )
 
 
 def _inverse_transform_target_values(preprocessor: Any, scaled_values: np.ndarray) -> np.ndarray:
@@ -662,6 +739,8 @@ def run(args) -> None:
             target_key=parsed_data.target_key,
             feature_keys=parsed_data.feature_keys,
         )
+        _validate_lstm_feature_types(parsed_data, feature_types)
+        _validate_lstm_numeric_columns(parsed_data, feature_types)
         if effective_forecast_strategy == DIRECT_FORECAST_STRATEGY and fit_forecast_horizon > 0:
             model, preprocessor, history_df = _fit_direct_model(
                 parsed_data,
@@ -721,6 +800,8 @@ def run(args) -> None:
             "production_forecast_horizon": desired_forecast_horizon,
             "std_dev_residuals": std_dev_residuals,
         }
+        output_strategy, output_notes = _metadata_for_strategy(effective_forecast_strategy)
+        attach_method_metadata(next_state, METHOD_NAME, output_strategy, output_notes)
         dump_model(next_state, save_path)
 
         out: Dict[str, Any] = {
@@ -734,6 +815,7 @@ def run(args) -> None:
             "feature_types": feature_types,
             "saved_model": save_path,
         }
+        attach_method_metadata(out, METHOD_NAME, output_strategy, output_notes)
         if fit_forecast_horizon > 0:
             out["forecast_horizon"] = fit_forecast_horizon
         out["logs"] = get_log_contents()
@@ -761,6 +843,8 @@ def run(args) -> None:
             "forecast_steps": steps,
             "predictions": predictions_with_std,
         }
+        output_strategy, output_notes = _metadata_for_strategy(str(state.get("forecast_strategy", LEGACY_FORECAST_STRATEGY)))
+        attach_method_metadata(out, METHOD_NAME, output_strategy, output_notes)
         log.info("Prediction finished successfully")
 
         # Add captured logs to the final output
@@ -790,22 +874,24 @@ def run(args) -> None:
         )
         months = parsed_data.timestamps or [str(i) for i in range(parsed_data.n_obs)]
 
-        # If feature_types is empty, infer from dataframe dtypes
+        inferred_feature_types = infer_parsed_feature_types(
+            parsed_data,
+            target_key=parsed_data.target_key,
+            feature_keys=parsed_data.feature_keys,
+        )
+
+        # If feature_types is provided, use it as an override over inferred defaults.
         if feature_types_override:
-            feature_types = dict(feature_types_override)
+            feature_types = {**inferred_feature_types, **dict(feature_types_override)}
             log.info("Using provided feature_types override.")
         else:
             log.info("No feature_types provided, inferring from DataFrame.")
-            feature_types = infer_parsed_feature_types(
-                parsed_data,
-                target_key=parsed_data.target_key,
-                feature_keys=parsed_data.feature_keys,
-            )
-            log.info(f"Inferred feature_types: {feature_types}")
+            feature_types = inferred_feature_types
 
-        if parsed_data.target_key not in feature_types:
-            feature_types[parsed_data.target_key] = 'numeric'
-            log.debug(f"Ensured target_key '{parsed_data.target_key}' is in feature_types.")
+        log.info(f"Resolved feature_types: {feature_types}")
+
+        _validate_lstm_feature_types(parsed_data, feature_types)
+        _validate_lstm_numeric_columns(parsed_data, feature_types)
 
         ts, te = int(args.train_start), int(args.train_end)
         es, ee = int(args.eval_start), int(args.eval_end)
@@ -856,6 +942,7 @@ def run(args) -> None:
             "eval_y_true": y_true,
             "predictions": predictions_with_std,
         }
+        attach_method_metadata(out, METHOD_NAME, DIRECT_FORECAST_STRATEGY, DIRECT_IMPLEMENTATION_NOTES)
 
         if save_path:
             log.info(f"Saving model to {save_path}")
@@ -891,6 +978,7 @@ def run(args) -> None:
                 ),
                 "std_dev_residuals": std_dev_residuals,
             }
+            attach_method_metadata(state, METHOD_NAME, DIRECT_FORECAST_STRATEGY, DIRECT_IMPLEMENTATION_NOTES)
             dump_model(state, save_path)
             log.info(f"Model saved successfully to {save_path} (Keras: {keras_model_path})")
             out["saved_model"] = save_path

@@ -346,6 +346,12 @@ def infer_feature_types(
     return inferred
 
 
+def _data_error(message: str) -> ValueError:
+    if message.startswith("[DATA]"):
+        return ValueError(message)
+    return ValueError(f"[DATA] {message}")
+
+
 def _parse_records(
     records: List[Dict[str, Any]],
     target_key: str,
@@ -361,7 +367,7 @@ def _parse_records(
     required_keys = [target_key] + (feature_keys or [])
     for key in required_keys:
         if key not in df.columns:
-            raise ValueError(f"Error processing records: missing key '{key}'")
+            raise _data_error(f"Error processing records: missing key '{key}'")
 
     # Attempt to convert numeric columns, coercing errors
     numeric_cols = [target_key] + (feature_keys or [])
@@ -371,7 +377,7 @@ def _parse_records(
              df[col] = pd.to_numeric(df[col], errors='coerce')
 
     if df[required_keys].isnull().values.any():
-        raise ValueError("Error processing records: contains null or non-numeric values in required columns.")
+        raise _data_error("Error processing records: contains null or non-numeric values in required columns.")
 
     return ParsedData(
         df=df,
@@ -397,11 +403,11 @@ def load_data_from_json(
         records = json.loads(json_string)
     except json.JSONDecodeError as e:
         log.error(f"JSONDecodeError: {e}")
-        raise ValueError(f"Invalid JSON format: {e}")
+        raise _data_error(f"Invalid JSON format: {e}")
 
     if not isinstance(records, list) or not records:
         log.error("JSON data is not a non-empty array of objects.")
-        raise ValueError("JSON data must be a non-empty array of objects.")
+        raise _data_error("JSON data must be a non-empty array of objects.")
 
     df = pd.DataFrame(records)
     log.debug(f"Initial DataFrame columns: {df.columns.tolist()}")
@@ -417,7 +423,7 @@ def load_data_from_json(
     
     if not target_key or target_key not in df.columns:
         log.error(f"Target key '{target_key}' not found. Available columns: {df.columns.tolist()}")
-        raise ValueError(f"Cannot determine target key. Please specify one. Available columns: {df.columns.tolist()}")
+        raise _data_error(f"Cannot determine target key. Please specify one. Available columns: {df.columns.tolist()}")
 
     # Auto-detect time_key and create composite timestamp if possible
     if time_key is None:
@@ -466,7 +472,7 @@ def load_data_from_json(
     if target_key in df.columns and not pd.api.types.is_numeric_dtype(df[target_key]):
         df[target_key] = pd.to_numeric(df[target_key], errors='coerce')
         if df[target_key].isnull().any():
-            raise ValueError(f"Target column '{target_key}' contains non-numeric values.")
+            raise _data_error(f"Target column '{target_key}' contains non-numeric values.")
         log.debug(f"Converted target column '{target_key}' to numeric")
 
     # Feature columns: convert if numeric-like, keep as-is if categorical
@@ -490,7 +496,7 @@ def load_data_from_json(
     missing_cols = [col for col in columns_to_keep if col not in df.columns]
     if missing_cols:
         log.error(f"Specified or inferred columns not found in dataset: {missing_cols}")
-        raise ValueError(f"Specified or inferred columns not found in dataset: {missing_cols}")
+        raise _data_error(f"Specified or inferred columns not found in dataset: {missing_cols}")
         
     df_filtered = df[columns_to_keep]
     log.info(f"Final columns after filtering: {df_filtered.columns.tolist()}")

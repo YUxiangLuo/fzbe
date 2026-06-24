@@ -26,6 +26,7 @@ FEATURE_KEYS = [
 sys.path.insert(0, str(PY_ROOT / "src"))
 
 from data_utils import infer_feature_types, load_data_from_json
+from model_metadata_assertions import assert_method_metadata
 
 
 INFERRED_SELECTED_FEATURE_TYPES = {
@@ -181,6 +182,7 @@ def main() -> None:
         train_predictions = extract_predictions(train_output)
         train_std_devs = extract_std_devs(train_output)
         assert train_output["mode"] == "lstm_train_eval"
+        assert_method_metadata(train_output, "lstm_direct")
         assert train_output["data_points"] == len(records)
         assert train_output["target_key"] == "销售数量"
         assert train_output["feature_types"] == INFERRED_SELECTED_FEATURE_TYPES
@@ -212,6 +214,7 @@ def main() -> None:
             "--pretty",
         )
         assert fit_output["mode"] == "lstm_fit_only"
+        assert_method_metadata(fit_output, "lstm_direct")
         assert fit_output["look_back"] == 4
         assert fit_output["epochs"] == 2
         assert fit_output["normalization"] == "minmax"
@@ -222,6 +225,7 @@ def main() -> None:
         assert fit_output["saved_model"] == str(production_model)
         production_state = load_pickled_state(production_model)
         assert production_state["forecast_strategy"] == "direct_multi_horizon"
+        assert_method_metadata(production_state, "lstm_direct")
         assert production_state["forecast_horizon"] == 6
         assert production_state["production_forecast_horizon"] == 6
 
@@ -247,6 +251,7 @@ def main() -> None:
         future_std_devs_one = extract_std_devs(predict_output_one)
         future_std_devs_two = extract_std_devs(predict_output_two)
         assert predict_output_one["mode"] == "lstm_loaded_predict"
+        assert_method_metadata(predict_output_one, "lstm_direct")
         assert predict_output_one["forecast_steps"] == 6
         assert predict_output_one["train_end_index"] == 35
         assert predict_output_one["target_key"] == "销售数量"
@@ -309,8 +314,10 @@ def main() -> None:
             "--fit-only",
         )
         assert small_fit_output["mode"] == "lstm_fit_only"
+        assert_method_metadata(small_fit_output, "lstm_autoregressive")
         small_production_state = load_pickled_state(small_production_model)
         assert small_production_state["forecast_strategy"] == "autoregressive"
+        assert_method_metadata(small_production_state, "lstm_autoregressive")
         assert small_production_state["forecast_horizon"] == 0
         assert small_production_state["production_forecast_horizon"] == 6
 
@@ -322,6 +329,7 @@ def main() -> None:
             "6",
         )
         assert small_predict_output["mode"] == "lstm_loaded_predict"
+        assert_method_metadata(small_predict_output, "lstm_autoregressive")
         assert small_predict_output["forecast_steps"] == 6
         assert len(extract_predictions(small_predict_output)) == 6
 

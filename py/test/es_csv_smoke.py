@@ -15,6 +15,8 @@ PY_ROOT = Path(__file__).resolve().parents[1]
 RUN_MODEL = PY_ROOT / "run_model.py"
 CSV_FIXTURE = Path(__file__).resolve().parent / "fixtures" / "core_models_smoke.csv"
 
+from model_metadata_assertions import assert_method_metadata
+
 
 def load_csv_records(csv_path: Path) -> list[dict[str, str]]:
     with csv_path.open("r", encoding="utf-8", newline="") as handle:
@@ -87,6 +89,7 @@ def main() -> None:
         expected_eval_predictions = build_es_forecast(sales[0:20], alpha, 4)
         actual_eval_predictions = [float(item["prediction"]) for item in train_output["predictions"]]
         assert train_output["mode"] == "fixed_alpha_only"
+        assert_method_metadata(train_output, "es")
         assert math.isclose(float(train_output["alpha"]), alpha, rel_tol=1e-9, abs_tol=1e-9)
         assert math.isclose(float(train_output["metrics"]["alpha"]), alpha, rel_tol=1e-9, abs_tol=1e-9)
         assert train_output["metrics"]["evaluate_months"] == timestamps[20:24]
@@ -107,6 +110,7 @@ def main() -> None:
             "--pretty",
         )
         assert fit_output["mode"] == "es_fit_only"
+        assert_method_metadata(fit_output, "es")
         assert fit_output["saved_model"] == str(production_model)
         assert math.isclose(float(fit_output["alpha"]), alpha, rel_tol=1e-9, abs_tol=1e-9)
 
@@ -121,6 +125,7 @@ def main() -> None:
         expected_future_predictions = build_es_forecast(sales[0:24], alpha, 3)
         actual_future_predictions = [float(item["prediction"]) for item in predict_output["predictions"]]
         assert predict_output["mode"] == "es_loaded_predict"
+        assert_method_metadata(predict_output, "es")
         assert predict_output["forecast_steps"] == 3
         assert predict_output["train_end_index"] == 23
         assert_series_close(actual_future_predictions, expected_future_predictions)

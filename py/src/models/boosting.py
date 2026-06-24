@@ -28,6 +28,7 @@ from ensemble_utils import (
     remove_member_model_artifact,
 )
 from metrics import mae, mape, r2, rmse
+from model_info import attach_method_metadata, ensure_state_metadata
 from serialization import dump_model, load_model
 from subprocess_utils import (
     extract_predictions_from_result,
@@ -38,6 +39,14 @@ from subprocess_utils import (
 
 MODEL_TYPE = "boosting"
 SUPPORTED_BASE_MODELS = ["ma", "es", "arima", "lstm"]
+METHOD_NAME = "残差提升融合"
+FORECAST_STRATEGY = "greedy_residual_additive_ensemble"
+IMPLEMENTATION_NOTES = [
+    "Boosting 的教科书核心是将多个弱学习器串行加到一个强学习器中，后续学习器重点修正前序误差。",
+    "梯度提升在平方误差损失下等价于逐步拟合残差；本系统借鉴这一思想，但候选学习器是 MA、ES、ARIMA、LSTM 等时间序列模型。",
+    "AdaBoost 通过样本权重实现错误关注；本系统的时间序列基础模型不支持样本权重，因此采用残差学习的加法模型。",
+    "每一轮在候选模型中贪心选择最能降低验证残差 RMSE 的模型，并用学习率控制新增阶段贡献。",
+]
 
 
 # ---------- utilities ----------
@@ -176,7 +185,7 @@ def _load_state(model_path: str) -> Dict[str, Any]:
     state = load_model(model_path)
     if not isinstance(state, dict) or state.get("model_type") != MODEL_TYPE:
         raise ValueError("[VALIDATION] Invalid Boosting model file.")
-    return state
+    return ensure_state_metadata(state, METHOD_NAME, FORECAST_STRATEGY, IMPLEMENTATION_NOTES)
 
 
 def _is_residual_boosting_state(state: Dict[str, Any]) -> bool:
@@ -1020,6 +1029,7 @@ def run(args) -> None:
             "learning_rate": float(state.get("learning_rate", 0.3)),
             "std_dev_residuals": float(state.get("std_dev_residuals", 0.0)),
         }
+        attach_method_metadata(next_state, METHOD_NAME, FORECAST_STRATEGY, IMPLEMENTATION_NOTES)
         dump_model(next_state, save_path)
 
         out = {
@@ -1027,6 +1037,7 @@ def run(args) -> None:
             "model_chain": state["model_chain"],
             "saved_model": save_path,
         }
+        attach_method_metadata(out, METHOD_NAME, FORECAST_STRATEGY, IMPLEMENTATION_NOTES)
         print(json.dumps(out, ensure_ascii=False, indent=2 if pretty else None))
         return
 
@@ -1038,6 +1049,7 @@ def run(args) -> None:
             "forecast_steps": steps,
             "predictions": _format_predictions(preds, std_dev),
         }
+        attach_method_metadata(out, METHOD_NAME, FORECAST_STRATEGY, IMPLEMENTATION_NOTES)
         print(json.dumps(out, ensure_ascii=False, indent=2 if pretty else None))
         return
 
@@ -1174,6 +1186,7 @@ def run(args) -> None:
         "eval_y_true": y_true,
         "predictions": _format_predictions(y_pred, std_dev),
     }
+    attach_method_metadata(out, METHOD_NAME, FORECAST_STRATEGY, IMPLEMENTATION_NOTES)
 
     if save_path:
         for model_name, model_info in base_model_states.items():
@@ -1198,6 +1211,7 @@ def run(args) -> None:
             "learning_rate": learning_rate,
             "std_dev_residuals": std_dev,
         }
+        attach_method_metadata(state, METHOD_NAME, FORECAST_STRATEGY, IMPLEMENTATION_NOTES)
         dump_model(state, save_path)
         out["saved_model"] = save_path
 

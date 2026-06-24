@@ -155,7 +155,7 @@ describe("model training result transformers", () => {
     expect(transformed.results).toMatchObject({
       model_names: ["arima", "lstm"],
       eval_predictions: [42, 43],
+      meta_model: { intercept: 0.1, coefficients: [0.4, 0.6] },
     });
-    expect(transformed.results.meta_model).toBeUndefined();
   });
 });
