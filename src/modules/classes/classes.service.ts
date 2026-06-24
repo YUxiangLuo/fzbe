@@ -26,6 +26,14 @@ interface UserRow extends RowDataPacket {
   role: string;
 }
 
+interface ClassAssistantRow extends UserRow {
+  class_id: number;
+}
+
+interface ClassWithAssistants extends ClassRow {
+  assistants: UserRow[];
+}
+
 interface CountRow extends RowDataPacket {
   count: number;
 }
@@ -47,6 +55,38 @@ export async function isAssistantAssignedToClass(classId: number, assistantId: n
     [classId, assistantId],
   );
   return Boolean(assignment);
+}
+
+async function attachAssistantsToClasses(classRows: ClassRow[]): Promise<ClassWithAssistants[]> {
+  if (classRows.length === 0) return [];
+
+  const classIds = classRows.map((classRow) => classRow.class_id);
+  const placeholders = classIds.map(() => "?").join(", ");
+  const [assistantRows] = await pool.query<ClassAssistantRow[]>(
+    `SELECT ca.class_id, u.user_id, u.username, u.full_name, u.email, u.role
+       FROM class_assistants ca
+       JOIN users u ON u.user_id = ca.assistant_id
+      WHERE ca.class_id IN (${placeholders})
+      ORDER BY u.full_name ASC, u.username ASC`,
+    classIds,
+  );
+
+  const assistantsByClassId = new Map<number, UserRow[]>();
+  for (const row of assistantRows) {
+    if (!assistantsByClassId.has(row.class_id)) assistantsByClassId.set(row.class_id, []);
+    assistantsByClassId.get(row.class_id)!.push({
+      user_id: row.user_id,
+      username: row.username,
+      full_name: row.full_name,
+      email: row.email,
+      role: row.role,
+    } as UserRow);
+  }
+
+  return classRows.map((classRow) => ({
+    ...classRow,
+    assistants: assistantsByClassId.get(classRow.class_id) ?? [],
+  }));
 }
 
 export interface CreateClassResult {
@@ -335,7 +375,7 @@ export async function getClassesByTeacher(teacherId: number, userId: number, use
     "SELECT c.*, u.full_name as teacher_name FROM classes c JOIN users u ON c.teacher_id = u.user_id WHERE c.teacher_id = ?",
     [teacherId],
   );
-  return { data: classRows };
+  return { data: await attachAssistantsToClasses(classRows) };
 }
 
 export async function getClassesByTeacherAssistant(
@@ -366,7 +406,7 @@ export async function getClassesByTeacherAssistant(
       WHERE c.teacher_id = ? AND ca.assistant_id = ?`,
     [teacherId, assistantId],
   );
-  return { data: classRows };
+  return { data: await attachAssistantsToClasses(classRows) };
 }
 
 export async function getClassesByAssistant(assistantId: number, userId: number, userRole: string) {
@@ -379,7 +419,7 @@ export async function getClassesByAssistant(assistantId: number, userId: number,
     `SELECT c.*, u.full_name as teacher_name FROM classes c JOIN class_assistants ca ON c.class_id = ca.class_id JOIN users u ON c.teacher_id = u.user_id WHERE ca.assistant_id = ?`,
     [assistantId],
   );
-  return { data: classRows };
+  return { data: await attachAssistantsToClasses(classRows) };
 }
 
 export { FileValidationError };
