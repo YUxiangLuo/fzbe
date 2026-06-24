@@ -16,6 +16,16 @@ import { cleanupExperimentModelArtifacts } from "../models/models.service";
 
 const pdfSemaphore = new Semaphore(CONCURRENCY_LIMITS.MAX_CONCURRENT_PDF_JOBS);
 
+export function getPdfQueueStats() {
+  return {
+    activeJobs: pdfSemaphore.active,
+    pendingJobs: pdfSemaphore.pending,
+    maxConcurrentJobs: CONCURRENCY_LIMITS.MAX_CONCURRENT_PDF_JOBS,
+    queueTimeoutMs: TIMEOUTS.PDF_QUEUE,
+    generationTimeoutMs: TIMEOUTS.PDF_GENERATION,
+  };
+}
+
 const MODEL_TYPES = [
   "ma", "exp", "arima", "lstm",
   "ensemble_weighted", "ensemble_boosting", "ensemble_stacking",

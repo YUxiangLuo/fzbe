@@ -117,4 +117,28 @@ describe("app route smoke tests", () => {
     expect(payload).toHaveProperty("error");
     expect(payload).not.toHaveProperty("data");
   });
+
+  test("runtime info exposes PDF queue observability", async () => {
+    const app = await getApp();
+    const response = await app.fetch(
+      new Request("http://localhost/api/v1/runtime-info"),
+    );
+
+    expect(response.status).toBe(200);
+    const payload = await response.json() as {
+      data?: {
+        concurrency?: { maxConcurrentPdfJobs?: unknown };
+        timeouts?: { pdfQueueMs?: unknown; pdfGenerationMs?: unknown };
+        pdfQueue?: Record<string, unknown>;
+      };
+    };
+
+    expect(payload.data?.pdfQueue).toEqual({
+      activeJobs: 0,
+      pendingJobs: 0,
+      maxConcurrentJobs: payload.data?.concurrency?.maxConcurrentPdfJobs,
+      queueTimeoutMs: payload.data?.timeouts?.pdfQueueMs,
+      generationTimeoutMs: payload.data?.timeouts?.pdfGenerationMs,
+    });
+  });
 });

@@ -181,7 +181,7 @@ await pdfSemaphore.acquire(TIMEOUTS.PDF_QUEUE);
 
 ## 运行时观测
 
-`GET /api/v1/runtime-info` 会返回当前后端实际生效的配置，便于部署后确认：
+`GET /api/v1/runtime-info` 会返回当前后端实际生效的配置和 PDF 队列瞬时状态，便于部署后确认和课堂监控：
 
 ```json
 {
@@ -202,10 +202,19 @@ await pdfSemaphore.acquire(TIMEOUTS.PDF_QUEUE);
     "timeouts": {
       "pdfQueueMs": 60000,
       "pdfGenerationMs": 30000
+    },
+    "pdfQueue": {
+      "activeJobs": 0,
+      "pendingJobs": 0,
+      "maxConcurrentJobs": 12,
+      "queueTimeoutMs": 60000,
+      "generationTimeoutMs": 30000
     }
   }
 }
 ```
+
+前端报告提交会读取 `runtime-info.timeouts`，按 `pdfQueueMs + pdfGenerationMs + 30s` 计算请求超时，并保底 120s。这样当后端提高 `PDF_QUEUE_TIMEOUT_MS` 时，前端不会提前中断仍在排队或生成中的报告请求。
 
 如果使用反向代理或容器部署，建议把这个接口作为发布后人工核对项之一。
 

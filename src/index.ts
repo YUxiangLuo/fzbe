@@ -16,6 +16,7 @@ import { manualsController } from "./modules/manuals";
 import { questionBankController } from "./modules/question-bank";
 import { quizzesController } from "./modules/quizzes";
 import { reportsController } from "./modules/reports";
+import { getPdfQueueStats } from "./modules/reports/reports.service";
 import { modelsController } from "./modules/models";
 import { classesController } from "./modules/classes";
 import { classMembersController } from "./modules/class-members";
@@ -245,6 +246,7 @@ app.get("/api/v1/runtime-info", (c) =>
       pdfQueueMs: TIMEOUTS.PDF_QUEUE,
       pdfGenerationMs: TIMEOUTS.PDF_GENERATION,
     },
+    pdfQueue: getPdfQueueStats(),
   }));
 app.get("/manuals/:filename", jwtAuth, async (c) => {
   const payload = c.get("jwtPayload") as JwtPayload;
