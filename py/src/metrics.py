@@ -85,7 +85,7 @@ def mape(y_true: ArrayLike, y_pred: ArrayLike) -> float:
         np.asarray(y_pred, dtype=np.float64),
     )
     diff = np.abs(y_true_arr - y_pred_arr)
-    denom = np.where(np.abs(y_true_arr) > EPS, y_true_arr, EPS)
+    denom = np.where(np.abs(y_true_arr) > EPS, np.abs(y_true_arr), EPS)
     return float(100.0 * np.mean(diff / denom))
 
 
