@@ -8,6 +8,13 @@ import { EXP_FLOW_FIELDS, EXPERIMENT_GRADE_FIELDS, EXPERIMENT_GRADE_MUTABLE_FIEL
 const STEP_COUNT = 7;
 const EXPORTS_DIR = path.resolve(import.meta.dir, "../../../uploads", "exports");
 
+const TOP_LEVEL_WEIGHT_FIELDS = [
+  "exp_flow_weight",
+  "knowledge_test_weight",
+  "model_quality_weight",
+  "report_quality_weight",
+] as const;
+
 function toPublicReportPath(filePath: string | null | undefined): string | null {
   if (!filePath) return null;
   return `reports/${path.basename(filePath)}`;
@@ -80,6 +87,24 @@ const toIsoString = (value: unknown): string | null => {
   const parsed = new Date(value as string);
   return Number.isNaN(parsed.getTime()) ? null : parsed.toISOString();
 };
+
+const sumWeightFields = (weights: Record<string, unknown>, fields: readonly string[]) =>
+  fields.reduce((sum, field) => sum + Number(weights[field] ?? 0), 0);
+
+export function validateGradeWeightTotals(weights: Record<string, unknown>) {
+  const topLevelTotal = sumWeightFields(weights, TOP_LEVEL_WEIGHT_FIELDS);
+  const flowDetailTotal = sumWeightFields(weights, EXP_FLOW_FIELDS);
+  const topLevelValid = Number.isFinite(topLevelTotal) && Math.abs(topLevelTotal - 100) < 0.0001;
+  const flowDetailValid = Number.isFinite(flowDetailTotal) && Math.abs(flowDetailTotal - 100) < 0.0001;
+
+  return {
+    valid: topLevelValid && flowDetailValid,
+    topLevelTotal,
+    flowDetailTotal,
+    topLevelValid,
+    flowDetailValid,
+  };
+}
 
 export function computeExperimentScores(row: Record<string, unknown>, weights: Record<string, number>) {
   const hasExperiment = row.experiment_id !== null && row.experiment_id !== undefined;
@@ -239,8 +264,12 @@ export async function getGradingPolicy(classId: number) {
 }
 
 export async function updateGradingPolicy(classId: number, input: UpdateGradeWeightsInput) {
-  const [existing] = await pool.query<RowDataPacket[]>("SELECT weight_id FROM grade_weights WHERE class_id = ?", [classId]);
+  const [existing] = await pool.query<RowDataPacket[]>("SELECT * FROM grade_weights WHERE class_id = ?", [classId]);
   if (existing.length === 0) return { error: "not_found" as const };
+
+  const mergedWeights = { ...existing[0], ...input };
+  const weightValidation = validateGradeWeightTotals(mergedWeights);
+  if (!weightValidation.valid) return { error: "invalid_weight_total" as const, details: weightValidation };
 
   const editableWeightFields = [
     "exp_flow_weight",
@@ -267,26 +296,60 @@ export async function updateGradingPolicy(classId: number, input: UpdateGradeWei
   return { data: updatedWeights[0] };
 }
 
-const LATEST_GRADE_SELECTION_SQL = `SELECT u.user_id, u.username, u.full_name, u.email, latest.experiment_id, latest.start_time AS experiment_started_at, grade.exp_flow_demand_data_preparation, grade.exp_flow_demand_descriptive_stats, grade.exp_flow_demand_model_selection, grade.exp_flow_demand_generate_results, grade.exp_flow_production_inventory_calc, grade.exp_flow_production_service_level, grade.exp_flow_production_variable_calc, grade.exp_flow_production_plan_creation, grade.exp_flow_report_submission, grade.knowledge_test, grade.model_quality, grade.report_quality, er.status AS report_status FROM enrollments e JOIN users u ON e.student_id = u.user_id LEFT JOIN (SELECT * FROM (SELECT es.*, ROW_NUMBER() OVER (PARTITION BY es.student_id ORDER BY COALESCE(es.last_activity_at, es.completion_time, es.start_time) DESC, es.experiment_id DESC) AS rn FROM experiment_status es) ranked WHERE ranked.rn = 1) latest ON latest.student_id = u.user_id LEFT JOIN experiment_grade grade ON grade.student_id = latest.student_id AND grade.experiment_id = latest.experiment_id LEFT JOIN experiment_reports er ON er.student_id = latest.student_id AND er.experiment_id = latest.experiment_id WHERE e.class_id = ? ORDER BY u.username ASC`;
+const LATEST_GRADE_SELECTION_SQL = `SELECT u.user_id, u.username, u.full_name, u.email,
+       latest.experiment_id, latest.start_time AS experiment_started_at,
+       grade.exp_flow_demand_data_preparation,
+       grade.exp_flow_demand_descriptive_stats,
+       grade.exp_flow_demand_model_selection,
+       grade.exp_flow_demand_generate_results,
+       grade.exp_flow_production_inventory_calc,
+       grade.exp_flow_production_service_level,
+       grade.exp_flow_production_variable_calc,
+       grade.exp_flow_production_plan_creation,
+       grade.exp_flow_report_submission,
+       grade.knowledge_test,
+       grade.model_quality,
+       grade.report_quality,
+       er.status AS report_status
+  FROM enrollments e
+  JOIN users u ON e.student_id = u.user_id
+  LEFT JOIN (
+    SELECT ranked.*
+      FROM (
+        SELECT es.*,
+               ROW_NUMBER() OVER (PARTITION BY es.student_id ORDER BY es.experiment_id DESC) AS rn
+          FROM experiment_status es
+          JOIN enrollments e2 ON e2.student_id = es.student_id
+         WHERE e2.class_id = ?
+      ) ranked
+     WHERE ranked.rn = 1
+  ) latest ON latest.student_id = u.user_id
+  LEFT JOIN experiment_grade grade ON grade.student_id = latest.student_id AND grade.experiment_id = latest.experiment_id
+  LEFT JOIN experiment_reports er ON er.student_id = latest.student_id AND er.experiment_id = latest.experiment_id
+ WHERE e.class_id = ?
+ ORDER BY u.username ASC`;
 
 export async function getGradeSummaries(classId: number) {
   const [weightRows] = await pool.query<RowDataPacket[]>("SELECT * FROM grade_weights WHERE class_id = ?", [classId]);
   if (weightRows.length === 0) return { error: "no_weights" as const };
 
   const weights = weightRows[0] as Record<string, number>;
-  const [gradeRows] = await pool.query<RowDataPacket[]>(LATEST_GRADE_SELECTION_SQL, [classId]);
+  const [gradeRows] = await pool.query<RowDataPacket[]>(LATEST_GRADE_SELECTION_SQL, [classId, classId]);
 
   const formatScore = (value: number | null) => value === null ? null : Number(value.toFixed(2));
 
   return {
     data: gradeRows.map((row) => {
-      const { expFlowScore, finalScore, expFlowComponents, finalScoreComponents } = computeExperimentScores(row, weights);
+      const reportStatus = row.report_status ?? null;
+      const hasFinalGrade = reportStatus === "graded";
+      const scoreRow = hasFinalGrade ? row : { ...row, report_quality: null };
+      const { expFlowScore, finalScore, expFlowComponents, finalScoreComponents } = computeExperimentScores(scoreRow, weights);
       const expFlowBreakdown = expFlowComponents.map((c) => ({ field: c.field, score: formatScore(c.score), weight: c.weight, weighted_score: formatScore(c.weighted_score) }));
       const formatFinalComponent = (c: { score: number | null; weight: number; weighted_score: number | null }) => ({ score: formatScore(c.score), weight: c.weight, weighted_score: formatScore(c.weighted_score) });
 
       return {
         student_id: row.user_id, username: row.username, full_name: row.full_name, experiment_id: row.experiment_id,
-        exp_flow_score: formatScore(expFlowScore), model_quality: toNumberOrNull(row.model_quality), knowledge_test: toNumberOrNull(row.knowledge_test), report_quality: toNumberOrNull(row.report_quality), report_status: row.report_status ?? null, final_score: formatScore(finalScore),
+        exp_flow_score: formatScore(expFlowScore), model_quality: toNumberOrNull(row.model_quality), knowledge_test: toNumberOrNull(row.knowledge_test), report_quality: hasFinalGrade ? toNumberOrNull(row.report_quality) : null, report_status: reportStatus, final_score: hasFinalGrade ? formatScore(finalScore) : null,
         exp_flow_breakdown: expFlowBreakdown,
         final_score_breakdown: { exp_flow: formatFinalComponent(finalScoreComponents.exp_flow), knowledge_test: formatFinalComponent(finalScoreComponents.knowledge_test), model_quality: formatFinalComponent(finalScoreComponents.model_quality), report_quality: formatFinalComponent(finalScoreComponents.report_quality) },
       };
@@ -453,7 +516,7 @@ export async function exportGradeCsv(classId: number) {
   if (weightRows.length === 0) return { error: "no_weights" as const };
 
   const weights = weightRows[0] as Record<string, number>;
-  const [gradeRows] = await pool.query<RowDataPacket[]>(LATEST_GRADE_SELECTION_SQL, [classId]);
+  const [gradeRows] = await pool.query<RowDataPacket[]>(LATEST_GRADE_SELECTION_SQL, [classId, classId]);
   if (gradeRows.length === 0) return { error: "no_students" as const };
 
   const toCsvValue = (value: unknown) => { if (value === null || value === undefined) return ""; let str = value instanceof Date ? value.toISOString() : String(value); if (/[",\n]/.test(str)) return `"${str.replace(/"/g, '""')}"`; return str; };
@@ -464,14 +527,18 @@ export async function exportGradeCsv(classId: number) {
 
   for (const row of gradeRows) {
     const isRejected = row.report_status === "rejected";
-    const { expFlowScore, finalScore } = computeExperimentScores(row, weights);
+    const isGraded = row.report_status === "graded";
+    const scoreRow = isGraded ? row : { ...row, report_quality: null };
+    const { expFlowScore, finalScore } = computeExperimentScores(scoreRow, weights);
     const val = (v: string) => isRejected ? "" : v;
     let statusText = "未提交";
     if (row.report_status === "submitted") statusText = "已提交";
     else if (row.report_status === "graded") statusText = "已评分";
     else if (row.report_status === "rejected") statusText = "已驳回";
 
-    const rowValues = [toCsvValue(row.username), toCsvValue(row.full_name), toCsvValue(row.experiment_id), ...EXP_FLOW_FIELDS.map((field) => val(formatNumeric(row[field]))), val(expFlowScore === null ? "" : expFlowScore.toFixed(2)), val(formatNumeric(row.knowledge_test)), val(formatNumeric(row.model_quality)), val(formatNumeric(row.report_quality)), toCsvValue(statusText), val(finalScore === null ? "" : finalScore.toFixed(2))];
+    const reportQuality = isGraded ? formatNumeric(row.report_quality) : "";
+    const finalScoreValue = isGraded && finalScore !== null ? finalScore.toFixed(2) : "";
+    const rowValues = [toCsvValue(row.username), toCsvValue(row.full_name), toCsvValue(row.experiment_id), ...EXP_FLOW_FIELDS.map((field) => val(formatNumeric(row[field]))), val(expFlowScore === null ? "" : expFlowScore.toFixed(2)), val(formatNumeric(row.knowledge_test)), val(formatNumeric(row.model_quality)), val(reportQuality), toCsvValue(statusText), val(finalScoreValue)];
     csvLines.push(rowValues.join(","));
   }
 

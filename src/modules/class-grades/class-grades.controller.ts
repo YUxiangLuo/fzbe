@@ -67,7 +67,12 @@ classGradesController.put("/api/v1/classes/:classId/grading-policy", jwtAuth, zV
     if ("error" in access) return c.json({ error: access.error === "not_found" ? "班级不存在" : "权限不足" }, access.error === "not_found" ? 404 : 403);
     const input = c.req.valid("json");
     const result = await updateGradingPolicy(parseInt(classId, 10), input);
-    if ("error" in result) return c.json({ error: "未找到该班级的成绩权重" }, 404);
+    if ("error" in result) {
+      if (result.error === "invalid_weight_total") {
+        return c.json({ error: "顶层权重和流程细节权重总和必须分别为 100%" }, 400);
+      }
+      return c.json({ error: "未找到该班级的成绩权重" }, 404);
+    }
     return c.json(result.data);
   } catch (error) { return handleUnexpectedError(c, error, "更新成绩权重失败"); }
 });
