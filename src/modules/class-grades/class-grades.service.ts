@@ -106,6 +106,8 @@ export function validateGradeWeightTotals(weights: Record<string, unknown>) {
   };
 }
 
+export const buildCsvContent = (csvLines: string[]) => `\uFEFF${csvLines.join("\r\n")}\r\n`;
+
 export function computeExperimentScores(row: Record<string, unknown>, weights: Record<string, number>) {
   const hasExperiment = row.experiment_id !== null && row.experiment_id !== undefined;
 
@@ -542,7 +544,7 @@ export async function exportGradeCsv(classId: number) {
     csvLines.push(rowValues.join(","));
   }
 
-  const csvContent = "\uFEFF" + csvLines.join("\n");
+  const csvContent = buildCsvContent(csvLines);
   await mkdir(EXPORTS_DIR, { recursive: true });
   const exportFileName = `class-${classId}-grades-${Date.now()}.csv`;
   const exportFilePath = path.join(EXPORTS_DIR, exportFileName);
@@ -573,7 +575,7 @@ export async function exportReportCsv(classId: number) {
     csvLines.push(rowValues.join(","));
   }
 
-  const csvContent = "\uFEFF" + csvLines.join("\n");
+  const csvContent = buildCsvContent(csvLines);
   await mkdir(EXPORTS_DIR, { recursive: true });
   const exportFileName = `class-${classId}-reports-${Date.now()}.csv`;
   const exportFilePath = path.join(EXPORTS_DIR, exportFileName);

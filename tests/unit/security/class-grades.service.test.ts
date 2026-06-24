@@ -2,6 +2,7 @@ import { describe, expect, test } from "bun:test";
 
 import { EXP_FLOW_FIELDS } from "../../../src/modules/class-grades/class-grades.schema";
 import {
+  buildCsvContent,
   computeExperimentScores,
   validateGradeWeightTotals,
 } from "../../../src/modules/class-grades/class-grades.service";
@@ -21,6 +22,15 @@ const defaultWeights: Record<string, number> = {
   model_quality_weight: 20,
   report_quality_weight: 20,
 };
+
+describe("buildCsvContent", () => {
+  test("adds UTF-8 BOM, CRLF line endings, and a final newline", () => {
+    const content = buildCsvContent(["a,b", "1,2"]);
+
+    expect(content.startsWith("\uFEFF")).toBe(true);
+    expect(content).toBe("\uFEFFa,b\r\n1,2\r\n");
+  });
+});
 
 describe("class grade score calculation", () => {
   test("uses class weights to calculate experiment-flow and final scores", () => {
