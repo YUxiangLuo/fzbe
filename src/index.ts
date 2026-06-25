@@ -2,9 +2,7 @@ import { Hono } from "hono";
 import { HTTPException } from "hono/http-exception";
 import { cors } from "hono/cors";
 import path from "path";
-import { createReadStream } from "node:fs";
 import { stat } from "node:fs/promises";
-import { Readable } from "node:stream";
 import type { RowDataPacket } from "mysql2/promise";
 import { env, pool, connectionLimit } from "./config";
 import { jwtAuth } from "./middleware";
@@ -190,11 +188,7 @@ async function buildLocalFileResponse(options: LocalFileResponseOptions): Promis
 
   if (range && range !== "unsupported") {
     const contentLength = range.end - range.start + 1;
-    const body = Readable.toWeb(createReadStream(options.absolutePath, {
-      start: range.start,
-      end: range.end,
-    })) as ReadableStream;
-    return new Response(body, {
+    return new Response(file.slice(range.start, range.end + 1, contentType), {
       status: 206,
       headers: {
         ...baseHeaders,
@@ -306,9 +300,37 @@ async function checkManualFileAccess(filename: string, role: UserRole): Promise<
   return manual.is_active ? "allowed" : "forbidden";
 }
 
+const directFileResponsePathPattern = /^\/(?:manuals|datasets|reports|exports)\//;
+const defaultCors = cors();
+
+function isDirectFileResponsePath(pathname: string): boolean {
+  return directFileResponsePathPattern.test(pathname);
+}
+
+function applyDirectFileCorsHeaders(headers: Headers): void {
+  headers.set("Access-Control-Allow-Origin", "*");
+  headers.set("Access-Control-Allow-Methods", "GET, HEAD, OPTIONS");
+  headers.set("Access-Control-Allow-Headers", "Authorization, Content-Type, Range");
+  headers.set("Access-Control-Expose-Headers", "Content-Length, Content-Range, Content-Disposition, Accept-Ranges, ETag, Last-Modified");
+}
+
 // --- Global Middleware ---
 // app.use(timestampedLogger);
-app.use(cors());
+app.use("*", async (c, next) => {
+  if (!isDirectFileResponsePath(new URL(c.req.url).pathname)) {
+    return defaultCors(c, next);
+  }
+
+  if (c.req.method === "OPTIONS") {
+    const headers = new Headers();
+    applyDirectFileCorsHeaders(headers);
+    headers.set("Content-Length", "0");
+    return new Response(null, { status: 204, headers });
+  }
+
+  await next();
+  applyDirectFileCorsHeaders(c.res.headers);
+});
 app.use("*", async (c, next) => {
   await next();
 
