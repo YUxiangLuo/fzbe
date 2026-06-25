@@ -2,6 +2,9 @@ import { Hono } from "hono";
 import { HTTPException } from "hono/http-exception";
 import { cors } from "hono/cors";
 import path from "path";
+import { createReadStream } from "node:fs";
+import { stat } from "node:fs/promises";
+import { Readable } from "node:stream";
 import type { RowDataPacket } from "mysql2/promise";
 import { env, pool, connectionLimit } from "./config";
 import { jwtAuth } from "./middleware";
@@ -54,6 +57,23 @@ interface ServerVariableRow extends RowDataPacket {
   Value: string;
 }
 
+type FileDisposition = "inline" | "attachment";
+
+interface LocalFileResponseOptions {
+  absolutePath: string;
+  filename: string;
+  disposition: FileDisposition;
+  fallbackContentType: string;
+  rangeHeader?: string;
+}
+
+interface ByteRange {
+  start: number;
+  end: number;
+}
+
+type ParsedByteRange = ByteRange | "invalid" | "unsupported" | null;
+
 function isPlainObject(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
@@ -93,6 +113,103 @@ function buildContentDisposition(type: "inline" | "attachment", filename: string
   const asciiFilename = toAsciiHeaderFilename(basename);
   const encodedFilename = encodeRFC5987Value(basename);
   return `${type}; filename="${asciiFilename}"; filename*=UTF-8''${encodedFilename}`;
+}
+
+function parseSingleByteRange(rangeHeader: string | undefined, fileSize: number): ParsedByteRange {
+  if (!rangeHeader) return null;
+  if (fileSize <= 0) return "invalid";
+
+  const trimmedRange = rangeHeader.trim();
+  if (!trimmedRange.toLowerCase().startsWith("bytes=")) return "unsupported";
+
+  const rawRangeSet = trimmedRange.slice("bytes=".length);
+  if (rawRangeSet.includes(",")) return "unsupported";
+
+  const match = rawRangeSet.match(/^(\d*)-(\d*)$/);
+  if (!match) return "invalid";
+
+  const rawStart = match[1] ?? "";
+  const rawEnd = match[2] ?? "";
+  if (!rawStart && !rawEnd) return "invalid";
+
+  const parseRangeNumber = (value: string): number | null => {
+    if (!/^\d+$/.test(value)) return null;
+    const parsed = Number(value);
+    return Number.isSafeInteger(parsed) ? parsed : null;
+  };
+
+  if (!rawStart) {
+    const suffixLength = parseRangeNumber(rawEnd);
+    if (!suffixLength || suffixLength <= 0) return "invalid";
+    return {
+      start: Math.max(fileSize - suffixLength, 0),
+      end: fileSize - 1,
+    };
+  }
+
+  const start = parseRangeNumber(rawStart);
+  if (start === null || start >= fileSize) return "invalid";
+
+  const end = rawEnd ? parseRangeNumber(rawEnd) : fileSize - 1;
+  if (end === null || start > end) return "invalid";
+
+  return {
+    start,
+    end: Math.min(end, fileSize - 1),
+  };
+}
+
+async function buildLocalFileResponse(options: LocalFileResponseOptions): Promise<Response | null> {
+  const fileStats = await stat(options.absolutePath).catch(() => null);
+  if (!fileStats?.isFile()) return null;
+
+  const file = Bun.file(options.absolutePath);
+  const contentType = file.type || options.fallbackContentType;
+  const etag = `"${fileStats.size.toString(16)}-${Math.trunc(fileStats.mtimeMs).toString(16)}"`;
+  const lastModified = fileStats.mtime.toUTCString();
+  const baseHeaders = {
+    "Content-Type": contentType,
+    "Content-Disposition": buildContentDisposition(options.disposition, options.filename),
+    "Cache-Control": "private, max-age=60",
+    "Accept-Ranges": "bytes",
+    "ETag": etag,
+    "Last-Modified": lastModified,
+    "X-Content-Type-Options": "nosniff",
+  };
+
+  const range = parseSingleByteRange(options.rangeHeader, fileStats.size);
+  if (range === "invalid") {
+    return new Response(null, {
+      status: 416,
+      headers: {
+        ...baseHeaders,
+        "Content-Range": `bytes */${fileStats.size}`,
+      },
+    });
+  }
+
+  if (range && range !== "unsupported") {
+    const contentLength = range.end - range.start + 1;
+    const body = Readable.toWeb(createReadStream(options.absolutePath, {
+      start: range.start,
+      end: range.end,
+    })) as ReadableStream;
+    return new Response(body, {
+      status: 206,
+      headers: {
+        ...baseHeaders,
+        "Content-Length": String(contentLength),
+        "Content-Range": `bytes ${range.start}-${range.end}/${fileStats.size}`,
+      },
+    });
+  }
+
+  return new Response(file, {
+    headers: {
+      ...baseHeaders,
+      "Content-Length": String(fileStats.size),
+    },
+  });
 }
 
 async function isTeacherOfStudent(studentId: number, teacherId: number): Promise<boolean> {
@@ -258,16 +375,16 @@ app.get("/manuals/:filename", jwtAuth, async (c) => {
   if (access === "not_found") return c.json({ error: "文件不存在" }, 404);
   if (access === "forbidden") return c.json({ error: "权限不足" }, 403);
 
-  const file = Bun.file(path.resolve(uploadsRoot, "manuals", filename));
-  if (!(await file.exists())) return c.json({ error: "文件不存在" }, 404);
-
-  return new Response(file, {
-    headers: {
-      "Content-Type": file.type || "application/pdf",
-      "Content-Disposition": buildContentDisposition("inline", filename),
-      "Cache-Control": "private, max-age=60",
-    },
+  const response = await buildLocalFileResponse({
+    absolutePath: path.resolve(uploadsRoot, "manuals", filename),
+    filename,
+    disposition: "inline",
+    fallbackContentType: "application/pdf",
+    rangeHeader: c.req.header("range"),
   });
+  if (!response) return c.json({ error: "文件不存在" }, 404);
+
+  return response;
 });
 
 app.get("/datasets/:filename", jwtAuth, async (c) => {
@@ -277,16 +394,16 @@ app.get("/datasets/:filename", jwtAuth, async (c) => {
   const filename = c.req.param("filename");
   if (!isSafeFilename(filename)) return c.json({ error: "无效的文件名" }, 400);
 
-  const file = Bun.file(path.resolve(uploadsRoot, "datasets", filename));
-  if (!(await file.exists())) return c.json({ error: "文件不存在" }, 404);
-
-  return new Response(file, {
-    headers: {
-      "Content-Type": file.type || "text/csv; charset=UTF-8",
-      "Content-Disposition": buildContentDisposition("attachment", filename),
-      "Cache-Control": "private, max-age=60",
-    },
+  const response = await buildLocalFileResponse({
+    absolutePath: path.resolve(uploadsRoot, "datasets", filename),
+    filename,
+    disposition: "attachment",
+    fallbackContentType: "text/csv; charset=UTF-8",
+    rangeHeader: c.req.header("range"),
   });
+  if (!response) return c.json({ error: "文件不存在" }, 404);
+
+  return response;
 });
 app.get("/reports/:filename", jwtAuth, async (c) => {
   const payload = c.get("jwtPayload") as JwtPayload;
@@ -297,16 +414,16 @@ app.get("/reports/:filename", jwtAuth, async (c) => {
   const allowed = await canAccessReportFile(filename, payload.sub, payload.role);
   if (!allowed) return c.json({ error: "权限不足" }, 403);
 
-  const file = Bun.file(path.resolve(reportsRoot, filename));
-  if (!(await file.exists())) return c.json({ error: "文件不存在" }, 404);
-
-  return new Response(file, {
-    headers: {
-      "Content-Type": file.type || "application/pdf",
-      "Content-Disposition": buildContentDisposition("inline", filename),
-      "Cache-Control": "private, max-age=60",
-    },
+  const response = await buildLocalFileResponse({
+    absolutePath: path.resolve(reportsRoot, filename),
+    filename,
+    disposition: "inline",
+    fallbackContentType: "application/pdf",
+    rangeHeader: c.req.header("range"),
   });
+  if (!response) return c.json({ error: "文件不存在" }, 404);
+
+  return response;
 });
 
 app.get("/exports/:filename", jwtAuth, async (c) => {
@@ -318,16 +435,16 @@ app.get("/exports/:filename", jwtAuth, async (c) => {
   const allowed = await canAccessExportFile(filename, payload.sub, payload.role);
   if (!allowed) return c.json({ error: "权限不足" }, 403);
 
-  const file = Bun.file(path.resolve(exportsRoot, filename));
-  if (!(await file.exists())) return c.json({ error: "文件不存在" }, 404);
-
-  return new Response(file, {
-    headers: {
-      "Content-Type": file.type || "application/octet-stream",
-      "Content-Disposition": buildContentDisposition("attachment", filename),
-      "Cache-Control": "private, max-age=60",
-    },
+  const response = await buildLocalFileResponse({
+    absolutePath: path.resolve(exportsRoot, filename),
+    filename,
+    disposition: "attachment",
+    fallbackContentType: "application/octet-stream",
+    rangeHeader: c.req.header("range"),
   });
+  if (!response) return c.json({ error: "文件不存在" }, 404);
+
+  return response;
 });
 // --- Mount Routes ---
 // New modular controllers (no pool/secret injection needed)

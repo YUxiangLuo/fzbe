@@ -1,4 +1,7 @@
 import { beforeEach, describe, expect, mock, test } from "bun:test";
+import { mkdir, rm, writeFile } from "node:fs/promises";
+import { resolve } from "node:path";
+import { sign } from "hono/jwt";
 
 type AppLike = {
   fetch: (request: Request) => Promise<Response>;
@@ -9,6 +12,14 @@ const loginMock = mock(async () => ({
   token: "test-token",
   user: { role: "Student" },
 }));
+
+const poolQueryMock = mock(async (sql?: string) => {
+  if (String(sql).includes("FROM experiment_manuals")) {
+    return [[{ manual_id: 1, is_active: 1 }]];
+  }
+
+  return [[]];
+});
 
 mock.module("../../../src/config", () => ({
   env: {
@@ -21,7 +32,7 @@ mock.module("../../../src/config", () => ({
   },
   connectionLimit: 64,
   pool: {
-    query: mock(async () => [[]]),
+    query: poolQueryMock,
   },
 }));
 
@@ -52,6 +63,7 @@ const getApp = async (): Promise<AppLike> => {
 describe("app route smoke tests", () => {
   beforeEach(() => {
     loginMock.mockClear();
+    poolQueryMock.mockClear();
   });
 
   test("wraps successful JSON responses from mounted controllers in a data envelope", async () => {
@@ -140,5 +152,66 @@ describe("app route smoke tests", () => {
       queueTimeoutMs: payload.data?.timeouts?.pdfQueueMs,
       generationTimeoutMs: payload.data?.timeouts?.pdfGenerationMs,
     });
+  });
+
+  test("authenticated file responses include length metadata and support byte ranges", async () => {
+    const app = await getApp();
+    const uploadsDir = resolve(import.meta.dir, "../../../uploads/manuals");
+    const filename = "unit-range-fixture.pdf";
+    const filePath = resolve(uploadsDir, filename);
+    const token = await sign(
+      {
+        sub: 123,
+        role: "Student",
+        exp: Math.floor(Date.now() / 1000) + 3600,
+      },
+      "test-jwt-secret",
+    );
+
+    await mkdir(uploadsDir, { recursive: true });
+    await writeFile(filePath, "0123456789");
+
+    try {
+      const fullResponse = await app.fetch(
+        new Request(`http://localhost/manuals/${filename}`, {
+          headers: { Authorization: `Bearer ${token}` },
+        }),
+      );
+
+      expect(fullResponse.status).toBe(200);
+      expect(fullResponse.headers.get("content-length")).toBe("10");
+      expect(fullResponse.headers.get("accept-ranges")).toBe("bytes");
+      expect(await fullResponse.text()).toBe("0123456789");
+
+      const rangeResponse = await app.fetch(
+        new Request(`http://localhost/manuals/${filename}`, {
+          headers: {
+            Authorization: `Bearer ${token}`,
+            Range: "bytes=2-5",
+          },
+        }),
+      );
+
+      expect(rangeResponse.status).toBe(206);
+      expect(rangeResponse.headers.get("content-length")).toBe("4");
+      expect(rangeResponse.headers.get("content-range")).toBe("bytes 2-5/10");
+      expect(await rangeResponse.text()).toBe("2345");
+
+      const multiRangeResponse = await app.fetch(
+        new Request(`http://localhost/manuals/${filename}`, {
+          headers: {
+            Authorization: `Bearer ${token}`,
+            Range: "bytes=0-0,2-3",
+          },
+        }),
+      );
+
+      expect(multiRangeResponse.status).toBe(200);
+      expect(multiRangeResponse.headers.get("content-length")).toBe("10");
+      expect(multiRangeResponse.headers.get("content-range")).toBeNull();
+      expect(await multiRangeResponse.text()).toBe("0123456789");
+    } finally {
+      await rm(filePath, { force: true });
+    }
   });
 });
