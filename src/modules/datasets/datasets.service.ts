@@ -38,6 +38,15 @@ function normalizeDatasetRow(row: DatasetRow) {
   return { ...row, file_path: toPublicFilePath(row.file_path) };
 }
 
+function isDuplicateDatasetSegmentError(error: unknown): boolean {
+  if (!error || typeof error !== "object") return false;
+  const maybeError = error as { code?: string; errno?: number; message?: string };
+  return (
+    (maybeError.code === "ER_DUP_ENTRY" || maybeError.errno === 1062) &&
+    (maybeError.message?.includes("uniq_dataset_segments_product") ?? false)
+  );
+}
+
 function toCsvString(data: Record<string, string>[]): string {
   if (data.length === 0) return "";
   const headers = Object.keys(data[0] ?? {});
@@ -49,6 +58,7 @@ function toCsvString(data: Record<string, string>[]): string {
 export async function uploadDataset(file: File, dataName: string, description?: string) {
   let tempUploadPath: string | null = null;
   let datasetDirectory: string | null = null;
+  let permanentOriginalPath: string | null = null;
 
   try {
     await validateFile(file, "csv", { maxSize: FILE_SIZE_LIMITS.DATASET_CSV_MAX_SIZE, checkMagicBytes: false });
@@ -140,7 +150,7 @@ export async function uploadDataset(file: File, dataName: string, description?: 
 
       const permanentStorageDir = path.resolve(uploadsRoot, "datasets");
       const uniquePermanentFilename = `${datasetId}-${file.name.replace(/[\/\\?%*:|"<>]/g, "-")}`;
-      const permanentOriginalPath = path.join(permanentStorageDir, uniquePermanentFilename);
+      permanentOriginalPath = path.join(permanentStorageDir, uniquePermanentFilename);
 
       datasetDirectory = path.join(permanentStorageDir, String(datasetId));
       const segmentsDir = path.join(datasetDirectory, "segments");
@@ -169,6 +179,10 @@ export async function uploadDataset(file: File, dataName: string, description?: 
     } catch (dbError) {
       await connection.rollback().catch(() => {});
       if (datasetDirectory) await rm(datasetDirectory, { recursive: true, force: true }).catch(() => {});
+      if (permanentOriginalPath) await rm(permanentOriginalPath, { force: true }).catch(() => {});
+      if (isDuplicateDatasetSegmentError(dbError)) {
+        return { error: "数据库已经存在相同产品的销售数据", status: 409 as const };
+      }
       throw dbError;
     } finally {
       connection.release();

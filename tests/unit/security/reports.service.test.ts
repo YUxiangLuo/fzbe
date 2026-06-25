@@ -264,6 +264,68 @@ describe("reports service", () => {
     expect(await listGeneratedReports(990001, 20241002)).toEqual([]);
   });
 
+  test("retries the database transaction on report submission deadlock", async () => {
+    poolQuery.mockImplementation(async (sql: string) => {
+      if (sql.includes("SELECT * FROM experiment_status")) {
+        return [[buildExperiment({ experiment_id: 990008 })]];
+      }
+
+      throw new Error(`Unexpected SQL in retry test: ${sql}`);
+    });
+
+    let insertAttempts = 0;
+    connectionQuery.mockImplementation(async (sql: string) => {
+      if (sql === "SET TRANSACTION ISOLATION LEVEL READ COMMITTED") {
+        return [[]];
+      }
+
+      if (sql.includes("SELECT * FROM experiment_status") && sql.includes("FOR UPDATE")) {
+        return [[buildExperiment({ experiment_id: 990008 })]];
+      }
+
+      if (sql.includes("FROM experiment_reports") && sql.includes("FOR UPDATE")) {
+        return [[]];
+      }
+
+      if (sql.includes("INSERT INTO experiment_reports")) {
+        insertAttempts += 1;
+        if (insertAttempts === 1) {
+          const error = new Error("Deadlock found when trying to get lock; try restarting transaction") as Error & { code: string; errno: number; sqlState: string };
+          error.code = "ER_LOCK_DEADLOCK";
+          error.errno = 1213;
+          error.sqlState = "40001";
+          throw error;
+        }
+        return [{ insertId: 880008, affectedRows: 1 }];
+      }
+
+      if (sql.includes("UPDATE experiment_grade") || sql.includes("UPDATE experiment_status")) {
+        return [{ affectedRows: 1 }];
+      }
+
+      throw new Error(`Unexpected SQL in retry test: ${sql}`);
+    });
+
+    const result = await submitReport(990008, 20241002, "# Test");
+
+    expect(result).toEqual({
+      data: {
+        message: "报告提交成功",
+        report_id: 880008,
+        pdf_path: expect.stringMatching(/^reports\/report-exp990008-student20241002-.*\.pdf$/),
+      },
+      isUpdate: false,
+    });
+    expect(launch).toHaveBeenCalledTimes(1);
+    expect(pagePdf).toHaveBeenCalledTimes(1);
+    expect(getConnection).toHaveBeenCalledTimes(2);
+    expect(beginTransaction).toHaveBeenCalledTimes(2);
+    expect(rollback).toHaveBeenCalledTimes(1);
+    expect(commit).toHaveBeenCalledTimes(1);
+    expect(logger.warn).toHaveBeenCalledTimes(1);
+    expect(await listGeneratedReports(990008, 20241002)).toHaveLength(1);
+  });
+
   test("removes the generated PDF when the locked experiment becomes ineligible", async () => {
     poolQuery.mockImplementation(async (sql: string) => {
       if (sql.includes("SELECT * FROM experiment_status")) {
@@ -274,6 +336,10 @@ describe("reports service", () => {
     });
 
     connectionQuery.mockImplementation(async (sql: string) => {
+      if (sql === "SET TRANSACTION ISOLATION LEVEL READ COMMITTED") {
+        return [[]];
+      }
+
       if (sql.includes("SELECT * FROM experiment_status") && sql.includes("FOR UPDATE")) {
         return [[buildExperiment({
           experiment_id: 990007,

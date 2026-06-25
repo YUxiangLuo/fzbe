@@ -8,6 +8,7 @@ import { sanitizeHTML, HTMLSanitizationError } from "../../utils/html-sanitizer"
 import { CONTENT_LIMITS, CONCURRENCY_LIMITS, TIMEOUTS, PATHS } from "../../utils/constants";
 import { Semaphore } from "../../utils/semaphore";
 import logger from "../../utils/logger";
+import { withDeadlockRetry } from "../../utils/db-retry";
 import {
   buildExperimentFlowGradeValues,
   getReportSubmissionEligibilityError,
@@ -278,89 +279,135 @@ export async function submitReport(
     pdfSemaphore.release();
   }
 
-  const connection = await pool.getConnection();
-  let previousPdfPath: string | null = null;
   try {
-    await connection.beginTransaction();
+    const transactionResult = await withDeadlockRetry(async () => {
+      const connection = await pool.getConnection();
+      try {
+        await connection.query("SET TRANSACTION ISOLATION LEVEL READ COMMITTED");
+        await connection.beginTransaction();
 
-    const [[experiment]] = await connection.query<ExperimentRow[]>(
-      `SELECT * FROM experiment_status WHERE experiment_id = ? LIMIT 1 FOR UPDATE`,
-      [experimentId],
-    );
+        const [[experiment]] = await connection.query<ExperimentRow[]>(
+          `SELECT * FROM experiment_status WHERE experiment_id = ? LIMIT 1 FOR UPDATE`,
+          [experimentId],
+        );
 
-    if (!experiment) {
-      await connection.rollback();
+        if (!experiment) {
+          await connection.rollback();
+          return { result: { error: "实验不存在", status: 404 as const }, previousPdfPath: null };
+        }
+
+        if (experiment.student_id !== studentId) {
+          await connection.rollback();
+          return { result: { error: "权限不足：该实验不属于当前用户", status: 403 as const }, previousPdfPath: null };
+        }
+
+        const eligibilityError = getReportSubmissionEligibilityError(experiment);
+        if (eligibilityError) {
+          await connection.rollback();
+          return { result: { error: eligibilityError, status: 400 as const }, previousPdfPath: null };
+        }
+
+        const [existingReports] = await connection.query<ReportRow[]>(
+          `SELECT report_id, pdf_file_path
+             FROM experiment_reports
+            WHERE experiment_id = ? AND student_id = ?
+            LIMIT 1
+            FOR UPDATE`,
+          [experimentId, studentId],
+        );
+        const existingReport = existingReports[0];
+        const previousPdfPath = existingReport?.pdf_file_path ?? null;
+
+        const [reportResult] = await connection.query<ResultSetHeader>(
+          `INSERT INTO experiment_reports (experiment_id, student_id, report_content, pdf_file_path, status, submitted_at)
+           VALUES (?, ?, ?, ?, 'submitted', NOW())
+           ON DUPLICATE KEY UPDATE
+             report_content = VALUES(report_content),
+             pdf_file_path = VALUES(pdf_file_path),
+             status = 'submitted',
+             submitted_at = NOW()`,
+          [experimentId, studentId, sanitizedReportContent, pdfPath],
+        );
+
+        const calculatedBest = getBestModel(experiment);
+        const selectedBest = experiment.selected_best_model;
+        let modelQualityScore = 0;
+        if (calculatedBest && selectedBest === calculatedBest) {
+          modelQualityScore = 100;
+        } else if (calculatedBest && selectedBest !== calculatedBest) {
+          modelQualityScore = 50;
+        }
+
+        const flowGradeValues = buildExperimentFlowGradeValues(experiment);
+        const EXP_FLOW_GRADE_COLUMNS = Object.keys(flowGradeValues) as Array<keyof typeof flowGradeValues>;
+        const GRADE_COLUMNS = [...EXP_FLOW_GRADE_COLUMNS, "model_quality"];
+        const GRADE_UPDATE_SET = GRADE_COLUMNS.map((col) => `${col} = ?`).join(", ");
+        const gradeValues = [...EXP_FLOW_GRADE_COLUMNS.map((column) => flowGradeValues[column]), modelQualityScore];
+
+        await connection.query(
+          `UPDATE experiment_grade SET ${GRADE_UPDATE_SET} WHERE experiment_id = ? AND student_id = ?`,
+          [...gradeValues, experimentId, studentId],
+        );
+
+        await connection.query(
+          `UPDATE experiment_status
+              SET status = 'Completed',
+                  completion_time = NOW(),
+                  last_activity_at = NOW()
+            WHERE experiment_id = ? AND student_id = ?`,
+          [experimentId, studentId],
+        );
+
+        await connection.commit();
+
+        let isUpdate = Boolean(existingReport);
+        let reportId = existingReport?.report_id ?? reportResult.insertId;
+        if (reportId === 0 && reportResult.affectedRows > 0) {
+          const [rows] = await connection.query<RowDataPacket[]>(
+            "SELECT report_id FROM experiment_reports WHERE experiment_id = ? AND student_id = ?",
+            [experimentId, studentId],
+          );
+          if (rows.length > 0) {
+            reportId = rows[0]!.report_id;
+            isUpdate = true;
+          }
+        }
+
+        return {
+          result: {
+            data: {
+              message: isUpdate ? "报告更新成功" : "报告提交成功",
+              report_id: reportId,
+              pdf_path: toPublicReportPath(pdfPath) ?? "",
+            },
+            isUpdate,
+          },
+          previousPdfPath,
+        };
+      } catch (error) {
+        await connection.rollback().catch(() => {});
+        throw error;
+      } finally {
+        connection.release();
+      }
+    }, {
+      maxAttempts: 4,
+      retryDelaysMs: [75, 200, 500],
+      onRetry: ({ error, attempt, nextAttempt, maxAttempts, delayMs }) => {
+        logger.warn(
+          { err: error, experimentId, studentId, attempt, nextAttempt, maxAttempts, delayMs },
+          "报告提交事务发生锁冲突，准备重试",
+        );
+      },
+    });
+
+    if ("error" in transactionResult.result) {
       await cleanupGeneratedReportPdf(pdfPath);
-      return { error: "实验不存在", status: 404 };
+      return transactionResult.result;
     }
 
-    if (experiment.student_id !== studentId) {
-      await connection.rollback();
-      await cleanupGeneratedReportPdf(pdfPath);
-      return { error: "权限不足：该实验不属于当前用户", status: 403 };
-    }
-
-    const eligibilityError = getReportSubmissionEligibilityError(experiment);
-    if (eligibilityError) {
-      await connection.rollback();
-      await cleanupGeneratedReportPdf(pdfPath);
-      return { error: eligibilityError, status: 400 };
-    }
-
-    const [existingReports] = await connection.query<ReportRow[]>(
-      `SELECT report_id, pdf_file_path
-         FROM experiment_reports
-        WHERE experiment_id = ? AND student_id = ?
-        LIMIT 1
-        FOR UPDATE`,
-      [experimentId, studentId],
-    );
-    previousPdfPath = existingReports[0]?.pdf_file_path ?? null;
-
-    const [reportResult] = await connection.query<ResultSetHeader>(
-      `INSERT INTO experiment_reports (experiment_id, student_id, report_content, pdf_file_path, status, submitted_at)
-       VALUES (?, ?, ?, ?, 'submitted', NOW())
-       ON DUPLICATE KEY UPDATE
-         report_content = VALUES(report_content),
-         pdf_file_path = VALUES(pdf_file_path),
-         status = 'submitted',
-         submitted_at = NOW()`,
-      [experimentId, studentId, sanitizedReportContent, pdfPath],
-    );
-
-    const calculatedBest = getBestModel(experiment);
-    const selectedBest = experiment.selected_best_model;
-    let modelQualityScore = 0;
-    if (calculatedBest && selectedBest === calculatedBest) {
-      modelQualityScore = 100;
-    } else if (calculatedBest && selectedBest !== calculatedBest) {
-      modelQualityScore = 50;
-    }
-
-    const flowGradeValues = buildExperimentFlowGradeValues(experiment);
-    const EXP_FLOW_GRADE_COLUMNS = Object.keys(flowGradeValues) as Array<keyof typeof flowGradeValues>;
-    const GRADE_COLUMNS = [...EXP_FLOW_GRADE_COLUMNS, "model_quality"];
-    const GRADE_UPDATE_SET = GRADE_COLUMNS.map((col) => `${col} = ?`).join(", ");
-    const gradeValues = [...EXP_FLOW_GRADE_COLUMNS.map((column) => flowGradeValues[column]), modelQualityScore];
-
-    await connection.query(
-      `UPDATE experiment_grade SET ${GRADE_UPDATE_SET} WHERE experiment_id = ? AND student_id = ?`,
-      [...gradeValues, experimentId, studentId],
-    );
-
-    await connection.query(
-      `UPDATE experiment_status
-          SET status = 'Completed',
-              completion_time = NOW(),
-              last_activity_at = NOW()
-        WHERE experiment_id = ? AND student_id = ?`,
-      [experimentId, studentId],
-    );
-
-    await connection.commit();
-
-    if (previousPdfPath && previousPdfPath !== pdfPath) {
-      Promise.resolve().then(() => cleanupGeneratedReportPdf(previousPdfPath));
+    if (transactionResult.previousPdfPath && transactionResult.previousPdfPath !== pdfPath) {
+      Promise.resolve().then(() => cleanupGeneratedReportPdf(transactionResult.previousPdfPath));
     }
 
     // 异步清理该实验产生的所有模型训练文件，不阻塞响应
@@ -372,34 +419,10 @@ export async function submitReport(
       }
     });
 
-    let reportId = reportResult.insertId;
-    let isUpdate = false;
-
-    if (reportId === 0 && reportResult.affectedRows > 0) {
-      const [rows] = await connection.query<RowDataPacket[]>(
-        "SELECT report_id FROM experiment_reports WHERE experiment_id = ? AND student_id = ?",
-        [experimentId, studentId],
-      );
-      if (rows.length > 0) {
-        reportId = rows[0]!.report_id;
-        isUpdate = true;
-      }
-    }
-
-    return {
-      data: {
-        message: isUpdate ? "报告更新成功" : "报告提交成功",
-        report_id: reportId,
-        pdf_path: toPublicReportPath(pdfPath) ?? "",
-      },
-      isUpdate,
-    };
+    return transactionResult.result;
   } catch (error) {
-    await connection.rollback();
     await cleanupGeneratedReportPdf(pdfPath);
     throw error;
-  } finally {
-    connection.release();
   }
 }
 
