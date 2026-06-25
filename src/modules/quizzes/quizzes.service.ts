@@ -34,9 +34,32 @@ interface StatsRow extends RowDataPacket {
   total_count: number;
 }
 
+interface AvailableQuestionCountRow extends RowDataPacket {
+  available_count: number;
+}
+
 type QuizType = "quiz_about_model" | "quiz_about_plan";
+const QUIZ_QUESTION_TARGET_COUNT = 4;
 const QUIZ_SUBMIT_MAX_ATTEMPTS = 3;
 const QUIZ_SUBMIT_RETRY_DELAYS_MS = [50, 150] as const;
+
+function getQuizTypeFromKnowledgePoint(knowledgePoint: string): QuizType {
+  return knowledgePoint.includes("生产计划") ? "quiz_about_plan" : "quiz_about_model";
+}
+
+async function getRequiredQuestionCountForQuizType(
+  connection: Pick<typeof pool, "query">,
+  quizType: QuizType,
+): Promise<number> {
+  const whereClause = quizType === "quiz_about_plan"
+    ? "knowledge_point LIKE '%生产计划%'"
+    : "knowledge_point LIKE '%模型%' AND knowledge_point NOT LIKE '%生产计划%'";
+  const [[row]] = await connection.query<AvailableQuestionCountRow[]>(
+    `SELECT COUNT(*) AS available_count FROM question_bank WHERE ${whereClause}`,
+  );
+  const availableCount = Number(row?.available_count ?? 0);
+  return Math.min(QUIZ_QUESTION_TARGET_COUNT, availableCount);
+}
 
 function isDeadlockError(error: unknown): boolean {
   if (!error || typeof error !== "object") return false;
@@ -107,7 +130,6 @@ export interface SubmittedAnswer {
 export interface AnswerResult {
   question_id: number;
   is_correct: boolean;
-  correct_answers: string[];
 }
 
 export async function submitAnswers(
@@ -160,14 +182,43 @@ export async function submitAnswers(
         questionIds,
       );
 
-      const correctAnswersMap = new Map<number, { answers: string[]; knowledge: string }>();
+      if (questionRows.length !== questionIds.length) {
+        await connection.rollback();
+        return { error: "测验题目不存在或不可用于提交", status: 400 };
+      }
+
+      const correctAnswersMap = new Map<number, { answers: string[]; quizType: QuizType }>();
       for (const row of questionRows) {
+        const knowledge = row.knowledge_point || "";
         correctAnswersMap.set(row.question_id, {
           answers: Array.isArray(row.correct_answers)
             ? row.correct_answers
             : JSON.parse(row.correct_answers),
-          knowledge: row.knowledge_point || "",
+          quizType: getQuizTypeFromKnowledgePoint(knowledge),
         });
+      }
+
+      const submittedQuestionCountByType = new Map<QuizType, number>();
+      for (const submitted of normalizedAnswers) {
+        const questionData = correctAnswersMap.get(submitted.question_id);
+        if (!questionData) continue;
+        submittedQuestionCountByType.set(
+          questionData.quizType,
+          (submittedQuestionCountByType.get(questionData.quizType) ?? 0) + 1,
+        );
+      }
+
+      for (const [quizType, submittedCount] of submittedQuestionCountByType) {
+        const requiredCount = await getRequiredQuestionCountForQuizType(connection, quizType);
+        if (requiredCount === 0) {
+          await connection.rollback();
+          return { error: "测验题目不存在或不可用于提交", status: 400 };
+        }
+        if (submittedCount !== requiredCount) {
+          await connection.rollback();
+          const quizName = quizType === "quiz_about_plan" ? "生产计划测验" : "预测模型测验";
+          return { error: `${quizName}必须一次提交 ${requiredCount} 道题`, status: 400 };
+        }
       }
 
       const insertValues: unknown[][] = [];
@@ -175,16 +226,13 @@ export async function submitAnswers(
       const resultsForFrontend: AnswerResult[] = [];
 
       for (const submitted of normalizedAnswers) {
-        const questionData = correctAnswersMap.get(submitted.question_id);
-        if (!questionData) continue;
+        const questionData = correctAnswersMap.get(submitted.question_id)!;
 
         const isCorrect =
           JSON.stringify([...submitted.submitted_answer].sort()) ===
           JSON.stringify([...questionData.answers].sort());
 
-        const quizType: QuizType = questionData.knowledge.includes("生产计划")
-          ? "quiz_about_plan"
-          : "quiz_about_model";
+        const quizType = questionData.quizType;
         submittedQuizTypes.add(quizType);
 
         insertValues.push([
@@ -199,7 +247,6 @@ export async function submitAnswers(
         resultsForFrontend.push({
           question_id: submitted.question_id,
           is_correct: isCorrect,
-          correct_answers: questionData.answers,
         });
       }
 

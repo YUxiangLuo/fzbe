@@ -155,6 +155,10 @@ describe("quizzes service", () => {
         ]];
       }
 
+      if (sql.includes("COUNT(*) AS available_count")) {
+        return [[{ available_count: 1 }]];
+      }
+
       if (sql.includes("DELETE FROM quiz_answers")) {
         expect(params).toEqual([990007, 20240007, "quiz_about_model", "quiz_about_plan"]);
         return [[]];
@@ -191,12 +195,10 @@ describe("quizzes service", () => {
         {
           question_id: 101,
           is_correct: true,
-          correct_answers: ["A"],
         },
         {
           question_id: 202,
           is_correct: false,
-          correct_answers: ["B"],
         },
       ],
     });
@@ -223,6 +225,10 @@ describe("quizzes service", () => {
             knowledge_point: "预测模型-模型评估指标",
           },
         ]];
+      }
+
+      if (sql.includes("COUNT(*) AS available_count")) {
+        return [[{ available_count: 1 }]];
       }
 
       if (sql.includes("DELETE FROM quiz_answers")) {
@@ -261,7 +267,6 @@ describe("quizzes service", () => {
         {
           question_id: 301,
           is_correct: true,
-          correct_answers: ["A", "C"],
         },
       ],
     });
@@ -287,6 +292,10 @@ describe("quizzes service", () => {
             knowledge_point: "预测模型-模型评估指标",
           },
         ]];
+      }
+
+      if (sql.includes("COUNT(*) AS available_count")) {
+        return [[{ available_count: 1 }]];
       }
 
       if (sql.includes("DELETE FROM quiz_answers")) {
@@ -324,7 +333,6 @@ describe("quizzes service", () => {
         {
           question_id: 501,
           is_correct: false,
-          correct_answers: ["A", "C"],
         },
       ],
     });
@@ -350,6 +358,10 @@ describe("quizzes service", () => {
             knowledge_point: "生产计划-库存与缺货",
           },
         ]];
+      }
+
+      if (sql.includes("COUNT(*) AS available_count")) {
+        return [[{ available_count: 1 }]];
       }
 
       if (sql.includes("DELETE FROM quiz_answers")) {
@@ -387,7 +399,6 @@ describe("quizzes service", () => {
         {
           question_id: 601,
           is_correct: false,
-          correct_answers: ["B"],
         },
       ],
     });
@@ -423,6 +434,10 @@ describe("quizzes service", () => {
             knowledge_point: "预测模型-模型融合技术",
           },
         ]];
+      }
+
+      if (sql.includes("COUNT(*) AS available_count")) {
+        return [[{ available_count: 3 }]];
       }
 
       if (sql.includes("DELETE FROM quiz_answers")) {
@@ -462,17 +477,14 @@ describe("quizzes service", () => {
         {
           question_id: 401,
           is_correct: true,
-          correct_answers: ["A"],
         },
         {
           question_id: 402,
           is_correct: true,
-          correct_answers: ["B"],
         },
         {
           question_id: 403,
           is_correct: false,
-          correct_answers: ["C"],
         },
       ],
     });
@@ -494,6 +506,76 @@ describe("quizzes service", () => {
     expect(beginTransaction).not.toHaveBeenCalled();
   });
 
+  test("rejects unknown question ids instead of silently accepting empty results", async () => {
+    connectionQuery.mockImplementation(async (sql: string) => {
+      if (sql === "SET TRANSACTION ISOLATION LEVEL READ COMMITTED") {
+        return [[]];
+      }
+
+      if (sql.includes("SELECT student_id, status FROM experiment_status")) {
+        return [[{ student_id: 20240012, status: "In Progress" }]];
+      }
+
+      if (sql.includes("SELECT question_id, correct_answers, knowledge_point")) {
+        return [[]];
+      }
+
+      throw new Error(`Unexpected SQL in unknown-question test: ${sql}`);
+    });
+
+    const result = await submitAnswers(990012, 20240012, [
+      { question_id: 999999, submitted_answer: ["A"] },
+    ]);
+
+    expect(result).toEqual({
+      error: "测验题目不存在或不可用于提交",
+      status: 400,
+    });
+    expect(beginTransaction).toHaveBeenCalledTimes(1);
+    expect(rollback).toHaveBeenCalledTimes(1);
+    expect(commit).not.toHaveBeenCalled();
+  });
+
+  test("rejects incomplete quiz submissions when enough questions are available", async () => {
+    connectionQuery.mockImplementation(async (sql: string) => {
+      if (sql === "SET TRANSACTION ISOLATION LEVEL READ COMMITTED") {
+        return [[]];
+      }
+
+      if (sql.includes("SELECT student_id, status FROM experiment_status")) {
+        return [[{ student_id: 20240013, status: "In Progress" }]];
+      }
+
+      if (sql.includes("SELECT question_id, correct_answers, knowledge_point")) {
+        return [[
+          {
+            question_id: 701,
+            correct_answers: JSON.stringify(["A"]),
+            knowledge_point: "预测模型-时间序列基础",
+          },
+        ]];
+      }
+
+      if (sql.includes("COUNT(*) AS available_count")) {
+        return [[{ available_count: 8 }]];
+      }
+
+      throw new Error(`Unexpected SQL in incomplete-quiz test: ${sql}`);
+    });
+
+    const result = await submitAnswers(990013, 20240013, [
+      { question_id: 701, submitted_answer: ["A"] },
+    ]);
+
+    expect(result).toEqual({
+      error: "预测模型测验必须一次提交 4 道题",
+      status: 400,
+    });
+    expect(beginTransaction).toHaveBeenCalledTimes(1);
+    expect(rollback).toHaveBeenCalledTimes(1);
+    expect(commit).not.toHaveBeenCalled();
+  });
+
   test("retries the transaction when MySQL reports a deadlock", async () => {
     let insertAttempt = 0;
 
@@ -506,7 +588,7 @@ describe("quizzes service", () => {
         return [[{ student_id: 20240004, status: "In Progress" }]];
       }
 
-      if (sql.includes("FROM question_bank")) {
+      if (sql.includes("SELECT question_id, correct_answers, knowledge_point")) {
         return [[
           {
             question_id: 11,
@@ -514,6 +596,10 @@ describe("quizzes service", () => {
             knowledge_point: "模型基础",
           },
         ]];
+      }
+
+      if (sql.includes("COUNT(*) AS available_count")) {
+        return [[{ available_count: 1 }]];
       }
 
       if (sql.includes("DELETE FROM quiz_answers")) {
@@ -560,7 +646,6 @@ describe("quizzes service", () => {
         {
           question_id: 11,
           is_correct: true,
-          correct_answers: ["A"],
         },
       ],
     });
