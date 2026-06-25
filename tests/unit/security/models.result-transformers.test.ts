@@ -2,10 +2,11 @@ process.env.DB_HOST ??= "127.0.0.1";
 process.env.DB_USER ??= "test";
 process.env.DB_PASSWORD ??= "test";
 process.env.DB_DATABASE ??= "test";
-process.env.JWT_SECRET ??= "test-jwt-secret";
+process.env.JWT_SECRET = "test-jwt-secret";
 process.env.PORT ??= "3001";
 
 import { describe, expect, test } from "bun:test";
+import * as actualFs from "node:fs";
 import path from "node:path";
 import { mock } from "bun:test";
 
@@ -14,6 +15,15 @@ const configModulePath = path.join(srcRoot, "config", "index.ts");
 const pythonModulePath = path.join(srcRoot, "utils", "python.ts");
 
 mock.module(configModulePath, () => ({
+  env: {
+    DB_HOST: process.env.DB_HOST ?? "127.0.0.1",
+    DB_USER: process.env.DB_USER ?? "test",
+    DB_PASSWORD: process.env.DB_PASSWORD ?? "test",
+    DB_DATABASE: process.env.DB_DATABASE ?? "test",
+    JWT_SECRET: "test-jwt-secret",
+    PORT: Number(process.env.PORT ?? "3001"),
+  },
+  connectionLimit: 64,
   pool: {
     query: async () => [[]],
     getConnection: async () => ({
@@ -24,16 +34,22 @@ mock.module(configModulePath, () => ({
 }));
 
 mock.module("fs", () => ({
+  ...actualFs,
   default: {
+    ...actualFs.default,
     existsSync: () => false,
     createReadStream: () => {
       throw new Error("createReadStream should not be called in transformer tests");
     },
+    readdirSync: () => [],
+    unlinkSync: () => {},
   },
   existsSync: () => false,
   createReadStream: () => {
     throw new Error("createReadStream should not be called in transformer tests");
   },
+  readdirSync: () => [],
+  unlinkSync: () => {},
 }));
 
 mock.module(pythonModulePath, () => ({

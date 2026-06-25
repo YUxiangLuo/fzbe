@@ -22,6 +22,15 @@ const getConnection = mock(async () => ({
 }));
 
 mock.module(configModulePath, () => ({
+  env: {
+    DB_HOST: process.env.DB_HOST ?? "127.0.0.1",
+    DB_USER: process.env.DB_USER ?? "test",
+    DB_PASSWORD: process.env.DB_PASSWORD ?? "test",
+    DB_DATABASE: process.env.DB_DATABASE ?? "test",
+    JWT_SECRET: "test-jwt-secret",
+    PORT: Number(process.env.PORT ?? "3001"),
+  },
+  connectionLimit: 64,
   pool: {
     getConnection,
     query: mock(async () => [[]]),

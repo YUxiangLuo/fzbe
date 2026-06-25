@@ -30,6 +30,7 @@ mock.module("../../../src/config", () => ({
     JWT_SECRET: "test-jwt-secret",
     PORT: 3001,
   },
+  connectionLimit: 64,
   pool: {
     query: queryMock,
   },

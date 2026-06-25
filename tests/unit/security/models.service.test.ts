@@ -1,4 +1,5 @@
 import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
+import * as actualFs from "node:fs";
 import { unlink, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { Readable } from "node:stream";
@@ -37,6 +38,8 @@ const existsSync = mock((_: string) => false);
 const createReadStream = mock(() => {
   throw new Error("createReadStream should not be called in this test");
 });
+const readdirSync = mock(() => []);
+const unlinkSync = mock(() => {});
 const spawnMock = mock((_: string[], __: Record<string, unknown>) => ({
   stdout: new ReadableStream({
     start(controller) {
@@ -63,21 +66,28 @@ mock.module(configModulePath, () => ({
     DB_USER: process.env.DB_USER ?? "test",
     DB_PASSWORD: process.env.DB_PASSWORD ?? "test",
     DB_DATABASE: process.env.DB_DATABASE ?? "test",
-    JWT_SECRET: process.env.JWT_SECRET ?? "test-jwt-secret",
+    JWT_SECRET: "test-jwt-secret",
     PORT: Number(process.env.PORT ?? "3001"),
   },
+  connectionLimit: 64,
   pool: {
     query: poolQuery,
   },
 }));
 
 mock.module("fs", () => ({
+  ...actualFs,
   default: {
+    ...actualFs.default,
     existsSync,
     createReadStream,
+    readdirSync,
+    unlinkSync,
   },
   existsSync,
   createReadStream,
+  readdirSync,
+  unlinkSync,
 }));
 
 mock.module(pythonModulePath, () => ({
@@ -135,6 +145,8 @@ describe("models service", () => {
     existsSync.mockReturnValue(false);
 
     createReadStream.mockClear();
+    readdirSync.mockClear();
+    unlinkSync.mockClear();
     spawnMock.mockClear();
     (Bun as { spawn: typeof Bun.spawn }).spawn = spawnMock as typeof Bun.spawn;
   });

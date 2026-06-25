@@ -45,7 +45,7 @@ const ensureTestEnv = () => {
   process.env.DB_USER ??= "test";
   process.env.DB_PASSWORD ??= "test";
   process.env.DB_DATABASE ??= "test";
-  process.env.JWT_SECRET ??= "test-jwt-secret";
+  process.env.JWT_SECRET = "test-jwt-secret";
   process.env.PORT ??= "3001";
 };
 

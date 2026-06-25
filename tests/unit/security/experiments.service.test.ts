@@ -28,9 +28,10 @@ mock.module(configModulePath, () => ({
     DB_USER: process.env.DB_USER ?? "test",
     DB_PASSWORD: process.env.DB_PASSWORD ?? "test",
     DB_DATABASE: process.env.DB_DATABASE ?? "test",
-    JWT_SECRET: process.env.JWT_SECRET ?? "test-jwt-secret",
+    JWT_SECRET: "test-jwt-secret",
     PORT: Number(process.env.PORT ?? "3001"),
   },
+  connectionLimit: 64,
   pool: {
     getConnection,
     query: poolQuery,
