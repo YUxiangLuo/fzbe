@@ -537,7 +537,10 @@ const validateMovingAverageWindow = (
 
 const normalizePersistedStringArray = (value: unknown): string[] => {
   if (Array.isArray(value)) {
-    return value.filter((item): item is string => typeof item === "string" && item.length > 0);
+    return value
+      .filter((item): item is string => typeof item === "string")
+      .map((item) => item.trim())
+      .filter((item) => item.length > 0);
   }
 
   if (typeof value === "string") {
@@ -584,7 +587,7 @@ const assertRequestMatchesPersistedValue = (
   if (Array.isArray(persistedValue)) {
     const normalizedPersisted = normalizePersistedStringArray(persistedValue);
     const normalizedRequest = normalizePersistedStringArray(requestValue);
-    if (normalizedRequest.join(",") !== normalizedPersisted.join(",")) {
+    if (JSON.stringify(normalizedRequest) !== JSON.stringify(normalizedPersisted)) {
       throw new ModelValidationError(`请求中的${label}与已完成基础模型记录不一致，请刷新页面后重试`);
     }
     return;
@@ -671,7 +674,7 @@ const buildEnsemblePythonParams = (
 
         pythonParams.lstmNormalization = experiment.lstm_normalization;
         pythonParams.lstmTargetFeature = experiment.lstm_target_field;
-        pythonParams.lstmFeatures = persistedFeatures.join(",");
+        pythonParams.lstmFeatures = JSON.stringify(persistedFeatures);
         break;
       }
     }
@@ -879,6 +882,7 @@ export async function runPythonModel(
     const scriptKey = allPossiblePythonParams[key] || key;
     const cliArg = `--${scriptKey}`;
     if (typeof value === "boolean") return value ? [cliArg] : [];
+    if (Array.isArray(value)) return [cliArg, JSON.stringify(value)];
     return [cliArg, String(value)];
   });
 

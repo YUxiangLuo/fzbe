@@ -27,7 +27,8 @@ mock.module(configModulePath, () => ({
   },
 }));
 
-const { getProductFields, getProductSales } = await import(freshDatasetsServiceModulePath);
+const { getProductFields, getProductSales, toCsvString } = await import(freshDatasetsServiceModulePath);
+const { getCsvHeaders, readCsvRows } = await import("../../../src/utils/csv-processor");
 
 const gbkDatasetCsv = Buffer.from([
   0xd0, 0xd0, 0xd2, 0xb5, 0xc3, 0xfb, 0xb3, 0xc6, 0x2c, 0xb9, 0xab, 0xcb,
@@ -80,5 +81,29 @@ describe("datasets service CSV encoding", () => {
         ],
       },
     });
+  });
+
+  test("writes segment CSV headers and values with RFC-compatible escaping", async () => {
+    const csvText = toCsvString([
+      {
+        "行业名称": "制造业",
+        "外部,指标": "12,345",
+        "备注\"字段": "包含\"引号\"和值,逗号",
+      },
+    ]);
+    await writeFile(datasetFilePath, csvText);
+
+    await expect(getCsvHeaders(datasetFilePath)).resolves.toEqual([
+      "行业名称",
+      "外部,指标",
+      "备注\"字段",
+    ]);
+    await expect(readCsvRows(datasetFilePath)).resolves.toEqual([
+      {
+        "行业名称": "制造业",
+        "外部,指标": "12,345",
+        "备注\"字段": "包含\"引号\"和值,逗号",
+      },
+    ]);
   });
 });

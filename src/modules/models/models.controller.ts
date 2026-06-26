@@ -255,6 +255,12 @@ modelsController.post(
         const timeoutSeconds = Math.ceil(TIMEOUTS.MODEL_PREDICTION / 1000);
         return c.json({ error: `预测超时（${timeoutSeconds}秒）` }, 504);
       }
+      if (err.message?.startsWith("[PYTHON_VALIDATION]")) {
+        return c.json({ error: err.message.substring(20) }, 400);
+      }
+      if (err.message?.startsWith("[PYTHON_DATA]")) {
+        return c.json({ error: err.message.substring(14) }, 400);
+      }
       const message = err.message || `${modelType.toUpperCase()} 预测失败`;
       return handleUnexpectedError(c, error, message);
     } finally {

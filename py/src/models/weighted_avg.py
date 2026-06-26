@@ -55,10 +55,16 @@ IMPLEMENTATION_NOTES = [
 def _parse_feature_name_list(raw_value: Any) -> List[str]:
     if raw_value is None:
         return []
-    if isinstance(raw_value, str):
-        return [item.strip() for item in raw_value.split(",") if item.strip()]
     if isinstance(raw_value, list):
         return [str(item).strip() for item in raw_value if str(item).strip()]
+    if isinstance(raw_value, str):
+        try:
+            parsed = json.loads(raw_value)
+        except json.JSONDecodeError:
+            parsed = None
+        if isinstance(parsed, list):
+            return [str(item).strip() for item in parsed if str(item).strip()]
+        return [item.strip() for item in raw_value.split(",") if item.strip()]
     return []
 
 
@@ -110,7 +116,7 @@ def _build_lstm_params_from_source_state(
         "lstm_target_feature": target_feature,
     }
     if feature_keys:
-        params["lstm_features"] = ",".join(feature_keys)
+        params["lstm_features"] = json.dumps(feature_keys, ensure_ascii=False)
     return params
 
 
@@ -892,11 +898,7 @@ def run(args) -> None:
         feature_types_str = get_arg("feature_types", None)
         lstm_features_str = get_arg("lstm_features", None)
         target_feature = get_arg("lstm_target_feature", parsed_data.target_key)
-        lstm_feature_names = (
-            [f.strip() for f in lstm_features_str.split(",") if f.strip()]
-            if lstm_features_str
-            else parsed_data.feature_keys
-        )
+        lstm_feature_names = _parse_feature_name_list(lstm_features_str) if lstm_features_str else parsed_data.feature_keys
 
         if feature_types_str:
             feature_types = json.loads(feature_types_str)

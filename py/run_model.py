@@ -56,7 +56,8 @@ def main():
     parser.add_argument("--look-back", type=int, help="LSTM look back window")
     parser.add_argument("--epochs", type=int, help="LSTM training epochs")
     parser.add_argument("--feature-types", type=str, help="LSTM feature types as JSON string")
-    parser.add_argument("--lstm-features", type=str, help="LSTM comma-separated feature list")
+    parser.add_argument("--lstm-features", type=str, help="LSTM feature list as JSON array or legacy comma-separated string")
+    parser.add_argument("--lstm-features-json", type=str, help="LSTM feature list as JSON array")
     parser.add_argument("--lstm-target-feature", type=str, help="LSTM target feature column name")
     parser.add_argument("--normalization", type=str, choices=['minmax', 'zscore'], help="LSTM normalization method")
     # Ensemble Models

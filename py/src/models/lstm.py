@@ -56,6 +56,29 @@ def _format_predictions(preds: List[float], std_dev: float) -> List[Dict[str, fl
     return [{"prediction": float(p), "std_dev": float(std_dev)} for p in preds]
 
 
+def _parse_feature_key_list(raw_value: Optional[str]) -> Optional[List[str]]:
+    if raw_value is None or raw_value == "":
+        return None
+
+    try:
+        parsed = json.loads(raw_value)
+    except (TypeError, json.JSONDecodeError):
+        parsed = None
+
+    if isinstance(parsed, list):
+        return [str(item).strip() for item in parsed if str(item).strip()]
+
+    return [item.strip() for item in str(raw_value).split(',') if item.strip()]
+
+
+def _summarize_args_for_log(args) -> Dict[str, Any]:
+    summarized = dict(vars(args))
+    data = summarized.get("data")
+    if isinstance(data, str):
+        summarized["data"] = f"<json payload chars={len(data)}>"
+    return summarized
+
+
 def _load_state(model_path: str) -> Dict[str, Any]:
     """
     Load and validate a saved LSTM model state.
@@ -677,7 +700,7 @@ def run(args) -> None:
     tf.keras.utils.set_random_seed(42)
     _set_random_seed(42)
 
-    log.info(f"LSTM run started with args: {vars(args)}")
+    log.info(f"LSTM run started with args: {_summarize_args_for_log(args)}")
 
     pretty: bool = bool(getattr(args, "pretty", False))
     save_path = getattr(args, "save_model", None)
@@ -860,9 +883,9 @@ def run(args) -> None:
         raise ValueError("[VALIDATION] --data is required for training.")
 
     target_key = getattr(args, "lstm_target_feature", None)
-    feature_keys_str = getattr(args, "lstm_features", None)
-    feature_keys_list = [k.strip() for k in feature_keys_str.split(',')] if feature_keys_str else None
-    log.debug(f"Received target_key: {target_key}, feature_keys_str: {feature_keys_str}, parsed_list: {feature_keys_list}")
+    feature_keys_raw = getattr(args, "lstm_features_json", None) or getattr(args, "lstm_features", None)
+    feature_keys_list = _parse_feature_key_list(feature_keys_raw)
+    log.debug(f"Received target_key: {target_key}, feature_keys_raw: {feature_keys_raw}, parsed_list: {feature_keys_list}")
 
     try:
         feature_types_str = getattr(args, "feature_types", None) or "{}"

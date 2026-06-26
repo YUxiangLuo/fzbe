@@ -256,6 +256,25 @@ describe("models controller", () => {
     expect(acquireModelExecutionLock).not.toHaveBeenCalled();
   });
 
+  test("accepts LSTM feature arrays and forwards them as JSON strings", async () => {
+    const response = await requestJson("/api/v1/models/lstm/training", {
+      ...buildTrainBody(),
+      lstmNormalization: "minmax",
+      lstmTargetFeature: "销售数量",
+      lstmFeatures: ["价格指数", "外部,指标"],
+    });
+    const data = await response.json();
+
+    expect(response.status).toBe(200);
+    expect(data).toEqual({
+      status: "success",
+      results: { metrics: { rmse: 1, mae: 1, r2: 0.9 } },
+    });
+    expect(trainModel).toHaveBeenCalledWith("lstm", 20240002, expect.objectContaining({
+      lstmFeatures: JSON.stringify(["价格指数", "外部,指标"]),
+    }));
+  });
+
   test("returns localized field errors for missing moving-average params", async () => {
     const body = buildTrainBody();
     delete (body as Partial<TrainInput>).moving_average_window;
@@ -517,6 +536,34 @@ describe("models controller", () => {
     });
     expect(predictExperimentModel).not.toHaveBeenCalled();
     expect(acquireModelExecutionLock).not.toHaveBeenCalled();
+  });
+
+  test("maps python validation failures from prediction to 400", async () => {
+    predictExperimentModel.mockRejectedValueOnce(
+      new Error("[PYTHON_VALIDATION] Requested forecast_steps (20) exceeds the saved LSTM horizon (12)."),
+    );
+
+    const response = await requestJson("/api/v1/models/lstm/predict", {
+      experiment_id: 990002,
+      forecast_steps: 20,
+    });
+    const data = await response.json();
+
+    expect(response.status).toBe(400);
+    expect(data).toEqual({ error: "Requested forecast_steps (20) exceeds the saved LSTM horizon (12)." });
+  });
+
+  test("maps python data failures from prediction to 400", async () => {
+    predictExperimentModel.mockRejectedValueOnce(new Error("[PYTHON_DATA] Saved LSTM history is invalid"));
+
+    const response = await requestJson("/api/v1/models/lstm/predict", {
+      experiment_id: 990002,
+      forecast_steps: 6,
+    });
+    const data = await response.json();
+
+    expect(response.status).toBe(400);
+    expect(data).toEqual({ error: "Saved LSTM history is invalid" });
   });
 
   test("translates prediction timeouts to 504", async () => {

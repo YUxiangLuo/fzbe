@@ -100,6 +100,20 @@ describe("Models Schemas", () => {
       expect(result.success).toBe(false);
     });
 
+    test("should accept LSTM feature arrays and encode them without losing comma-containing field names", () => {
+      const result = getTrainSchemaForModel("lstm").safeParse({
+        experiment_id: 12,
+        lstmFeatures: ["价格指数", "外部,指标"],
+        lstmTargetFeature: "销售数量",
+        lstmNormalization: "minmax",
+      });
+
+      expect(result.success).toBe(true);
+      if (result.success) {
+        expect(result.data.lstmFeatures).toBe(JSON.stringify(["价格指数", "外部,指标"]));
+      }
+    });
+
     test("should require model-specific params for weighted ensemble training", () => {
       const result = getTrainSchemaForModel("weighted_avg").safeParse({
         experiment_id: 12,

@@ -613,6 +613,86 @@ describe("models service", () => {
     });
   });
 
+  test("passes persisted LSTM feature lists to ensemble training as JSON to preserve comma-containing field names", async () => {
+    poolQuery.mockReset();
+    poolQuery
+      .mockResolvedValueOnce([[buildExperimentContextRow({
+        lstm_features: JSON.stringify(["价格指数", "外部,指标"]),
+      })]])
+      .mockResolvedValueOnce([[{ file_path: "/tmp/dataset.csv" }]]);
+
+    existsSync.mockImplementation((filePath: string) => (
+      filePath.endsWith("/run_model.py")
+      || filePath.includes("-ma.pkl")
+      || filePath.includes("-lstm.pkl")
+      || filePath.includes("-lstm_keras_model.h5")
+    ));
+    spawnMock.mockImplementationOnce(() => ({
+      stdout: new ReadableStream({
+        start(controller) {
+          controller.enqueue(new TextEncoder().encode('{"metrics":{"rmse":1,"mae":1,"r2":0.9},"models":["ma","lstm"],"weights":{"ma":0.4,"lstm":0.6},"eval_y_true":[],"predictions":[]}'));
+          controller.close();
+        },
+      }),
+      stderr: new ReadableStream({
+        start(controller) {
+          controller.close();
+        },
+      }),
+      exited: Promise.resolve(0),
+      exitCode: 0,
+      killed: false,
+      pid: 4321,
+      kill: mock(() => {}),
+    }));
+
+    await trainModel("weighted_avg", 20240002, {
+      experiment_id: 990002,
+      selected_industry: "制造业",
+      selected_company: "样本企业",
+      selected_product: "样本产品",
+      data_window_train_start_index: 0,
+      data_window_train_end_index: 11,
+      data_window_evaluate_start_index: 12,
+      data_window_evaluate_end_index: 17,
+      models: "ma,lstm",
+      moving_average_window: 4,
+      lstmNormalization: "minmax",
+      lstmTargetFeature: "销售数量",
+      lstmFeatures: JSON.stringify(["价格指数", "外部,指标"]),
+    });
+
+    const [command] = spawnMock.mock.calls[0] ?? [];
+    const lstmFeaturesArgIndex = command.indexOf("--lstm-features");
+    expect(lstmFeaturesArgIndex).toBeGreaterThan(-1);
+    expect(JSON.parse(command[lstmFeaturesArgIndex + 1])).toEqual(["价格指数", "外部,指标"]);
+  });
+
+  test("rejects comma-collision LSTM feature lists that differ from persisted config", async () => {
+    poolQuery.mockReset();
+    poolQuery.mockResolvedValueOnce([[buildExperimentContextRow({
+      lstm_features: JSON.stringify(["价格指数", "外部,指标"]),
+    })]]);
+
+    await expect(trainModel("weighted_avg", 20240002, {
+      experiment_id: 990002,
+      selected_industry: "制造业",
+      selected_company: "样本企业",
+      selected_product: "样本产品",
+      data_window_train_start_index: 0,
+      data_window_train_end_index: 11,
+      data_window_evaluate_start_index: 12,
+      data_window_evaluate_end_index: 17,
+      models: "ma,lstm",
+      moving_average_window: 4,
+      lstmNormalization: "minmax",
+      lstmTargetFeature: "销售数量",
+      lstmFeatures: JSON.stringify(["价格指数,外部", "指标"]),
+    })).rejects.toThrow("请求中的LSTM 输入特征与已完成基础模型记录不一致");
+
+    expect(spawnMock).not.toHaveBeenCalled();
+  });
+
   test("returns an empty prediction list when python omits predictions", async () => {
     existsSync.mockImplementation(() => true);
     spawnMock.mockImplementationOnce(() => ({

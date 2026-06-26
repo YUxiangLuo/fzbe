@@ -47,11 +47,17 @@ function isDuplicateDatasetSegmentError(error: unknown): boolean {
   );
 }
 
-function toCsvString(data: Record<string, string>[]): string {
+function escapeCsvCell(value: unknown): string {
+  const text = String(value ?? "");
+  const escaped = text.replace(/"/g, '""');
+  return /[",\r\n]/.test(text) ? `"${escaped}"` : escaped;
+}
+
+export function toCsvString(data: Record<string, string>[]): string {
   if (data.length === 0) return "";
   const headers = Object.keys(data[0] ?? {});
-  const headerRow = headers.join(",");
-  const bodyRows = data.map((row) => headers.map((header) => `"${row[header]}"`).join(","));
+  const headerRow = headers.map(escapeCsvCell).join(",");
+  const bodyRows = data.map((row) => headers.map((header) => escapeCsvCell(row[header])).join(","));
   return [headerRow, ...bodyRows].join("\n");
 }
 

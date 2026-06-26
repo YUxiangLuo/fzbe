@@ -20,11 +20,25 @@ const evalRangeSchema = z.object({
   data_window_evaluate_end_index: z.coerce.number().int().min(0).optional(),
 });
 
+const normalizeLstmFeaturesInput = (value: unknown) => {
+  if (Array.isArray(value)) {
+    const features = value
+      .filter((item): item is string => typeof item === "string")
+      .map((item) => item.trim())
+      .filter((item) => item.length > 0);
+    return features.length > 0 ? JSON.stringify(features) : "";
+  }
+
+  return value;
+};
+
+const lstmFeaturesSchema = z.preprocess(normalizeLstmFeaturesInput, z.string().min(1));
+
 const modelParamsSchema = z.object({
   moving_average_window: z.coerce.number().int().min(2).optional(),
   exponential_smoothing_alpha: z.coerce.number().gt(0).max(1).optional(),
   arimaD: z.coerce.number().int().min(0).optional(),
-  lstmFeatures: z.string().min(1).optional(),
+  lstmFeatures: lstmFeaturesSchema.optional(),
   lstmTargetFeature: z.string().min(1).optional(),
   lstmNormalization: z.enum(["minmax", "zscore"]).optional(),
   models: z.string().min(1).optional(),
@@ -102,7 +116,7 @@ const arimaTrainSchema = withRangeValidation(
 
 const lstmTrainSchema = withRangeValidation(
   trainSchemaBase.extend({
-    lstmFeatures: z.string().min(1),
+    lstmFeatures: lstmFeaturesSchema,
     lstmTargetFeature: z.string().min(1),
     lstmNormalization: z.enum(["minmax", "zscore"]),
   }),
