@@ -296,6 +296,26 @@ describe("models controller", () => {
     expect(trainModel).not.toHaveBeenCalled();
   });
 
+  test("returns localized integer errors for decimal moving-average params", async () => {
+    const response = await requestJson("/api/v1/models/ma/training", {
+      ...buildTrainBody(),
+      moving_average_window: 2.5,
+    });
+    const data = await response.json();
+
+    expect(response.status).toBe(400);
+    expect(data).toEqual({
+      error: "移动平均时间窗口必须为整数",
+      details: {
+        formErrors: [],
+        fieldErrors: {
+          moving_average_window: ["移动平均时间窗口必须为整数"],
+        },
+      },
+    });
+    expect(trainModel).not.toHaveBeenCalled();
+  });
+
   test("releases the execution lock when slot acquisition throws during training", async () => {
     const executionLock = { connection: {} as never, name: "exec:throw" };
     acquireModelExecutionLock.mockResolvedValueOnce(executionLock);

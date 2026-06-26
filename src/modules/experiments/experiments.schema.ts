@@ -76,7 +76,7 @@ const optionalFields: Record<string, z.ZodTypeAny> = {
   selected_base_models: optionalJson, selected_ensemble_models: optionalJson,
   data_window_train_start_index: optionalInt(0), data_window_train_end_index: optionalInt(0),
   data_window_evaluate_start_index: optionalInt(0), data_window_evaluate_end_index: optionalInt(0),
-  moving_average_completed: optionalBoolean, moving_average_window: optionalInt(1),
+  moving_average_completed: optionalBoolean, moving_average_window: optionalInt(2),
   moving_average_metrics_rmse: optionalFloat(0), moving_average_metrics_mae: optionalFloat(0), moving_average_metrics_r2: optionalFloat(),
   exponential_smoothing_completed: optionalBoolean, exponential_smoothing_alpha: optionalFloat(0),
   exponential_smoothing_metrics_rmse: optionalFloat(0), exponential_smoothing_metrics_mae: optionalFloat(0), exponential_smoothing_metrics_r2: optionalFloat(),

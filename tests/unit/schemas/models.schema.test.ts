@@ -56,6 +56,15 @@ describe("Models Schemas", () => {
       expect(result.success).toBe(false);
     });
 
+    test("should reject decimal moving average windows", () => {
+      const result = getTrainSchemaForModel("ma").safeParse({
+        experiment_id: 12,
+        moving_average_window: 2.5,
+      });
+
+      expect(result.success).toBe(false);
+    });
+
     test("should require model-specific params for exponential smoothing training", () => {
       const result = getTrainSchemaForModel("es").safeParse({
         experiment_id: 12,

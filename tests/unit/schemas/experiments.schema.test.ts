@@ -125,6 +125,20 @@ describe("Experiments Schemas", () => {
       expect(result.success).toBe(true);
     });
 
+    test("should reject non-integer moving average windows", () => {
+      const result = updateExperimentSchema.safeParse({
+        moving_average_window: 2.5,
+      });
+      expect(result.success).toBe(false);
+    });
+
+    test("should reject moving average windows below 2", () => {
+      const result = updateExperimentSchema.safeParse({
+        moving_average_window: 1,
+      });
+      expect(result.success).toBe(false);
+    });
+
     test("should accept best model selection", () => {
       const result = updateExperimentSchema.safeParse({
         selected_best_model: "lstm",

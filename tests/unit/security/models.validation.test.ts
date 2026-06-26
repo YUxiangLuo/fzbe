@@ -59,6 +59,16 @@ describe("models validation helpers", () => {
       expect(localizeTrainValidationIssue(issue)).toBe("移动平均时间窗口必须大于等于 2");
     });
 
+    test("localizes integer type violations", () => {
+      const issue = buildIssue({
+        code: "invalid_type",
+        path: ["moving_average_window"],
+        expected: "int",
+      });
+
+      expect(localizeTrainValidationIssue(issue)).toBe("移动平均时间窗口必须为整数");
+    });
+
     test("localizes invalid type errors with natural spacing", () => {
       const issue = buildIssue({
         code: "invalid_type",

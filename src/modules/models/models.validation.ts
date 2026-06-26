@@ -26,7 +26,7 @@ const PREDICT_FIELD_LABELS: Partial<Record<string, string>> = {
 const getTrainFieldLabel = (field: string) => TRAIN_FIELD_LABELS[field] ?? field;
 const getPredictFieldLabel = (field: string) => PREDICT_FIELD_LABELS[field] ?? field;
 
-type IssueWithInput = ZodIssue & { input?: unknown };
+type IssueWithInput = ZodIssue & { input?: unknown; expected?: string };
 type IssueWithMinimum = ZodIssue & { minimum?: number | bigint; inclusive?: boolean; origin?: string };
 
 const formatInvalidTypeMessage = (label: string) => `${label} 类型无效`;
@@ -59,6 +59,9 @@ export const localizeTrainValidationIssue = (issue: ZodIssue): string => {
 
   if (issue.code === "invalid_type") {
     const issueWithInput = issue as IssueWithInput;
+    if (issueWithInput.expected === "int") {
+      return `${label}必须为整数`;
+    }
     if (issueWithInput.input === undefined) {
       return `${label}不能为空`;
     }
@@ -111,6 +114,9 @@ export const localizePredictValidationIssue = (issue: ZodIssue): string => {
 
   if (issue.code === "invalid_type") {
     const issueWithInput = issue as IssueWithInput;
+    if (issueWithInput.expected === "int") {
+      return `${label}必须为整数`;
+    }
     if (issueWithInput.input === undefined) {
       return `${label}不能为空`;
     }
