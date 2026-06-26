@@ -156,6 +156,20 @@ function normalizeNumeric(value: unknown) {
   return Number.isNaN(num) ? null : num;
 }
 
+function normalizeDatetime(value: unknown) {
+  if (value === null || value === undefined) return null;
+  if (value instanceof Date) {
+    return Number.isNaN(value.getTime()) ? null : value.toISOString();
+  }
+  if (typeof value === "string") {
+    const trimmed = value.trim();
+    if (!trimmed || trimmed.startsWith("0000-00-00")) return null;
+    const parsed = new Date(trimmed);
+    return Number.isNaN(parsed.getTime()) ? trimmed : parsed.toISOString();
+  }
+  return value;
+}
+
 export function normalizeExperimentRow(row: RowDataPacket) {
   const result: Record<string, unknown> = {};
   for (const [key, value] of Object.entries(row)) {
@@ -168,7 +182,7 @@ export function normalizeExperimentRow(row: RowDataPacket) {
     }
     if (BOOLEAN_FIELDS.has(key)) { result[key] = normalizeBoolean(value); continue; }
     if (INTEGER_FIELDS.has(key) || FLOAT_FIELDS.has(key)) { result[key] = normalizeNumeric(value); continue; }
-    if (datetimeFields.has(key) && value instanceof Date) { result[key] = value.toISOString(); continue; }
+    if (datetimeFields.has(key)) { result[key] = normalizeDatetime(value); continue; }
     result[key] = value ?? null;
   }
   return result;

@@ -154,7 +154,7 @@ CREATE TABLE IF NOT EXISTS `experiment_status` (
 
   `start_time` TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
   `last_activity_at` TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-  `completion_time` TIMESTAMP DEFAULT NULL,
+  `completion_time` TIMESTAMP NULL DEFAULT NULL,
 
   FOREIGN KEY (`student_id`) REFERENCES `users`(`user_id`) ON DELETE CASCADE,
   INDEX `idx_experiment_status_student` (`student_id`),
