@@ -124,6 +124,22 @@ def load_pickled_state(model_path: Path) -> dict:
         return pickle.load(handle)
 
 
+def parse_stored_feature_names(raw_value: object) -> list[str]:
+    if isinstance(raw_value, list):
+        return [str(item).strip() for item in raw_value if str(item).strip()]
+
+    if isinstance(raw_value, str):
+        try:
+            parsed = json.loads(raw_value)
+            if isinstance(parsed, list):
+                return [str(item).strip() for item in parsed if str(item).strip()]
+        except json.JSONDecodeError:
+            pass
+        return [item.strip() for item in raw_value.split(",") if item.strip()]
+
+    raise AssertionError(f"unsupported stored feature list value: {raw_value!r}")
+
+
 def train_base_model_artifacts(
     data_json: str,
     base_model_paths: dict[str, Path],
@@ -513,10 +529,9 @@ def main() -> None:
         if not reused_saved_lstm_member.exists():
             raise AssertionError(f"reused stacking LSTM member artifact missing: {reused_saved_lstm_member}")
         assert reuse_param_mismatch_state["base_model_states"]["lstm"]["params"]["look_back"] == 4
-        assert (
+        assert parse_stored_feature_names(
             reuse_param_mismatch_state["base_model_states"]["lstm"]["params"]["lstm_features"]
-            == ",".join(LSTM_FEATURE_KEYS)
-        )
+        ) == LSTM_FEATURE_KEYS
 
         short_horizon_lstm_source = temp_path / "lstm-reuse-short-horizon.pkl"
         invoke_model(
