@@ -866,10 +866,93 @@ const assertModelReadyForProduction = (
   }
 };
 
+export interface ModelProgressEvent {
+  type: "phase" | "log" | "progress";
+  message: string;
+  phase?: string;
+  percent?: number;
+  source?: "backend" | "python";
+  timestamp?: string;
+}
+
+export type ModelProgressReporter = (event: ModelProgressEvent) => void;
+
+const reportModelProgress = (
+  reporter: ModelProgressReporter | undefined,
+  event: ModelProgressEvent,
+) => {
+  reporter?.({
+    ...event,
+    timestamp: event.timestamp ?? new Date().toISOString(),
+  });
+};
+
+const SUPPRESSED_PYTHON_PROGRESS_PREFIXES = [
+  "Skipping non-numeric feature for subprocess model:",
+];
+
+const sanitizePythonProgressLine = (line: string): string | null => {
+  const trimmed = line.trim();
+  if (!trimmed) return null;
+
+  const withoutTimestamp = trimmed.replace(
+    /^\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2},\d+\s+-\s+(?:DEBUG|INFO|WARNING|ERROR)\s+-\s+/,
+    "",
+  );
+
+  if (SUPPRESSED_PYTHON_PROGRESS_PREFIXES.some((prefix) => withoutTimestamp.startsWith(prefix))) {
+    return null;
+  }
+
+  return withoutTimestamp.length > 320
+    ? `${withoutTimestamp.slice(0, 320)}...`
+    : withoutTimestamp;
+};
+
+const readStreamText = async (
+  stream: ReadableStream<Uint8Array> | null | undefined,
+  onLine?: (line: string) => void,
+): Promise<string> => {
+  if (!stream) return "";
+
+  const reader = stream.getReader();
+  const decoder = new TextDecoder();
+  let text = "";
+  let lineBuffer = "";
+
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+
+    const chunk = decoder.decode(value, { stream: true });
+    text += chunk;
+
+    if (onLine) {
+      lineBuffer += chunk;
+      const lines = lineBuffer.split(/\r?\n/);
+      lineBuffer = lines.pop() ?? "";
+      for (const line of lines) onLine(line);
+    }
+  }
+
+  const finalChunk = decoder.decode();
+  if (finalChunk) {
+    text += finalChunk;
+    if (onLine) lineBuffer += finalChunk;
+  }
+
+  if (onLine && lineBuffer.trim()) {
+    onLine(lineBuffer);
+  }
+
+  return text;
+};
+
 export async function runPythonModel(
   modelType: string,
   params: Record<string, unknown>,
   timeoutMs?: number,
+  progressReporter?: ModelProgressReporter,
 ): Promise<unknown> {
   const pythonExec = resolvePythonExecutable();
 
@@ -890,6 +973,14 @@ export async function runPythonModel(
   const command = process.platform !== "win32" && SETSID_PATH
     ? [SETSID_PATH, pythonExec, scriptPath, ...fullArgs]
     : [pythonExec, scriptPath, ...fullArgs];
+
+  reportModelProgress(progressReporter, {
+    type: "phase",
+    phase: "python_start",
+    percent: 24,
+    source: "backend",
+    message: `已启动 ${modelType.toUpperCase()} Python 训练进程`,
+  });
 
   const proc = Bun.spawn(command, {
     cwd: PY_DIR,
@@ -928,12 +1019,33 @@ export async function runPythonModel(
 
   const executionPromise = new Promise<unknown>(async (resolve, reject) => {
     try {
+      let pythonLogProgress = 26;
       const [stdout, stderr] = await Promise.all([
-        new Response(proc.stdout).text(),
-        new Response(proc.stderr).text(),
+        readStreamText(proc.stdout),
+        readStreamText(proc.stderr, (line) => {
+          const message = sanitizePythonProgressLine(line);
+          if (!message) return;
+
+          pythonLogProgress = Math.min(86, pythonLogProgress + 2);
+          reportModelProgress(progressReporter, {
+            type: "log",
+            phase: "python_training",
+            percent: pythonLogProgress,
+            source: "python",
+            message,
+          });
+        }),
       ]);
 
       await proc.exited;
+
+      reportModelProgress(progressReporter, {
+        type: "phase",
+        phase: "python_finished",
+        percent: 88,
+        source: "backend",
+        message: `${modelType.toUpperCase()} Python 训练进程已结束，正在解析结果`,
+      });
 
       if (proc.exitCode !== 0) {
         // 截断日志，避免泄露完整数据
@@ -1048,7 +1160,19 @@ export function transformTrainingResult(
   return finalResponse;
 }
 
-export async function trainModel(modelType: ModelType, studentId: number, body: TrainInput) {
+export async function trainModel(
+  modelType: ModelType,
+  studentId: number,
+  body: TrainInput,
+  progressReporter?: ModelProgressReporter,
+) {
+  reportModelProgress(progressReporter, {
+    type: "phase",
+    phase: "validate",
+    percent: 4,
+    source: "backend",
+    message: "正在校验实验状态、模型参数和数据窗口",
+  });
   const experiment = await assertExperimentModelAccess(body.experiment_id, studentId);
   assertTrainingRequestMatchesExperiment(experiment, body);
   const trainingConfig = getExperimentTrainingConfig(experiment);
@@ -1062,9 +1186,23 @@ export async function trainModel(modelType: ModelType, studentId: number, body: 
     const baseModelArtifactMap = buildAvailableBaseModelArtifactMap(body.experiment_id, studentId, body.models);
     if (Object.keys(baseModelArtifactMap).length > 0) {
       derivedModelParams.baseModelFiles = JSON.stringify(baseModelArtifactMap);
+      reportModelProgress(progressReporter, {
+        type: "phase",
+        phase: "reuse_artifacts",
+        percent: 9,
+        source: "backend",
+        message: "已找到可复用的基础模型产物，融合训练将优先复用这些结果",
+      });
     }
   }
 
+  reportModelProgress(progressReporter, {
+    type: "phase",
+    phase: "load_data",
+    percent: 12,
+    source: "backend",
+    message: `正在加载 ${trainingConfig.selected_industry} / ${trainingConfig.selected_company} / ${trainingConfig.selected_product} 的实验数据`,
+  });
   const allData = await loadDatasetFromDb(
     trainingConfig.selected_industry,
     trainingConfig.selected_company,
@@ -1077,6 +1215,14 @@ export async function trainModel(modelType: ModelType, studentId: number, body: 
   ) {
     throw new ModelValidationError("数据窗口索引超出范围", { dataset_size: allData.length });
   }
+
+  reportModelProgress(progressReporter, {
+    type: "phase",
+    phase: "prepare_python_params",
+    percent: 18,
+    source: "backend",
+    message: "实验数据已加载，正在准备 Python 训练参数",
+  });
 
   const modelSaveLoc = getBacktestModelPath(body.experiment_id, studentId, modelType);
 
@@ -1103,9 +1249,23 @@ export async function trainModel(modelType: ModelType, studentId: number, body: 
   }
 
   const timeout = TRAINING_TIMEOUT;
-  const result = (await runPythonModel(modelType, pythonParams, timeout)) as Record<string, unknown>;
+  const result = (await runPythonModel(modelType, pythonParams, timeout, progressReporter)) as Record<string, unknown>;
+  reportModelProgress(progressReporter, {
+    type: "phase",
+    phase: "invalidate_production_artifact",
+    percent: 92,
+    source: "backend",
+    message: "训练结果已生成，正在更新模型产物状态",
+  });
   invalidateProductionArtifact(body.experiment_id, studentId, modelType);
 
+  reportModelProgress(progressReporter, {
+    type: "phase",
+    phase: "transform_result",
+    percent: 96,
+    source: "backend",
+    message: "正在整理评估指标、预测值和模型元数据",
+  });
   return transformTrainingResult(modelType, result);
 }
 

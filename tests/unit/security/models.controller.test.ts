@@ -104,6 +104,15 @@ const requestJson = async (path: string, body: Record<string, unknown>) => {
   });
 };
 
+const readNdjson = async (response: Response) => {
+  const text = await response.text();
+  return text
+    .trim()
+    .split(/\n+/)
+    .filter(Boolean)
+    .map((line) => JSON.parse(line));
+};
+
 describe("models controller", () => {
   beforeEach(() => {
     trainModel.mockReset();
@@ -273,6 +282,43 @@ describe("models controller", () => {
     expect(trainModel).toHaveBeenCalledWith("lstm", 20240002, expect.objectContaining({
       lstmFeatures: JSON.stringify(["价格指数", "外部,指标"]),
     }));
+  });
+
+  test("streams training progress and the final result", async () => {
+    trainModel.mockImplementationOnce(async (_modelType, _studentId, _body, reportProgress) => {
+      reportProgress?.({
+        type: "phase",
+        phase: "python_training",
+        percent: 50,
+        source: "python",
+        message: "正在执行 Python 训练",
+      });
+      return {
+        status: "success",
+        results: { metrics: { rmse: 2, mae: 1.5, r2: 0.8 } },
+      };
+    });
+
+    const response = await requestJson("/api/v1/models/ma/training/stream", buildTrainBody());
+    const events = await readNdjson(response);
+
+    expect(response.status).toBe(200);
+    expect(response.headers.get("content-type")).toContain("application/x-ndjson");
+    expect(events.some((event) => event.type === "progress" && event.phase === "queued")).toBe(true);
+    expect(events.some((event) => event.type === "phase" && event.message === "正在执行 Python 训练")).toBe(true);
+    expect(events.at(-1)).toEqual({
+      type: "result",
+      timestamp: expect.any(String),
+      data: {
+        status: "success",
+        results: { metrics: { rmse: 2, mae: 1.5, r2: 0.8 } },
+      },
+    });
+    expect(trainModel).toHaveBeenCalledWith("ma", 20240002, expect.objectContaining({
+      moving_average_window: 4,
+    }), expect.any(Function));
+    expect(releaseModelSlot).toHaveBeenCalledTimes(1);
+    expect(releaseModelExecutionLock).toHaveBeenCalledTimes(1);
   });
 
   test("returns localized field errors for missing moving-average params", async () => {
