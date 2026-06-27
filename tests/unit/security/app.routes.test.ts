@@ -154,6 +154,32 @@ describe("app route smoke tests", () => {
     });
   });
 
+  test("forbids assistants without assigned classes from reading the question bank", async () => {
+    const app = await getApp();
+    const token = await sign(
+      {
+        sub: 201,
+        role: "Assistant",
+        exp: Math.floor(Date.now() / 1000) + 3600,
+      },
+      "test-jwt-secret",
+    );
+
+    const response = await app.fetch(
+      new Request("http://localhost/api/v1/question-bank/questions", {
+        headers: { Authorization: `Bearer ${token}` },
+      }),
+    );
+
+    expect(response.status).toBe(403);
+    await expect(response.json()).resolves.toEqual({ error: "权限不足" });
+    expect(poolQueryMock).toHaveBeenCalledWith(
+      "SELECT 1 FROM class_assistants WHERE assistant_id = ? LIMIT 1",
+      [201],
+    );
+    expect(poolQueryMock.mock.calls.some(([sql]) => String(sql).includes("FROM question_bank"))).toBe(false);
+  });
+
   test("authenticated file responses include length metadata and support byte ranges", async () => {
     const app = await getApp();
     const uploadsDir = resolve(import.meta.dir, "../../../uploads/manuals");

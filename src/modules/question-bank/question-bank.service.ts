@@ -14,6 +14,8 @@ interface QuestionRow extends RowDataPacket {
   creator_name?: string;
 }
 
+interface AssignmentRow extends RowDataPacket { }
+
 type QuestionType = CreateQuestionInput["question_type"];
 type QuestionOptions = CreateQuestionInput["options"];
 
@@ -100,6 +102,14 @@ export async function getAllQuestions() {
       ORDER BY qb.question_id DESC`,
   );
   return questions.map((row) => normalizeQuestionRow(row, true));
+}
+
+export async function isAssistantAssignedToAnyClass(assistantId: number): Promise<boolean> {
+  const [[assignment]] = await pool.query<AssignmentRow[]>(
+    "SELECT 1 FROM class_assistants WHERE assistant_id = ? LIMIT 1",
+    [assistantId],
+  );
+  return Boolean(assignment);
 }
 
 export async function createQuestion(input: CreateQuestionInput, creatorId: number) {

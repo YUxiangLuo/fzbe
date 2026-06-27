@@ -1,5 +1,6 @@
 import { Hono } from "hono";
 import { zValidator } from "@hono/zod-validator";
+import { createMiddleware } from "hono/factory";
 import { jwtAuth, requireTeacherOrAssistant } from "../../middleware";
 import {
   createQuestionSchema,
@@ -8,6 +9,7 @@ import {
 } from "./question-bank.schema";
 import {
   getAllQuestions,
+  isAssistantAssignedToAnyClass,
   createQuestion,
   updateQuestion,
   deleteQuestion,
@@ -17,10 +19,27 @@ import type { JwtPayload } from "../../types";
 
 const questionBankController = new Hono();
 
+const requireQuestionBankAccess = createMiddleware(async (c, next) => {
+  const payload = c.get("jwtPayload") as JwtPayload | undefined;
+  if (!payload) {
+    return c.json({ error: "未授权" }, 401);
+  }
+
+  if (payload.role === "Assistant") {
+    const hasAssignedClass = await isAssistantAssignedToAnyClass(payload.sub);
+    if (!hasAssignedClass) {
+      return c.json({ error: "权限不足" }, 403);
+    }
+  }
+
+  await next();
+});
+
 questionBankController.get(
   "/api/v1/question-bank/questions",
   jwtAuth,
   requireTeacherOrAssistant,
+  requireQuestionBankAccess,
   async (c) => {
     try {
       const questions = await getAllQuestions();
@@ -35,6 +54,7 @@ questionBankController.post(
   "/api/v1/question-bank/questions",
   jwtAuth,
   requireTeacherOrAssistant,
+  requireQuestionBankAccess,
   zValidator("json", createQuestionSchema),
   async (c) => {
     try {
@@ -52,6 +72,7 @@ questionBankController.put(
   "/api/v1/question-bank/questions/:questionId",
   jwtAuth,
   requireTeacherOrAssistant,
+  requireQuestionBankAccess,
   zValidator("param", questionIdParamSchema),
   zValidator("json", updateQuestionSchema),
   async (c) => {
@@ -85,6 +106,7 @@ questionBankController.delete(
   "/api/v1/question-bank/questions/:questionId",
   jwtAuth,
   requireTeacherOrAssistant,
+  requireQuestionBankAccess,
   zValidator("param", questionIdParamSchema),
   async (c) => {
     try {
