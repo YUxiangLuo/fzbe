@@ -41,7 +41,7 @@ from subprocess_utils import (
 )
 
 MODEL_TYPE = "weighted_avg"
-METHOD_NAME = "验证残差MSE倒数加权融合"
+METHOD_NAME = "验证残差MSE倒数加权平均融合"
 FORECAST_STRATEGY = "validation_residual_mse_weighted_average"
 IMPLEMENTATION_NOTES = [
     "教科书组合预测常用逆方差或误差方差-协方差思想分配权重；当预测误差近似无偏时，MSE 与方差口径一致。",

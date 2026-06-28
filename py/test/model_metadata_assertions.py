@@ -25,7 +25,7 @@ EXPECTED_METHOD_METADATA = {
         "note_fragments": ("递归", "回退"),
     },
     "weighted_avg": {
-        "method_name": "验证残差MSE倒数加权融合",
+        "method_name": "验证残差MSE倒数加权平均融合",
         "forecast_strategy": "validation_residual_mse_weighted_average",
         "note_fragments": ("残差", "权重"),
     },
