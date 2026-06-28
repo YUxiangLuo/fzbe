@@ -29,9 +29,18 @@ const SLOT_FREE_REUSABLE_PRODUCTION_MODEL_TYPES = new Set<ModelType>(["ma", "es"
 
 type StreamSend = (event: object) => void;
 
+const TRAINING_STREAM_HEARTBEAT_INTERVAL_MS = 5000;
+
 const createNdjsonStreamResponse = (run: (send: StreamSend) => Promise<void>) => {
   const encoder = new TextEncoder();
   let closed = false;
+  let heartbeatTimer: ReturnType<typeof setInterval> | undefined;
+
+  const stopHeartbeat = () => {
+    if (!heartbeatTimer) return;
+    clearInterval(heartbeatTimer);
+    heartbeatTimer = undefined;
+  };
 
   const stream = new ReadableStream<Uint8Array>({
     start(controller) {
@@ -43,14 +52,28 @@ const createNdjsonStreamResponse = (run: (send: StreamSend) => Promise<void>) =>
           );
         } catch {
           closed = true;
+          stopHeartbeat();
         }
       };
+
+      heartbeatTimer = setInterval(() => {
+        if (closed) {
+          stopHeartbeat();
+          return;
+        }
+        send({
+          type: "heartbeat",
+          source: "backend",
+          message: "模型训练仍在进行中",
+        });
+      }, TRAINING_STREAM_HEARTBEAT_INTERVAL_MS);
 
       void (async () => {
         try {
           await run(send);
         } finally {
           closed = true;
+          stopHeartbeat();
           try {
             controller.close();
           } catch {
@@ -61,6 +84,7 @@ const createNdjsonStreamResponse = (run: (send: StreamSend) => Promise<void>) =>
     },
     cancel() {
       closed = true;
+      stopHeartbeat();
     },
   });
 
@@ -91,6 +115,9 @@ const normalizeTrainingStreamError = (error: unknown, modelType: ModelType) => {
   }
   if (err.message?.startsWith("[PYTHON_DATA]")) {
     return { status: 400, message: err.message.substring(14) };
+  }
+  if (err.message?.startsWith("Python 执行失败")) {
+    return { status: 500, message: `${modelType.toUpperCase()} 训练失败，请稍后重试` };
   }
 
   return {

@@ -891,22 +891,93 @@ const SUPPRESSED_PYTHON_PROGRESS_PREFIXES = [
   "Skipping non-numeric feature for subprocess model:",
 ];
 
+const PYTHON_PROGRESS_LOG_LINE_PATTERN = /^\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2},\d+\s+-\s+(DEBUG|INFO|WARNING|ERROR)\s+-\s+(.*)$/;
+
+const UNSAFE_PYTHON_PROGRESS_PATTERNS = [
+  /^Traceback \(most recent call last\):/,
+  /^File \".*\", line \d+/,
+  /^\^+$/,
+  /^(?:[A-Za-z_][\w.]*)(?:Error|Exception|Warning):/,
+  /\b(?:args|vars\(args\))\s*[:=]/i,
+  /\b--data\b/i,
+  /\bJSONDecodeError\b/i,
+  /\bsite-packages\b/i,
+  /\bvenv\b/i,
+  /\/(?:opt|root|home|usr|tmp)\//i,
+  /[A-Za-z]:\\/,
+];
+
+const SAFE_PYTHON_PROGRESS_PATTERNS = [
+  /^\[[^\]]+\]/,
+  /^✓\s/,
+  /^(?:数据划分|权重训练集|权重验证集|评估集|误差计算|权重归一化)[:：]/,
+  /^(?:训练|重新训练|复用|生成|计算|评估|预测|扩展horizon后生成|稳定性回退)\b/,
+  /^Round \d+ candidate /,
+  /^Final RMSE:/,
+  /^Model chain:/,
+  /^Entering training mode\.$/,
+  /^Starting (?:MA|ES|ARIMA|LSTM|model training|prediction|.*train_and_evaluate)/,
+  /^Data loaded successfully\./,
+  /^Validation passed:/,
+  /^Auto-selected /,
+  /^Using /,
+  /^Running auto_arima /,
+  /^Selected /,
+  /^Final selected order:/,
+  /^Model complexity:/,
+  /^Model converged successfully$/,
+  /^Model did not converge properly$/,
+  /^Forecasting \d+ steps/,
+  /^Fitting /,
+  /^Generated \d+ /,
+  /^Calculated residuals:/,
+  /^Evaluation metrics computed:/,
+  /^Training finished\./,
+  /^Prediction finished successfully$/,
+  /^Run finished successfully\.$/,
+  /^Training dataset created:/,
+  /^Creating autoregressive /,
+  /^Training (?:direct|autoregressive) LSTM model /,
+  /^Initial learning rate:/,
+  /^Model training completed$/,
+  /^Fitting preprocessor /,
+  /^No feature_types provided/,
+  /^Using provided feature_types/,
+  /^Resolved feature_types:/,
+  /^After d=/,
+  /^(?:Very small|Small) effective sample size /,
+  /^High parameter-to-sample ratio /,
+  /^Empty evaluation range/,
+];
+
 const sanitizePythonProgressLine = (line: string): string | null => {
   const trimmed = line.trim();
   if (!trimmed) return null;
 
-  const withoutTimestamp = trimmed.replace(
-    /^\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2},\d+\s+-\s+(?:DEBUG|INFO|WARNING|ERROR)\s+-\s+/,
-    "",
-  );
+  const logMatch = trimmed.match(PYTHON_PROGRESS_LOG_LINE_PATTERN);
+  const level = logMatch?.[1];
+  const message = logMatch?.[2]?.trim() ?? trimmed;
+  if (!message) return null;
 
-  if (SUPPRESSED_PYTHON_PROGRESS_PREFIXES.some((prefix) => withoutTimestamp.startsWith(prefix))) {
+  if (level === "DEBUG" || level === "ERROR") {
     return null;
   }
 
-  return withoutTimestamp.length > 320
-    ? `${withoutTimestamp.slice(0, 320)}...`
-    : withoutTimestamp;
+  if (SUPPRESSED_PYTHON_PROGRESS_PREFIXES.some((prefix) => message.startsWith(prefix))) {
+    return null;
+  }
+
+  if (UNSAFE_PYTHON_PROGRESS_PATTERNS.some((pattern) => pattern.test(message))) {
+    return null;
+  }
+
+  if (!SAFE_PYTHON_PROGRESS_PATTERNS.some((pattern) => pattern.test(message))) {
+    return null;
+  }
+
+  return message.length > 320
+    ? `${message.slice(0, 320)}...`
+    : message;
 };
 
 const readStreamText = async (
@@ -1057,7 +1128,7 @@ export async function runPythonModel(
         if (taggedError) {
           reject(taggedError);
         } else {
-          reject(new Error(`Python 执行失败: ${stderr}`));
+          reject(new Error("Python 执行失败"));
         }
       } else {
         try {

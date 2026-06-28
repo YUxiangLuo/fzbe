@@ -321,6 +321,28 @@ describe("models controller", () => {
     expect(releaseModelExecutionLock).toHaveBeenCalledTimes(1);
   });
 
+  test("does not expose raw Python stderr in training stream errors", async () => {
+    trainModel.mockRejectedValueOnce(new Error(
+      "Python 执行失败: Traceback (most recent call last): File \"/opt/fangzhen2/fzbe/py/src/models/ma.py\"",
+    ));
+
+    const response = await requestJson("/api/v1/models/ma/training/stream", buildTrainBody());
+    const events = await readNdjson(response);
+    const errorEvent = events.find((event) => event.type === "error");
+
+    expect(response.status).toBe(200);
+    expect(errorEvent).toEqual({
+      type: "error",
+      timestamp: expect.any(String),
+      status: 500,
+      message: "MA 训练失败，请稍后重试",
+    });
+    expect(JSON.stringify(events)).not.toContain("Traceback");
+    expect(JSON.stringify(events)).not.toContain("/opt/fangzhen2");
+    expect(releaseModelSlot).toHaveBeenCalledTimes(1);
+    expect(releaseModelExecutionLock).toHaveBeenCalledTimes(1);
+  });
+
   test("returns localized field errors for missing moving-average params", async () => {
     const body = buildTrainBody();
     delete (body as Partial<TrainInput>).moving_average_window;
