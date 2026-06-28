@@ -523,9 +523,32 @@ app.onError((err, c) => {
   return c.json({ error: "服务器内部错误" }, 500);
 });
 
+const longRunningModelPathPattern = /^\/api\/v1\/models\/[^/]+\/(training(?:\/stream)?|prepare-production|predict)$/;
+
+const resolveBunIdleTimeoutSeconds = () => {
+  const rawValue = process.env.BUN_IDLE_TIMEOUT_SECONDS?.trim() || "255";
+  const parsed = Number(rawValue);
+  if (!Number.isInteger(parsed) || parsed < 1 || parsed > 255) {
+    logger.warn(
+      { rawValue, fallback: 255 },
+      "Invalid BUN_IDLE_TIMEOUT_SECONDS; using 255 seconds",
+    );
+    return 255;
+  }
+  return parsed;
+};
+
 export const serverConfig = {
+  hostname: process.env.HOST?.trim() || "127.0.0.1",
   port: env.PORT,
-  fetch: app.fetch,
+  idleTimeout: resolveBunIdleTimeoutSeconds(),
+  fetch(request: Request, server: Bun.Server<undefined>) {
+    const { pathname } = new URL(request.url);
+    if (longRunningModelPathPattern.test(pathname)) {
+      server.timeout(request, 0);
+    }
+    return app.fetch(request);
+  },
   error(error: Error) {
     logger.error(
       { err: { message: error.message, stack: error.stack } },
