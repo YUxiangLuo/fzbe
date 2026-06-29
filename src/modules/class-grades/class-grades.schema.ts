@@ -55,7 +55,7 @@ export const gradeReportSchema = z.object({
     ctx.addIssue({
       code: z.ZodIssueCode.custom,
       path: ["grade"],
-      message: "标记为已评阅时必须填写报告得分",
+      message: "标记为已评分时必须填写报告得分",
     });
   }
 });

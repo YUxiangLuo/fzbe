@@ -534,7 +534,7 @@ export async function exportGradeCsv(classId: number) {
     const { expFlowScore, finalScore } = computeExperimentScores(scoreRow, weights);
     const val = (v: string) => isRejected ? "" : v;
     let statusText = "未提交";
-    if (row.report_status === "submitted") statusText = "已提交";
+    if (row.report_status === "submitted") statusText = "待评分";
     else if (row.report_status === "graded") statusText = "已评分";
     else if (row.report_status === "rejected") statusText = "已驳回";
 
@@ -567,7 +567,7 @@ export async function exportReportCsv(classId: number) {
 
   for (const row of reportRows) {
     let statusText = "未提交";
-    if (row.status === "submitted") statusText = "已提交";
+    if (row.status === "submitted") statusText = "待评分";
     else if (row.status === "graded") statusText = "已评分";
     else if (row.status === "rejected") statusText = "已驳回";
 
