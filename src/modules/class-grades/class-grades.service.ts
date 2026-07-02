@@ -4,6 +4,7 @@ import { access, copyFile, mkdtemp, rm, mkdir } from "node:fs/promises";
 import type { RowDataPacket, ResultSetHeader, Pool, PoolConnection } from "mysql2/promise";
 import { pool } from "../../config";
 import { EXP_FLOW_FIELDS, EXPERIMENT_GRADE_FIELDS, EXPERIMENT_GRADE_MUTABLE_FIELDS, type GradeReportInput, type UpdateGradeWeightsInput } from "./class-grades.schema";
+import type { AcademicTermQuery } from "../classes/classes.schema";
 
 const STEP_COUNT = 7;
 const EXPORTS_DIR = path.resolve(import.meta.dir, "../../../uploads", "exports");
@@ -24,13 +25,35 @@ type Queryable = Pool | PoolConnection;
 
 interface ClassRow extends RowDataPacket { teacher_id: number; }
 interface AssignmentRow extends RowDataPacket { }
-interface TeacherClassRow extends RowDataPacket { class_id: number; class_name: string; }
-interface AssistantClassRow extends RowDataPacket { class_id: number; class_name: string; }
+interface TeacherClassRow extends RowDataPacket { class_id: number; class_name: string; academic_year_start: number; semester: number; }
+interface AssistantClassRow extends RowDataPacket { class_id: number; class_name: string; academic_year_start: number; semester: number; }
 interface UserRoleRow extends RowDataPacket { role: string; }
+
+type AcademicTermFilter = AcademicTermQuery;
+
+const hasAcademicTermFilter = (
+  filter?: AcademicTermFilter,
+): filter is { academic_year_start: number; semester: number } =>
+  filter?.academic_year_start !== undefined && filter.semester !== undefined;
+
+const appendAcademicTermClause = (
+  clauses: string[],
+  values: Array<string | number>,
+  filter?: AcademicTermFilter,
+  alias = "c",
+) => {
+  if (!hasAcademicTermFilter(filter)) return;
+  clauses.push(`${alias}.academic_year_start = ?`);
+  values.push(filter.academic_year_start);
+  clauses.push(`${alias}.semester = ?`);
+  values.push(filter.semester);
+};
 
 export interface TeacherClassGradeSummary {
   class_id: number;
   class_name: string;
+  academic_year_start: number;
+  semester: number;
   total_students: number;
   graded_count: number;
   submitted_count: number;
@@ -362,6 +385,8 @@ export async function getGradeSummaries(classId: number) {
 function buildTeacherClassSummary(
   classId: number,
   className: string,
+  academicYearStart: number,
+  semester: number,
   gradeRows: Array<{ report_status: string | null; final_score: number | null }>,
 ): TeacherClassGradeSummary {
   const gradedCount = gradeRows.filter((row) => row.report_status === "graded").length;
@@ -379,6 +404,8 @@ function buildTeacherClassSummary(
   return {
     class_id: classId,
     class_name: className,
+    academic_year_start: academicYearStart,
+    semester,
     total_students: gradeRows.length,
     graded_count: gradedCount,
     submitted_count: submittedCount,
@@ -388,9 +415,16 @@ function buildTeacherClassSummary(
   };
 }
 
-const createEmptyTeacherClassSummary = (classId: number, className: string): TeacherClassGradeSummary => ({
+const createEmptyTeacherClassSummary = (
+  classId: number,
+  className: string,
+  academicYearStart: number,
+  semester: number,
+): TeacherClassGradeSummary => ({
   class_id: classId,
   class_name: className,
+  academic_year_start: academicYearStart,
+  semester,
   total_students: 0,
   graded_count: 0,
   submitted_count: 0,
@@ -399,21 +433,41 @@ const createEmptyTeacherClassSummary = (classId: number, className: string): Tea
   average_score: null,
 });
 
-async function buildClassGradeSummaries(classRows: Array<{ class_id: number; class_name: string }>) {
+async function buildClassGradeSummaries(
+  classRows: Array<{ class_id: number; class_name: string; academic_year_start: number; semester: number }>,
+) {
   const summaries = await Promise.all(
     classRows.map(async (classRow) => {
       try {
         const result = await getGradeSummaries(classRow.class_id);
-        if ("error" in result) return createEmptyTeacherClassSummary(classRow.class_id, classRow.class_name);
+        if ("error" in result) {
+          return createEmptyTeacherClassSummary(
+            classRow.class_id,
+            classRow.class_name,
+            classRow.academic_year_start,
+            classRow.semester,
+          );
+        }
 
         const summaryRows = result.data.map((row) => ({
           report_status: row.report_status ?? null,
           final_score: toNumberOrNull(row.final_score),
         }));
 
-        return buildTeacherClassSummary(classRow.class_id, classRow.class_name, summaryRows);
+        return buildTeacherClassSummary(
+          classRow.class_id,
+          classRow.class_name,
+          classRow.academic_year_start,
+          classRow.semester,
+          summaryRows,
+        );
       } catch {
-        return createEmptyTeacherClassSummary(classRow.class_id, classRow.class_name);
+        return createEmptyTeacherClassSummary(
+          classRow.class_id,
+          classRow.class_name,
+          classRow.academic_year_start,
+          classRow.semester,
+        );
       }
     }),
   );
@@ -421,7 +475,12 @@ async function buildClassGradeSummaries(classRows: Array<{ class_id: number; cla
   return summaries;
 }
 
-export async function getTeacherClassGradeSummaries(teacherId: number, userId: number, userRole: string) {
+export async function getTeacherClassGradeSummaries(
+  teacherId: number,
+  userId: number,
+  userRole: string,
+  termFilter?: AcademicTermFilter,
+) {
   if (userRole !== "Admin" && userId !== teacherId) return { error: "forbidden" as const };
 
   const [teacherRows] = await pool.query<UserRoleRow[]>(
@@ -430,19 +489,36 @@ export async function getTeacherClassGradeSummaries(teacherId: number, userId: n
   );
   if (teacherRows.length === 0) return { error: "not_teacher" as const };
 
+  const clauses = ["teacher_id = ?"];
+  const values: Array<string | number> = [teacherId];
+  appendAcademicTermClause(clauses, values, termFilter, "classes");
+
   const [classRows] = await pool.query<TeacherClassRow[]>(
-    "SELECT class_id, class_name FROM classes WHERE teacher_id = ? ORDER BY class_id ASC",
-    [teacherId],
+    `SELECT class_id, class_name, academic_year_start, semester
+       FROM classes
+      WHERE ${clauses.join(" AND ")}
+      ORDER BY academic_year_start DESC, semester DESC, class_id ASC`,
+    values,
   );
   if (classRows.length === 0) return { data: [] as TeacherClassGradeSummary[] };
 
   const summaries = await buildClassGradeSummaries(
-    classRows.map((row) => ({ class_id: row.class_id, class_name: row.class_name })),
+    classRows.map((row) => ({
+      class_id: row.class_id,
+      class_name: row.class_name,
+      academic_year_start: row.academic_year_start,
+      semester: row.semester,
+    })),
   );
   return { data: summaries };
 }
 
-export async function getAssistantClassGradeSummaries(assistantId: number, userId: number, userRole: string) {
+export async function getAssistantClassGradeSummaries(
+  assistantId: number,
+  userId: number,
+  userRole: string,
+  termFilter?: AcademicTermFilter,
+) {
   if (userRole !== "Admin" && userId !== assistantId) return { error: "forbidden" as const };
 
   const [assistantRows] = await pool.query<UserRoleRow[]>(
@@ -451,18 +527,27 @@ export async function getAssistantClassGradeSummaries(assistantId: number, userI
   );
   if (assistantRows.length === 0) return { error: "not_assistant" as const };
 
+  const clauses = ["ca.assistant_id = ?"];
+  const values: Array<string | number> = [assistantId];
+  appendAcademicTermClause(clauses, values, termFilter);
+
   const [classRows] = await pool.query<AssistantClassRow[]>(
-    `SELECT c.class_id, c.class_name
+    `SELECT c.class_id, c.class_name, c.academic_year_start, c.semester
        FROM class_assistants ca
        JOIN classes c ON c.class_id = ca.class_id
-      WHERE ca.assistant_id = ?
-      ORDER BY c.class_id ASC`,
-    [assistantId],
+      WHERE ${clauses.join(" AND ")}
+      ORDER BY c.academic_year_start DESC, c.semester DESC, c.class_id ASC`,
+    values,
   );
   if (classRows.length === 0) return { data: [] as TeacherClassGradeSummary[] };
 
   const summaries = await buildClassGradeSummaries(
-    classRows.map((row) => ({ class_id: row.class_id, class_name: row.class_name })),
+    classRows.map((row) => ({
+      class_id: row.class_id,
+      class_name: row.class_name,
+      academic_year_start: row.academic_year_start,
+      semester: row.semester,
+    })),
   );
   return { data: summaries };
 }

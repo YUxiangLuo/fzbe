@@ -2,6 +2,7 @@ import { Hono } from "hono";
 import { zValidator } from "@hono/zod-validator";
 import { jwtAuth, requireTeacher, requireAdmin } from "../../middleware";
 import {
+  academicTermQuerySchema,
   classIdParamSchema,
   teacherIdParamSchema,
   assistantIdParamSchema,
@@ -24,6 +25,12 @@ import type { JwtPayload } from "../../types";
 
 const classesController = new Hono();
 
+const normalizeOptionalBodyValue = (value: unknown) => {
+  if (typeof value !== "string") return undefined;
+  const trimmed = value.trim();
+  return trimmed.length > 0 ? trimmed : undefined;
+};
+
 classesController.post("/api/v1/classes", jwtAuth, requireTeacher, async (c) => {
   try {
     const payload = c.get("jwtPayload") as JwtPayload;
@@ -37,11 +44,21 @@ classesController.post("/api/v1/classes", jwtAuth, requireTeacher, async (c) => 
       return c.json({ error: "班级名称不能为空" }, 400);
     }
 
+    const termValidation = academicTermQuerySchema.safeParse({
+      academic_year_start: normalizeOptionalBodyValue(body["academic_year_start"]),
+      semester: normalizeOptionalBodyValue(body["semester"]),
+    });
+    if (!termValidation.success) {
+      return c.json({ error: termValidation.error.issues[0]?.message ?? "学年学期参数无效" }, 400);
+    }
+
     const result = await createClass(
       className,
       typeof classCode === "string" ? classCode : null,
       payload.sub,
       studentListFile instanceof File ? studentListFile : undefined,
+      termValidation.data.academic_year_start,
+      termValidation.data.semester,
     );
 
     if ("error" in result) {
@@ -145,11 +162,13 @@ classesController.get(
   "/api/v1/teachers/:teacherId/classes",
   jwtAuth,
   zValidator("param", teacherIdParamSchema),
+  zValidator("query", academicTermQuerySchema),
   async (c) => {
     try {
       const payload = c.get("jwtPayload") as JwtPayload;
       const { teacherId } = c.req.valid("param");
-      const result = await getClassesByTeacher(parseInt(teacherId, 10), payload.sub, payload.role);
+      const termFilter = c.req.valid("query");
+      const result = await getClassesByTeacher(parseInt(teacherId, 10), payload.sub, payload.role, termFilter);
 
       if ("error" in result) {
         if (result.error === "forbidden") return c.json({ error: "权限不足" }, 403);
@@ -167,15 +186,18 @@ classesController.get(
   "/api/v1/teachers/:teacherId/assistants/:assistantId/classes",
   jwtAuth,
   zValidator("param", teacherAssistantParamSchema),
+  zValidator("query", academicTermQuerySchema),
   async (c) => {
     try {
       const payload = c.get("jwtPayload") as JwtPayload;
       const { teacherId, assistantId } = c.req.valid("param");
+      const termFilter = c.req.valid("query");
       const result = await getClassesByTeacherAssistant(
         parseInt(teacherId, 10),
         parseInt(assistantId, 10),
         payload.sub,
         payload.role,
+        termFilter,
       );
 
       if ("error" in result) {
@@ -195,11 +217,13 @@ classesController.get(
   "/api/v1/assistants/:assistantId/classes",
   jwtAuth,
   zValidator("param", assistantIdParamSchema),
+  zValidator("query", academicTermQuerySchema),
   async (c) => {
     try {
       const payload = c.get("jwtPayload") as JwtPayload;
       const { assistantId } = c.req.valid("param");
-      const result = await getClassesByAssistant(parseInt(assistantId, 10), payload.sub, payload.role);
+      const termFilter = c.req.valid("query");
+      const result = await getClassesByAssistant(parseInt(assistantId, 10), payload.sub, payload.role, termFilter);
 
       if ("error" in result) {
         if (result.error === "forbidden") return c.json({ error: "权限不足" }, 403);

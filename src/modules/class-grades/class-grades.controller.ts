@@ -2,6 +2,7 @@ import { Hono } from "hono";
 import { zValidator } from "@hono/zod-validator";
 import { jwtAuth } from "../../middleware";
 import { classIdParamSchema, teacherIdParamSchema, assistantIdParamSchema, reportIdParamSchema, gradeReportSchema, updateGradeWeightsSchema } from "./class-grades.schema";
+import { academicTermQuerySchema } from "../classes/classes.schema";
 import { checkClassAccess, getClassReports, gradeReport, getClassExperimentRuns, getGradingPolicy, updateGradingPolicy, getGradeSummaries, getTeacherClassGradeSummaries, getAssistantClassGradeSummaries, exportReportArchive, exportGradeCsv, exportReportCsv, getExperimentEvents } from "./class-grades.service";
 import { handleUnexpectedError } from "../../utils/error-handler";
 import type { JwtPayload } from "../../types";
@@ -89,11 +90,12 @@ classGradesController.get("/api/v1/classes/:classId/grade-summaries", jwtAuth, z
   } catch (error) { return handleUnexpectedError(c, error, "获取最新成绩失败"); }
 });
 
-classGradesController.get("/api/v1/teachers/:teacherId/grade-summaries", jwtAuth, zValidator("param", teacherIdParamSchema), async (c) => {
+classGradesController.get("/api/v1/teachers/:teacherId/grade-summaries", jwtAuth, zValidator("param", teacherIdParamSchema), zValidator("query", academicTermQuerySchema), async (c) => {
   try {
     const payload = c.get("jwtPayload") as JwtPayload;
     const { teacherId } = c.req.valid("param");
-    const result = await getTeacherClassGradeSummaries(parseInt(teacherId, 10), payload.sub, payload.role);
+    const termFilter = c.req.valid("query");
+    const result = await getTeacherClassGradeSummaries(parseInt(teacherId, 10), payload.sub, payload.role, termFilter);
     if ("error" in result) {
       if (result.error === "forbidden") return c.json({ error: "权限不足" }, 403);
       return c.json({ error: "目标用户不是教师" }, 404);
@@ -102,11 +104,12 @@ classGradesController.get("/api/v1/teachers/:teacherId/grade-summaries", jwtAuth
   } catch (error) { return handleUnexpectedError(c, error, "获取班级成绩汇总失败"); }
 });
 
-classGradesController.get("/api/v1/assistants/:assistantId/grade-summaries", jwtAuth, zValidator("param", assistantIdParamSchema), async (c) => {
+classGradesController.get("/api/v1/assistants/:assistantId/grade-summaries", jwtAuth, zValidator("param", assistantIdParamSchema), zValidator("query", academicTermQuerySchema), async (c) => {
   try {
     const payload = c.get("jwtPayload") as JwtPayload;
     const { assistantId } = c.req.valid("param");
-    const result = await getAssistantClassGradeSummaries(parseInt(assistantId, 10), payload.sub, payload.role);
+    const termFilter = c.req.valid("query");
+    const result = await getAssistantClassGradeSummaries(parseInt(assistantId, 10), payload.sub, payload.role, termFilter);
     if ("error" in result) {
       if (result.error === "forbidden") return c.json({ error: "权限不足" }, 403);
       return c.json({ error: "目标用户不是助教" }, 404);

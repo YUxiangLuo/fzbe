@@ -29,10 +29,13 @@ CREATE TABLE IF NOT EXISTS `classes` (
   `class_id` INT AUTO_INCREMENT PRIMARY KEY,
   `class_name` VARCHAR(255) NOT NULL,
   `class_code` VARCHAR(255) UNIQUE,
+  `academic_year_start` SMALLINT UNSIGNED NOT NULL DEFAULT 2025,
+  `semester` TINYINT UNSIGNED NOT NULL DEFAULT 1,
   `teacher_id` INT NULL,
   `created_at` TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
   FOREIGN KEY (`teacher_id`) REFERENCES `users`(`user_id`) ON DELETE SET NULL,
-  INDEX `idx_teacher_id` (`teacher_id`)
+  INDEX `idx_teacher_id` (`teacher_id`),
+  INDEX `idx_teacher_academic_term` (`teacher_id`, `academic_year_start`, `semester`)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
 CREATE TABLE IF NOT EXISTS `enrollments` (
