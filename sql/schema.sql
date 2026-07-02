@@ -25,14 +25,29 @@ CREATE TABLE IF NOT EXISTS `users` (
   FULLTEXT INDEX `ft_user_search` (`full_name`, `email`, `phone_number`)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
+CREATE TABLE IF NOT EXISTS `academic_terms` (
+  `term_id` INT AUTO_INCREMENT PRIMARY KEY,
+  `academic_year` VARCHAR(20) NOT NULL,
+  `semester` TINYINT UNSIGNED NOT NULL,
+  `is_active` BOOLEAN NOT NULL DEFAULT false,
+  `created_at` TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  UNIQUE KEY `academic_year_semester_unique` (`academic_year`, `semester`),
+  INDEX `idx_academic_terms_active` (`is_active`),
+  CONSTRAINT `chk_academic_terms_semester` CHECK (`semester` IN (1, 2))
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
 CREATE TABLE IF NOT EXISTS `classes` (
   `class_id` INT AUTO_INCREMENT PRIMARY KEY,
   `class_name` VARCHAR(255) NOT NULL,
   `class_code` VARCHAR(255) UNIQUE,
   `teacher_id` INT NULL,
+  `term_id` INT NOT NULL,
   `created_at` TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
   FOREIGN KEY (`teacher_id`) REFERENCES `users`(`user_id`) ON DELETE SET NULL,
-  INDEX `idx_teacher_id` (`teacher_id`)
+  FOREIGN KEY (`term_id`) REFERENCES `academic_terms`(`term_id`) ON DELETE RESTRICT,
+  INDEX `idx_teacher_id` (`teacher_id`),
+  INDEX `idx_classes_term_id` (`term_id`),
+  INDEX `idx_classes_teacher_term` (`teacher_id`, `term_id`)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
 CREATE TABLE IF NOT EXISTS `enrollments` (

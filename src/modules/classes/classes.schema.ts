@@ -20,15 +20,17 @@ export const teacherAssistantParamSchema = z.object({
 export const createClassSchema = z.object({
   class_name: z.string().min(1),
   class_code: z.string().optional(),
+  term_id: z.coerce.number().int().positive().optional(),
 });
 
 export const updateClassSchema = z
   .object({
     class_name: z.string().min(1).optional(),
     class_code: z.string().optional(),
+    term_id: z.coerce.number().int().positive().optional(),
   })
-  .refine((data) => data.class_name !== undefined || data.class_code !== undefined, {
-    message: "至少需要提供一个字段 (class_name 或 class_code)",
+  .refine((data) => data.class_name !== undefined || data.class_code !== undefined || data.term_id !== undefined, {
+    message: "至少需要提供一个字段 (class_name、class_code 或 term_id)",
   });
 
 export type ClassIdParam = z.infer<typeof classIdParamSchema>;

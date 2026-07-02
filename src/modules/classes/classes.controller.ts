@@ -19,10 +19,17 @@ import {
   getClassesByAssistant,
   FileValidationError,
 } from "./classes.service";
+import { resolveAcademicTermId } from "../academic-terms";
 import { handleUnexpectedError } from "../../utils/error-handler";
 import type { JwtPayload } from "../../types";
 
 const classesController = new Hono();
+
+async function parseTermFilter(rawTermId: string | undefined | null) {
+  const result = await resolveAcademicTermId(rawTermId);
+  if ("error" in result) return result;
+  return { termId: result.termId };
+}
 
 classesController.post("/api/v1/classes", jwtAuth, requireTeacher, async (c) => {
   try {
@@ -30,6 +37,7 @@ classesController.post("/api/v1/classes", jwtAuth, requireTeacher, async (c) => 
     const body = await c.req.parseBody();
     const className = body["class_name"];
     const classCode = body["class_code"];
+    const rawTermId = body["term_id"];
     // Backward-compatible field support: FE currently uses `students_file`.
     const studentListFile = body["student_list"] ?? body["students_file"];
 
@@ -37,11 +45,21 @@ classesController.post("/api/v1/classes", jwtAuth, requireTeacher, async (c) => 
       return c.json({ error: "班级名称不能为空" }, 400);
     }
 
+    let termId: number | undefined;
+    if (typeof rawTermId === "string" && rawTermId.trim()) {
+      const parsed = Number(rawTermId);
+      if (!Number.isInteger(parsed) || parsed <= 0) {
+        return c.json({ error: "学期 ID 无效" }, 400);
+      }
+      termId = parsed;
+    }
+
     const result = await createClass(
       className,
       typeof classCode === "string" ? classCode : null,
       payload.sub,
       studentListFile instanceof File ? studentListFile : undefined,
+      termId,
     );
 
     if ("error" in result) {
@@ -61,7 +79,12 @@ classesController.post("/api/v1/classes", jwtAuth, requireTeacher, async (c) => 
 
 classesController.get("/api/v1/classes", jwtAuth, requireAdmin, async (c) => {
   try {
-    const classes = await getAllClasses();
+    const termFilter = await parseTermFilter(c.req.query("term_id"));
+    if ("error" in termFilter) {
+      if (termFilter.error === "no_current_term") return c.json({ error: "当前学期未设置" }, 404);
+      return c.json({ error: "学期不存在" }, 400);
+    }
+    const classes = await getAllClasses(termFilter.termId);
     return c.json(classes);
   } catch (error) {
     return handleUnexpectedError(c, error, "获取班级列表失败");
@@ -109,6 +132,7 @@ classesController.put(
         if (result.error === "not_found") return c.json({ error: "班级不存在" }, 404);
         if (result.error === "forbidden") return c.json({ error: "权限不足" }, 403);
         if (result.error === "duplicate") return c.json({ error: "班级代码已存在" }, 409);
+        if (result.error === "invalid_term") return c.json({ error: "学期不存在" }, 400);
         return c.json({ error: "没有需要更新的字段" }, 400);
       }
 
@@ -149,7 +173,12 @@ classesController.get(
     try {
       const payload = c.get("jwtPayload") as JwtPayload;
       const { teacherId } = c.req.valid("param");
-      const result = await getClassesByTeacher(parseInt(teacherId, 10), payload.sub, payload.role);
+      const termFilter = await parseTermFilter(c.req.query("term_id"));
+      if ("error" in termFilter) {
+        if (termFilter.error === "no_current_term") return c.json({ error: "当前学期未设置" }, 404);
+        return c.json({ error: "学期不存在" }, 400);
+      }
+      const result = await getClassesByTeacher(parseInt(teacherId, 10), payload.sub, payload.role, termFilter.termId);
 
       if ("error" in result) {
         if (result.error === "forbidden") return c.json({ error: "权限不足" }, 403);
@@ -171,11 +200,17 @@ classesController.get(
     try {
       const payload = c.get("jwtPayload") as JwtPayload;
       const { teacherId, assistantId } = c.req.valid("param");
+      const termFilter = await parseTermFilter(c.req.query("term_id"));
+      if ("error" in termFilter) {
+        if (termFilter.error === "no_current_term") return c.json({ error: "当前学期未设置" }, 404);
+        return c.json({ error: "学期不存在" }, 400);
+      }
       const result = await getClassesByTeacherAssistant(
         parseInt(teacherId, 10),
         parseInt(assistantId, 10),
         payload.sub,
         payload.role,
+        termFilter.termId,
       );
 
       if ("error" in result) {
@@ -199,7 +234,12 @@ classesController.get(
     try {
       const payload = c.get("jwtPayload") as JwtPayload;
       const { assistantId } = c.req.valid("param");
-      const result = await getClassesByAssistant(parseInt(assistantId, 10), payload.sub, payload.role);
+      const termFilter = await parseTermFilter(c.req.query("term_id"));
+      if ("error" in termFilter) {
+        if (termFilter.error === "no_current_term") return c.json({ error: "当前学期未设置" }, 404);
+        return c.json({ error: "学期不存在" }, 400);
+      }
+      const result = await getClassesByAssistant(parseInt(assistantId, 10), payload.sub, payload.role, termFilter.termId);
 
       if ("error" in result) {
         if (result.error === "forbidden") return c.json({ error: "权限不足" }, 403);

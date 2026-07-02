@@ -1,5 +1,5 @@
 import mysql from "mysql2/promise";
-import type { Connection } from "mysql2/promise";
+import type { Connection, RowDataPacket } from "mysql2/promise";
 
 type ExperimentStatusValue = "Completed" | "In Progress";
 type ReportStatusValue = "submitted" | "graded" | "rejected";
@@ -13,6 +13,10 @@ interface UserSeed {
   email: string;
   role: "Teacher" | "Assistant" | "Student";
   phoneNumber: string | null;
+}
+
+interface CurrentTermRow extends RowDataPacket {
+  term_id: number;
 }
 
 interface GradeFixture {
@@ -785,10 +789,18 @@ async function insertUsers(conn: Connection) {
 }
 
 async function insertClasses(conn: Connection) {
+  const [[currentTerm]] = await conn.query<CurrentTermRow[]>(
+    "SELECT term_id FROM academic_terms WHERE is_active = TRUE ORDER BY term_id DESC LIMIT 1",
+  );
+  const termId = Number(currentTerm?.term_id ?? 0);
+  if (!termId) {
+    throw new Error("Current academic term is missing. Run the academic term migration or db reset first.");
+  }
+
   for (const classSeed of CLASSES) {
     await conn.query(
-      "INSERT INTO classes (class_id, class_name, class_code, teacher_id) VALUES (?, ?, ?, ?)",
-      [classSeed.classId, classSeed.className, classSeed.classCode, TEACHER.userId],
+      "INSERT INTO classes (class_id, class_name, class_code, teacher_id, term_id) VALUES (?, ?, ?, ?, ?)",
+      [classSeed.classId, classSeed.className, classSeed.classCode, TEACHER.userId, termId],
     );
     await conn.query(
       `INSERT INTO grade_weights (

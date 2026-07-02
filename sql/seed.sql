@@ -20,6 +20,7 @@ TRUNCATE TABLE `experiment_manuals`;
 TRUNCATE TABLE `class_assistants`;
 TRUNCATE TABLE `enrollments`;
 TRUNCATE TABLE `classes`;
+TRUNCATE TABLE `academic_terms`;
 TRUNCATE TABLE `users`;
 
 SET FOREIGN_KEY_CHECKS = 1;
@@ -30,6 +31,11 @@ SET FOREIGN_KEY_CHECKS = 1;
 
 INSERT INTO `users` (`user_id`, `username`, `password_hash`, `full_name`, `email`, `phone_number`, `role`, `created_at`) VALUES
 (1, 'admin', '$2b$10$DVZtxD9Efhm/j8.LSWMFx.hfdpk81iHO4Tv0fUaDr1LlW/mFrgXrG', '系统管理员', 'admin@university.edu', '010-1234-5678', 'Admin', '2024-01-01 09:00:00');
+
+INSERT INTO `academic_terms` (`term_id`, `academic_year`, `semester`, `is_active`) VALUES
+(1, '2025-2026', 2, TRUE),
+(2, '2025-2026', 1, FALSE),
+(3, '2026-2027', 1, FALSE);
 
 -- ========================================================
 -- 2. Question Bank
@@ -400,13 +406,13 @@ INSERT INTO users (user_id, username, password_hash, full_name, email, phone_num
 (20241301, '20240300', '$2b$10$wz0v1DLwOe.h5t79JfO9zu1iIgLaaVJ76UCcnzpD39J0UL.eClcL6', '薛博', '20240300@student.test.com', NULL, 'Student');
 
 -- Classes
-INSERT INTO classes (class_id, class_name, class_code, teacher_id) VALUES
-(1, '计算机科学与技术2501', 'C17652574433451', 101),
-(2, '计算机科学与技术2502', 'C17652574457032', 101),
-(3, '人工智能2501', 'C17652574480553', 102),
-(4, '人工智能2502', 'C17652574503984', 102),
-(5, '数据科学2501', 'C17652574527335', 103),
-(6, '数据科学2502', 'C17652574550736', 103);
+INSERT INTO classes (class_id, class_name, class_code, teacher_id, term_id) VALUES
+(1, '计算机科学与技术2501', 'C17652574433451', 101, 1),
+(2, '计算机科学与技术2502', 'C17652574457032', 101, 1),
+(3, '人工智能2501', 'C17652574480553', 102, 1),
+(4, '人工智能2502', 'C17652574503984', 102, 1),
+(5, '数据科学2501', 'C17652574527335', 103, 1),
+(6, '数据科学2502', 'C17652574550736', 103, 1);
 
 -- Grade Weights
 INSERT INTO grade_weights (class_id) VALUES
@@ -719,4 +725,3 @@ INSERT INTO enrollments (student_id, class_id) VALUES
 (20241299, 6),
 (20241300, 6),
 (20241301, 6);
-

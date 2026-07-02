@@ -4,9 +4,16 @@ import { jwtAuth } from "../../middleware";
 import { classIdParamSchema, teacherIdParamSchema, assistantIdParamSchema, reportIdParamSchema, gradeReportSchema, updateGradeWeightsSchema } from "./class-grades.schema";
 import { checkClassAccess, getClassReports, gradeReport, getClassExperimentRuns, getGradingPolicy, updateGradingPolicy, getGradeSummaries, getTeacherClassGradeSummaries, getAssistantClassGradeSummaries, exportReportArchive, exportGradeCsv, exportReportCsv, getExperimentEvents } from "./class-grades.service";
 import { handleUnexpectedError } from "../../utils/error-handler";
+import { resolveAcademicTermId } from "../academic-terms";
 import type { JwtPayload } from "../../types";
 
 const classGradesController = new Hono();
+
+async function parseTermFilter(rawTermId: string | undefined | null) {
+  const result = await resolveAcademicTermId(rawTermId);
+  if ("error" in result) return result;
+  return { termId: result.termId };
+}
 
 classGradesController.get("/api/v1/classes/:classId/reports", jwtAuth, zValidator("param", classIdParamSchema), async (c) => {
   try {
@@ -93,7 +100,12 @@ classGradesController.get("/api/v1/teachers/:teacherId/grade-summaries", jwtAuth
   try {
     const payload = c.get("jwtPayload") as JwtPayload;
     const { teacherId } = c.req.valid("param");
-    const result = await getTeacherClassGradeSummaries(parseInt(teacherId, 10), payload.sub, payload.role);
+    const termFilter = await parseTermFilter(c.req.query("term_id"));
+    if ("error" in termFilter) {
+      if (termFilter.error === "no_current_term") return c.json({ error: "当前学期未设置" }, 404);
+      return c.json({ error: "学期不存在" }, 400);
+    }
+    const result = await getTeacherClassGradeSummaries(parseInt(teacherId, 10), payload.sub, payload.role, termFilter.termId);
     if ("error" in result) {
       if (result.error === "forbidden") return c.json({ error: "权限不足" }, 403);
       return c.json({ error: "目标用户不是教师" }, 404);
@@ -106,7 +118,12 @@ classGradesController.get("/api/v1/assistants/:assistantId/grade-summaries", jwt
   try {
     const payload = c.get("jwtPayload") as JwtPayload;
     const { assistantId } = c.req.valid("param");
-    const result = await getAssistantClassGradeSummaries(parseInt(assistantId, 10), payload.sub, payload.role);
+    const termFilter = await parseTermFilter(c.req.query("term_id"));
+    if ("error" in termFilter) {
+      if (termFilter.error === "no_current_term") return c.json({ error: "当前学期未设置" }, 404);
+      return c.json({ error: "学期不存在" }, 400);
+    }
+    const result = await getAssistantClassGradeSummaries(parseInt(assistantId, 10), payload.sub, payload.role, termFilter.termId);
     if ("error" in result) {
       if (result.error === "forbidden") return c.json({ error: "权限不足" }, 403);
       return c.json({ error: "目标用户不是助教" }, 404);

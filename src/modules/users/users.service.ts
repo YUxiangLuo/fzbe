@@ -458,16 +458,28 @@ export async function batchCreateAssistants(file: File, password: unknown) {
   }
 }
 
-export async function getTeacherAssistants(teacherId: number) {
+export async function getTeacherAssistants(teacherId: number, termId?: number) {
   const [teacherRows] = await pool.query<UserRow[]>(
     "SELECT role FROM users WHERE user_id = ? AND role = 'Teacher'",
     [teacherId],
   );
   if (teacherRows.length === 0) return { error: "not_teacher" as const };
 
+  const conditions = ["c.teacher_id = ?", "u.role = 'Assistant'"];
+  const values: unknown[] = [teacherId];
+  if (termId !== undefined) {
+    conditions.push("c.term_id = ?");
+    values.push(termId);
+  }
+
   const [rows] = await pool.query<RowDataPacket[]>(
-    "SELECT DISTINCT u.user_id, u.username, u.full_name, u.email, u.phone_number FROM users u JOIN class_assistants ca ON u.user_id = ca.assistant_id JOIN classes c ON ca.class_id = c.class_id WHERE c.teacher_id = ? AND u.role = 'Assistant'",
-    [teacherId],
+    `SELECT DISTINCT u.user_id, u.username, u.full_name, u.email, u.phone_number
+       FROM users u
+       JOIN class_assistants ca ON u.user_id = ca.assistant_id
+       JOIN classes c ON ca.class_id = c.class_id
+      WHERE ${conditions.join(" AND ")}
+      ORDER BY u.user_id DESC`,
+    values,
   );
   return { data: rows };
 }

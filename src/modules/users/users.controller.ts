@@ -14,8 +14,15 @@ import {
   getUnenrolledStudents, getCurrentUser, updateCurrentUser, changePassword, getUserById, adminChangePassword,
   resetStudentPassword, deleteUser, batchDeleteUsers
 } from "./users.service";
+import { resolveAcademicTermId } from "../academic-terms";
 
 const usersController = new Hono();
+
+async function parseTermFilter(rawTermId: string | undefined | null) {
+  const result = await resolveAcademicTermId(rawTermId);
+  if ("error" in result) return result;
+  return { termId: result.termId };
+}
 
 usersController.post("/api/v1/users/register/:role", zValidator("param", roleParamSchema), async (c) => {
   try {
@@ -146,7 +153,12 @@ usersController.get("/api/v1/teachers/:teacherId/assistants", jwtAuth, zValidato
     const { teacherId } = c.req.valid("param");
     const teacherIdNumber = parseInt(teacherId, 10);
     if (payload.role !== "Admin" && payload.sub !== teacherIdNumber) return c.json({ error: "权限不足" }, 403);
-    const result = await getTeacherAssistants(teacherIdNumber);
+    const termFilter = await parseTermFilter(c.req.query("term_id"));
+    if ("error" in termFilter) {
+      if (termFilter.error === "no_current_term") return c.json({ error: "当前学期未设置" }, 404);
+      return c.json({ error: "学期不存在" }, 400);
+    }
+    const result = await getTeacherAssistants(teacherIdNumber, termFilter.termId);
     if ("error" in result) return c.json({ error: "目标用户不是教师" }, 404);
     return c.json(result.data);
   } catch (error) { return handleUnexpectedError(c, error, "获取教师的助教失败"); }

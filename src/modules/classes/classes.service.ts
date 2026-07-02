@@ -8,11 +8,17 @@ import { hashPassword } from "../../utils/password";
 import { USER_CONSTANTS, CSV_LIMITS } from "../../utils/constants";
 import { CsvEncodingError, parseCsvFileRows } from "../../utils/csv-processor";
 import type { UpdateClassInput } from "./classes.schema";
+import { getAcademicTermById, getDefaultClassTermId } from "../academic-terms";
 
 interface ClassRow extends RowDataPacket {
   class_id: number;
   class_name: string;
   class_code: string | null;
+  term_id: number;
+  academic_year: string;
+  semester: 1 | 2;
+  term_label: string;
+  is_current_term: number | boolean;
   teacher_id: number;
   teacher_name?: string;
   created_at: Date;
@@ -48,6 +54,24 @@ const { STUDENT_ID_REGEX, MIN_NAME_LENGTH, MAX_NAME_LENGTH } = USER_CONSTANTS;
 const isValidStudentId = (value: string) => STUDENT_ID_REGEX.test(value);
 const isValidFullName = (value: string) =>
   value.length >= MIN_NAME_LENGTH && value.length <= MAX_NAME_LENGTH;
+
+const CLASS_SELECT_FRAGMENT = `
+  SELECT c.*,
+         u.full_name as teacher_name,
+         at.academic_year,
+         at.semester,
+         CONCAT(at.academic_year, ' 第', at.semester, '学期') AS term_label,
+         at.is_active AS is_current_term
+    FROM classes c
+    JOIN users u ON c.teacher_id = u.user_id
+    JOIN academic_terms at ON at.term_id = c.term_id`;
+
+const appendTermFilter = (conditions: string[], values: unknown[], termId?: number) => {
+  if (termId !== undefined) {
+    conditions.push("c.term_id = ?");
+    values.push(termId);
+  }
+};
 
 export async function isAssistantAssignedToClass(classId: number, assistantId: number): Promise<boolean> {
   const [[assignment]] = await pool.query<AssignmentRow[]>(
@@ -101,6 +125,7 @@ export async function createClass(
   classCode: string | null,
   teacherId: number,
   studentListFile?: File,
+  termId?: number,
 ): Promise<{ error: string; status: 400 | 409; details?: unknown } | { data: CreateClassResult }> {
   let tempCsvPath: string | null = null;
 
@@ -119,9 +144,25 @@ export async function createClass(
   try {
     await connection.beginTransaction();
 
+    let classTermId = termId;
+    if (classTermId !== undefined) {
+      const term = await getAcademicTermById(classTermId, connection);
+      if (!term) {
+        await connection.rollback();
+        return { error: "学期不存在", status: 400 };
+      }
+    } else {
+      const defaultTerm = await getDefaultClassTermId(connection);
+      if ("error" in defaultTerm) {
+        await connection.rollback();
+        return { error: "当前学期未设置", status: 400 };
+      }
+      classTermId = defaultTerm.termId;
+    }
+
     const [result] = await connection.query<ResultSetHeader>(
-      "INSERT INTO classes (class_name, class_code, teacher_id) VALUES (?, ?, ?)",
-      [className, classCode || null, teacherId],
+      "INSERT INTO classes (class_name, class_code, teacher_id, term_id) VALUES (?, ?, ?, ?)",
+      [className, classCode || null, teacherId, classTermId],
     );
     const classId = result.insertId;
 
@@ -214,7 +255,7 @@ export async function createClass(
     await connection.commit();
 
     const [newClassRows] = await connection.query<ClassRow[]>(
-      "SELECT c.*, u.full_name as teacher_name FROM classes c JOIN users u ON c.teacher_id = u.user_id WHERE c.class_id = ?",
+      `${CLASS_SELECT_FRAGMENT} WHERE c.class_id = ?`,
       [classId],
     );
 
@@ -241,16 +282,22 @@ export async function createClass(
   }
 }
 
-export async function getAllClasses() {
+export async function getAllClasses(termId?: number) {
+  const conditions: string[] = [];
+  const values: unknown[] = [];
+  appendTermFilter(conditions, values, termId);
+
+  const whereClause = conditions.length > 0 ? ` WHERE ${conditions.join(" AND ")}` : "";
   const [rows] = await pool.query<ClassRow[]>(
-    "SELECT c.*, u.full_name as teacher_name FROM classes c JOIN users u ON c.teacher_id = u.user_id",
+    `${CLASS_SELECT_FRAGMENT}${whereClause} ORDER BY c.class_id ASC`,
+    values,
   );
   return rows;
 }
 
 export async function getClassById(classId: number, userId: number, userRole: string) {
   const [classRows] = await pool.query<ClassRow[]>(
-    "SELECT c.*, u.full_name as teacher_name FROM classes c JOIN users u ON c.teacher_id = u.user_id WHERE c.class_id = ?",
+    `${CLASS_SELECT_FRAGMENT} WHERE c.class_id = ?`,
     [classId],
   );
   const classInfo = classRows[0];
@@ -306,6 +353,12 @@ export async function updateClass(classId: number, userId: number, userRole: str
     fields.push("class_code = ?");
     values.push(input.class_code || null);
   }
+  if (input.term_id !== undefined) {
+    const term = await getAcademicTermById(input.term_id);
+    if (!term) return { error: "invalid_term" as const };
+    fields.push("term_id = ?");
+    values.push(input.term_id);
+  }
   if (fields.length === 0) return { error: "no_fields" as const };
 
   values.push(classId);
@@ -318,7 +371,7 @@ export async function updateClass(classId: number, userId: number, userRole: str
   }
 
   const [updatedRows] = await pool.query<ClassRow[]>(
-    "SELECT c.*, u.full_name as teacher_name FROM classes c JOIN users u ON c.teacher_id = u.user_id WHERE c.class_id = ?",
+    `${CLASS_SELECT_FRAGMENT} WHERE c.class_id = ?`,
     [classId],
   );
   return { data: updatedRows[0]! };
@@ -365,15 +418,19 @@ export async function deleteClass(classId: number, userId: number, userRole: str
   }
 }
 
-export async function getClassesByTeacher(teacherId: number, userId: number, userRole: string) {
+export async function getClassesByTeacher(teacherId: number, userId: number, userRole: string, termId?: number) {
   if (userRole !== "Admin" && userId !== teacherId) return { error: "forbidden" as const };
 
   const [teacherRows] = await pool.query<UserRow[]>("SELECT role FROM users WHERE user_id = ? AND role = 'Teacher'", [teacherId]);
   if (teacherRows.length === 0) return { error: "not_teacher" as const };
 
+  const conditions = ["c.teacher_id = ?"];
+  const values: unknown[] = [teacherId];
+  appendTermFilter(conditions, values, termId);
+
   const [classRows] = await pool.query<ClassRow[]>(
-    "SELECT c.*, u.full_name as teacher_name FROM classes c JOIN users u ON c.teacher_id = u.user_id WHERE c.teacher_id = ?",
-    [teacherId],
+    `${CLASS_SELECT_FRAGMENT} WHERE ${conditions.join(" AND ")} ORDER BY c.class_id ASC`,
+    values,
   );
   return { data: await attachAssistantsToClasses(classRows) };
 }
@@ -383,6 +440,7 @@ export async function getClassesByTeacherAssistant(
   assistantId: number,
   userId: number,
   userRole: string,
+  termId?: number,
 ) {
   if (userRole !== "Admin" && userId !== teacherId) return { error: "forbidden" as const };
 
@@ -398,26 +456,36 @@ export async function getClassesByTeacherAssistant(
   );
   if (assistantRows.length === 0) return { error: "not_assistant" as const };
 
+  const conditions = ["c.teacher_id = ?", "ca.assistant_id = ?"];
+  const values: unknown[] = [teacherId, assistantId];
+  appendTermFilter(conditions, values, termId);
+
   const [classRows] = await pool.query<ClassRow[]>(
-    `SELECT c.*, u.full_name as teacher_name
-       FROM classes c
+    `${CLASS_SELECT_FRAGMENT}
        JOIN class_assistants ca ON c.class_id = ca.class_id
-       JOIN users u ON c.teacher_id = u.user_id
-      WHERE c.teacher_id = ? AND ca.assistant_id = ?`,
-    [teacherId, assistantId],
+      WHERE ${conditions.join(" AND ")}
+      ORDER BY c.class_id ASC`,
+    values,
   );
   return { data: await attachAssistantsToClasses(classRows) };
 }
 
-export async function getClassesByAssistant(assistantId: number, userId: number, userRole: string) {
+export async function getClassesByAssistant(assistantId: number, userId: number, userRole: string, termId?: number) {
   if (userRole !== "Admin" && userId !== assistantId) return { error: "forbidden" as const };
 
   const [assistantRows] = await pool.query<UserRow[]>("SELECT role FROM users WHERE user_id = ? AND role = 'Assistant'", [assistantId]);
   if (assistantRows.length === 0) return { error: "not_assistant" as const };
 
+  const conditions = ["ca.assistant_id = ?"];
+  const values: unknown[] = [assistantId];
+  appendTermFilter(conditions, values, termId);
+
   const [classRows] = await pool.query<ClassRow[]>(
-    `SELECT c.*, u.full_name as teacher_name FROM classes c JOIN class_assistants ca ON c.class_id = ca.class_id JOIN users u ON c.teacher_id = u.user_id WHERE ca.assistant_id = ?`,
-    [assistantId],
+    `${CLASS_SELECT_FRAGMENT}
+       JOIN class_assistants ca ON c.class_id = ca.class_id
+      WHERE ${conditions.join(" AND ")}
+      ORDER BY c.class_id ASC`,
+    values,
   );
   return { data: await attachAssistantsToClasses(classRows) };
 }

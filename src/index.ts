@@ -25,6 +25,7 @@ import { datasetsController } from "./modules/datasets";
 import { experimentsController } from "./modules/experiments";
 import { classGradesController } from "./modules/class-grades";
 import { usersController } from "./modules/users";
+import { academicTermsController } from "./modules/academic-terms";
 
 // --- Hono App Initialization ---
 const app = new Hono();
@@ -497,6 +498,7 @@ app.route("/", datasetsController);
 app.route("/", experimentsController);
 app.route("/", classGradesController);
 app.route("/", usersController);
+app.route("/", academicTermsController);
 
 // --- 404 & Error Handling ---
 app.notFound((c) => c.json({ error: "接口不存在" }, 404));

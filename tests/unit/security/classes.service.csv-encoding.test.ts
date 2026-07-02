@@ -10,6 +10,15 @@ const classesServiceModulePath = path.join(srcRoot, "modules", "classes", "class
 const freshClassesServiceModulePath = `${classesServiceModulePath}?classes-csv-encoding-test`;
 
 const connectionQuery = mock(async (query: string) => {
+  if (query.includes("FROM academic_terms") && query.includes("is_active = TRUE")) {
+    return [[{
+      term_id: 1,
+      academic_year: "2025-2026",
+      semester: 2,
+      is_active: true,
+      created_at: new Date("2026-01-01T00:00:00Z"),
+    }]];
+  }
   if (query.startsWith("INSERT INTO classes")) {
     return [{ insertId: 17 }];
   }
@@ -24,6 +33,11 @@ const connectionQuery = mock(async (query: string) => {
       class_id: 17,
       class_name: "GBK班级",
       class_code: "GBK001",
+      term_id: 1,
+      academic_year: "2025-2026",
+      semester: 2,
+      term_label: "2025-2026 第2学期",
+      is_current_term: true,
       teacher_id: 99,
       teacher_name: "测试教师",
       created_at: new Date("2026-01-01T00:00:00Z"),

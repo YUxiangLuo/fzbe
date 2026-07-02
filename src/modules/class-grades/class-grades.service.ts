@@ -24,13 +24,27 @@ type Queryable = Pool | PoolConnection;
 
 interface ClassRow extends RowDataPacket { teacher_id: number; }
 interface AssignmentRow extends RowDataPacket { }
-interface TeacherClassRow extends RowDataPacket { class_id: number; class_name: string; }
-interface AssistantClassRow extends RowDataPacket { class_id: number; class_name: string; }
+interface ClassSummarySourceRow extends RowDataPacket {
+  class_id: number;
+  class_name: string;
+  term_id: number;
+  academic_year: string;
+  semester: 1 | 2;
+  term_label: string;
+  is_current_term: number | boolean;
+}
+interface TeacherClassRow extends ClassSummarySourceRow {}
+interface AssistantClassRow extends ClassSummarySourceRow {}
 interface UserRoleRow extends RowDataPacket { role: string; }
 
 export interface TeacherClassGradeSummary {
   class_id: number;
   class_name: string;
+  term_id: number;
+  academic_year: string;
+  semester: 1 | 2;
+  term_label: string;
+  is_current_term: boolean;
   total_students: number;
   graded_count: number;
   submitted_count: number;
@@ -144,6 +158,24 @@ export function computeExperimentScores(row: Record<string, unknown>, weights: R
 }
 
 const EXPERIMENT_GRADE_SELECT_FRAGMENT = EXPERIMENT_GRADE_FIELDS.length ? `,\n             ${EXPERIMENT_GRADE_FIELDS.map((column) => `eg.${column} AS grade_${column}`).join(",\n             ")}` : "";
+
+const CLASS_SUMMARY_SELECT_FRAGMENT = `
+  SELECT c.class_id,
+         c.class_name,
+         c.term_id,
+         at.academic_year,
+         at.semester,
+         CONCAT(at.academic_year, ' 第', at.semester, '学期') AS term_label,
+         at.is_active AS is_current_term
+    FROM classes c
+    JOIN academic_terms at ON at.term_id = c.term_id`;
+
+const appendTermFilter = (conditions: string[], values: unknown[], termId?: number) => {
+  if (termId !== undefined) {
+    conditions.push("c.term_id = ?");
+    values.push(termId);
+  }
+};
 
 export async function getClassReports(classId: number) {
   const [reportRows] = await pool.query<RowDataPacket[]>(`SELECT u.user_id, u.username, u.full_name, er.report_id, latest.experiment_id, er.status, er.submitted_at, er.pdf_file_path, er.grade, er.feedback, grader.full_name AS grader_name${EXPERIMENT_GRADE_SELECT_FRAGMENT}
@@ -360,8 +392,7 @@ export async function getGradeSummaries(classId: number) {
 }
 
 function buildTeacherClassSummary(
-  classId: number,
-  className: string,
+  classRow: ClassSummarySourceRow,
   gradeRows: Array<{ report_status: string | null; final_score: number | null }>,
 ): TeacherClassGradeSummary {
   const gradedCount = gradeRows.filter((row) => row.report_status === "graded").length;
@@ -377,8 +408,13 @@ function buildTeacherClassSummary(
     : null;
 
   return {
-    class_id: classId,
-    class_name: className,
+    class_id: classRow.class_id,
+    class_name: classRow.class_name,
+    term_id: classRow.term_id,
+    academic_year: classRow.academic_year,
+    semester: classRow.semester,
+    term_label: classRow.term_label,
+    is_current_term: Boolean(classRow.is_current_term),
     total_students: gradeRows.length,
     graded_count: gradedCount,
     submitted_count: submittedCount,
@@ -388,9 +424,14 @@ function buildTeacherClassSummary(
   };
 }
 
-const createEmptyTeacherClassSummary = (classId: number, className: string): TeacherClassGradeSummary => ({
-  class_id: classId,
-  class_name: className,
+const createEmptyTeacherClassSummary = (classRow: ClassSummarySourceRow): TeacherClassGradeSummary => ({
+  class_id: classRow.class_id,
+  class_name: classRow.class_name,
+  term_id: classRow.term_id,
+  academic_year: classRow.academic_year,
+  semester: classRow.semester,
+  term_label: classRow.term_label,
+  is_current_term: Boolean(classRow.is_current_term),
   total_students: 0,
   graded_count: 0,
   submitted_count: 0,
@@ -399,21 +440,21 @@ const createEmptyTeacherClassSummary = (classId: number, className: string): Tea
   average_score: null,
 });
 
-async function buildClassGradeSummaries(classRows: Array<{ class_id: number; class_name: string }>) {
+async function buildClassGradeSummaries(classRows: ClassSummarySourceRow[]) {
   const summaries = await Promise.all(
     classRows.map(async (classRow) => {
       try {
         const result = await getGradeSummaries(classRow.class_id);
-        if ("error" in result) return createEmptyTeacherClassSummary(classRow.class_id, classRow.class_name);
+        if ("error" in result) return createEmptyTeacherClassSummary(classRow);
 
         const summaryRows = result.data.map((row) => ({
           report_status: row.report_status ?? null,
           final_score: toNumberOrNull(row.final_score),
         }));
 
-        return buildTeacherClassSummary(classRow.class_id, classRow.class_name, summaryRows);
+        return buildTeacherClassSummary(classRow, summaryRows);
       } catch {
-        return createEmptyTeacherClassSummary(classRow.class_id, classRow.class_name);
+        return createEmptyTeacherClassSummary(classRow);
       }
     }),
   );
@@ -421,7 +462,7 @@ async function buildClassGradeSummaries(classRows: Array<{ class_id: number; cla
   return summaries;
 }
 
-export async function getTeacherClassGradeSummaries(teacherId: number, userId: number, userRole: string) {
+export async function getTeacherClassGradeSummaries(teacherId: number, userId: number, userRole: string, termId?: number) {
   if (userRole !== "Admin" && userId !== teacherId) return { error: "forbidden" as const };
 
   const [teacherRows] = await pool.query<UserRoleRow[]>(
@@ -430,19 +471,23 @@ export async function getTeacherClassGradeSummaries(teacherId: number, userId: n
   );
   if (teacherRows.length === 0) return { error: "not_teacher" as const };
 
+  const conditions = ["c.teacher_id = ?"];
+  const values: unknown[] = [teacherId];
+  appendTermFilter(conditions, values, termId);
+
   const [classRows] = await pool.query<TeacherClassRow[]>(
-    "SELECT class_id, class_name FROM classes WHERE teacher_id = ? ORDER BY class_id ASC",
-    [teacherId],
+    `${CLASS_SUMMARY_SELECT_FRAGMENT}
+      WHERE ${conditions.join(" AND ")}
+      ORDER BY c.class_id ASC`,
+    values,
   );
   if (classRows.length === 0) return { data: [] as TeacherClassGradeSummary[] };
 
-  const summaries = await buildClassGradeSummaries(
-    classRows.map((row) => ({ class_id: row.class_id, class_name: row.class_name })),
-  );
+  const summaries = await buildClassGradeSummaries(classRows);
   return { data: summaries };
 }
 
-export async function getAssistantClassGradeSummaries(assistantId: number, userId: number, userRole: string) {
+export async function getAssistantClassGradeSummaries(assistantId: number, userId: number, userRole: string, termId?: number) {
   if (userRole !== "Admin" && userId !== assistantId) return { error: "forbidden" as const };
 
   const [assistantRows] = await pool.query<UserRoleRow[]>(
@@ -451,19 +496,20 @@ export async function getAssistantClassGradeSummaries(assistantId: number, userI
   );
   if (assistantRows.length === 0) return { error: "not_assistant" as const };
 
+  const conditions = ["ca.assistant_id = ?"];
+  const values: unknown[] = [assistantId];
+  appendTermFilter(conditions, values, termId);
+
   const [classRows] = await pool.query<AssistantClassRow[]>(
-    `SELECT c.class_id, c.class_name
-       FROM class_assistants ca
-       JOIN classes c ON c.class_id = ca.class_id
-      WHERE ca.assistant_id = ?
+    `${CLASS_SUMMARY_SELECT_FRAGMENT}
+       JOIN class_assistants ca ON c.class_id = ca.class_id
+      WHERE ${conditions.join(" AND ")}
       ORDER BY c.class_id ASC`,
-    [assistantId],
+    values,
   );
   if (classRows.length === 0) return { data: [] as TeacherClassGradeSummary[] };
 
-  const summaries = await buildClassGradeSummaries(
-    classRows.map((row) => ({ class_id: row.class_id, class_name: row.class_name })),
-  );
+  const summaries = await buildClassGradeSummaries(classRows);
   return { data: summaries };
 }
 
