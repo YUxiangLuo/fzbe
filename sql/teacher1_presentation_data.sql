@@ -6,11 +6,11 @@ START TRANSACTION;
 DELETE FROM classes WHERE class_id BETWEEN 9001 AND 9005;
 DELETE FROM users WHERE role = 'Student' AND user_id BETWEEN 20255001 AND 20255256;
 INSERT INTO classes (class_id, class_name, class_code, academic_year_start, semester, teacher_id) VALUES
-(9001,'供应链管理2401','SCM2401-2026',2025,1,101),
-(9002,'供应链管理2402','SCM2402-2026',2025,1,101),
-(9003,'工业工程2401','IE2401-2026',2025,1,101),
-(9004,'信息管理与信息系统2401','IMIS2401-2026',2025,1,101),
-(9005,'物流管理2401','LM2401-2026',2025,1,101);
+(9001,'供应链管理2401','SCM2401-2026',2025,2,101),
+(9002,'供应链管理2402','SCM2402-2026',2025,2,101),
+(9003,'工业工程2401','IE2401-2026',2025,2,101),
+(9004,'信息管理与信息系统2401','IMIS2401-2026',2025,2,101),
+(9005,'物流管理2401','LM2401-2026',2025,2,101);
 INSERT INTO grade_weights (class_id, exp_flow_demand_data_preparation, exp_flow_demand_descriptive_stats, exp_flow_demand_model_selection, exp_flow_demand_generate_results, exp_flow_production_inventory_calc, exp_flow_production_service_level, exp_flow_production_variable_calc, exp_flow_production_plan_creation, exp_flow_report_submission, exp_flow_weight, knowledge_test_weight, model_quality_weight, report_quality_weight) VALUES
 (9001,5,5,10,10,10,5,5,15,35,40,20,20,20),
 (9002,5,5,10,10,10,5,5,15,35,40,20,20,20),
