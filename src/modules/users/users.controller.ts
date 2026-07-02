@@ -14,6 +14,7 @@ import {
   getUnenrolledStudents, getCurrentUser, updateCurrentUser, changePassword, getUserById, adminChangePassword,
   resetStudentPassword, deleteUser, batchDeleteUsers
 } from "./users.service";
+import { academicTermQuerySchema } from "../classes/classes.schema";
 
 const usersController = new Hono();
 
@@ -140,17 +141,24 @@ usersController.post("/api/v1/users/assistants/batch", jwtAuth, async (c) => {
   } catch (error) { return handleUnexpectedError(c, error, "批量创建助教失败"); }
 });
 
-usersController.get("/api/v1/teachers/:teacherId/assistants", jwtAuth, zValidator("param", teacherIdParamSchema), async (c) => {
-  try {
-    const payload = c.get("jwtPayload") as JwtPayload;
-    const { teacherId } = c.req.valid("param");
-    const teacherIdNumber = parseInt(teacherId, 10);
-    if (payload.role !== "Admin" && payload.sub !== teacherIdNumber) return c.json({ error: "权限不足" }, 403);
-    const result = await getTeacherAssistants(teacherIdNumber);
-    if ("error" in result) return c.json({ error: "目标用户不是教师" }, 404);
-    return c.json(result.data);
-  } catch (error) { return handleUnexpectedError(c, error, "获取教师的助教失败"); }
-});
+usersController.get(
+  "/api/v1/teachers/:teacherId/assistants",
+  jwtAuth,
+  zValidator("param", teacherIdParamSchema),
+  zValidator("query", academicTermQuerySchema),
+  async (c) => {
+    try {
+      const payload = c.get("jwtPayload") as JwtPayload;
+      const { teacherId } = c.req.valid("param");
+      const termFilter = c.req.valid("query");
+      const teacherIdNumber = parseInt(teacherId, 10);
+      if (payload.role !== "Admin" && payload.sub !== teacherIdNumber) return c.json({ error: "权限不足" }, 403);
+      const result = await getTeacherAssistants(teacherIdNumber, termFilter);
+      if ("error" in result) return c.json({ error: "目标用户不是教师" }, 404);
+      return c.json(result.data);
+    } catch (error) { return handleUnexpectedError(c, error, "获取教师的助教失败"); }
+  },
+);
 
 usersController.get("/api/v1/users", jwtAuth, zValidator("query", paginationQuerySchema), async (c) => {
   try {

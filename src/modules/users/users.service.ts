@@ -8,6 +8,7 @@ import { USER_CONSTANTS, FILE_SIZE_LIMITS, CSV_LIMITS } from "../../utils/consta
 import { CsvEncodingError, parseCsvFileRows } from "../../utils/csv-processor";
 import type { CreateTeacherInput, CreateAssistantSingleInput, CreateAssistantInput, UpdateUserInput, ResetPasswordInput, UserSearchQuery, PaginationQuery } from "./users.schema";
 import { studentSelfRegisterSchema, teacherAssistantSelfRegisterSchema } from "./users.schema";
+import type { AcademicTermQuery } from "../classes/classes.schema";
 
 const { TEACHER_EMAIL_DOMAIN, ASSISTANT_EMAIL_DOMAIN, PHONE_REGEX, MIN_NAME_LENGTH } = USER_CONSTANTS;
 const BATCH_CSV_MIME_TYPES = new Set([
@@ -33,6 +34,26 @@ interface DeleteCleanupSummary {
   removedAssistantAssignments?: number;
   removedEnrollments?: number;
 }
+
+type AcademicTermFilter = AcademicTermQuery;
+
+const hasAcademicTermFilter = (
+  filter?: AcademicTermFilter,
+): filter is { academic_year_start: number; semester: number } =>
+  filter?.academic_year_start !== undefined && filter.semester !== undefined;
+
+const appendAcademicTermClause = (
+  clauses: string[],
+  values: Array<string | number>,
+  filter?: AcademicTermFilter,
+  alias = "c",
+) => {
+  if (!hasAcademicTermFilter(filter)) return;
+  clauses.push(`${alias}.academic_year_start = ?`);
+  values.push(filter.academic_year_start);
+  clauses.push(`${alias}.semester = ?`);
+  values.push(filter.semester);
+};
 
 type Queryable = {
   query<T extends RowDataPacket[] | ResultSetHeader>(sql: string, values?: unknown[]): Promise<[T, unknown]>;
@@ -458,16 +479,25 @@ export async function batchCreateAssistants(file: File, password: unknown) {
   }
 }
 
-export async function getTeacherAssistants(teacherId: number) {
+export async function getTeacherAssistants(teacherId: number, termFilter?: AcademicTermFilter) {
   const [teacherRows] = await pool.query<UserRow[]>(
     "SELECT role FROM users WHERE user_id = ? AND role = 'Teacher'",
     [teacherId],
   );
   if (teacherRows.length === 0) return { error: "not_teacher" as const };
 
+  const clauses = ["c.teacher_id = ?", "u.role = 'Assistant'"];
+  const values: Array<string | number> = [teacherId];
+  appendAcademicTermClause(clauses, values, termFilter);
+
   const [rows] = await pool.query<RowDataPacket[]>(
-    "SELECT DISTINCT u.user_id, u.username, u.full_name, u.email, u.phone_number FROM users u JOIN class_assistants ca ON u.user_id = ca.assistant_id JOIN classes c ON ca.class_id = c.class_id WHERE c.teacher_id = ? AND u.role = 'Assistant'",
-    [teacherId],
+    `SELECT DISTINCT u.user_id, u.username, u.full_name, u.email, u.phone_number
+       FROM users u
+       JOIN class_assistants ca ON u.user_id = ca.assistant_id
+       JOIN classes c ON ca.class_id = c.class_id
+      WHERE ${clauses.join(" AND ")}
+      ORDER BY u.full_name ASC, u.username ASC`,
+    values,
   );
   return { data: rows };
 }
