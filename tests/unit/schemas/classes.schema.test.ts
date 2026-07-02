@@ -2,6 +2,7 @@ import { describe, test, expect } from "bun:test";
 import {
   createClassSchema,
   updateClassSchema,
+  academicTermQuerySchema,
   classIdParamSchema,
   teacherAssistantParamSchema,
 } from "../../../src/modules/classes/classes.schema";
@@ -81,6 +82,39 @@ describe("Classes Schemas", () => {
         ...validAcademicTerm,
       });
       expect(result.success).toBe(true);
+    });
+  });
+
+  describe("academicTermQuerySchema", () => {
+    test("should accept a complete academic term filter", () => {
+      const result = academicTermQuerySchema.safeParse({
+        academic_year_start: "2026",
+        semester: "2",
+      });
+      expect(result).toMatchObject({
+        success: true,
+        data: { academic_year_start: 2026, semester: 2 },
+      });
+    });
+
+    test("should accept an omitted academic term filter for unfiltered endpoints", () => {
+      const result = academicTermQuerySchema.safeParse({});
+      expect(result.success).toBe(true);
+    });
+
+    test("should reject partial academic term query parameters", () => {
+      const result = academicTermQuerySchema.safeParse({
+        academic_year_start: "2026",
+      });
+      expect(result.success).toBe(false);
+    });
+
+    test("should reject semesters outside the supported range", () => {
+      const result = academicTermQuerySchema.safeParse({
+        academic_year_start: "2026",
+        semester: "3",
+      });
+      expect(result.success).toBe(false);
     });
   });
 
