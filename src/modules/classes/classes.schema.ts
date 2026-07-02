@@ -41,19 +41,12 @@ export const academicTermQuerySchema = z
     { message: "academic_year_start 和 semester 必须同时提供" },
   );
 
-export const createClassSchema = z
-  .object({
-    class_name: z.string().min(1),
-    class_code: z.string().optional(),
-    academic_year_start: academicYearStartSchema.optional(),
-    semester: semesterSchema.optional(),
-  })
-  .refine(
-    (data) =>
-      (data.academic_year_start === undefined && data.semester === undefined) ||
-      (data.academic_year_start !== undefined && data.semester !== undefined),
-    { message: "academic_year_start 和 semester 必须同时提供" },
-  );
+export const createClassSchema = z.object({
+  class_name: z.string().min(1),
+  class_code: z.string().optional(),
+  academic_year_start: academicYearStartSchema,
+  semester: semesterSchema,
+});
 
 export const updateClassSchema = z
   .object({

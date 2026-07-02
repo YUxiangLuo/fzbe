@@ -6,20 +6,44 @@ import {
   teacherAssistantParamSchema,
 } from "../../../src/modules/classes/classes.schema";
 
+const validAcademicTerm = {
+  academic_year_start: 2025,
+  semester: 1,
+};
+
 describe("Classes Schemas", () => {
   describe("createClassSchema", () => {
     test("should accept valid class data", () => {
       const result = createClassSchema.safeParse({
         class_name: "Math 101",
         class_code: "MATH101",
+        ...validAcademicTerm,
       });
       expect(result.success).toBe(true);
+    });
+
+    test("should reject missing academic term", () => {
+      const result = createClassSchema.safeParse({
+        class_name: "Math 101",
+        class_code: "MATH101",
+      });
+      expect(result.success).toBe(false);
+    });
+
+    test("should reject partial academic term", () => {
+      const result = createClassSchema.safeParse({
+        class_name: "Math 101",
+        class_code: "MATH101",
+        academic_year_start: 2025,
+      });
+      expect(result.success).toBe(false);
     });
 
     test("should reject empty class_name", () => {
       const result = createClassSchema.safeParse({
         class_name: "",
         class_code: "MATH101",
+        ...validAcademicTerm,
       });
       expect(result.success).toBe(false);
     });
@@ -28,6 +52,7 @@ describe("Classes Schemas", () => {
       const result = createClassSchema.safeParse({
         class_name: "Math 101",
         class_code: "",
+        ...validAcademicTerm,
       });
       expect(result.success).toBe(true);
     });
@@ -35,6 +60,7 @@ describe("Classes Schemas", () => {
     test("should accept missing class_code", () => {
       const result = createClassSchema.safeParse({
         class_name: "Math 101",
+        ...validAcademicTerm,
       });
       expect(result.success).toBe(true);
     });
@@ -43,6 +69,7 @@ describe("Classes Schemas", () => {
       const result = createClassSchema.safeParse({
         class_name: "高等数学",
         class_code: "MATH101",
+        ...validAcademicTerm,
       });
       expect(result.success).toBe(true);
     });
@@ -51,6 +78,7 @@ describe("Classes Schemas", () => {
       const result = createClassSchema.safeParse({
         class_name: "Physics",
         class_code: "PHY2024A",
+        ...validAcademicTerm,
       });
       expect(result.success).toBe(true);
     });

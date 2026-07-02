@@ -7,6 +7,7 @@ import {
   teacherIdParamSchema,
   assistantIdParamSchema,
   teacherAssistantParamSchema,
+  createClassSchema,
   updateClassSchema,
 } from "./classes.schema";
 import {
@@ -44,21 +45,24 @@ classesController.post("/api/v1/classes", jwtAuth, requireTeacher, async (c) => 
       return c.json({ error: "班级名称不能为空" }, 400);
     }
 
-    const termValidation = academicTermQuerySchema.safeParse({
+    const validation = createClassSchema.safeParse({
+      class_name: typeof className === "string" ? className : undefined,
+      class_code: typeof classCode === "string" ? classCode : undefined,
       academic_year_start: normalizeOptionalBodyValue(body["academic_year_start"]),
       semester: normalizeOptionalBodyValue(body["semester"]),
     });
-    if (!termValidation.success) {
-      return c.json({ error: termValidation.error.issues[0]?.message ?? "学年学期参数无效" }, 400);
+    if (!validation.success) {
+      return c.json({ error: validation.error.issues[0]?.message ?? "班级参数无效" }, 400);
     }
 
+    const input = validation.data;
     const result = await createClass(
-      className,
-      typeof classCode === "string" ? classCode : null,
+      input.class_name,
+      input.class_code ?? null,
       payload.sub,
       studentListFile instanceof File ? studentListFile : undefined,
-      termValidation.data.academic_year_start,
-      termValidation.data.semester,
+      input.academic_year_start,
+      input.semester,
     );
 
     if ("error" in result) {

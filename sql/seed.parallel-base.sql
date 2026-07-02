@@ -70,8 +70,8 @@ INSERT INTO `users` (`user_id`, `username`, `password_hash`, `full_name`, `email
 -- ========================================================
 -- 2. Class / Enrollment / Grade Weights
 -- ========================================================
-INSERT INTO `classes` (`class_id`, `class_name`, `class_code`, `teacher_id`) VALUES
-(8401, '并发实验测试班', 'PARALLEL-SHIYAN-2026', 900101);
+INSERT INTO `classes` (`class_id`, `class_name`, `class_code`, `academic_year_start`, `semester`, `teacher_id`) VALUES
+(8401, '并发实验测试班', 'PARALLEL-SHIYAN-2026', 2025, 1, 900101);
 
 INSERT INTO `enrollments` (`student_id`, `class_id`) VALUES
 (20246001, 8401),

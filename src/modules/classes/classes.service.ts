@@ -46,8 +46,6 @@ interface AssignmentRow extends RowDataPacket {
 }
 
 const { STUDENT_ID_REGEX, MIN_NAME_LENGTH, MAX_NAME_LENGTH } = USER_CONSTANTS;
-const DEFAULT_ACADEMIC_YEAR_START = 2025;
-const DEFAULT_SEMESTER = 1;
 
 type AcademicTermFilter = AcademicTermQuery;
 
@@ -124,9 +122,9 @@ export async function createClass(
   className: string,
   classCode: string | null,
   teacherId: number,
-  studentListFile?: File,
-  academicYearStart = DEFAULT_ACADEMIC_YEAR_START,
-  semester = DEFAULT_SEMESTER,
+  studentListFile: File | undefined,
+  academicYearStart: number,
+  semester: number,
 ): Promise<{ error: string; status: 400 | 409; details?: unknown } | { data: CreateClassResult }> {
   let tempCsvPath: string | null = null;
 

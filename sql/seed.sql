@@ -400,13 +400,13 @@ INSERT INTO users (user_id, username, password_hash, full_name, email, phone_num
 (20241301, '20240300', '$2b$10$wz0v1DLwOe.h5t79JfO9zu1iIgLaaVJ76UCcnzpD39J0UL.eClcL6', '薛博', '20240300@student.test.com', NULL, 'Student');
 
 -- Classes
-INSERT INTO classes (class_id, class_name, class_code, teacher_id) VALUES
-(1, '计算机科学与技术2501', 'C17652574433451', 101),
-(2, '计算机科学与技术2502', 'C17652574457032', 101),
-(3, '人工智能2501', 'C17652574480553', 102),
-(4, '人工智能2502', 'C17652574503984', 102),
-(5, '数据科学2501', 'C17652574527335', 103),
-(6, '数据科学2502', 'C17652574550736', 103);
+INSERT INTO classes (class_id, class_name, class_code, academic_year_start, semester, teacher_id) VALUES
+(1, '计算机科学与技术2501', 'C17652574433451', 2025, 1, 101),
+(2, '计算机科学与技术2502', 'C17652574457032', 2025, 1, 101),
+(3, '人工智能2501', 'C17652574480553', 2025, 1, 102),
+(4, '人工智能2502', 'C17652574503984', 2025, 1, 102),
+(5, '数据科学2501', 'C17652574527335', 2025, 1, 103),
+(6, '数据科学2502', 'C17652574550736', 2025, 1, 103);
 
 -- Grade Weights
 INSERT INTO grade_weights (class_id) VALUES

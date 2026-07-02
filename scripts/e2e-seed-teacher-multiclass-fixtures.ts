@@ -787,8 +787,8 @@ async function insertUsers(conn: Connection) {
 async function insertClasses(conn: Connection) {
   for (const classSeed of CLASSES) {
     await conn.query(
-      "INSERT INTO classes (class_id, class_name, class_code, teacher_id) VALUES (?, ?, ?, ?)",
-      [classSeed.classId, classSeed.className, classSeed.classCode, TEACHER.userId],
+      "INSERT INTO classes (class_id, class_name, class_code, academic_year_start, semester, teacher_id) VALUES (?, ?, ?, ?, ?, ?)",
+      [classSeed.classId, classSeed.className, classSeed.classCode, 2025, 1, TEACHER.userId],
     );
     await conn.query(
       `INSERT INTO grade_weights (

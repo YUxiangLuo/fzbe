@@ -86,6 +86,8 @@ describe("classes service CSV encoding", () => {
       "GBK001",
       99,
       new File([gbkStudentCsv], "students.csv", { type: "text/csv" }),
+      2025,
+      1,
     );
 
     expect(result).toMatchObject({
