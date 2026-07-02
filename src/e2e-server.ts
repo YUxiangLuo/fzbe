@@ -1,4 +1,6 @@
-import { runServerStartupPreflight, serverConfig } from "./index";
+process.env.E2E_SERVER ??= "1";
+
+const { runServerStartupPreflight, serverConfig } = await import("./index");
 
 await runServerStartupPreflight();
 const server = Bun.serve(serverConfig);

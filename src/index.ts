@@ -17,7 +17,7 @@ import { manualsController } from "./modules/manuals";
 import { questionBankController } from "./modules/question-bank";
 import { quizzesController } from "./modules/quizzes";
 import { reportsController } from "./modules/reports";
-import { getPdfQueueStats } from "./modules/reports/reports.service";
+import { getPdfQueueStats, holdPdfQueueSlotForTest } from "./modules/reports/reports.service";
 import { modelsController } from "./modules/models";
 import { classesController } from "./modules/classes";
 import { classMembersController } from "./modules/class-members";
@@ -387,6 +387,20 @@ app.get("/api/v1/runtime-info", (c) =>
     },
     pdfQueue: getPdfQueueStats(),
   }));
+
+if (process.env.E2E_SERVER === "1") {
+  app.post("/api/v1/e2e/pdf-slot/hold", async (c) => {
+    const body = await c.req.json().catch(() => ({})) as { hold_ms?: unknown };
+    const holdMs = Number(body.hold_ms ?? 5_000);
+    if (!Number.isInteger(holdMs) || holdMs <= 0 || holdMs > 30_000) {
+      return c.json({ error: "hold_ms must be an integer between 1 and 30000" }, 400);
+    }
+
+    await holdPdfQueueSlotForTest(holdMs);
+    return c.json({ data: { held_ms: holdMs } });
+  });
+}
+
 app.get("/manuals/:filename", jwtAuth, async (c) => {
   const payload = c.get("jwtPayload") as JwtPayload;
   const filename = c.req.param("filename");

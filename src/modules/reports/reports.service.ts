@@ -27,6 +27,15 @@ export function getPdfQueueStats() {
   };
 }
 
+export async function holdPdfQueueSlotForTest(holdMs: number): Promise<void> {
+  await pdfSemaphore.acquire(TIMEOUTS.PDF_QUEUE);
+  try {
+    await new Promise((resolve) => setTimeout(resolve, holdMs));
+  } finally {
+    pdfSemaphore.release();
+  }
+}
+
 const MODEL_TYPES = [
   "ma", "exp", "arima", "lstm",
   "ensemble_weighted", "ensemble_boosting", "ensemble_stacking",

@@ -80,7 +80,7 @@ function generateFixturesContent(): string {
  * E2E Test Fixtures and Constants
  * 
  * ⚠️ 此文件由脚本自动生成，请勿手动修改！
- * 运行 \`bun run ../fangzhen-be/scripts/generate-e2e-fixtures.ts\` 重新生成
+ * 运行 \`bun run e2e:gen\` 重新生成
  * 
  * Generated at: ${new Date().toISOString()}
  */
@@ -228,7 +228,7 @@ function main() {
   const content = generateFixturesContent();
   const frontendE2EDir = process.env.E2E_FRONTEND_FIXTURES_DIR
     ? path.resolve(process.env.E2E_FRONTEND_FIXTURES_DIR)
-    : path.resolve(__dirname, "../../fangzhen-bun/tests/e2e");
+    : path.resolve(__dirname, "../../fzfe/tests/e2e");
   
   // 输出到前端目录
   const outputPath = path.resolve(frontendE2EDir, "fixtures.ts");
