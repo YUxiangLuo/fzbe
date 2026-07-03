@@ -759,12 +759,17 @@ const copyModelArtifact = async (
   fs.copyFileSync(sourceModelPath, destinationModelPath);
 };
 
-const restoreGuidedSessionBacktestArtifact = async (row: GuidedTrainingSessionRow) => {
+const restoreGuidedSessionBacktestArtifact = async (
+  row: GuidedTrainingSessionRow,
+  options: { invalidateProductionArtifact?: boolean } = {},
+) => {
   const sourceModelPath = getGuidedSessionModelPath(row.artifact_dir, row.model_type);
   const backtestModelPath = getBacktestModelPath(row.experiment_id, row.student_id, row.model_type);
 
   await copyModelArtifact(row.model_type, sourceModelPath, backtestModelPath);
-  invalidateProductionArtifact(row.experiment_id, row.student_id, row.model_type);
+  if (options.invalidateProductionArtifact) {
+    invalidateProductionArtifact(row.experiment_id, row.student_id, row.model_type);
+  }
   return backtestModelPath;
 };
 
@@ -1987,7 +1992,9 @@ export async function runGuidedTrainingStep(
 
     let transformedResult: ReturnType<typeof transformTrainingResult> | null = null;
     if (pythonStepResult.final_result) {
-      const backtestModelPath = await restoreGuidedSessionBacktestArtifact(row);
+      const backtestModelPath = await restoreGuidedSessionBacktestArtifact(row, {
+        invalidateProductionArtifact: true,
+      });
       pythonStepResult.final_result.saved_model = backtestModelPath;
       transformedResult = transformTrainingResult(modelType, pythonStepResult.final_result);
     }

@@ -317,6 +317,7 @@ describe("models service", () => {
     };
     const artifactDir = "/tmp/fangzhen-py/guided_training/exp990002-student20240002-ma-guided-a";
     const sessionModelPath = `${artifactDir}/ma.pkl`;
+    const productionModelPath = "/tmp/fangzhen-py/trained_models/exp990002-student20240002-ma-production.pkl";
 
     poolQuery.mockReset();
     poolQuery
@@ -341,7 +342,9 @@ describe("models service", () => {
           error_message: null,
         },
       ]]);
-    existsSync.mockImplementation((filePath: string) => filePath === sessionModelPath);
+    existsSync.mockImplementation((filePath: string) =>
+      filePath === sessionModelPath || filePath === productionModelPath
+    );
 
     const session = await createOrResumeGuidedTrainingSession("ma", 20240002, requestBody);
 
@@ -350,6 +353,7 @@ describe("models service", () => {
       sessionModelPath,
       "/tmp/fangzhen-py/trained_models/exp990002-student20240002-ma.pkl",
     );
+    expect(unlinkSync).not.toHaveBeenCalledWith(productionModelPath);
     expect(spawnMock).not.toHaveBeenCalled();
   });
 
