@@ -130,111 +130,165 @@ const GUIDED_TRAINING_STEPS: Record<GuidedModelType, GuidedTrainingStepDefinitio
   ma: [
     {
       id: "prepare_data",
-      label: "校验训练窗口",
-      description: "读取实验数据，确认训练区间、评估区间和移动平均窗口可以用于建模。",
+      label: "确认训练材料",
+      description: "读取实验数据，检查训练区间、评估区间和移动平均窗口，确保后续计算有足够历史样本。",
       actionLabel: "校验数据",
     },
     {
       id: "build_windows",
-      label: "构造滚动窗口",
-      description: "取训练集末尾的历史销量作为初始窗口，准备按窗口均值递推预测。",
-      actionLabel: "构造窗口",
+      label: "准备初始窗口",
+      description: "取训练集末尾的连续销量作为第一个滚动窗口，明确每次预测会参考哪些最近历史值。",
+      actionLabel: "准备窗口",
     },
     {
       id: "forecast",
-      label: "逐期生成预测",
-      description: "每预测一期，就把预测值放回窗口，为下一期预测提供历史。",
+      label: "滚动生成预测",
+      description: "按窗口均值逐期外推；每得到一个预测值，就把它放回窗口中作为下一期的历史输入。",
       actionLabel: "生成预测",
     },
     {
-      id: "evaluate",
-      label: "计算指标并保存",
-      description: "比较预测值和评估集真实销量，计算 RMSE、MAE、R² 并保存模型产物。",
-      actionLabel: "完成评估",
+      id: "estimate_residuals",
+      label: "估计预测波动",
+      description: "比较评估区间真实值和预测值，估计残差波动，用于给预测结果附上不确定性范围。",
+      actionLabel: "估计残差",
+    },
+    {
+      id: "evaluate_metrics",
+      label: "计算误差指标",
+      description: "汇总 RMSE、MAE、MAPE、R² 等指标，把模型误差转化为可比较的评估结果。",
+      actionLabel: "计算指标",
+    },
+    {
+      id: "save_artifact",
+      label: "保存模型产物",
+      description: "保存移动平均窗口、最近历史值和残差波动，供后续预测和报告复用。",
+      actionLabel: "保存结果",
     },
   ],
   es: [
     {
       id: "prepare_data",
-      label: "校验平滑参数",
-      description: "读取实验数据，确认训练/评估窗口和 alpha 平滑系数有效。",
+      label: "确认平滑设置",
+      description: "读取实验数据，检查训练/评估区间，并确认 alpha 平滑系数处在有效范围内。",
       actionLabel: "校验数据",
     },
     {
       id: "fit_model",
-      label: "拟合指数平滑",
-      description: "用训练集销量和 alpha 参数拟合一次指数平滑水平项。",
+      label: "拟合平滑水平",
+      description: "用训练集销量和固定 alpha 更新指数平滑水平项，让近期观测对模型产生更高权重。",
       actionLabel: "拟合模型",
     },
     {
       id: "forecast",
-      label: "生成评估预测",
-      description: "使用拟合后的水平项，对评估区间进行多期外推预测。",
+      label: "外推评估区间",
+      description: "使用拟合后的平滑水平，对评估区间进行多期预测，形成待检验的销量序列。",
       actionLabel: "生成预测",
     },
     {
-      id: "evaluate",
-      label: "计算指标并保存",
-      description: "计算误差指标，保存可复用的指数平滑模型产物。",
-      actionLabel: "完成评估",
+      id: "estimate_residuals",
+      label: "估计残差波动",
+      description: "比较预测值和真实值，估计指数平滑模型在评估区间的误差离散程度。",
+      actionLabel: "估计残差",
+    },
+    {
+      id: "evaluate_metrics",
+      label: "计算误差指标",
+      description: "计算 RMSE、MAE、MAPE、R²，判断固定 alpha 的预测效果是否稳定。",
+      actionLabel: "计算指标",
+    },
+    {
+      id: "save_artifact",
+      label: "保存模型产物",
+      description: "保存平滑模型、alpha 和残差波动，供后续预测、生产准备和实验报告复用。",
+      actionLabel: "保存结果",
     },
   ],
   arima: [
     {
       id: "prepare_data",
-      label: "校验差分和搜索范围",
-      description: "读取训练序列，确认 d 阶差分后仍有足够样本，并确定 p/q 搜索上限。",
+      label: "确认差分和搜索范围",
+      description: "读取训练序列，检查 d 阶差分后是否仍有足够样本，并确定 p/q 搜索上限。",
       actionLabel: "准备搜索",
     },
     {
       id: "aic_search",
       label: "执行 AIC 搜索",
-      description: "按 AIC 信息准则搜索候选 ARIMA(p,d,q) 模型。",
+      description: "按 AIC 信息准则搜索候选 ARIMA(p,d,q) 模型，优先寻找拟合能力更强的阶数组合。",
       actionLabel: "运行 AIC",
     },
     {
       id: "bic_search",
       label: "执行 BIC 搜索",
-      description: "按 BIC 信息准则搜索候选模型，增强小样本下的复杂度惩罚。",
+      description: "按 BIC 信息准则搜索候选模型，给复杂模型更强惩罚，降低小样本过拟合风险。",
       actionLabel: "运行 BIC",
     },
     {
       id: "select_model",
       label: "选择最优阶数",
-      description: "比较 AIC/BIC 候选模型，并根据样本量选择最终 p、d、q。",
+      description: "比较 AIC 与 BIC 的候选结果，结合样本量选择最终用于预测的 p、d、q。",
       actionLabel: "选择模型",
     },
     {
-      id: "evaluate",
-      label: "预测评估并保存",
-      description: "用最终 ARIMA 模型预测评估区间，计算指标并保存模型产物。",
-      actionLabel: "完成评估",
+      id: "forecast",
+      label: "预测评估区间",
+      description: "使用选定阶数的 ARIMA 模型预测评估区间，并生成置信区间作为不确定性参考。",
+      actionLabel: "生成预测",
+    },
+    {
+      id: "evaluate_metrics",
+      label: "计算误差指标",
+      description: "把 ARIMA 预测与真实销量对齐，计算误差指标并记录模型收敛状态。",
+      actionLabel: "计算指标",
+    },
+    {
+      id: "save_artifact",
+      label: "保存模型产物",
+      description: "保存最终 ARIMA 模型、阶数选择摘要和评估结果，供后续预测和报告复用。",
+      actionLabel: "保存结果",
     },
   ],
   lstm: [
     {
       id: "prepare_data",
       label: "解析字段并校验窗口",
-      description: "读取多变量数据，确认目标字段、特征字段、归一化方式和训练窗口有效。",
+      description: "读取多变量数据，确认目标字段、特征字段、字段类型、归一化方式和训练窗口有效。",
       actionLabel: "解析数据",
     },
     {
       id: "preprocess",
       label: "预处理并构造样本",
-      description: "仅用训练集拟合归一化/编码器，再构造 LSTM 输入序列和多步预测标签。",
+      description: "仅用训练集拟合归一化和编码器，再把时间序列切成 LSTM 输入窗口与多步预测标签。",
       actionLabel: "构造样本",
     },
     {
       id: "build_model",
       label: "确定网络结构",
-      description: "根据特征维度和样本量确定 LSTM 层、Dense 层和 batch size。",
+      description: "根据特征维度、样本量和预测跨度确定 LSTM 层、Dense 层、batch size 和学习率计划。",
       actionLabel: "构建网络",
     },
     {
-      id: "train_evaluate",
-      label: "训练、预测并保存",
-      description: "执行真实 Keras 训练，生成评估预测，反归一化后计算指标并保存模型产物。",
-      actionLabel: "训练并评估",
+      id: "train_model",
+      label: "训练神经网络",
+      description: "执行真实 Keras 训练，使用学习率衰减和早停策略，让网络学习窗口与未来销量的关系。",
+      actionLabel: "训练模型",
+    },
+    {
+      id: "forecast",
+      label: "生成评估预测",
+      description: "加载训练后的网络，对评估区间进行多步预测，并把预测结果还原到原始销量尺度。",
+      actionLabel: "生成预测",
+    },
+    {
+      id: "evaluate_metrics",
+      label: "计算误差指标",
+      description: "比较 LSTM 预测和真实销量，计算 RMSE、MAE、MAPE、R²，并估计残差波动。",
+      actionLabel: "计算指标",
+    },
+    {
+      id: "save_artifact",
+      label: "保存模型产物",
+      description: "保存预处理器、历史窗口、Keras 网络文件和评估结果，供后续预测和生产准备复用。",
+      actionLabel: "保存结果",
     },
   ],
 };
@@ -1688,6 +1742,7 @@ const buildGuidedTrainingSessionPayload = (
   const nextStepId = getGuidedNextStepId(row.model_type, completedStepIds);
   const activeStepId = row.current_step_id ?? nextStepId;
   const completedSet = new Set(completedStepIds);
+  const isCompletedSession = row.status === "completed";
 
   return {
     session_id: row.session_id,
@@ -1698,7 +1753,7 @@ const buildGuidedTrainingSessionPayload = (
     next_step_id: row.status === "completed" ? null : nextStepId,
     steps: getGuidedTrainingSteps(row.model_type).map((step) => ({
       ...step,
-      status: completedSet.has(step.id)
+      status: isCompletedSession || completedSet.has(step.id)
         ? "completed"
         : row.status === "failed" && activeStepId === step.id
           ? "failed"

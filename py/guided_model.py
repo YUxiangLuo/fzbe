@@ -12,6 +12,7 @@ import json
 import os
 import pickle
 import random
+import shutil
 import sys
 from typing import Any, Dict, List, Tuple
 
@@ -77,6 +78,8 @@ def _jsonable(value: Any) -> Any:
 
 def _load_state(path: str) -> Dict[str, Any]:
     if not path or not os.path.exists(path):
+        return {}
+    if os.path.getsize(path) == 0:
         return {}
     with open(path, "rb") as handle:
         return pickle.load(handle)
@@ -175,13 +178,9 @@ def _run_ma(step_id: str, args, state: Dict[str, Any]) -> Dict[str, Any]:
 
         y_true = y[list(eval_range)]
         y_pred = np.asarray(preds)
-        residuals = y_true - y_pred
-        train_history = y[train_range]
-        std_dev_residuals = ma._estimate_std_dev(residuals, train_history)
         state.update({
             "y_true": y_true.tolist(),
             "y_pred": y_pred.tolist(),
-            "std_dev_residuals": std_dev_residuals,
         })
         return {
             "predicted_points": len(preds),
@@ -191,8 +190,26 @@ def _run_ma(step_id: str, args, state: Dict[str, Any]) -> Dict[str, Any]:
             ],
         }
 
-    if step_id == "evaluate":
-        train_range, eval_range = _state_ranges(state)
+    if step_id == "estimate_residuals":
+        train_range, _ = _state_ranges(state)
+        y = np.asarray(state["y"])
+        y_true = np.asarray(state["y_true"])
+        y_pred = np.asarray(state["y_pred"])
+        residuals = y_true - y_pred
+        train_history = y[train_range]
+        std_dev_residuals = ma._estimate_std_dev(residuals, train_history)
+        state.update({
+            "residuals": residuals.tolist(),
+            "std_dev_residuals": std_dev_residuals,
+        })
+        return {
+            "residual_points": len(residuals),
+            "mean_residual": float(np.mean(residuals)) if len(residuals) else 0.0,
+            "std_dev_residuals": float(std_dev_residuals),
+        }
+
+    if step_id == "evaluate_metrics":
+        _, eval_range = _state_ranges(state)
         timestamps = state["timestamps"]
         y_true = np.asarray(state["y_true"])
         y_pred = np.asarray(state["y_pred"])
@@ -207,6 +224,18 @@ def _run_ma(step_id: str, args, state: Dict[str, Any]) -> Dict[str, Any]:
             "evaluate_months": _month_labels(timestamps, eval_range),
         }
         predictions_with_std = ma._format_predictions(y_pred.tolist(), float(state["std_dev_residuals"]))
+        state.update({
+            "metrics": metrics,
+            "predictions": predictions_with_std,
+        })
+        return {"metrics": metrics}
+
+    if step_id == "save_artifact":
+        train_range, eval_range = _state_ranges(state)
+        timestamps = state["timestamps"]
+        y_true = np.asarray(state["y_true"])
+        metrics = state["metrics"]
+        predictions_with_std = state["predictions"]
         final_result: Dict[str, Any] = {
             "mode": "fixed_window_only",
             "data_points": int(state["data_points"]),
@@ -294,13 +323,28 @@ def _run_es(step_id: str, args, state: Dict[str, Any]) -> Dict[str, Any]:
             "preview": [float(value) for value in y_pred[:3]],
         }
 
-    if step_id == "evaluate":
+    if step_id == "estimate_residuals":
         train_range, eval_range = _state_ranges(state)
         y = np.asarray(state["y"])
         y_true = y[eval_range].tolist()
         y_pred = state["y_pred"]
         residuals = np.asarray(y_true) - np.asarray(y_pred)
         std_dev_residuals = es._estimate_std_dev(residuals, y[train_range])
+        state.update({
+            "y_true": y_true,
+            "residuals": residuals.tolist(),
+            "std_dev_residuals": std_dev_residuals,
+        })
+        return {
+            "residual_points": len(residuals),
+            "mean_residual": float(np.mean(residuals)) if len(residuals) else 0.0,
+            "std_dev_residuals": float(std_dev_residuals),
+        }
+
+    if step_id == "evaluate_metrics":
+        _, eval_range = _state_ranges(state)
+        y_true = state["y_true"]
+        y_pred = state["y_pred"]
         timestamps = state["timestamps"]
         metrics = {
             "alpha": float(state["alpha"]),
@@ -312,7 +356,19 @@ def _run_es(step_id: str, args, state: Dict[str, Any]) -> Dict[str, Any]:
             "evaluate_indices": list(eval_range),
             "evaluate_months": _month_labels(timestamps, eval_range),
         }
-        predictions_with_std = es._format_predictions(y_pred, std_dev_residuals)
+        predictions_with_std = es._format_predictions(y_pred, float(state["std_dev_residuals"]))
+        state.update({
+            "metrics": metrics,
+            "predictions": predictions_with_std,
+        })
+        return {"metrics": metrics}
+
+    if step_id == "save_artifact":
+        train_range, eval_range = _state_ranges(state)
+        timestamps = state["timestamps"]
+        y_true = state["y_true"]
+        metrics = state["metrics"]
+        predictions_with_std = state["predictions"]
         final_result: Dict[str, Any] = {
             "mode": "fixed_alpha_only",
             "data_points": int(state["data_points"]),
@@ -339,7 +395,7 @@ def _run_es(step_id: str, args, state: Dict[str, Any]) -> Dict[str, Any]:
                 "alpha": float(state["alpha"]),
                 "train_end_index": train_range.stop - 1,
                 "model": state["model"],
-                "std_dev_residuals": std_dev_residuals,
+                "std_dev_residuals": float(state["std_dev_residuals"]),
             }
             attach_method_metadata(model_state, es.METHOD_NAME, es.FORECAST_STRATEGY, es.IMPLEMENTATION_NOTES)
             dump_model(model_state, state["save_model"])
@@ -488,7 +544,7 @@ def _run_arima(step_id: str, args, state: Dict[str, Any]) -> Dict[str, Any]:
         state["search_summary"] = search_summary
         return {"best_order": best_order, "selection_criterion": selection_criterion}
 
-    if step_id == "evaluate":
+    if step_id == "forecast":
         train_range, eval_range = _state_ranges(state)
         y = np.asarray(state["y"])
         y_eval = y[eval_range]
@@ -496,6 +552,30 @@ def _run_arima(step_id: str, args, state: Dict[str, Any]) -> Dict[str, Any]:
         y_pred, conf_int = best_model.predict(n_periods=len(eval_range), return_conf_int=True)
         y_true = y_eval.tolist()
         converged = bool(best_model.arima_res_.mle_retvals.get("converged", False))
+        state.update({
+            "y_true": y_true,
+            "y_pred": y_pred.tolist(),
+            "confidence_intervals": conf_int.tolist(),
+            "converged": converged,
+        })
+        return {
+            "predicted_points": len(y_true),
+            "preview": [
+                {
+                    "actual": float(actual),
+                    "predicted": float(predicted),
+                    "lower": float(interval[0]),
+                    "upper": float(interval[1]),
+                }
+                for actual, predicted, interval in list(zip(y_true, y_pred, conf_int))[:3]
+            ],
+        }
+
+    if step_id == "evaluate_metrics":
+        _, eval_range = _state_ranges(state)
+        y_eval = np.asarray(state["y_true"])
+        y_pred = np.asarray(state["y_pred"])
+        best_model = state["best_model"]
         timestamps = state["timestamps"]
         metrics = {
             "rmse": rmse(y_eval, y_pred),
@@ -504,12 +584,28 @@ def _run_arima(step_id: str, args, state: Dict[str, Any]) -> Dict[str, Any]:
             "r2": r2(y_eval, y_pred),
             "aic": float(best_model.aic()),
             "bic": float(best_model.bic()),
-            "converged": converged,
+            "converged": bool(state["converged"]),
             "evaluated_points": len(y_eval),
             "evaluate_indices": list(eval_range),
             "evaluate_months": _month_labels(timestamps, eval_range),
         }
-        predictions_with_std = arima._format_predictions(y_pred.tolist(), conf_int.tolist())
+        predictions_with_std = arima._format_predictions(
+            y_pred.tolist(),
+            state["confidence_intervals"],
+        )
+        state.update({
+            "metrics": metrics,
+            "predictions": predictions_with_std,
+        })
+        return {"metrics": metrics, "best_order": state["best_order"]}
+
+    if step_id == "save_artifact":
+        train_range, eval_range = _state_ranges(state)
+        timestamps = state["timestamps"]
+        y_true = state["y_true"]
+        best_model = state["best_model"]
+        metrics = state["metrics"]
+        predictions_with_std = state["predictions"]
         final_result: Dict[str, Any] = {
             "mode": "arima_search_pq_fixed_d",
             "data_points": int(state["data_points"]),
@@ -673,7 +769,7 @@ def _run_lstm(step_id: str, args, state: Dict[str, Any]) -> Dict[str, Any]:
         state["model_config"] = config
         return config
 
-    if step_id == "train_evaluate":
+    if step_id == "train_model":
         os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
         import tensorflow as tf
         from tensorflow.keras.callbacks import EarlyStopping, LearningRateScheduler
@@ -682,8 +778,6 @@ def _run_lstm(step_id: str, args, state: Dict[str, Any]) -> Dict[str, Any]:
         tf.keras.utils.set_random_seed(42)
         _set_lstm_seed(42)
 
-        train_range, eval_range = _state_ranges(state)
-        parsed_data = state["parsed_data"]
         config = state["model_config"]
         model = _build_lstm_model(config)
         epochs = int(state["epochs"])
@@ -693,7 +787,12 @@ def _run_lstm(step_id: str, args, state: Dict[str, Any]) -> Dict[str, Any]:
         def lr_schedule(epoch):
             return initial_learning_rate * (decay_rate ** epoch)
 
-        model.fit(
+        early_stopping = EarlyStopping(
+            monitor="loss",
+            patience=max(2, min(6, epochs // 4 or 2)),
+            restore_best_weights=True,
+        )
+        history = model.fit(
             state["train_x"],
             state["train_y"],
             epochs=epochs,
@@ -701,16 +800,48 @@ def _run_lstm(step_id: str, args, state: Dict[str, Any]) -> Dict[str, Any]:
             verbose=0,
             callbacks=[
                 LearningRateScheduler(lr_schedule, verbose=0),
-                EarlyStopping(
-                    monitor="loss",
-                    patience=max(2, min(6, epochs // 4 or 2)),
-                    restore_best_weights=True,
-                ),
+                early_stopping,
             ],
             shuffle=False,
         )
 
+        keras_model_path = os.path.join(args.artifact_dir, "lstm_trained_keras_model.h5")
+        temp_keras_model_path = os.path.join(args.artifact_dir, f"lstm_trained_keras_model.tmp-{os.getpid()}.h5")
+        try:
+            model.save(temp_keras_model_path)
+            os.replace(temp_keras_model_path, keras_model_path)
+        finally:
+            if os.path.exists(temp_keras_model_path):
+                try:
+                    os.remove(temp_keras_model_path)
+                except OSError:
+                    pass
+
+        loss_history = [float(value) for value in history.history.get("loss", [])]
+        state.update({
+            "trained_keras_model_path": keras_model_path,
+            "training_loss": loss_history,
+            "epochs_ran": len(loss_history),
+            "early_stopped": bool(getattr(early_stopping, "stopped_epoch", 0)),
+        })
+        return {
+            "epochs_requested": epochs,
+            "epochs_ran": len(loss_history),
+            "batch_size": int(config["batch_size"]),
+            "final_loss": loss_history[-1] if loss_history else None,
+            "early_stopped": bool(getattr(early_stopping, "stopped_epoch", 0)),
+        }
+
+    if step_id == "forecast":
+        os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
+        import tensorflow as tf
+        from tensorflow.keras.models import load_model
+
+        tf.get_logger().setLevel("ERROR")
         forecast_horizon = int(state["forecast_horizon"])
+        train_range, eval_range = _state_ranges(state)
+        parsed_data = state["parsed_data"]
+        model = load_model(state["trained_keras_model_path"], compile=False)
         forecast_offset = eval_range.start - train_range.stop
         state_for_eval = {
             "keras_model": model,
@@ -727,9 +858,29 @@ def _run_lstm(step_id: str, args, state: Dict[str, Any]) -> Dict[str, Any]:
             raise ValueError("[VALIDATION] 无法为完整评估区间生成 LSTM 预测。")
 
         y_true = parsed_data.df[parsed_data.target_key].values[eval_range]
+        state.update({
+            "y_true": y_true.tolist(),
+            "y_pred": np.asarray(y_pred).tolist(),
+        })
+        return {
+            "predicted_points": len(y_pred),
+            "forecast_horizon": forecast_horizon,
+            "preview": [
+                {"actual": float(actual), "predicted": float(predicted)}
+                for actual, predicted in list(zip(y_true, y_pred))[:3]
+            ],
+        }
+
+    if step_id == "evaluate_metrics":
+        train_range, eval_range = _state_ranges(state)
+        parsed_data = state["parsed_data"]
+        forecast_horizon = int(state["forecast_horizon"])
+        y_true = np.asarray(state["y_true"], dtype=float)
+        y_pred = np.asarray(state["y_pred"], dtype=float)
         residuals = y_true - y_pred
         train_target_values = parsed_data.df[parsed_data.target_key].values[train_range]
         std_dev_residuals = lstm._estimate_std_dev(residuals, train_target_values)
+        epochs = int(state["epochs"])
         metrics = {
             "rmse": rmse(y_true, y_pred),
             "mae": mae(y_true, y_pred),
@@ -743,6 +894,22 @@ def _run_lstm(step_id: str, args, state: Dict[str, Any]) -> Dict[str, Any]:
             "evaluate_months": _month_labels(state["months"], eval_range),
         }
         predictions_with_std = lstm._format_predictions(y_pred, std_dev_residuals)
+        state.update({
+            "residuals": residuals.tolist(),
+            "std_dev_residuals": std_dev_residuals,
+            "metrics": metrics,
+            "predictions": predictions_with_std,
+        })
+        return {"metrics": metrics}
+
+    if step_id == "save_artifact":
+        train_range, eval_range = _state_ranges(state)
+        parsed_data = state["parsed_data"]
+        epochs = int(state["epochs"])
+        forecast_horizon = int(state["forecast_horizon"])
+        metrics = state["metrics"]
+        y_true = state["y_true"]
+        predictions_with_std = state["predictions"]
         final_result: Dict[str, Any] = {
             "mode": "lstm_train_eval",
             "data_points": int(state["data_points"]),
@@ -752,10 +919,18 @@ def _run_lstm(step_id: str, args, state: Dict[str, Any]) -> Dict[str, Any]:
             "epochs": epochs,
             "normalization": state["normalization"],
             "forecast_horizon": forecast_horizon,
-            "train_range": {"start_index": train_range.start, "end_index": train_range.stop - 1},
-            "evaluate_range": {"start_index": eval_range.start, "end_index": eval_range.stop - 1},
+            "train_range": {
+                "start_index": train_range.start,
+                "end_index": train_range.stop - 1,
+                "months": _month_labels(state["months"], train_range),
+            },
+            "evaluate_range": {
+                "start_index": eval_range.start,
+                "end_index": eval_range.stop - 1,
+                "months": _month_labels(state["months"], eval_range),
+            },
             "metrics": metrics,
-            "eval_y_true": y_true.tolist(),
+            "eval_y_true": y_true,
             "predictions": predictions_with_std,
         }
         attach_method_metadata(final_result, lstm.METHOD_NAME, lstm.DIRECT_FORECAST_STRATEGY, lstm.DIRECT_IMPLEMENTATION_NOTES)
@@ -765,7 +940,7 @@ def _run_lstm(step_id: str, args, state: Dict[str, Any]) -> Dict[str, Any]:
             keras_model_path = os.path.splitext(save_path)[0] + "_keras_model.h5"
             temp_keras_model_path = os.path.splitext(save_path)[0] + f"_keras_model.tmp-{os.getpid()}.h5"
             try:
-                model.save(temp_keras_model_path)
+                shutil.copy2(state["trained_keras_model_path"], temp_keras_model_path)
                 os.replace(temp_keras_model_path, keras_model_path)
             finally:
                 if os.path.exists(temp_keras_model_path):
@@ -791,7 +966,7 @@ def _run_lstm(step_id: str, args, state: Dict[str, Any]) -> Dict[str, Any]:
                 "production_forecast_horizon": lstm._resolve_production_forecast_horizon(
                     eval_forecast_horizon=forecast_horizon
                 ),
-                "std_dev_residuals": std_dev_residuals,
+                "std_dev_residuals": float(state["std_dev_residuals"]),
             }
             attach_method_metadata(model_state, lstm.METHOD_NAME, lstm.DIRECT_FORECAST_STRATEGY, lstm.DIRECT_IMPLEMENTATION_NOTES)
             dump_model(model_state, save_path)

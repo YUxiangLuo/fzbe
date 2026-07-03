@@ -332,8 +332,15 @@ describe("models service", () => {
           request_payload: JSON.stringify(requestBody),
           status: "completed",
           current_step_id: null,
-          completed_step_ids: JSON.stringify(["prepare_data", "build_windows", "forecast", "evaluate"]),
-          step_outputs: JSON.stringify({ evaluate: { metrics: { rmse: 1 } } }),
+          completed_step_ids: JSON.stringify([
+            "prepare_data",
+            "build_windows",
+            "forecast",
+            "estimate_residuals",
+            "evaluate_metrics",
+            "save_artifact",
+          ]),
+          step_outputs: JSON.stringify({ save_artifact: { metrics: { rmse: 1 } } }),
           result_payload: JSON.stringify({
             status: "success",
             results: { metrics: { rmse: 1, mae: 1, r2: 0.9 } },
