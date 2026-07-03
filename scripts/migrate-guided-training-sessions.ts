@@ -23,13 +23,14 @@ try {
       session_id CHAR(36) PRIMARY KEY,
       experiment_id INT NOT NULL,
       student_id INT NOT NULL,
-      model_type ENUM('ma', 'es', 'arima', 'lstm') NOT NULL,
+      model_type ENUM('ma', 'es', 'arima', 'lstm', 'weighted_avg', 'stacking', 'boosting') NOT NULL,
       request_hash CHAR(64) NOT NULL,
       request_payload JSON NOT NULL,
       status ENUM('ready', 'running', 'failed', 'completed') NOT NULL DEFAULT 'ready',
       current_step_id VARCHAR(64) DEFAULT NULL,
       completed_step_ids JSON NOT NULL,
       step_outputs JSON NOT NULL,
+      step_plan JSON NOT NULL,
       result_payload JSON DEFAULT NULL,
       artifact_dir VARCHAR(1024) NOT NULL,
       error_message TEXT DEFAULT NULL,
@@ -48,6 +49,40 @@ try {
       INDEX idx_guided_training_student (student_id, experiment_id, model_type, updated_at),
       INDEX idx_guided_training_status (status, expires_at)
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+  `);
+
+  await connection.query(`
+    ALTER TABLE model_guided_training_sessions
+      MODIFY model_type ENUM('ma', 'es', 'arima', 'lstm', 'weighted_avg', 'stacking', 'boosting') NOT NULL
+  `);
+
+  const [columns] = await connection.query(
+    `
+      SELECT COLUMN_NAME
+        FROM INFORMATION_SCHEMA.COLUMNS
+       WHERE TABLE_SCHEMA = DATABASE()
+         AND TABLE_NAME = 'model_guided_training_sessions'
+         AND COLUMN_NAME = 'step_plan'
+      LIMIT 1
+    `,
+  );
+
+  if (!Array.isArray(columns) || columns.length === 0) {
+    await connection.query(`
+      ALTER TABLE model_guided_training_sessions
+        ADD COLUMN step_plan JSON NULL AFTER step_outputs
+    `);
+  }
+
+  await connection.query(`
+    UPDATE model_guided_training_sessions
+       SET step_plan = JSON_ARRAY()
+     WHERE step_plan IS NULL
+  `);
+
+  await connection.query(`
+    ALTER TABLE model_guided_training_sessions
+      MODIFY step_plan JSON NOT NULL
   `);
 
   console.log("Guided training session migration complete.");

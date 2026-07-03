@@ -87,12 +87,12 @@ interface TrainingMetricsPayload extends Record<string, unknown> {
 
 type BaseModelType = "ma" | "es" | "arima" | "lstm";
 type EnsembleModelType = Extract<ModelType, "weighted_avg" | "boosting" | "stacking">;
-type GuidedModelType = BaseModelType;
+type GuidedModelType = BaseModelType | EnsembleModelType;
 type GuidedTrainingStatus = "ready" | "running" | "failed" | "completed";
 
 const BASE_MODEL_TYPES = new Set<ModelType>(["ma", "es", "arima", "lstm"]);
 const ENSEMBLE_MODEL_TYPES = new Set<ModelType>(["weighted_avg", "boosting", "stacking"]);
-const GUIDED_MODEL_TYPES = new Set<ModelType>(["ma", "es", "arima", "lstm"]);
+const GUIDED_MODEL_TYPES = new Set<ModelType>(["ma", "es", "arima", "lstm", "weighted_avg", "boosting", "stacking"]);
 const ENSEMBLE_DERIVED_BODY_KEYS = new Set([
   "models",
   "moving_average_window",
@@ -291,6 +291,126 @@ const GUIDED_TRAINING_STEPS: Record<GuidedModelType, GuidedTrainingStepDefinitio
       actionLabel: "保存结果",
     },
   ],
+  weighted_avg: [
+    {
+      id: "prepare_data",
+      label: "确认融合材料",
+      description: "读取实验数据，校验训练/评估窗口和已选择的基础模型，确认可复用的基础模型产物。",
+      actionLabel: "校验数据",
+    },
+    {
+      id: "split_validation",
+      label: "划分权重验证段",
+      description: "按时间顺序从训练区间末尾留出一段验证数据，专门用于比较各基础模型的残差大小。",
+      actionLabel: "划分数据",
+    },
+    {
+      id: "validation_predictions",
+      label: "生成验证段预测",
+      description: "让每个基础模型只用前半段训练数据学习，再预测留出的验证段，形成可比较的误差证据。",
+      actionLabel: "训练并预测",
+    },
+    {
+      id: "compute_weights",
+      label: "计算融合权重",
+      description: "根据验证段残差 MSE 的倒数分配权重，误差越小的基础模型获得越高的组合权重。",
+      actionLabel: "计算权重",
+    },
+    {
+      id: "eval_predictions",
+      label: "完整训练后评估预测",
+      description: "在完整训练区间重训或复用基础模型，并生成独立评估区间的预测值。",
+      actionLabel: "生成评估预测",
+    },
+    {
+      id: "blend_evaluate",
+      label: "加权组合并评估",
+      description: "按固定权重组合基础模型预测，计算最终 RMSE、MAE、MAPE、R² 和残差波动。",
+      actionLabel: "组合评估",
+    },
+    {
+      id: "save_artifact",
+      label: "保存融合产物",
+      description: "保存融合权重、成员模型产物和评估结果，供后续预测和报告复用。",
+      actionLabel: "保存结果",
+    },
+  ],
+  stacking: [
+    {
+      id: "prepare_data",
+      label: "确认 Stacking 材料",
+      description: "读取实验数据，校验训练/评估窗口和基础模型选择，准备二层学习所需的输入。",
+      actionLabel: "校验数据",
+    },
+    {
+      id: "split_levels",
+      label: "划分 Level-0/Level-1",
+      description: "按时间顺序把训练区间拆成基础模型训练段和元模型训练段，避免时间序列信息泄漏。",
+      actionLabel: "划分层级",
+    },
+    {
+      id: "level1_predictions",
+      label: "生成元模型训练特征",
+      description: "基础模型在 Level-0 学习后预测 Level-1，预测矩阵将作为元模型的输入特征。",
+      actionLabel: "生成二层特征",
+    },
+    {
+      id: "fit_meta_model",
+      label: "拟合元模型",
+      description: "用 Level-1 的基础模型预测和真实销量训练非负线性元模型，必要时回退到稳定权重。",
+      actionLabel: "拟合元模型",
+    },
+    {
+      id: "eval_predictions",
+      label: "完整训练后评估预测",
+      description: "基础模型在完整训练区间重训或复用产物，为独立评估区间生成二层输入。",
+      actionLabel: "生成评估预测",
+    },
+    {
+      id: "meta_evaluate",
+      label: "元模型组合并评估",
+      description: "把评估区间的基础模型预测交给元模型组合，计算最终误差指标和残差波动。",
+      actionLabel: "组合评估",
+    },
+    {
+      id: "save_artifact",
+      label: "保存融合产物",
+      description: "保存元模型、成员模型产物和评估结果，供后续预测和报告复用。",
+      actionLabel: "保存结果",
+    },
+  ],
+  boosting: [
+    {
+      id: "prepare_data",
+      label: "确认 Boosting 材料",
+      description: "读取实验数据，校验训练/评估窗口、基础模型候选库、学习率和最大迭代轮数。",
+      actionLabel: "校验数据",
+    },
+    {
+      id: "split_residual_sets",
+      label: "初始化残差训练集",
+      description: "把训练区间拆成残差训练段和残差验证段，并把原始销量作为第一轮要解释的残差。",
+      actionLabel: "初始化残差",
+    },
+    {
+      id: "retrain_chain",
+      label: "重训已选模型链",
+      description: "按前面选出的模型链，在完整训练区间逐级拟合残差，并生成评估区间阶段预测。",
+      actionLabel: "重训模型链",
+    },
+    {
+      id: "combine_evaluate",
+      label: "累加阶段预测并评估",
+      description: "把各轮模型的预测按学习率累加，计算 Boosting 融合的最终误差指标。",
+      actionLabel: "组合评估",
+    },
+    {
+      id: "save_artifact",
+      label: "保存融合产物",
+      description: "保存模型链、阶段系数、成员模型产物和评估结果，供后续预测和报告复用。",
+      actionLabel: "保存结果",
+    },
+  ],
 };
 
 export interface AdvisoryLockHandle {
@@ -391,6 +511,7 @@ interface GuidedTrainingSessionRow extends RowDataPacket {
   current_step_id: string | null;
   completed_step_ids: unknown;
   step_outputs: unknown;
+  step_plan: unknown;
   result_payload: unknown;
   artifact_dir: string;
   error_message: string | null;
@@ -794,6 +915,100 @@ const copyLstmModelArtifact = async (sourceModelPath: string, destinationModelPa
   }
 };
 
+const ENSEMBLE_ARTIFACT_COPY_SCRIPT = `
+import os
+import sys
+
+sys.path.insert(0, os.path.join(os.getcwd(), "src"))
+
+from ensemble_utils import get_member_model_path, persist_member_model_artifact
+from serialization import dump_model, load_model
+
+source_model_path = sys.argv[1]
+destination_model_path = sys.argv[2]
+
+if not os.path.exists(source_model_path):
+    raise FileNotFoundError(f"source model not found: {source_model_path}")
+
+state = load_model(source_model_path)
+if not isinstance(state, dict):
+    raise ValueError("invalid ensemble state")
+
+base_model_states = state.get("base_model_states")
+if not isinstance(base_model_states, dict):
+    raise ValueError("ensemble state is missing base_model_states")
+
+os.makedirs(os.path.dirname(destination_model_path), exist_ok=True)
+
+def persist_state(model_name, model_state, round_idx=None):
+    if not isinstance(model_state, dict):
+        return
+    source_member_path = model_state.get("model_file")
+    if not isinstance(source_member_path, str) or not source_member_path:
+        raise ValueError(f"missing member artifact for {model_name}")
+    destination_member_path = get_member_model_path(destination_model_path, model_name, round_idx)
+    persist_member_model_artifact(
+        model_name,
+        source_member_path,
+        destination_member_path,
+        move_source=False,
+    )
+    model_state["model_file"] = destination_member_path
+    model_state.pop("artifact_origin", None)
+
+for outer_name, model_info in base_model_states.items():
+    if isinstance(model_info, dict) and isinstance(model_info.get("models"), list):
+        for index, model_state in enumerate(model_info["models"]):
+            if not isinstance(model_state, dict):
+                continue
+            model_name = str(model_state.get("model_type") or outer_name)
+            round_value = model_state.get("round", index)
+            try:
+                round_idx = int(round_value)
+            except (TypeError, ValueError):
+                round_idx = index
+            persist_state(model_name, model_state, round_idx)
+    elif isinstance(model_info, dict):
+        model_name = str(model_info.get("model_type") or outer_name)
+        persist_state(model_name, model_info)
+
+dump_model(state, destination_model_path)
+`;
+
+const copyEnsembleModelArtifact = async (sourceModelPath: string, destinationModelPath: string) => {
+  const pythonExec = resolvePythonExecutable();
+  const proc = Bun.spawn([
+    pythonExec,
+    "-c",
+    ENSEMBLE_ARTIFACT_COPY_SCRIPT,
+    sourceModelPath,
+    destinationModelPath,
+  ], {
+    cwd: PY_DIR,
+    stdout: "pipe",
+    stderr: "pipe",
+    env: {
+      ...process.env,
+      ...buildPythonModelProcessEnv(),
+      PATH: `${path.dirname(pythonExec)}${path.delimiter}${process.env.PATH ?? ""}`,
+    },
+  });
+
+  const [, stderr] = await Promise.all([
+    new Response(proc.stdout).text(),
+    new Response(proc.stderr).text(),
+  ]);
+  await proc.exited;
+
+  if (proc.exitCode !== 0) {
+    logger.error(
+      { stderr: stderr.slice(0, 2000), sourceModelPath, destinationModelPath },
+      "恢复 guided 融合模型产物失败",
+    );
+    throw new Error("恢复融合模型产物失败");
+  }
+};
+
 const copyModelArtifact = async (
   modelType: GuidedModelType,
   sourceModelPath: string,
@@ -807,6 +1022,12 @@ const copyModelArtifact = async (
 
   if (modelType === "lstm") {
     await copyLstmModelArtifact(sourceModelPath, destinationModelPath);
+    return;
+  }
+
+  if (isEnsembleModelType(modelType)) {
+    removeSiblingArtifactsByPrefix(destinationModelPath);
+    await copyEnsembleModelArtifact(sourceModelPath, destinationModelPath);
     return;
   }
 
@@ -1554,7 +1775,7 @@ async function runPythonGuidedTrainingStep(
   timeoutMs = TRAINING_TIMEOUT,
 ): Promise<GuidedPythonStepResult> {
   const pythonExec = resolvePythonExecutable();
-  const scriptPath = path.join(PY_DIR, "guided_model.py");
+  const scriptPath = path.join(PY_DIR, isEnsembleModelType(modelType) ? "guided_ensemble_model.py" : "guided_model.py");
   if (!fs.existsSync(scriptPath)) {
     throw new Error(`未找到 Python guided 训练入口脚本: ${scriptPath}`);
   }
@@ -1726,11 +1947,108 @@ export function transformTrainingResult(
   return finalResponse;
 }
 
-const getGuidedTrainingSteps = (modelType: GuidedModelType) => GUIDED_TRAINING_STEPS[modelType];
+const buildBoostingRoundStepDefinitions = (maxRounds: number): GuidedTrainingStepDefinition[] => {
+  const steps: GuidedTrainingStepDefinition[] = [];
+  for (let round = 1; round <= maxRounds; round += 1) {
+    steps.push(
+      {
+        id: `round_${round}_evaluate_candidates`,
+        label: `第 ${round} 轮评估候选模型`,
+        description: "用当前残差训练每个候选基础模型，并比较它们降低验证残差 RMSE 的能力。",
+        actionLabel: "评估候选",
+      },
+      {
+        id: `round_${round}_select_winner`,
+        label: `第 ${round} 轮选择胜出模型`,
+        description: "选择本轮最能降低验证残差的基础模型加入模型链；若没有改善，则提前停止迭代。",
+        actionLabel: "选择模型",
+      },
+    );
+  }
+  return steps;
+};
 
-const getGuidedNextStepId = (modelType: GuidedModelType, completedStepIds: string[]) => {
+const buildGuidedTrainingStepPlan = (
+  modelType: GuidedModelType,
+  body: TrainInput,
+): GuidedTrainingStepDefinition[] => {
+  if (modelType !== "boosting") {
+    return GUIDED_TRAINING_STEPS[modelType];
+  }
+
+  const requestedModels = body.models ? parseRequestedBaseModels(body.models) : [];
+  const maxRounds = Math.max(1, requestedModels.length);
+  const [prepareStep, splitStep, retrainStep, combineStep, saveStep] = GUIDED_TRAINING_STEPS.boosting;
+
+  return [
+    prepareStep!,
+    splitStep!,
+    ...buildBoostingRoundStepDefinitions(maxRounds),
+    retrainStep!,
+    combineStep!,
+    saveStep!,
+  ];
+};
+
+const parseGuidedStepPlan = (
+  modelType: GuidedModelType,
+  stepPlan: unknown,
+): GuidedTrainingStepDefinition[] => {
+  if (!Array.isArray(stepPlan)) {
+    return GUIDED_TRAINING_STEPS[modelType];
+  }
+
+  const parsedSteps = stepPlan.filter((item): item is GuidedTrainingStepDefinition => {
+    if (!item || typeof item !== "object") {
+      return false;
+    }
+    const candidate = item as Record<string, unknown>;
+    return typeof candidate.id === "string"
+      && typeof candidate.label === "string"
+      && typeof candidate.description === "string"
+      && typeof candidate.actionLabel === "string";
+  });
+
+  return parsedSteps.length > 0 ? parsedSteps : GUIDED_TRAINING_STEPS[modelType];
+};
+
+const getGuidedTrainingSteps = (row: Pick<GuidedTrainingSessionRow, "model_type" | "step_plan">) =>
+  parseGuidedStepPlan(row.model_type, parseJsonColumn<unknown>(row.step_plan, null));
+
+const getGuidedNextStepId = (steps: GuidedTrainingStepDefinition[], completedStepIds: string[]) => {
   const completedSet = new Set(completedStepIds);
-  return getGuidedTrainingSteps(modelType).find((step) => !completedSet.has(step.id))?.id ?? null;
+  return steps.find((step) => !completedSet.has(step.id))?.id ?? null;
+};
+
+const isRecordValue = (value: unknown): value is Record<string, unknown> =>
+  Boolean(value) && typeof value === "object" && !Array.isArray(value);
+
+const shouldTrimBoostingRoundSteps = (
+  modelType: GuidedModelType,
+  stepId: string,
+  output: unknown,
+) => {
+  if (modelType !== "boosting" || !/^round_\d+_select_winner$/.test(stepId) || !isRecordValue(output)) {
+    return false;
+  }
+
+  return output.action === "early_stop";
+};
+
+const trimBoostingStepPlanAfterEarlyStop = (
+  stepPlan: GuidedTrainingStepDefinition[],
+  stepId: string,
+) => {
+  const currentIndex = stepPlan.findIndex((step) => step.id === stepId);
+  if (currentIndex === -1) {
+    return stepPlan;
+  }
+
+  const finalStepIds = new Set(["retrain_chain", "combine_evaluate", "save_artifact"]);
+  return [
+    ...stepPlan.slice(0, currentIndex + 1),
+    ...stepPlan.filter((step, index) => index > currentIndex && finalStepIds.has(step.id)),
+  ];
 };
 
 const buildGuidedTrainingSessionPayload = (
@@ -1739,7 +2057,8 @@ const buildGuidedTrainingSessionPayload = (
   const completedStepIds = parseJsonColumn<string[]>(row.completed_step_ids, []);
   const stepOutputs = parseJsonColumn<Record<string, unknown>>(row.step_outputs, {});
   const result = parseJsonColumn<GuidedTrainingSessionPayload["result"]>(row.result_payload, null);
-  const nextStepId = getGuidedNextStepId(row.model_type, completedStepIds);
+  const stepPlan = getGuidedTrainingSteps(row);
+  const nextStepId = getGuidedNextStepId(stepPlan, completedStepIds);
   const activeStepId = row.current_step_id ?? nextStepId;
   const completedSet = new Set(completedStepIds);
   const isCompletedSession = row.status === "completed";
@@ -1751,7 +2070,7 @@ const buildGuidedTrainingSessionPayload = (
     status: row.status,
     current_step_id: activeStepId,
     next_step_id: row.status === "completed" ? null : nextStepId,
-    steps: getGuidedTrainingSteps(row.model_type).map((step) => ({
+    steps: stepPlan.map((step) => ({
       ...step,
       status: isCompletedSession || completedSet.has(step.id)
         ? "completed"
@@ -1782,6 +2101,7 @@ const fetchGuidedTrainingSessionRow = async (
             current_step_id,
             completed_step_ids,
             step_outputs,
+            step_plan,
             result_payload,
             artifact_dir,
             error_message
@@ -1805,6 +2125,12 @@ const buildGuidedTrainingPythonParams = async (
   if (modelType === "ma") {
     validateMovingAverageWindow(trainingConfig, body.moving_average_window);
   }
+  if (isEnsembleModelType(modelType)) {
+    buildEnsemblePythonParams(experiment, body);
+  }
+  const derivedModelParams: Record<string, unknown> = isEnsembleModelType(modelType)
+    ? buildEnsemblePythonParams(experiment, body)
+    : {};
 
   const allData = await loadDatasetFromDb(
     trainingConfig.selected_industry,
@@ -1834,6 +2160,14 @@ const buildGuidedTrainingPythonParams = async (
     const value = body[bodyKey as keyof TrainInput];
     if (value !== undefined) {
       pythonParams[bodyKey] = value;
+    }
+  }
+
+  Object.assign(pythonParams, derivedModelParams);
+  if (isEnsembleModelType(modelType) && body.models) {
+    const baseModelArtifactMap = buildAvailableBaseModelArtifactMap(body.experiment_id, studentId, body.models);
+    if (Object.keys(baseModelArtifactMap).length > 0) {
+      pythonParams.baseModelFiles = JSON.stringify(baseModelArtifactMap);
     }
   }
 
@@ -1868,6 +2202,7 @@ export async function createOrResumeGuidedTrainingSession(
             current_step_id,
             completed_step_ids,
             step_outputs,
+            step_plan,
             result_payload,
             artifact_dir,
             error_message
@@ -1902,7 +2237,8 @@ export async function createOrResumeGuidedTrainingSession(
   fs.mkdirSync(artifactDir, { recursive: true });
 
   const completedStepIds: string[] = [];
-  const currentStepId = getGuidedNextStepId(modelType, completedStepIds);
+  const stepPlan = buildGuidedTrainingStepPlan(modelType, body);
+  const currentStepId = getGuidedNextStepId(stepPlan, completedStepIds);
   await pool.query(
     `INSERT INTO model_guided_training_sessions
        (session_id,
@@ -1915,10 +2251,11 @@ export async function createOrResumeGuidedTrainingSession(
         current_step_id,
         completed_step_ids,
         step_outputs,
+        step_plan,
         result_payload,
         artifact_dir,
         expires_at)
-     VALUES (?, ?, ?, ?, ?, ?, 'ready', ?, ?, ?, NULL, ?, DATE_ADD(NOW(), INTERVAL 7 DAY))`,
+     VALUES (?, ?, ?, ?, ?, ?, 'ready', ?, ?, ?, ?, NULL, ?, DATE_ADD(NOW(), INTERVAL 7 DAY))`,
     [
       sessionId,
       body.experiment_id,
@@ -1929,6 +2266,7 @@ export async function createOrResumeGuidedTrainingSession(
       currentStepId,
       JSON.stringify(completedStepIds),
       JSON.stringify({}),
+      JSON.stringify(stepPlan),
       artifactDir,
     ],
   );
@@ -1996,7 +2334,8 @@ export async function runGuidedTrainingStep(
     return buildGuidedTrainingSessionPayload(row);
   }
 
-  const nextStepId = getGuidedNextStepId(modelType, completedStepIds);
+  const stepPlan = getGuidedTrainingSteps(row);
+  const nextStepId = getGuidedNextStepId(stepPlan, completedStepIds);
   if (stepId !== nextStepId) {
     throw new ModelValidationError("只能按训练流程顺序执行下一个阶段");
   }
@@ -2044,6 +2383,9 @@ export async function runGuidedTrainingStep(
       ...stepOutputs,
       [stepId]: pythonStepResult.output ?? {},
     };
+    const nextStepPlan = shouldTrimBoostingRoundSteps(modelType, stepId, pythonStepResult.output)
+      ? trimBoostingStepPlanAfterEarlyStop(stepPlan, stepId)
+      : stepPlan;
 
     let transformedResult: ReturnType<typeof transformTrainingResult> | null = null;
     if (pythonStepResult.final_result) {
@@ -2057,7 +2399,7 @@ export async function runGuidedTrainingStep(
     const status: GuidedTrainingStatus = transformedResult ? "completed" : "ready";
     const currentStepId = status === "completed"
       ? null
-      : getGuidedNextStepId(modelType, nextCompletedStepIds);
+      : getGuidedNextStepId(nextStepPlan, nextCompletedStepIds);
 
     await pool.query(
       `UPDATE model_guided_training_sessions
@@ -2065,6 +2407,7 @@ export async function runGuidedTrainingStep(
               current_step_id = ?,
               completed_step_ids = ?,
               step_outputs = ?,
+              step_plan = ?,
               result_payload = ?,
               error_message = NULL
         WHERE session_id = ?`,
@@ -2073,6 +2416,7 @@ export async function runGuidedTrainingStep(
         currentStepId,
         JSON.stringify(nextCompletedStepIds),
         JSON.stringify(nextStepOutputs),
+        JSON.stringify(nextStepPlan),
         transformedResult ? JSON.stringify(transformedResult) : null,
         sessionId,
       ],
