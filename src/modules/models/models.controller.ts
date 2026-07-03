@@ -9,6 +9,9 @@ import {
 } from "./models.validation";
 import {
   trainModel,
+  createOrResumeGuidedTrainingSession,
+  getGuidedTrainingSession,
+  runGuidedTrainingStep,
   getReusableProductionModelArtifactResult,
   prepareExperimentModelForProduction,
   predictExperimentModel,
@@ -289,6 +292,132 @@ modelsController.post(
         await releaseModelExecutionLock(executionLock);
       }
     });
+  },
+);
+
+modelsController.post(
+  "/api/v1/models/:model_type/guided-training/sessions",
+  jwtAuth,
+  requireStudent,
+  async (c) => {
+    const modelTypeParam = c.req.param("model_type");
+    if (!isModelType(modelTypeParam)) {
+      return c.json({ error: "指定的模型类型无效" }, 400);
+    }
+    const modelType = modelTypeParam;
+
+    const payload = c.get("jwtPayload") as JwtPayload;
+    let rawBody: unknown;
+    try {
+      rawBody = await c.req.json();
+    } catch {
+      return c.json({ error: "请求体必须是有效的 JSON" }, 400);
+    }
+
+    const validation = getTrainSchemaForModel(modelType).safeParse(rawBody);
+    if (!validation.success) {
+      const localizedDetails = buildLocalizedTrainValidationDetails(validation.error.issues);
+      return c.json(
+        {
+          error: validation.error.issues[0]
+            ? localizeTrainValidationIssue(validation.error.issues[0])
+            : "训练请求参数无效",
+          details: localizedDetails,
+        },
+        400,
+      );
+    }
+
+    try {
+      const session = await createOrResumeGuidedTrainingSession(modelType, payload.sub, validation.data);
+      return c.json(session);
+    } catch (error: unknown) {
+      if (error instanceof ModelAccessError) {
+        return c.json({ error: error.message }, error.status);
+      }
+      if (error instanceof ModelValidationError) {
+        return c.json({ error: error.message, ...error.details }, 400);
+      }
+      if (error instanceof ModelNotFoundError) {
+        return c.json({ error: error.message }, 404);
+      }
+      return handleUnexpectedError(c, error, "创建分阶段训练会话失败");
+    }
+  },
+);
+
+modelsController.get(
+  "/api/v1/models/:model_type/guided-training/sessions/:session_id",
+  jwtAuth,
+  requireStudent,
+  async (c) => {
+    const modelTypeParam = c.req.param("model_type");
+    if (!isModelType(modelTypeParam)) {
+      return c.json({ error: "指定的模型类型无效" }, 400);
+    }
+
+    const payload = c.get("jwtPayload") as JwtPayload;
+    try {
+      const session = await getGuidedTrainingSession(
+        modelTypeParam,
+        payload.sub,
+        c.req.param("session_id"),
+      );
+      return c.json(session);
+    } catch (error: unknown) {
+      if (error instanceof ModelAccessError) {
+        return c.json({ error: error.message }, error.status);
+      }
+      if (error instanceof ModelValidationError) {
+        return c.json({ error: error.message, ...error.details }, 400);
+      }
+      if (error instanceof ModelNotFoundError) {
+        return c.json({ error: error.message }, 404);
+      }
+      return handleUnexpectedError(c, error, "获取分阶段训练会话失败");
+    }
+  },
+);
+
+modelsController.post(
+  "/api/v1/models/:model_type/guided-training/sessions/:session_id/steps/:step_id/run",
+  jwtAuth,
+  requireStudent,
+  async (c) => {
+    const modelTypeParam = c.req.param("model_type");
+    if (!isModelType(modelTypeParam)) {
+      return c.json({ error: "指定的模型类型无效" }, 400);
+    }
+
+    const payload = c.get("jwtPayload") as JwtPayload;
+    try {
+      const session = await runGuidedTrainingStep(
+        modelTypeParam,
+        payload.sub,
+        c.req.param("session_id"),
+        c.req.param("step_id"),
+      );
+      return c.json(session);
+    } catch (error: unknown) {
+      if (error instanceof ModelAccessError) {
+        return c.json({ error: error.message }, error.status);
+      }
+      if (error instanceof ModelValidationError) {
+        if (error.message.includes("模型服务繁忙")) {
+          return c.json({ error: error.message }, 429);
+        }
+        if (error.message.includes("同一模型正在训练或预测")) {
+          return c.json({ error: error.message }, 409);
+        }
+        return c.json({ error: error.message, ...error.details }, 400);
+      }
+      if (error instanceof ModelNotFoundError) {
+        return c.json({ error: error.message }, 404);
+      }
+
+      const normalizedError = normalizeTrainingStreamError(error, modelTypeParam);
+      return c.json({ error: normalizedError.message, details: normalizedError }, normalizedError.status as any);
+    }
   },
 );
 

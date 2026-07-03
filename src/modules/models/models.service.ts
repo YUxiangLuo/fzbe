@@ -1,5 +1,6 @@
 import path from "path";
 import fs from "fs";
+import crypto from "crypto";
 import type { PoolConnection, RowDataPacket } from "mysql2/promise";
 import { pool } from "../../config";
 import logger from "../../utils/logger";
@@ -8,6 +9,8 @@ import { TIMEOUTS, CONCURRENCY_LIMITS, PYTHON_RUNTIME_CONFIG } from "../../utils
 import { PY_DIR, resolvePythonExecutable } from "../../utils/python";
 import { CsvEncodingError, readCsvRows } from "../../utils/csv-processor";
 import {
+  buildGuidedTrainingArtifactDir,
+  buildGuidedTrainingStatePath,
   buildExperimentScopedModelPath,
   buildModelExecutionLockName,
   buildModelSlotLockName,
@@ -84,9 +87,12 @@ interface TrainingMetricsPayload extends Record<string, unknown> {
 
 type BaseModelType = "ma" | "es" | "arima" | "lstm";
 type EnsembleModelType = Extract<ModelType, "weighted_avg" | "boosting" | "stacking">;
+type GuidedModelType = BaseModelType;
+type GuidedTrainingStatus = "ready" | "running" | "failed" | "completed";
 
 const BASE_MODEL_TYPES = new Set<ModelType>(["ma", "es", "arima", "lstm"]);
 const ENSEMBLE_MODEL_TYPES = new Set<ModelType>(["weighted_avg", "boosting", "stacking"]);
+const GUIDED_MODEL_TYPES = new Set<ModelType>(["ma", "es", "arima", "lstm"]);
 const ENSEMBLE_DERIVED_BODY_KEYS = new Set([
   "models",
   "moving_average_window",
@@ -96,6 +102,142 @@ const ENSEMBLE_DERIVED_BODY_KEYS = new Set([
   "lstmTargetFeature",
   "lstmNormalization",
 ]);
+
+export interface GuidedTrainingStepDefinition {
+  id: string;
+  label: string;
+  description: string;
+  actionLabel: string;
+}
+
+export interface GuidedTrainingSessionPayload {
+  session_id: string;
+  experiment_id: number;
+  model_type: GuidedModelType;
+  status: GuidedTrainingStatus;
+  current_step_id: string | null;
+  next_step_id: string | null;
+  steps: Array<GuidedTrainingStepDefinition & {
+    status: "pending" | "active" | "completed" | "failed";
+    output?: unknown;
+  }>;
+  step_outputs: Record<string, unknown>;
+  result: { status: string; results: Record<string, unknown>; inferred_feature_types?: unknown } | null;
+  error_message: string | null;
+}
+
+const GUIDED_TRAINING_STEPS: Record<GuidedModelType, GuidedTrainingStepDefinition[]> = {
+  ma: [
+    {
+      id: "prepare_data",
+      label: "校验训练窗口",
+      description: "读取实验数据，确认训练区间、评估区间和移动平均窗口可以用于建模。",
+      actionLabel: "校验数据",
+    },
+    {
+      id: "build_windows",
+      label: "构造滚动窗口",
+      description: "取训练集末尾的历史销量作为初始窗口，准备按窗口均值递推预测。",
+      actionLabel: "构造窗口",
+    },
+    {
+      id: "forecast",
+      label: "逐期生成预测",
+      description: "每预测一期，就把预测值放回窗口，为下一期预测提供历史。",
+      actionLabel: "生成预测",
+    },
+    {
+      id: "evaluate",
+      label: "计算指标并保存",
+      description: "比较预测值和评估集真实销量，计算 RMSE、MAE、R² 并保存模型产物。",
+      actionLabel: "完成评估",
+    },
+  ],
+  es: [
+    {
+      id: "prepare_data",
+      label: "校验平滑参数",
+      description: "读取实验数据，确认训练/评估窗口和 alpha 平滑系数有效。",
+      actionLabel: "校验数据",
+    },
+    {
+      id: "fit_model",
+      label: "拟合指数平滑",
+      description: "用训练集销量和 alpha 参数拟合一次指数平滑水平项。",
+      actionLabel: "拟合模型",
+    },
+    {
+      id: "forecast",
+      label: "生成评估预测",
+      description: "使用拟合后的水平项，对评估区间进行多期外推预测。",
+      actionLabel: "生成预测",
+    },
+    {
+      id: "evaluate",
+      label: "计算指标并保存",
+      description: "计算误差指标，保存可复用的指数平滑模型产物。",
+      actionLabel: "完成评估",
+    },
+  ],
+  arima: [
+    {
+      id: "prepare_data",
+      label: "校验差分和搜索范围",
+      description: "读取训练序列，确认 d 阶差分后仍有足够样本，并确定 p/q 搜索上限。",
+      actionLabel: "准备搜索",
+    },
+    {
+      id: "aic_search",
+      label: "执行 AIC 搜索",
+      description: "按 AIC 信息准则搜索候选 ARIMA(p,d,q) 模型。",
+      actionLabel: "运行 AIC",
+    },
+    {
+      id: "bic_search",
+      label: "执行 BIC 搜索",
+      description: "按 BIC 信息准则搜索候选模型，增强小样本下的复杂度惩罚。",
+      actionLabel: "运行 BIC",
+    },
+    {
+      id: "select_model",
+      label: "选择最优阶数",
+      description: "比较 AIC/BIC 候选模型，并根据样本量选择最终 p、d、q。",
+      actionLabel: "选择模型",
+    },
+    {
+      id: "evaluate",
+      label: "预测评估并保存",
+      description: "用最终 ARIMA 模型预测评估区间，计算指标并保存模型产物。",
+      actionLabel: "完成评估",
+    },
+  ],
+  lstm: [
+    {
+      id: "prepare_data",
+      label: "解析字段并校验窗口",
+      description: "读取多变量数据，确认目标字段、特征字段、归一化方式和训练窗口有效。",
+      actionLabel: "解析数据",
+    },
+    {
+      id: "preprocess",
+      label: "预处理并构造样本",
+      description: "仅用训练集拟合归一化/编码器，再构造 LSTM 输入序列和多步预测标签。",
+      actionLabel: "构造样本",
+    },
+    {
+      id: "build_model",
+      label: "确定网络结构",
+      description: "根据特征维度和样本量确定 LSTM 层、Dense 层和 batch size。",
+      actionLabel: "构建网络",
+    },
+    {
+      id: "train_evaluate",
+      label: "训练、预测并保存",
+      description: "执行真实 Keras 训练，生成评估预测，反归一化后计算指标并保存模型产物。",
+      actionLabel: "训练并评估",
+    },
+  ],
+};
 
 export interface AdvisoryLockHandle {
   connection: PoolConnection;
@@ -182,6 +324,22 @@ export const releaseModelExecutionLock = async (handle: AdvisoryLockHandle | nul
 
 interface SegmentRow extends RowDataPacket {
   file_path: string;
+}
+
+interface GuidedTrainingSessionRow extends RowDataPacket {
+  session_id: string;
+  experiment_id: number;
+  student_id: number;
+  model_type: GuidedModelType;
+  request_hash: string;
+  request_payload: unknown;
+  status: GuidedTrainingStatus;
+  current_step_id: string | null;
+  completed_step_ids: unknown;
+  step_outputs: unknown;
+  result_payload: unknown;
+  artifact_dir: string;
+  error_message: string | null;
 }
 
 export class ModelValidationError extends Error {
@@ -342,6 +500,9 @@ const getProductionModelPath = (experimentId: number, studentId: number, modelTy
 
 const getLstmSidecarPath = (modelPath: string) => modelPath.replace(/\.pkl$/, "_keras_model.h5");
 
+const getGuidedSessionModelPath = (artifactDir: string, modelType: GuidedModelType) =>
+  path.join(artifactDir, `${modelType}.pkl`);
+
 const removeFileIfExists = (filePath: string) => {
   if (!fs.existsSync(filePath)) {
     return;
@@ -494,6 +655,159 @@ const hasReusableSavedModelArtifact = async (modelType: ModelType, modelPath: st
   }
 
   return await hasCompleteEnsembleArtifact(modelPath);
+};
+
+const LSTM_ARTIFACT_COPY_SCRIPT = `
+import os
+import pickle
+import shutil
+import sys
+import tempfile
+
+source_model_path = sys.argv[1]
+destination_model_path = sys.argv[2]
+
+if not os.path.exists(source_model_path):
+    raise FileNotFoundError(f"source model not found: {source_model_path}")
+
+os.makedirs(os.path.dirname(destination_model_path), exist_ok=True)
+shutil.copy2(source_model_path, destination_model_path)
+
+with open(destination_model_path, "rb") as handle:
+    state = pickle.load(handle)
+
+source_keras_path = state.get("keras_model_path")
+if not source_keras_path:
+    source_keras_path = os.path.splitext(source_model_path)[0] + "_keras_model.h5"
+
+if not os.path.exists(source_keras_path):
+    raise FileNotFoundError(f"source keras model not found: {source_keras_path}")
+
+destination_keras_path = os.path.splitext(destination_model_path)[0] + "_keras_model.h5"
+shutil.copy2(source_keras_path, destination_keras_path)
+state["keras_model_path"] = destination_keras_path
+
+fd, temp_name = tempfile.mkstemp(
+    prefix=f".{os.path.basename(destination_model_path)}.",
+    suffix=".tmp",
+    dir=os.path.dirname(destination_model_path),
+)
+try:
+    with os.fdopen(fd, "wb") as handle:
+        pickle.dump(state, handle, protocol=pickle.HIGHEST_PROTOCOL)
+        handle.flush()
+        os.fsync(handle.fileno())
+    os.replace(temp_name, destination_model_path)
+finally:
+    if os.path.exists(temp_name):
+        try:
+            os.remove(temp_name)
+        except OSError:
+            pass
+`;
+
+const copyLstmModelArtifact = async (sourceModelPath: string, destinationModelPath: string) => {
+  const pythonExec = resolvePythonExecutable();
+  const proc = Bun.spawn([
+    pythonExec,
+    "-c",
+    LSTM_ARTIFACT_COPY_SCRIPT,
+    sourceModelPath,
+    destinationModelPath,
+  ], {
+    cwd: PY_DIR,
+    stdout: "pipe",
+    stderr: "pipe",
+    env: {
+      ...process.env,
+      ...buildPythonModelProcessEnv(),
+      PATH: `${path.dirname(pythonExec)}${path.delimiter}${process.env.PATH ?? ""}`,
+    },
+  });
+
+  const [, stderr] = await Promise.all([
+    new Response(proc.stdout).text(),
+    new Response(proc.stderr).text(),
+  ]);
+  await proc.exited;
+
+  if (proc.exitCode !== 0) {
+    logger.error(
+      { stderr: stderr.slice(0, 2000), sourceModelPath, destinationModelPath },
+      "恢复 guided LSTM 模型产物失败",
+    );
+    throw new Error("恢复 LSTM 模型产物失败");
+  }
+};
+
+const copyModelArtifact = async (
+  modelType: GuidedModelType,
+  sourceModelPath: string,
+  destinationModelPath: string,
+) => {
+  if (!fs.existsSync(sourceModelPath)) {
+    throw new ModelNotFoundError("分阶段训练模型产物已丢失，请重新训练");
+  }
+
+  fs.mkdirSync(path.dirname(destinationModelPath), { recursive: true });
+
+  if (modelType === "lstm") {
+    await copyLstmModelArtifact(sourceModelPath, destinationModelPath);
+    return;
+  }
+
+  fs.copyFileSync(sourceModelPath, destinationModelPath);
+};
+
+const restoreGuidedSessionBacktestArtifact = async (row: GuidedTrainingSessionRow) => {
+  const sourceModelPath = getGuidedSessionModelPath(row.artifact_dir, row.model_type);
+  const backtestModelPath = getBacktestModelPath(row.experiment_id, row.student_id, row.model_type);
+
+  await copyModelArtifact(row.model_type, sourceModelPath, backtestModelPath);
+  invalidateProductionArtifact(row.experiment_id, row.student_id, row.model_type);
+  return backtestModelPath;
+};
+
+const stableJsonStringify = (value: unknown): string => {
+  if (Array.isArray(value)) {
+    return `[${value.map((item) => stableJsonStringify(item)).join(",")}]`;
+  }
+
+  if (value && typeof value === "object") {
+    const record = value as Record<string, unknown>;
+    return `{${Object.keys(record)
+      .sort()
+      .map((key) => `${JSON.stringify(key)}:${stableJsonStringify(record[key])}`)
+      .join(",")}}`;
+  }
+
+  return JSON.stringify(value);
+};
+
+const hashGuidedTrainingRequest = (modelType: GuidedModelType, body: TrainInput) =>
+  crypto
+    .createHash("sha256")
+    .update(stableJsonStringify({ modelType, body }))
+    .digest("hex");
+
+const parseJsonColumn = <T>(value: unknown, fallback: T): T => {
+  if (value === null || value === undefined) {
+    return fallback;
+  }
+
+  if (typeof value === "string") {
+    try {
+      return JSON.parse(value) as T;
+    } catch {
+      return fallback;
+    }
+  }
+
+  return value as T;
+};
+
+const isGuidedModelType = (modelType: ModelType): modelType is GuidedModelType => {
+  return GUIDED_MODEL_TYPES.has(modelType);
 };
 
 const normalizeBooleanFlag = (value: number | boolean | null | undefined): boolean => {
@@ -1166,6 +1480,128 @@ export async function runPythonModel(
   return Promise.race([executionPromise, timeoutPromise]);
 }
 
+interface GuidedPythonStepResult {
+  step_id: string;
+  output?: unknown;
+  final_result?: Record<string, unknown>;
+}
+
+async function runPythonGuidedTrainingStep(
+  modelType: GuidedModelType,
+  stepId: string,
+  params: Record<string, unknown>,
+  stateFilePath: string,
+  artifactDir: string,
+  timeoutMs = TRAINING_TIMEOUT,
+): Promise<GuidedPythonStepResult> {
+  const pythonExec = resolvePythonExecutable();
+  const scriptPath = path.join(PY_DIR, "guided_model.py");
+  if (!fs.existsSync(scriptPath)) {
+    throw new Error(`未找到 Python guided 训练入口脚本: ${scriptPath}`);
+  }
+
+  fs.mkdirSync(artifactDir, { recursive: true });
+  const args = Object.entries(params).flatMap(([key, value]) => {
+    const scriptKey = allPossiblePythonParams[key] || key;
+    const cliArg = `--${scriptKey}`;
+    if (typeof value === "boolean") return value ? [cliArg] : [];
+    if (Array.isArray(value)) return [cliArg, JSON.stringify(value)];
+    return [cliArg, String(value)];
+  });
+
+  const fullArgs = [
+    modelType,
+    stepId,
+    "--state-file",
+    stateFilePath,
+    "--artifact-dir",
+    artifactDir,
+    ...args,
+  ];
+  const command = process.platform !== "win32" && SETSID_PATH
+    ? [SETSID_PATH, pythonExec, scriptPath, ...fullArgs]
+    : [pythonExec, scriptPath, ...fullArgs];
+
+  const proc = Bun.spawn(command, {
+    cwd: PY_DIR,
+    stdout: "pipe",
+    stderr: "pipe",
+    env: {
+      ...process.env,
+      ...buildPythonModelProcessEnv(),
+      PATH: `${path.dirname(pythonExec)}${path.delimiter}${process.env.PATH ?? ""}`,
+    },
+  });
+
+  let timeoutId: ReturnType<typeof setTimeout> | undefined;
+
+  const killPythonProcessTree = () => {
+    if (proc.exitCode !== null || proc.killed) return;
+
+    if (process.platform !== "win32" && SETSID_PATH) {
+      try {
+        process.kill(-proc.pid, "SIGKILL");
+        return;
+      } catch (error) {
+        logger.warn({ error, pid: proc.pid, modelType, stepId }, "终止 guided Python 进程组失败");
+      }
+    }
+
+    try {
+      proc.kill("SIGKILL");
+    } catch (error) {
+      logger.warn({ err: error, pid: proc.pid, modelType, stepId }, "终止 guided Python 主进程失败");
+    }
+  };
+
+  const executionPromise = new Promise<GuidedPythonStepResult>(async (resolve, reject) => {
+    try {
+      const [stdout, stderr] = await Promise.all([
+        new Response(proc.stdout).text(),
+        new Response(proc.stderr).text(),
+      ]);
+      await proc.exited;
+
+      if (proc.exitCode !== 0) {
+        logger.error(
+          { stderr: stderr.slice(0, 2000), modelType, stepId },
+          "guided Python 阶段执行失败",
+        );
+        const taggedError = extractPythonTaggedError(stderr);
+        reject(taggedError ?? new Error("Python 执行失败"));
+        return;
+      }
+
+      try {
+        resolve(JSON.parse(stdout) as GuidedPythonStepResult);
+      } catch {
+        logger.error(
+          { stdout: stdout.slice(0, 2000), modelType, stepId },
+          "解析 guided Python 输出失败",
+        );
+        reject(new Error("Python 输出无效"));
+      }
+    } catch (err) {
+      reject(err);
+    } finally {
+      if (timeoutId) clearTimeout(timeoutId);
+    }
+  });
+
+  const timeoutPromise = new Promise<GuidedPythonStepResult>((_, reject) => {
+    timeoutId = setTimeout(() => {
+      killPythonProcessTree();
+      reject(new Error(`Python 执行超时 (${timeoutMs}ms)`));
+    }, timeoutMs);
+  });
+
+  executionPromise.catch((err) => {
+    logger.debug({ err, modelType, stepId }, "guided Python 超时后滞后 rejection（已忽略）");
+  });
+
+  return Promise.race([executionPromise, timeoutPromise]);
+}
+
 const resultTransformers: Record<ModelType, (result: Record<string, unknown>) => Record<string, unknown>> = {
   arima: (result) => ({
     best_order: result.best_order,
@@ -1229,6 +1665,380 @@ export function transformTrainingResult(
   }
 
   return finalResponse;
+}
+
+const getGuidedTrainingSteps = (modelType: GuidedModelType) => GUIDED_TRAINING_STEPS[modelType];
+
+const getGuidedNextStepId = (modelType: GuidedModelType, completedStepIds: string[]) => {
+  const completedSet = new Set(completedStepIds);
+  return getGuidedTrainingSteps(modelType).find((step) => !completedSet.has(step.id))?.id ?? null;
+};
+
+const buildGuidedTrainingSessionPayload = (
+  row: GuidedTrainingSessionRow,
+): GuidedTrainingSessionPayload => {
+  const completedStepIds = parseJsonColumn<string[]>(row.completed_step_ids, []);
+  const stepOutputs = parseJsonColumn<Record<string, unknown>>(row.step_outputs, {});
+  const result = parseJsonColumn<GuidedTrainingSessionPayload["result"]>(row.result_payload, null);
+  const nextStepId = getGuidedNextStepId(row.model_type, completedStepIds);
+  const activeStepId = row.current_step_id ?? nextStepId;
+  const completedSet = new Set(completedStepIds);
+
+  return {
+    session_id: row.session_id,
+    experiment_id: row.experiment_id,
+    model_type: row.model_type,
+    status: row.status,
+    current_step_id: activeStepId,
+    next_step_id: row.status === "completed" ? null : nextStepId,
+    steps: getGuidedTrainingSteps(row.model_type).map((step) => ({
+      ...step,
+      status: completedSet.has(step.id)
+        ? "completed"
+        : row.status === "failed" && activeStepId === step.id
+          ? "failed"
+          : activeStepId === step.id
+            ? "active"
+            : "pending",
+      output: stepOutputs[step.id],
+    })),
+    step_outputs: stepOutputs,
+    result,
+    error_message: row.error_message,
+  };
+};
+
+const fetchGuidedTrainingSessionRow = async (
+  sessionId: string,
+): Promise<GuidedTrainingSessionRow | null> => {
+  const [rows] = await pool.query<GuidedTrainingSessionRow[]>(
+    `SELECT session_id,
+            experiment_id,
+            student_id,
+            model_type,
+            request_hash,
+            request_payload,
+            status,
+            current_step_id,
+            completed_step_ids,
+            step_outputs,
+            result_payload,
+            artifact_dir,
+            error_message
+       FROM model_guided_training_sessions
+      WHERE session_id = ?
+      LIMIT 1`,
+    [sessionId],
+  );
+
+  return rows[0] ?? null;
+};
+
+const buildGuidedTrainingPythonParams = async (
+  modelType: GuidedModelType,
+  studentId: number,
+  body: TrainInput,
+): Promise<Record<string, unknown>> => {
+  const experiment = await assertExperimentModelAccess(body.experiment_id, studentId);
+  assertTrainingRequestMatchesExperiment(experiment, body);
+  const trainingConfig = getExperimentTrainingConfig(experiment);
+  if (modelType === "ma") {
+    validateMovingAverageWindow(trainingConfig, body.moving_average_window);
+  }
+
+  const allData = await loadDatasetFromDb(
+    trainingConfig.selected_industry,
+    trainingConfig.selected_company,
+    trainingConfig.selected_product,
+  );
+
+  if (
+    trainingConfig.data_window_train_end_index >= allData.length
+    || trainingConfig.data_window_evaluate_end_index >= allData.length
+  ) {
+    throw new ModelValidationError("数据窗口索引超出范围", { dataset_size: allData.length });
+  }
+
+  const modelSaveLoc = getBacktestModelPath(body.experiment_id, studentId, modelType);
+  const pythonParams: Record<string, unknown> = {
+    data: JSON.stringify(allData),
+    trainStart: trainingConfig.data_window_train_start_index,
+    trainEnd: trainingConfig.data_window_train_end_index,
+    evalStart: trainingConfig.data_window_evaluate_start_index,
+    evalEnd: trainingConfig.data_window_evaluate_end_index,
+    saveModel: modelSaveLoc,
+    pretty: true,
+  };
+
+  for (const bodyKey of Object.keys(allPossiblePythonParams)) {
+    const value = body[bodyKey as keyof TrainInput];
+    if (value !== undefined) {
+      pythonParams[bodyKey] = value;
+    }
+  }
+
+  return pythonParams;
+};
+
+export async function createOrResumeGuidedTrainingSession(
+  modelType: ModelType,
+  studentId: number,
+  body: TrainInput,
+): Promise<GuidedTrainingSessionPayload> {
+  if (!isGuidedModelType(modelType)) {
+    throw new ModelValidationError("当前模型暂不支持分阶段训练");
+  }
+
+  const experiment = await assertExperimentModelAccess(body.experiment_id, studentId);
+  assertTrainingRequestMatchesExperiment(experiment, body);
+  const trainingConfig = getExperimentTrainingConfig(experiment);
+  if (modelType === "ma") {
+    validateMovingAverageWindow(trainingConfig, body.moving_average_window);
+  }
+
+  const requestHash = hashGuidedTrainingRequest(modelType, body);
+  const [existingRows] = await pool.query<GuidedTrainingSessionRow[]>(
+    `SELECT session_id,
+            experiment_id,
+            student_id,
+            model_type,
+            request_hash,
+            request_payload,
+            status,
+            current_step_id,
+            completed_step_ids,
+            step_outputs,
+            result_payload,
+            artifact_dir,
+            error_message
+       FROM model_guided_training_sessions
+      WHERE experiment_id = ?
+        AND student_id = ?
+        AND model_type = ?
+        AND request_hash = ?
+      LIMIT 1`,
+    [body.experiment_id, studentId, modelType, requestHash],
+  );
+
+  const existingSession = existingRows[0];
+  if (existingSession) {
+    if (existingSession.status === "running") {
+      await pool.query(
+        `UPDATE model_guided_training_sessions
+            SET status = 'ready'
+          WHERE session_id = ?`,
+        [existingSession.session_id],
+      );
+      existingSession.status = "ready";
+    }
+    if (existingSession.status === "completed") {
+      await restoreGuidedSessionBacktestArtifact(existingSession);
+    }
+    return buildGuidedTrainingSessionPayload(existingSession);
+  }
+
+  const sessionId = crypto.randomUUID();
+  const artifactDir = buildGuidedTrainingArtifactDir(body.experiment_id, studentId, modelType, sessionId);
+  fs.mkdirSync(artifactDir, { recursive: true });
+
+  const completedStepIds: string[] = [];
+  const currentStepId = getGuidedNextStepId(modelType, completedStepIds);
+  await pool.query(
+    `INSERT INTO model_guided_training_sessions
+       (session_id,
+        experiment_id,
+        student_id,
+        model_type,
+        request_hash,
+        request_payload,
+        status,
+        current_step_id,
+        completed_step_ids,
+        step_outputs,
+        result_payload,
+        artifact_dir,
+        expires_at)
+     VALUES (?, ?, ?, ?, ?, ?, 'ready', ?, ?, ?, NULL, ?, DATE_ADD(NOW(), INTERVAL 7 DAY))`,
+    [
+      sessionId,
+      body.experiment_id,
+      studentId,
+      modelType,
+      requestHash,
+      JSON.stringify(body),
+      currentStepId,
+      JSON.stringify(completedStepIds),
+      JSON.stringify({}),
+      artifactDir,
+    ],
+  );
+
+  const row = await fetchGuidedTrainingSessionRow(sessionId);
+  if (!row) {
+    throw new Error("创建分阶段训练会话失败");
+  }
+
+  return buildGuidedTrainingSessionPayload(row);
+}
+
+export async function getGuidedTrainingSession(
+  modelType: ModelType,
+  studentId: number,
+  sessionId: string,
+): Promise<GuidedTrainingSessionPayload> {
+  if (!isGuidedModelType(modelType)) {
+    throw new ModelValidationError("当前模型暂不支持分阶段训练");
+  }
+
+  const row = await fetchGuidedTrainingSessionRow(sessionId);
+  if (!row || row.model_type !== modelType) {
+    throw new ModelNotFoundError("未找到分阶段训练会话");
+  }
+
+  if (row.student_id !== studentId) {
+    throw new ModelAccessError("权限不足：该训练会话不属于当前用户", 403);
+  }
+
+  await assertExperimentModelAccess(row.experiment_id, studentId);
+  if (row.status === "completed") {
+    await restoreGuidedSessionBacktestArtifact(row);
+  }
+  return buildGuidedTrainingSessionPayload(row);
+}
+
+export async function runGuidedTrainingStep(
+  modelType: ModelType,
+  studentId: number,
+  sessionId: string,
+  stepId: string,
+): Promise<GuidedTrainingSessionPayload> {
+  if (!isGuidedModelType(modelType)) {
+    throw new ModelValidationError("当前模型暂不支持分阶段训练");
+  }
+
+  const row = await fetchGuidedTrainingSessionRow(sessionId);
+  if (!row || row.model_type !== modelType) {
+    throw new ModelNotFoundError("未找到分阶段训练会话");
+  }
+
+  if (row.student_id !== studentId) {
+    throw new ModelAccessError("权限不足：该训练会话不属于当前用户", 403);
+  }
+
+  if (row.status === "completed") {
+    await restoreGuidedSessionBacktestArtifact(row);
+    return buildGuidedTrainingSessionPayload(row);
+  }
+
+  const body = parseJsonColumn<TrainInput>(row.request_payload, {} as TrainInput);
+  const completedStepIds = parseJsonColumn<string[]>(row.completed_step_ids, []);
+  if (completedStepIds.includes(stepId)) {
+    return buildGuidedTrainingSessionPayload(row);
+  }
+
+  const nextStepId = getGuidedNextStepId(modelType, completedStepIds);
+  if (stepId !== nextStepId) {
+    throw new ModelValidationError("只能按训练流程顺序执行下一个阶段");
+  }
+
+  let executionLock = null;
+  let slotLock = null;
+  let sessionMarkedRunning = false;
+
+  try {
+    executionLock = await acquireModelExecutionLock(row.experiment_id, modelType);
+    if (!executionLock) {
+      throw new ModelValidationError("同一模型正在训练或预测，请稍后再试");
+    }
+
+    slotLock = await acquireModelSlot();
+    if (!slotLock) {
+      throw new ModelValidationError("模型服务繁忙，请稍后再试");
+    }
+
+    await pool.query(
+      `UPDATE model_guided_training_sessions
+          SET status = 'running',
+              current_step_id = ?,
+              error_message = NULL
+        WHERE session_id = ?`,
+      [stepId, sessionId],
+    );
+    sessionMarkedRunning = true;
+
+    const sessionModelPath = getGuidedSessionModelPath(row.artifact_dir, modelType);
+    const pythonParams = await buildGuidedTrainingPythonParams(modelType, studentId, body);
+    pythonParams.saveModel = sessionModelPath;
+    const stateFilePath = buildGuidedTrainingStatePath(row.experiment_id, studentId, modelType, sessionId);
+    const pythonStepResult = await runPythonGuidedTrainingStep(
+      modelType,
+      stepId,
+      pythonParams,
+      stateFilePath,
+      row.artifact_dir,
+    );
+
+    const nextCompletedStepIds = [...completedStepIds, stepId];
+    const stepOutputs = parseJsonColumn<Record<string, unknown>>(row.step_outputs, {});
+    const nextStepOutputs = {
+      ...stepOutputs,
+      [stepId]: pythonStepResult.output ?? {},
+    };
+
+    let transformedResult: ReturnType<typeof transformTrainingResult> | null = null;
+    if (pythonStepResult.final_result) {
+      const backtestModelPath = await restoreGuidedSessionBacktestArtifact(row);
+      pythonStepResult.final_result.saved_model = backtestModelPath;
+      transformedResult = transformTrainingResult(modelType, pythonStepResult.final_result);
+    }
+
+    const status: GuidedTrainingStatus = transformedResult ? "completed" : "ready";
+    const currentStepId = status === "completed"
+      ? null
+      : getGuidedNextStepId(modelType, nextCompletedStepIds);
+
+    await pool.query(
+      `UPDATE model_guided_training_sessions
+          SET status = ?,
+              current_step_id = ?,
+              completed_step_ids = ?,
+              step_outputs = ?,
+              result_payload = ?,
+              error_message = NULL
+        WHERE session_id = ?`,
+      [
+        status,
+        currentStepId,
+        JSON.stringify(nextCompletedStepIds),
+        JSON.stringify(nextStepOutputs),
+        transformedResult ? JSON.stringify(transformedResult) : null,
+        sessionId,
+      ],
+    );
+
+    const updatedRow = await fetchGuidedTrainingSessionRow(sessionId);
+    if (!updatedRow) {
+      throw new Error("分阶段训练会话已丢失");
+    }
+
+    return buildGuidedTrainingSessionPayload(updatedRow);
+  } catch (error) {
+    if (sessionMarkedRunning) {
+      const detail = error instanceof Error ? error.message : "分阶段训练执行失败";
+      await pool.query(
+        `UPDATE model_guided_training_sessions
+            SET status = 'failed',
+                current_step_id = ?,
+                error_message = ?
+          WHERE session_id = ?`,
+        [stepId, detail, sessionId],
+      );
+    }
+    throw error;
+  } finally {
+    await releaseModelSlot(slotLock);
+    await releaseModelExecutionLock(executionLock);
+  }
 }
 
 export async function trainModel(
