@@ -22,6 +22,7 @@
     "db:reset:live": "bun run scripts/db-reset-live.ts",
     "db:reset:parallel": "bun run scripts/db-reset-parallel.ts",
     "db:migrate:academic-terms": "bun run scripts/migrate-academic-terms.ts",
+    "db:migrate:quiz-answer-snapshots": "bun run scripts/migrate-quiz-answer-snapshots.ts",
     "seed:parallel:assets": "bun run scripts/seed-parallel-assets.ts",
     "seed:parallel:scenario": "bun run scripts/seed-parallel-scenarios.ts",
     "seed:parallel:report-burst": "bun run scripts/seed-parallel-report-burst.ts",

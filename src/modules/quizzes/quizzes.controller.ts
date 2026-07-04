@@ -1,8 +1,8 @@
 import { Hono } from "hono";
 import { zValidator } from "@hono/zod-validator";
 import { jwtAuth, requireStudent } from "../../middleware";
-import { batchSubmitAnswersSchema } from "./quizzes.schema";
-import { getQuestionsByKnowledge, submitAnswers } from "./quizzes.service";
+import { batchSubmitAnswersSchema, quizKindParamSchema, quizResultsQuerySchema } from "./quizzes.schema";
+import { getQuestionsByKnowledge, getSubmittedQuizResults, submitAnswers } from "./quizzes.service";
 import { handleUnexpectedError } from "../../utils/error-handler";
 import type { JwtPayload } from "../../types";
 
@@ -38,6 +38,30 @@ quizzesController.get(
       return c.json(questions);
     } catch (error) {
       return handleUnexpectedError(c, error, "获取生产计划测试题目失败");
+    }
+  },
+);
+
+quizzesController.get(
+  "/api/v1/quizzes/:kind/results",
+  jwtAuth,
+  requireStudent,
+  zValidator("param", quizKindParamSchema),
+  zValidator("query", quizResultsQuerySchema),
+  async (c) => {
+    try {
+      const payload = c.get("jwtPayload") as JwtPayload;
+      const { kind } = c.req.valid("param");
+      const { experiment_id } = c.req.valid("query");
+
+      const result = await getSubmittedQuizResults(experiment_id, payload.sub, kind);
+      if ("error" in result) {
+        return c.json({ error: result.error }, result.status);
+      }
+
+      return c.json(result.results);
+    } catch (error) {
+      return handleUnexpectedError(c, error, "获取测试答题结果失败");
     }
   },
 );

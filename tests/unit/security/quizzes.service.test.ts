@@ -13,6 +13,7 @@ const beginTransaction = mock(async () => {});
 const commit = mock(async () => {});
 const rollback = mock(async () => {});
 const release = mock(() => {});
+const poolQuery = mock(async () => [[]]);
 const getConnection = mock(async () => ({
   query: connectionQuery,
   beginTransaction,
@@ -33,11 +34,23 @@ mock.module(configModulePath, () => ({
   connectionLimit: 64,
   pool: {
     getConnection,
-    query: mock(async () => [[]]),
+    query: poolQuery,
   },
 }));
 
-const { submitAnswers } = await import(freshQuizzesServiceModulePath);
+const { getSubmittedQuizResults, submitAnswers } = await import(freshQuizzesServiceModulePath);
+
+function expectAnswerOutcomes(
+  result: Awaited<ReturnType<typeof submitAnswers>>,
+  expected: Array<{ question_id: number; is_correct: boolean }>,
+) {
+  expect("results" in result).toBe(true);
+  if (!("results" in result)) {
+    throw new Error(`Expected quiz answer results, got error: ${result.error}`);
+  }
+
+  expect(result.results.map(({ question_id, is_correct }) => ({ question_id, is_correct }))).toEqual(expected);
+}
 
 describe("quizzes service", () => {
   beforeEach(() => {
@@ -47,6 +60,7 @@ describe("quizzes service", () => {
     rollback.mockClear();
     release.mockClear();
     getConnection.mockClear();
+    poolQuery.mockReset();
   });
 
   test("rejects empty submissions before opening a transaction", async () => {
@@ -155,11 +169,17 @@ describe("quizzes service", () => {
             question_id: 101,
             correct_answers: JSON.stringify(["A"]),
             knowledge_point: "预测模型-ARIMA模型",
+            question_type: "Single Choice",
+            question_text: "ARIMA 中 d 表示什么？",
+            options: JSON.stringify({ A: "差分阶数", B: "移动平均阶数" }),
           },
           {
             question_id: 202,
             correct_answers: JSON.stringify(["B"]),
             knowledge_point: "生产计划-MPS基本原理",
+            question_type: "Single Choice",
+            question_text: "MPS 主要用于什么？",
+            options: JSON.stringify({ A: "采购付款", B: "主生产计划" }),
           },
         ]];
       }
@@ -174,6 +194,17 @@ describe("quizzes service", () => {
       }
 
       if (sql.includes("INSERT INTO quiz_answers")) {
+        const rows = params?.[0] as unknown[][];
+        expect(rows).toHaveLength(2);
+        const modelSnapshot = JSON.parse(String(rows[0]?.[5]));
+        expect(modelSnapshot).toEqual({
+          question_id: 101,
+          knowledge_point: "预测模型-ARIMA模型",
+          question_type: "Single Choice",
+          question_text: "ARIMA 中 d 表示什么？",
+          options: { A: "差分阶数", B: "移动平均阶数" },
+          correct_answers: ["A"],
+        });
         return [[]];
       }
 
@@ -199,21 +230,144 @@ describe("quizzes service", () => {
       { question_id: 202, submitted_answer: ["A"] },
     ]);
 
-    expect(result).toEqual({
-      results: [
-        {
-          question_id: 101,
-          is_correct: true,
-        },
-        {
-          question_id: 202,
-          is_correct: false,
-        },
-      ],
+    expectAnswerOutcomes(result, [
+      { question_id: 101, is_correct: true },
+      { question_id: 202, is_correct: false },
+    ]);
+    expect("results" in result && result.results[0]).toEqual({
+      question_id: 101,
+      quiz_type: "quiz_about_model",
+      knowledge_point: "预测模型-ARIMA模型",
+      question_type: "Single Choice",
+      question_text: "ARIMA 中 d 表示什么？",
+      options: { A: "差分阶数", B: "移动平均阶数" },
+      submitted_answer: ["A"],
+      correct_answers: ["A"],
+      is_correct: true,
     });
     expect(beginTransaction).toHaveBeenCalledTimes(1);
     expect(commit).toHaveBeenCalledTimes(1);
     expect(rollback).not.toHaveBeenCalled();
+  });
+
+  test("loads submitted quiz results for the owning student", async () => {
+    poolQuery.mockImplementation(async (sql: string, params?: unknown[]) => {
+      if (sql.includes("SELECT student_id FROM experiment_status")) {
+        expect(params).toEqual([990020]);
+        return [[{ student_id: 20240020 }]];
+      }
+
+      if (sql.includes("FROM quiz_answers qa")) {
+        expect(params).toEqual([990020, 20240020, "quiz_about_model"]);
+        return [[
+          {
+            answer_id: 1,
+            question_id: 9001,
+            quiz_type: "quiz_about_model",
+            submitted_answer: JSON.stringify(["A"]),
+            is_correct: 1,
+            question_snapshot: JSON.stringify({
+              question_id: 9001,
+              knowledge_point: "预测模型-提交时题目",
+              question_type: "Single Choice",
+              question_text: "提交时 RMSE 越小通常说明什么？",
+              options: { A: "提交时误差更小", B: "提交时误差更大" },
+              correct_answers: ["A"],
+            }),
+            knowledge_point: "预测模型-已编辑题目",
+            question_type: "Single Choice",
+            question_text: "编辑后 RMSE 越小通常说明什么？",
+            options: JSON.stringify({ A: "编辑后误差更大", B: "编辑后误差更小" }),
+            correct_answers: JSON.stringify(["B"]),
+          },
+        ]];
+      }
+
+      throw new Error(`Unexpected SQL in submitted-results test: ${sql}`);
+    });
+
+    const result = await getSubmittedQuizResults(990020, 20240020, "model");
+
+    expect(result).toEqual({
+      results: [
+        {
+          question_id: 9001,
+          quiz_type: "quiz_about_model",
+          knowledge_point: "预测模型-提交时题目",
+          question_type: "Single Choice",
+          question_text: "提交时 RMSE 越小通常说明什么？",
+          options: { A: "提交时误差更小", B: "提交时误差更大" },
+          submitted_answer: ["A"],
+          correct_answers: ["A"],
+          is_correct: true,
+        },
+      ],
+    });
+  });
+
+  test("falls back to question bank data for legacy submitted results without snapshots", async () => {
+    poolQuery.mockImplementation(async (sql: string, params?: unknown[]) => {
+      if (sql.includes("SELECT student_id FROM experiment_status")) {
+        expect(params).toEqual([990022]);
+        return [[{ student_id: 20240022 }]];
+      }
+
+      if (sql.includes("FROM quiz_answers qa")) {
+        expect(params).toEqual([990022, 20240022, "quiz_about_plan"]);
+        return [[
+          {
+            answer_id: 2,
+            question_id: 9002,
+            quiz_type: "quiz_about_plan",
+            submitted_answer: JSON.stringify(["B"]),
+            is_correct: 0,
+            question_snapshot: null,
+            knowledge_point: "生产计划-MPS基本原理",
+            question_type: "Single Choice",
+            question_text: "MPS 主要用于什么？",
+            options: JSON.stringify({ A: "采购付款", B: "主生产计划" }),
+            correct_answers: JSON.stringify(["B"]),
+          },
+        ]];
+      }
+
+      throw new Error(`Unexpected SQL in legacy-results test: ${sql}`);
+    });
+
+    const result = await getSubmittedQuizResults(990022, 20240022, "plan");
+
+    expect(result).toEqual({
+      results: [
+        {
+          question_id: 9002,
+          quiz_type: "quiz_about_plan",
+          knowledge_point: "生产计划-MPS基本原理",
+          question_type: "Single Choice",
+          question_text: "MPS 主要用于什么？",
+          options: { A: "采购付款", B: "主生产计划" },
+          submitted_answer: ["B"],
+          correct_answers: ["B"],
+          is_correct: false,
+        },
+      ],
+    });
+  });
+
+  test("rejects submitted quiz result reads for another student's experiment", async () => {
+    poolQuery.mockImplementation(async (sql: string) => {
+      if (sql.includes("SELECT student_id FROM experiment_status")) {
+        return [[{ student_id: 20249999 }]];
+      }
+
+      throw new Error(`Unexpected SQL in forbidden-results-read test: ${sql}`);
+    });
+
+    const result = await getSubmittedQuizResults(990021, 20240021, "plan");
+
+    expect(result).toEqual({
+      error: "权限不足：该实验不属于当前用户",
+      status: 403,
+    });
   });
 
   test("grades multiple-choice answers correctly regardless of submitted order", async () => {
@@ -271,14 +425,9 @@ describe("quizzes service", () => {
       { question_id: 301, submitted_answer: ["C", "A"] },
     ]);
 
-    expect(result).toEqual({
-      results: [
-        {
-          question_id: 301,
-          is_correct: true,
-        },
-      ],
-    });
+    expectAnswerOutcomes(result, [
+      { question_id: 301, is_correct: true },
+    ]);
     expect(commit).toHaveBeenCalledTimes(1);
     expect(rollback).not.toHaveBeenCalled();
   });
@@ -337,14 +486,9 @@ describe("quizzes service", () => {
       { question_id: 501, submitted_answer: ["A"] },
     ]);
 
-    expect(result).toEqual({
-      results: [
-        {
-          question_id: 501,
-          is_correct: false,
-        },
-      ],
-    });
+    expectAnswerOutcomes(result, [
+      { question_id: 501, is_correct: false },
+    ]);
     expect(commit).toHaveBeenCalledTimes(1);
     expect(rollback).not.toHaveBeenCalled();
   });
@@ -403,14 +547,9 @@ describe("quizzes service", () => {
       { question_id: 601, submitted_answer: ["B", "D"] },
     ]);
 
-    expect(result).toEqual({
-      results: [
-        {
-          question_id: 601,
-          is_correct: false,
-        },
-      ],
-    });
+    expectAnswerOutcomes(result, [
+      { question_id: 601, is_correct: false },
+    ]);
     expect(commit).toHaveBeenCalledTimes(1);
     expect(rollback).not.toHaveBeenCalled();
   });
@@ -481,22 +620,11 @@ describe("quizzes service", () => {
       { question_id: 403, submitted_answer: ["D"] },
     ]);
 
-    expect(result).toEqual({
-      results: [
-        {
-          question_id: 401,
-          is_correct: true,
-        },
-        {
-          question_id: 402,
-          is_correct: true,
-        },
-        {
-          question_id: 403,
-          is_correct: false,
-        },
-      ],
-    });
+    expectAnswerOutcomes(result, [
+      { question_id: 401, is_correct: true },
+      { question_id: 402, is_correct: true },
+      { question_id: 403, is_correct: false },
+    ]);
     expect(commit).toHaveBeenCalledTimes(1);
     expect(rollback).not.toHaveBeenCalled();
   });
@@ -650,14 +778,9 @@ describe("quizzes service", () => {
       { question_id: 11, submitted_answer: ["A"] },
     ]);
 
-    expect(result).toEqual({
-      results: [
-        {
-          question_id: 11,
-          is_correct: true,
-        },
-      ],
-    });
+    expectAnswerOutcomes(result, [
+      { question_id: 11, is_correct: true },
+    ]);
     expect(beginTransaction).toHaveBeenCalledTimes(2);
     expect(rollback).toHaveBeenCalledTimes(1);
     expect(commit).toHaveBeenCalledTimes(1);
