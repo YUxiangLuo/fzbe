@@ -157,6 +157,44 @@ export function computeExperimentScores(row: Record<string, unknown>, weights: R
   return { expFlowScore: Number.isFinite(expFlowScore) ? expFlowScore : null, finalScore: Number.isFinite(finalScore) ? finalScore : null, expFlowComponents, finalScoreComponents };
 }
 
+const toCsvValue = (value: unknown) => {
+  if (value === null || value === undefined) return "";
+  const str = value instanceof Date ? value.toISOString() : String(value);
+  if (/[",\n]/.test(str)) return `"${str.replace(/"/g, '""')}"`;
+  return str;
+};
+
+const formatNumeric = (value: unknown) => {
+  if (value === null || value === undefined) return "";
+  const num = Number(value);
+  return Number.isFinite(num) ? num.toFixed(2) : "";
+};
+
+const GRADE_EXPORT_HEADER = ["学号", "姓名", "实验ID", "数据准备", "描述性统计", "预测模型选择", "生成预测结果", "库存变量参数计算", "服务水平参数计算", "生产变量参数计算", "制定生产计划", "提交实验报告", "实验流程", "知识点测试", "模型选择", "实验报告", "报告状态", "报告评语", "最终得分"];
+
+export function buildGradeCsvLines(gradeRows: Array<Record<string, unknown>>, weights: Record<string, number>) {
+  const csvLines: string[] = [GRADE_EXPORT_HEADER.join(",")];
+
+  for (const row of gradeRows) {
+    const isRejected = row.report_status === "rejected";
+    const isGraded = row.report_status === "graded";
+    const scoreRow = isGraded ? row : { ...row, report_quality: null };
+    const { expFlowScore, finalScore } = computeExperimentScores(scoreRow, weights);
+    const val = (v: string) => isRejected ? "" : v;
+    let statusText = "未提交";
+    if (row.report_status === "submitted") statusText = "待评分";
+    else if (row.report_status === "graded") statusText = "已评分";
+    else if (row.report_status === "rejected") statusText = "已驳回";
+
+    const reportQuality = isGraded ? formatNumeric(row.report_quality) : "";
+    const finalScoreValue = isGraded && finalScore !== null ? finalScore.toFixed(2) : "";
+    const rowValues = [toCsvValue(row.username), toCsvValue(row.full_name), toCsvValue(row.experiment_id), ...EXP_FLOW_FIELDS.map((field) => val(formatNumeric(row[field]))), val(expFlowScore === null ? "" : expFlowScore.toFixed(2)), val(formatNumeric(row.knowledge_test)), val(formatNumeric(row.model_quality)), val(reportQuality), toCsvValue(statusText), toCsvValue(row.report_feedback), val(finalScoreValue)];
+    csvLines.push(rowValues.join(","));
+  }
+
+  return csvLines;
+}
+
 const EXPERIMENT_GRADE_SELECT_FRAGMENT = EXPERIMENT_GRADE_FIELDS.length ? `,\n             ${EXPERIMENT_GRADE_FIELDS.map((column) => `eg.${column} AS grade_${column}`).join(",\n             ")}` : "";
 
 const CLASS_SUMMARY_SELECT_FRAGMENT = `
@@ -344,7 +382,8 @@ const LATEST_GRADE_SELECTION_SQL = `SELECT u.user_id, u.username, u.full_name, u
        grade.knowledge_test,
        grade.model_quality,
        grade.report_quality,
-       er.status AS report_status
+       er.status AS report_status,
+       er.feedback AS report_feedback
   FROM enrollments e
   JOIN users u ON e.student_id = u.user_id
   LEFT JOIN (
@@ -384,6 +423,7 @@ export async function getGradeSummaries(classId: number) {
       return {
         student_id: row.user_id, username: row.username, full_name: row.full_name, experiment_id: row.experiment_id,
         exp_flow_score: formatScore(expFlowScore), model_quality: toNumberOrNull(row.model_quality), knowledge_test: toNumberOrNull(row.knowledge_test), report_quality: hasFinalGrade ? toNumberOrNull(row.report_quality) : null, report_status: reportStatus, final_score: hasFinalGrade ? formatScore(finalScore) : null,
+        report_feedback: row.report_feedback ?? null,
         exp_flow_breakdown: expFlowBreakdown,
         final_score_breakdown: { exp_flow: formatFinalComponent(finalScoreComponents.exp_flow), knowledge_test: formatFinalComponent(finalScoreComponents.knowledge_test), model_quality: formatFinalComponent(finalScoreComponents.model_quality), report_quality: formatFinalComponent(finalScoreComponents.report_quality) },
       };
@@ -567,30 +607,7 @@ export async function exportGradeCsv(classId: number) {
   const [gradeRows] = await pool.query<RowDataPacket[]>(LATEST_GRADE_SELECTION_SQL, [classId, classId]);
   if (gradeRows.length === 0) return { error: "no_students" as const };
 
-  const toCsvValue = (value: unknown) => { if (value === null || value === undefined) return ""; let str = value instanceof Date ? value.toISOString() : String(value); if (/[",\n]/.test(str)) return `"${str.replace(/"/g, '""')}"`; return str; };
-  const formatNumeric = (value: unknown) => { if (value === null || value === undefined) return ""; const num = Number(value); return Number.isFinite(num) ? num.toFixed(2) : ""; };
-
-  const header = ["学号", "姓名", "实验ID", "数据准备", "描述性统计", "预测模型选择", "生成预测结果", "库存变量参数计算", "服务水平参数计算", "生产变量参数计算", "制定生产计划", "提交实验报告", "实验流程", "知识点测试", "模型选择", "实验报告", "报告状态", "最终得分"];
-  const csvLines: string[] = [header.join(",")];
-
-  for (const row of gradeRows) {
-    const isRejected = row.report_status === "rejected";
-    const isGraded = row.report_status === "graded";
-    const scoreRow = isGraded ? row : { ...row, report_quality: null };
-    const { expFlowScore, finalScore } = computeExperimentScores(scoreRow, weights);
-    const val = (v: string) => isRejected ? "" : v;
-    let statusText = "未提交";
-    if (row.report_status === "submitted") statusText = "待评分";
-    else if (row.report_status === "graded") statusText = "已评分";
-    else if (row.report_status === "rejected") statusText = "已驳回";
-
-    const reportQuality = isGraded ? formatNumeric(row.report_quality) : "";
-    const finalScoreValue = isGraded && finalScore !== null ? finalScore.toFixed(2) : "";
-    const rowValues = [toCsvValue(row.username), toCsvValue(row.full_name), toCsvValue(row.experiment_id), ...EXP_FLOW_FIELDS.map((field) => val(formatNumeric(row[field]))), val(expFlowScore === null ? "" : expFlowScore.toFixed(2)), val(formatNumeric(row.knowledge_test)), val(formatNumeric(row.model_quality)), val(reportQuality), toCsvValue(statusText), val(finalScoreValue)];
-    csvLines.push(rowValues.join(","));
-  }
-
-  const csvContent = buildCsvContent(csvLines);
+  const csvContent = buildCsvContent(buildGradeCsvLines(gradeRows, weights));
   await mkdir(EXPORTS_DIR, { recursive: true });
   const exportFileName = `class-${classId}-grades-${Date.now()}.csv`;
   const exportFilePath = path.join(EXPORTS_DIR, exportFileName);
@@ -604,8 +621,6 @@ export async function exportReportCsv(classId: number) {
 
   if (reportRows.length === 0) return { error: "no_students" as const };
 
-  const toCsvValue = (value: unknown) => { if (value === null || value === undefined) return ""; let str = value instanceof Date ? value.toISOString() : String(value); if (/[",\n]/.test(str)) return `"${str.replace(/"/g, '""')}"`; return str; };
-  const formatNumeric = (value: unknown) => { if (value === null || value === undefined) return ""; const num = Number(value); return Number.isFinite(num) ? num.toFixed(2) : ""; };
   const formatDateTime = (value: unknown) => { if (value === null || value === undefined) return ""; if (value instanceof Date) return value.toISOString().replace("T", " ").substring(0, 19); try { const date = new Date(String(value)); if (!isNaN(date.getTime())) return date.toISOString().replace("T", " ").substring(0, 19); } catch {} return String(value); };
 
   const header = ["学号", "姓名", "实验ID", "报告ID", "报告状态", "提交时间", "报告得分", "评阅人", "评语"];
