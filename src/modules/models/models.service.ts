@@ -169,13 +169,13 @@ const GUIDED_TRAINING_STEPS: Record<GuidedModelType, GuidedTrainingStepDefinitio
     {
       id: "prepare_data",
       label: "确认平滑设置",
-      description: "读取实验数据，检查训练/评估区间，并确认 alpha 平滑系数处在有效范围内。",
+      description: "读取实验数据，检查训练区间和评估区间，并确认 α（alpha，平滑系数）处在有效范围内。",
       actionLabel: "校验数据",
     },
     {
       id: "fit_model",
       label: "拟合平滑水平",
-      description: "用训练集销量和固定 alpha 更新指数平滑水平项，让近期观测对模型产生更高权重。",
+      description: "用训练集销量和固定 α 更新指数平滑水平项，让近期观测对模型产生更高权重。",
       actionLabel: "拟合模型",
     },
     {
@@ -193,13 +193,13 @@ const GUIDED_TRAINING_STEPS: Record<GuidedModelType, GuidedTrainingStepDefinitio
     {
       id: "evaluate_metrics",
       label: "计算误差指标",
-      description: "计算 RMSE、MAE、MAPE、R²，判断固定 alpha 的预测效果是否稳定。",
+      description: "计算 RMSE、MAE、MAPE、R²，判断固定 α 的预测效果是否稳定。",
       actionLabel: "计算指标",
     },
     {
       id: "save_artifact",
       label: "保存模型产物",
-      description: "保存平滑模型、alpha 和残差波动，供后续预测、生产准备和实验报告复用。",
+      description: "保存平滑模型、α 和残差波动，供后续预测、生产准备和实验报告复用。",
       actionLabel: "保存结果",
     },
   ],
@@ -263,13 +263,13 @@ const GUIDED_TRAINING_STEPS: Record<GuidedModelType, GuidedTrainingStepDefinitio
     {
       id: "build_model",
       label: "确定网络结构",
-      description: "根据特征维度、样本量和预测跨度确定 LSTM 层、Dense 层、batch size 和学习率计划。",
+      description: "根据特征维度、样本量和预测跨度确定 LSTM 层、输出层、批大小和学习率计划。",
       actionLabel: "构建网络",
     },
     {
       id: "train_model",
       label: "训练神经网络",
-      description: "执行真实 Keras 训练，使用学习率衰减和早停策略，让网络学习窗口与未来销量的关系。",
+      description: "执行真实神经网络训练，使用学习率衰减和早停策略，让网络学习历史窗口与未来销量的关系。",
       actionLabel: "训练模型",
     },
     {
@@ -287,7 +287,7 @@ const GUIDED_TRAINING_STEPS: Record<GuidedModelType, GuidedTrainingStepDefinitio
     {
       id: "save_artifact",
       label: "保存模型产物",
-      description: "保存预处理器、历史窗口、Keras 网络文件和评估结果，供后续预测和生产准备复用。",
+      description: "保存预处理器、历史窗口、神经网络文件和评估结果，供后续预测和生产准备复用。",
       actionLabel: "保存结果",
     },
   ],
@@ -295,7 +295,7 @@ const GUIDED_TRAINING_STEPS: Record<GuidedModelType, GuidedTrainingStepDefinitio
     {
       id: "prepare_data",
       label: "确认融合材料",
-      description: "读取实验数据，校验训练/评估窗口和已选择的基础模型，确认可复用的基础模型产物。",
+      description: "读取实验数据，校验训练区间、评估区间和已选择的基础模型，确认可复用的基础模型产物。",
       actionLabel: "校验数据",
     },
     {
@@ -307,7 +307,7 @@ const GUIDED_TRAINING_STEPS: Record<GuidedModelType, GuidedTrainingStepDefinitio
     {
       id: "validation_predictions",
       label: "生成验证段预测",
-      description: "让每个基础模型只用前半段训练数据学习，再预测留出的验证段，形成可比较的误差证据。",
+      description: "让每个基础模型只用验证段之前的训练数据学习，再预测留出的验证段，形成可比较的误差证据。",
       actionLabel: "训练并预测",
     },
     {
@@ -339,7 +339,7 @@ const GUIDED_TRAINING_STEPS: Record<GuidedModelType, GuidedTrainingStepDefinitio
     {
       id: "prepare_data",
       label: "确认 Stacking 材料",
-      description: "读取实验数据，校验训练/评估窗口和基础模型选择，准备二层学习所需的输入。",
+      description: "读取实验数据，校验训练区间、评估区间和基础模型选择，准备二层学习所需的输入。",
       actionLabel: "校验数据",
     },
     {
@@ -383,7 +383,7 @@ const GUIDED_TRAINING_STEPS: Record<GuidedModelType, GuidedTrainingStepDefinitio
     {
       id: "prepare_data",
       label: "确认 Boosting 材料",
-      description: "读取实验数据，校验训练/评估窗口、基础模型候选库、学习率和最大迭代轮数。",
+      description: "读取实验数据，校验训练区间、评估区间、基础模型候选库、学习率和最大迭代轮数。",
       actionLabel: "校验数据",
     },
     {
