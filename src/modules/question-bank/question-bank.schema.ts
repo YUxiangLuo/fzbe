@@ -48,6 +48,7 @@ export const createQuestionSchema = z
     question_text: z.string().trim().min(1),
     options: optionsSchema.optional(),
     correct_answers: z.array(z.string().trim().min(1)).min(1),
+    answer_explanation: z.string().trim().max(4000).nullable().optional(),
   })
   .refine((data) => {
     if (data.question_type === "Single Choice") {
@@ -88,6 +89,7 @@ export const updateQuestionSchema = z
     question_text: z.string().trim().min(1).optional(),
     options: optionsSchema.optional(),
     correct_answers: z.array(z.string().trim().min(1)).min(1).optional(),
+    answer_explanation: z.string().trim().max(4000).nullable().optional(),
   })
   .refine(
     (data) =>
@@ -95,7 +97,8 @@ export const updateQuestionSchema = z
       data.question_type !== undefined ||
       data.question_text !== undefined ||
       data.options !== undefined ||
-      data.correct_answers !== undefined,
+      data.correct_answers !== undefined ||
+      data.answer_explanation !== undefined,
     { message: "至少需要提供一个字段" },
   )
   .refine(

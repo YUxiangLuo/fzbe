@@ -24,6 +24,7 @@ interface AnswerBackfillRow extends mysql.RowDataPacket {
   question_text: string | null;
   options: unknown;
   correct_answers: unknown;
+  answer_explanation?: string | null;
 }
 
 interface ForeignKeyRow extends mysql.RowDataPacket {
@@ -65,6 +66,12 @@ function parseOptionsField(value: unknown): QuestionOptions {
     );
   }
   return null;
+}
+
+function normalizeAnswerExplanationField(value: unknown): string | null {
+  if (typeof value !== "string") return null;
+  const normalized = value.trim();
+  return normalized ? normalized : null;
 }
 
 async function hasColumn(tableName: string, columnName: string) {
@@ -118,10 +125,12 @@ function buildQuestionSnapshot(row: AnswerBackfillRow) {
     question_text: row.question_text || `Question #${row.question_id}`,
     options: parseOptionsField(row.options),
     correct_answers: parseStringArrayField(row.correct_answers),
+    answer_explanation: normalizeAnswerExplanationField(row.answer_explanation),
   };
 }
 
 async function backfillSnapshots() {
+  const hasAnswerExplanationColumn = await hasColumn("question_bank", "answer_explanation");
   const [rows] = await connection.query<AnswerBackfillRow[]>(
     `SELECT qa.answer_id,
             qa.question_id,
@@ -129,7 +138,8 @@ async function backfillSnapshots() {
             qb.question_type,
             qb.question_text,
             qb.options,
-            qb.correct_answers
+            qb.correct_answers,
+            ${hasAnswerExplanationColumn ? "qb.answer_explanation" : "NULL AS answer_explanation"}
        FROM quiz_answers qa
        JOIN question_bank qb ON qb.question_id = qa.question_id
       WHERE qa.question_snapshot IS NULL`,

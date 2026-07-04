@@ -172,6 +172,7 @@ describe("quizzes service", () => {
             question_type: "Single Choice",
             question_text: "ARIMA 中 d 表示什么？",
             options: JSON.stringify({ A: "差分阶数", B: "移动平均阶数" }),
+            answer_explanation: "d 表示差分阶数。",
           },
           {
             question_id: 202,
@@ -180,6 +181,7 @@ describe("quizzes service", () => {
             question_type: "Single Choice",
             question_text: "MPS 主要用于什么？",
             options: JSON.stringify({ A: "采购付款", B: "主生产计划" }),
+            answer_explanation: null,
           },
         ]];
       }
@@ -204,6 +206,7 @@ describe("quizzes service", () => {
           question_text: "ARIMA 中 d 表示什么？",
           options: { A: "差分阶数", B: "移动平均阶数" },
           correct_answers: ["A"],
+          answer_explanation: "d 表示差分阶数。",
         });
         return [[]];
       }
@@ -243,6 +246,7 @@ describe("quizzes service", () => {
       options: { A: "差分阶数", B: "移动平均阶数" },
       submitted_answer: ["A"],
       correct_answers: ["A"],
+      answer_explanation: "d 表示差分阶数。",
       is_correct: true,
     });
     expect(beginTransaction).toHaveBeenCalledTimes(1);
@@ -273,12 +277,14 @@ describe("quizzes service", () => {
               question_text: "提交时 RMSE 越小通常说明什么？",
               options: { A: "提交时误差更小", B: "提交时误差更大" },
               correct_answers: ["A"],
+              answer_explanation: "RMSE 越小表示预测误差越小。",
             }),
             knowledge_point: "预测模型-已编辑题目",
             question_type: "Single Choice",
             question_text: "编辑后 RMSE 越小通常说明什么？",
             options: JSON.stringify({ A: "编辑后误差更大", B: "编辑后误差更小" }),
             correct_answers: JSON.stringify(["B"]),
+            answer_explanation: "编辑后的解析不应覆盖快照。",
           },
         ]];
       }
@@ -299,6 +305,7 @@ describe("quizzes service", () => {
           options: { A: "提交时误差更小", B: "提交时误差更大" },
           submitted_answer: ["A"],
           correct_answers: ["A"],
+          answer_explanation: "RMSE 越小表示预测误差越小。",
           is_correct: true,
         },
       ],
@@ -327,6 +334,7 @@ describe("quizzes service", () => {
             question_text: "MPS 主要用于什么？",
             options: JSON.stringify({ A: "采购付款", B: "主生产计划" }),
             correct_answers: JSON.stringify(["B"]),
+            answer_explanation: "MPS 是主生产计划。",
           },
         ]];
       }
@@ -347,6 +355,7 @@ describe("quizzes service", () => {
           options: { A: "采购付款", B: "主生产计划" },
           submitted_answer: ["B"],
           correct_answers: ["B"],
+          answer_explanation: "MPS 是主生产计划。",
           is_correct: false,
         },
       ],

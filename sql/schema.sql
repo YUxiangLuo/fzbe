@@ -232,6 +232,8 @@ CREATE TABLE IF NOT EXISTS `question_bank` (
 
   -- ["A","B","D"] / ["True"]
   `correct_answers` JSON NOT NULL,
+  -- Optional answer explanation shown to students after submission for incorrect answers
+  `answer_explanation` TEXT NULL,
 
   `creator_id` INT,
   FOREIGN KEY (`creator_id`) REFERENCES `users`(`user_id`) ON DELETE SET NULL,

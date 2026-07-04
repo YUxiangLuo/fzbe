@@ -26,6 +26,7 @@ interface QuestionAnswerRow extends RowDataPacket {
   question_text?: string | null;
   options: unknown;
   correct_answers: unknown;
+  answer_explanation?: string | null;
   submitted_answer?: unknown;
   is_correct?: number | boolean;
 }
@@ -39,6 +40,7 @@ interface QuizAnswerResultRow extends RowDataPacket {
   question_text?: string | null;
   options?: unknown;
   correct_answers?: unknown;
+  answer_explanation?: string | null;
   submitted_answer: unknown;
   is_correct: number | boolean;
   question_snapshot?: unknown;
@@ -59,6 +61,7 @@ export interface QuizAnswerDetail {
   options: QuestionOptions;
   submitted_answer: string[];
   correct_answers: string[];
+  answer_explanation: string | null;
   is_correct: boolean;
 }
 
@@ -85,6 +88,7 @@ interface QuestionSnapshot {
   question_text: string;
   options: QuestionOptions;
   correct_answers: string[];
+  answer_explanation: string | null;
 }
 
 const QUIZ_QUESTION_TARGET_COUNT = 4;
@@ -136,6 +140,12 @@ function normalizeBooleanField(value: unknown): boolean {
   return value === true || value === 1 || value === "1";
 }
 
+function normalizeAnswerExplanationField(value: unknown): string | null {
+  if (typeof value !== "string") return null;
+  const normalized = value.trim();
+  return normalized ? normalized : null;
+}
+
 function normalizeQuestionSnapshot(question: {
   question_id?: unknown;
   knowledge_point?: unknown;
@@ -143,6 +153,7 @@ function normalizeQuestionSnapshot(question: {
   question_text?: unknown;
   options?: unknown;
   correct_answers?: unknown;
+  answer_explanation?: unknown;
 }): QuestionSnapshot {
   const questionId = Number(question.question_id ?? 0);
   return {
@@ -158,6 +169,7 @@ function normalizeQuestionSnapshot(question: {
         : `题目 #${Number.isFinite(questionId) ? questionId : 0}`,
     options: parseOptionsField(question.options),
     correct_answers: parseStringArrayField(question.correct_answers),
+    answer_explanation: normalizeAnswerExplanationField(question.answer_explanation),
   };
 }
 
@@ -184,6 +196,7 @@ function buildAnswerDetailFromSnapshot(
     options: snapshot.options,
     submitted_answer: submittedAnswer,
     correct_answers: snapshot.correct_answers,
+    answer_explanation: snapshot.answer_explanation,
     is_correct: isCorrect,
   };
 }
@@ -325,7 +338,8 @@ export async function submitAnswers(
         `SELECT question_id, correct_answers, knowledge_point,
                 question_type,
                 question_text,
-                options
+                options,
+                answer_explanation
            FROM question_bank
           WHERE question_id IN (${placeholders})`,
         questionIds,
@@ -515,7 +529,8 @@ export async function getSubmittedQuizResults(
             qb.question_type,
             qb.question_text,
             qb.options,
-            qb.correct_answers
+            qb.correct_answers,
+            qb.answer_explanation
        FROM quiz_answers qa
   LEFT JOIN question_bank qb ON qb.question_id = qa.question_id
       WHERE qa.experiment_id = ?
