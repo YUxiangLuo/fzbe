@@ -202,10 +202,13 @@ function buildPdfDocument(content: string): string {
           background: #f1f5f9; padding: 2px 4px; border-radius: 4px;
         }
         .report-content table { border-collapse: collapse; width: 100%; margin: 1.2rem 0; }
+        .report-content thead { display: table-header-group; }
+        .report-content tr { break-inside: avoid; page-break-inside: avoid; }
         .report-content th, .report-content td { border: 1px solid #cbd5f5; padding: 8px 10px; text-align: left; }
         .report-content ul, .report-content ol { padding-left: 1.4rem; }
         .report-content blockquote { border-left: 4px solid #94a3b8; padding-left: 12px; color: #475569; margin: 1rem 0; }
         .report-content hr { border: none; border-top: 1px solid #e2e8f0; margin: 2rem 0; }
+        .report-content .report-appendix-break { break-before: page; page-break-before: always; height: 0; }
       </style>
     </head>
     <body><main class="report-content">${content}</main></body>

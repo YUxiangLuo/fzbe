@@ -523,4 +523,59 @@ describe("reports service", () => {
     expect(commit).not.toHaveBeenCalled();
     expect(await listGeneratedReports(990007, 20241002)).toEqual([]);
   });
+
+  test("adds print styles for report appendix and long tables", async () => {
+    poolQuery.mockImplementation(async (sql: string) => {
+      if (sql.includes("SELECT * FROM experiment_status")) {
+        return [[buildExperiment({ experiment_id: 990009 })]];
+      }
+
+      throw new Error(`Unexpected SQL in report print style test: ${sql}`);
+    });
+
+    connectionQuery.mockImplementation(async (sql: string) => {
+      if (sql === "SET TRANSACTION ISOLATION LEVEL READ COMMITTED") {
+        return [[]];
+      }
+
+      if (sql.includes("SELECT * FROM experiment_status") && sql.includes("FOR UPDATE")) {
+        return [[buildExperiment({ experiment_id: 990009 })]];
+      }
+
+      if (sql.includes("FROM experiment_reports") && sql.includes("FOR UPDATE")) {
+        return [[]];
+      }
+
+      if (sql.includes("INSERT INTO experiment_reports")) {
+        return [{ insertId: 880009, affectedRows: 1 }];
+      }
+
+      if (sql.includes("UPDATE experiment_grade") || sql.includes("UPDATE experiment_status")) {
+        return [{ affectedRows: 1 }];
+      }
+
+      throw new Error(`Unexpected SQL in report print style test: ${sql}`);
+    });
+
+    await submitReport(
+      990009,
+      20241002,
+      `# Test
+
+| 月份 | 销量 |
+|---|---|
+| 2024-01 | 100 |
+
+<div class="report-appendix-break"></div>
+
+## 附录：原始销量明细`,
+    );
+
+    expect(page.setContent).toHaveBeenCalledTimes(1);
+    const htmlDocument = page.setContent.mock.calls[0]?.[0] as string;
+    expect(htmlDocument).toContain(".report-content thead { display: table-header-group; }");
+    expect(htmlDocument).toContain(".report-content tr { break-inside: avoid; page-break-inside: avoid; }");
+    expect(htmlDocument).toContain(".report-content .report-appendix-break { break-before: page; page-break-before: always; height: 0; }");
+    expect(htmlDocument).toContain('<div class="report-appendix-break"></div>');
+  });
 });
