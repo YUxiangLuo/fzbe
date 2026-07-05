@@ -14,9 +14,11 @@ describe("Question Bank Schemas", () => {
         knowledge_point: "MPS基本原理",
         options: ["选项甲", "选项乙"],
         correct_answers: ["选项甲"],
+        answer_explanation: "选项甲对应主生产计划的基本定义。",
       });
 
       expect(result.success).toBe(true);
+      expect(result.data?.answer_explanation).toBe("选项甲对应主生产计划的基本定义。");
     });
 
     test("should reject single choice answers outside options", () => {
@@ -73,6 +75,15 @@ describe("Question Bank Schemas", () => {
       });
 
       expect(result.success).toBe(true);
+    });
+
+    test("should allow updating only the optional answer explanation", () => {
+      const result = updateQuestionSchema.safeParse({
+        answer_explanation: "  解析会被 trim  ",
+      });
+
+      expect(result.success).toBe(true);
+      expect(result.data?.answer_explanation).toBe("解析会被 trim");
     });
   });
 

@@ -263,6 +263,8 @@ CREATE TABLE IF NOT EXISTS `question_bank` (
 
   -- ["A","B","D"] / ["True"]
   `correct_answers` JSON NOT NULL,
+  -- Optional answer explanation shown to students after submission for incorrect answers
+  `answer_explanation` TEXT NULL,
 
   `creator_id` INT,
   FOREIGN KEY (`creator_id`) REFERENCES `users`(`user_id`) ON DELETE SET NULL,
@@ -275,10 +277,12 @@ CREATE TABLE IF NOT EXISTS `quiz_answers` (
   `answer_id` INT AUTO_INCREMENT PRIMARY KEY,
   `experiment_id` INT NOT NULL,
   `student_id` INT NOT NULL,
-  `question_id` INT NOT NULL,
+  `question_id` INT NULL,
   `quiz_type` ENUM('quiz_about_model', 'quiz_about_plan') NOT NULL,
   -- Submitted answers, stored in the same JSON array format as the question bank's correct_answers
   `submitted_answer` JSON NOT NULL,
+  -- Snapshot of the graded question, options, and correct answers at submission time
+  `question_snapshot` JSON,
   -- Fixed: Add default value
   `is_correct` BOOLEAN DEFAULT false,
   `answered_at` TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
@@ -292,12 +296,13 @@ CREATE TABLE IF NOT EXISTS `quiz_answers` (
     REFERENCES `users`(`user_id`)
     ON DELETE CASCADE,
 
-  -- Foreign key to the question
-  FOREIGN KEY (`question_id`) 
+  -- Keep submitted answer records even if the source question is deleted later
+  CONSTRAINT `quiz_answers_question_id_fk` FOREIGN KEY (`question_id`) 
     REFERENCES `question_bank`(`question_id`) 
-    ON DELETE CASCADE,
+    ON DELETE SET NULL,
 
   -- Index to efficiently look up the latest answers for a given quiz
+  INDEX `idx_quiz_answers_question_id` (`question_id`),
   INDEX `idx_quiz_answers_lookup` (`student_id`, `experiment_id`, `quiz_type`, `answered_at` DESC)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 

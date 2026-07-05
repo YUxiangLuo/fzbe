@@ -20,8 +20,49 @@ interface QuestionRow extends RowDataPacket {
 
 interface QuestionAnswerRow extends RowDataPacket {
   question_id: number;
-  correct_answers: string;
+  quiz_type?: QuizType;
+  knowledge_point?: string | null;
+  question_type?: string | null;
+  question_text?: string | null;
+  options: unknown;
+  correct_answers: unknown;
+  answer_explanation?: string | null;
+  submitted_answer?: unknown;
+  is_correct?: number | boolean;
+}
+
+interface QuizAnswerResultRow extends RowDataPacket {
+  answer_id: number;
+  question_id: number | null;
+  quiz_type: QuizType;
+  knowledge_point?: string | null;
+  question_type?: string | null;
+  question_text?: string | null;
+  options?: unknown;
+  correct_answers?: unknown;
+  answer_explanation?: string | null;
+  submitted_answer: unknown;
+  is_correct: number | boolean;
+  question_snapshot?: unknown;
+}
+
+interface ExperimentAccessRow extends RowDataPacket {
+  student_id: number;
+}
+
+type QuestionOptions = Record<string, string> | string[] | null;
+
+export interface QuizAnswerDetail {
+  question_id: number;
+  quiz_type: QuizType;
   knowledge_point: string | null;
+  question_type: string;
+  question_text: string;
+  options: QuestionOptions;
+  submitted_answer: string[];
+  correct_answers: string[];
+  answer_explanation: string | null;
+  is_correct: boolean;
 }
 
 interface ExperimentOwnerRow extends RowDataPacket {
@@ -39,12 +80,135 @@ interface AvailableQuestionCountRow extends RowDataPacket {
 }
 
 type QuizType = "quiz_about_model" | "quiz_about_plan";
+type QuizKind = "model" | "plan";
+interface QuestionSnapshot {
+  question_id: number;
+  knowledge_point: string | null;
+  question_type: string;
+  question_text: string;
+  options: QuestionOptions;
+  correct_answers: string[];
+  answer_explanation: string | null;
+}
+
 const QUIZ_QUESTION_TARGET_COUNT = 4;
 const QUIZ_SUBMIT_MAX_ATTEMPTS = 3;
 const QUIZ_SUBMIT_RETRY_DELAYS_MS = [50, 150] as const;
+const DEFAULT_QUESTION_TYPE = "Single Choice";
 
 function getQuizTypeFromKnowledgePoint(knowledgePoint: string): QuizType {
   return knowledgePoint.includes("生产计划") ? "quiz_about_plan" : "quiz_about_model";
+}
+
+function getQuizTypeFromKind(kind: QuizKind): QuizType {
+  return kind === "plan" ? "quiz_about_plan" : "quiz_about_model";
+}
+
+function parseJsonField(value: unknown): unknown {
+  if (value === null || value === undefined) return value;
+  if (typeof value !== "string") return value;
+  try {
+    return JSON.parse(value);
+  } catch {
+    return value;
+  }
+}
+
+function parseStringArrayField(value: unknown): string[] {
+  const parsed = parseJsonField(value);
+  if (!Array.isArray(parsed)) return [];
+  return parsed.map((item) => String(item));
+}
+
+function parseOptionsField(value: unknown): QuestionOptions {
+  const parsed = parseJsonField(value);
+  if (Array.isArray(parsed)) {
+    return parsed.map((item) => String(item));
+  }
+  if (parsed && typeof parsed === "object") {
+    return Object.fromEntries(
+      Object.entries(parsed as Record<string, unknown>).map(([key, optionValue]) => [
+        key,
+        String(optionValue),
+      ]),
+    );
+  }
+  return null;
+}
+
+function normalizeBooleanField(value: unknown): boolean {
+  return value === true || value === 1 || value === "1";
+}
+
+function normalizeAnswerExplanationField(value: unknown): string | null {
+  if (typeof value !== "string") return null;
+  const normalized = value.trim();
+  return normalized ? normalized : null;
+}
+
+function normalizeQuestionSnapshot(question: {
+  question_id?: unknown;
+  knowledge_point?: unknown;
+  question_type?: unknown;
+  question_text?: unknown;
+  options?: unknown;
+  correct_answers?: unknown;
+  answer_explanation?: unknown;
+}): QuestionSnapshot {
+  const questionId = Number(question.question_id ?? 0);
+  return {
+    question_id: Number.isFinite(questionId) ? questionId : 0,
+    knowledge_point: question.knowledge_point == null ? null : String(question.knowledge_point),
+    question_type:
+      typeof question.question_type === "string" && question.question_type.trim()
+        ? question.question_type
+        : DEFAULT_QUESTION_TYPE,
+    question_text:
+      typeof question.question_text === "string" && question.question_text.trim()
+        ? question.question_text
+        : `题目 #${Number.isFinite(questionId) ? questionId : 0}`,
+    options: parseOptionsField(question.options),
+    correct_answers: parseStringArrayField(question.correct_answers),
+    answer_explanation: normalizeAnswerExplanationField(question.answer_explanation),
+  };
+}
+
+function parseQuestionSnapshotField(value: unknown): QuestionSnapshot | null {
+  const parsed = parseJsonField(value);
+  if (!parsed || typeof parsed !== "object") return null;
+
+  const snapshot = normalizeQuestionSnapshot(parsed as Record<string, unknown> & { question_id?: number | null });
+  return snapshot.question_id > 0 ? snapshot : null;
+}
+
+function buildAnswerDetailFromSnapshot(
+  snapshot: QuestionSnapshot,
+  quizType: QuizType,
+  submittedAnswer: string[],
+  isCorrect: boolean,
+): QuizAnswerDetail {
+  return {
+    question_id: snapshot.question_id,
+    quiz_type: quizType,
+    knowledge_point: snapshot.knowledge_point,
+    question_type: snapshot.question_type,
+    question_text: snapshot.question_text,
+    options: snapshot.options,
+    submitted_answer: submittedAnswer,
+    correct_answers: snapshot.correct_answers,
+    answer_explanation: snapshot.answer_explanation,
+    is_correct: isCorrect,
+  };
+}
+
+function normalizeStoredAnswerRow(row: QuizAnswerResultRow): QuizAnswerDetail {
+  const snapshot = parseQuestionSnapshotField(row.question_snapshot) ?? normalizeQuestionSnapshot(row);
+  return buildAnswerDetailFromSnapshot(
+    snapshot,
+    row.quiz_type,
+    parseStringArrayField(row.submitted_answer),
+    normalizeBooleanField(row.is_correct),
+  );
 }
 
 async function getRequiredQuestionCountForQuizType(
@@ -127,16 +291,11 @@ export interface SubmittedAnswer {
   submitted_answer: string[];
 }
 
-export interface AnswerResult {
-  question_id: number;
-  is_correct: boolean;
-}
-
 export async function submitAnswers(
   experimentId: number,
   studentId: number,
   submittedAnswers: SubmittedAnswer[],
-): Promise<{ error: string; status: 400 | 403 | 404 } | { results: AnswerResult[] }> {
+): Promise<{ error: string; status: 400 | 403 | 404 } | { results: QuizAnswerDetail[] }> {
   const normalizedAnswers = [...submittedAnswers].sort(
     (left, right) => left.question_id - right.question_id,
   );
@@ -176,7 +335,11 @@ export async function submitAnswers(
 
       const placeholders = questionIds.map(() => "?").join(",");
       const [questionRows] = await connection.query<QuestionAnswerRow[]>(
-        `SELECT question_id, correct_answers, knowledge_point
+        `SELECT question_id, correct_answers, knowledge_point,
+                question_type,
+                question_text,
+                options,
+                answer_explanation
            FROM question_bank
           WHERE question_id IN (${placeholders})`,
         questionIds,
@@ -187,13 +350,12 @@ export async function submitAnswers(
         return { error: "测验题目不存在或不可用于提交", status: 400 };
       }
 
-      const correctAnswersMap = new Map<number, { answers: string[]; quizType: QuizType }>();
+      const correctAnswersMap = new Map<number, { row: QuestionAnswerRow; answers: string[]; quizType: QuizType }>();
       for (const row of questionRows) {
         const knowledge = row.knowledge_point || "";
         correctAnswersMap.set(row.question_id, {
-          answers: Array.isArray(row.correct_answers)
-            ? row.correct_answers
-            : JSON.parse(row.correct_answers),
+          row,
+          answers: parseStringArrayField(row.correct_answers),
           quizType: getQuizTypeFromKnowledgePoint(knowledge),
         });
       }
@@ -223,7 +385,7 @@ export async function submitAnswers(
 
       const insertValues: unknown[][] = [];
       const submittedQuizTypes = new Set<QuizType>();
-      const resultsForFrontend: AnswerResult[] = [];
+      const resultsForFrontend: QuizAnswerDetail[] = [];
 
       for (const submitted of normalizedAnswers) {
         const questionData = correctAnswersMap.get(submitted.question_id)!;
@@ -233,6 +395,7 @@ export async function submitAnswers(
           JSON.stringify([...questionData.answers].sort());
 
         const quizType = questionData.quizType;
+        const questionSnapshot = normalizeQuestionSnapshot(questionData.row);
         submittedQuizTypes.add(quizType);
 
         insertValues.push([
@@ -241,13 +404,13 @@ export async function submitAnswers(
           submitted.question_id,
           quizType,
           JSON.stringify(submitted.submitted_answer),
+          JSON.stringify(questionSnapshot),
           isCorrect,
         ]);
 
-        resultsForFrontend.push({
-          question_id: submitted.question_id,
-          is_correct: isCorrect,
-        });
+        resultsForFrontend.push(
+          buildAnswerDetailFromSnapshot(questionSnapshot, quizType, submitted.submitted_answer, isCorrect),
+        );
       }
 
       if (submittedQuizTypes.size > 0) {
@@ -264,7 +427,7 @@ export async function submitAnswers(
       if (insertValues.length > 0) {
         await connection.query(
           `INSERT INTO quiz_answers
-             (experiment_id, student_id, question_id, quiz_type, submitted_answer, is_correct)
+             (experiment_id, student_id, question_id, quiz_type, submitted_answer, question_snapshot, is_correct)
            VALUES ?`,
           [insertValues],
         );
@@ -334,4 +497,48 @@ export async function submitAnswers(
   }
 
   throw new Error("Quiz submission retries exhausted unexpectedly");
+}
+
+export async function getSubmittedQuizResults(
+  experimentId: number,
+  studentId: number,
+  kind: QuizKind,
+): Promise<{ error: string; status: 403 | 404 } | { results: QuizAnswerDetail[] }> {
+  const [[experiment]] = await pool.query<ExperimentAccessRow[]>(
+    `SELECT student_id FROM experiment_status WHERE experiment_id = ? LIMIT 1`,
+    [experimentId],
+  );
+
+  if (!experiment) {
+    return { error: "实验不存在", status: 404 };
+  }
+
+  if (experiment.student_id !== studentId) {
+    return { error: "权限不足：该实验不属于当前用户", status: 403 };
+  }
+
+  const quizType = getQuizTypeFromKind(kind);
+  const [rows] = await pool.query<QuizAnswerResultRow[]>(
+    `SELECT qa.answer_id,
+            qa.question_id,
+            qa.quiz_type,
+            qa.submitted_answer,
+            qa.is_correct,
+            qa.question_snapshot,
+            qb.knowledge_point,
+            qb.question_type,
+            qb.question_text,
+            qb.options,
+            qb.correct_answers,
+            qb.answer_explanation
+       FROM quiz_answers qa
+  LEFT JOIN question_bank qb ON qb.question_id = qa.question_id
+      WHERE qa.experiment_id = ?
+        AND qa.student_id = ?
+        AND qa.quiz_type = ?
+      ORDER BY qa.answer_id ASC`,
+    [experimentId, studentId, quizType],
+  );
+
+  return { results: rows.map(normalizeStoredAnswerRow) };
 }

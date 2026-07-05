@@ -10,4 +10,14 @@ export const batchSubmitAnswersSchema = z.object({
   answers: z.array(singleAnswerSchema).min(1, "至少需要提供一个答案"),
 });
 
+export const quizKindParamSchema = z.object({
+  kind: z.enum(["model", "plan"]),
+});
+
+export const quizResultsQuerySchema = z.object({
+  experiment_id: z.coerce.number().int().positive(),
+});
+
 export type BatchSubmitAnswersInput = z.infer<typeof batchSubmitAnswersSchema>;
+export type QuizKindParam = z.infer<typeof quizKindParamSchema>;
+export type QuizResultsQuery = z.infer<typeof quizResultsQuerySchema>;

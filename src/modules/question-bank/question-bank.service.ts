@@ -10,6 +10,7 @@ interface QuestionRow extends RowDataPacket {
   question_text: string;
   options: string | null;
   correct_answers: string;
+  answer_explanation?: string | null;
   creator_id: number | null;
   creator_name?: string;
 }
@@ -65,6 +66,11 @@ function normalizeCorrectAnswersForStorage(
   return normalizedAnswers;
 }
 
+function normalizeAnswerExplanationForStorage(value: string | null | undefined): string | null {
+  const normalized = value?.trim();
+  return normalized ? normalized : null;
+}
+
 export function normalizeQuestionRow(row: QuestionRow, includeAnswers = true) {
   const parsedOptions = parseJsonField(row.options);
   const normalized: Record<string, unknown> = {
@@ -73,6 +79,7 @@ export function normalizeQuestionRow(row: QuestionRow, includeAnswers = true) {
       Array.isArray(parsedOptions) || (parsedOptions && typeof parsedOptions === "object")
         ? parsedOptions
         : null,
+    answer_explanation: normalizeAnswerExplanationForStorage(row.answer_explanation),
   };
 
   if (includeAnswers) {
@@ -82,6 +89,7 @@ export function normalizeQuestionRow(row: QuestionRow, includeAnswers = true) {
     normalized.correct_answers = Array.isArray(parsedAnswers) ? parsedAnswers : [];
   } else {
     delete normalized.correct_answers;
+    delete normalized.answer_explanation;
   }
 
   return normalized;
@@ -95,6 +103,7 @@ export async function getAllQuestions() {
             qb.question_text,
             qb.options,
             qb.correct_answers,
+            qb.answer_explanation,
             qb.creator_id,
             creator.full_name AS creator_name
        FROM question_bank qb
@@ -113,7 +122,14 @@ export async function isAssistantAssignedToAnyClass(assistantId: number): Promis
 }
 
 export async function createQuestion(input: CreateQuestionInput, creatorId: number) {
-  const { knowledge_point, question_type, question_text, options, correct_answers } = input;
+  const {
+    knowledge_point,
+    question_type,
+    question_text,
+    options,
+    correct_answers,
+    answer_explanation,
+  } = input;
 
   let optionsToStore = options;
   if (question_type === "True/False" && !optionsToStore) {
@@ -127,14 +143,15 @@ export async function createQuestion(input: CreateQuestionInput, creatorId: numb
 
   const [result] = await pool.query<ResultSetHeader>(
     `INSERT INTO question_bank
-       (knowledge_point, question_type, question_text, options, correct_answers, creator_id)
-     VALUES (?, ?, ?, ?, ?, ?)`,
+       (knowledge_point, question_type, question_text, options, correct_answers, answer_explanation, creator_id)
+     VALUES (?, ?, ?, ?, ?, ?, ?)`,
     [
       knowledge_point || null,
       question_type,
       question_text,
       optionsToStore ? JSON.stringify(optionsToStore) : null,
       JSON.stringify(normalizedCorrectAnswers),
+      normalizeAnswerExplanationForStorage(answer_explanation),
       creatorId,
     ],
   );
@@ -146,6 +163,7 @@ export async function createQuestion(input: CreateQuestionInput, creatorId: numb
             qb.question_text,
             qb.options,
             qb.correct_answers,
+            qb.answer_explanation,
             qb.creator_id,
             creator.full_name AS creator_name
        FROM question_bank qb
@@ -223,6 +241,10 @@ export async function updateQuestion(
     fields.push("correct_answers = ?");
     values.push(JSON.stringify(nextCorrectAnswers));
   }
+  if (input.answer_explanation !== undefined) {
+    fields.push("answer_explanation = ?");
+    values.push(normalizeAnswerExplanationForStorage(input.answer_explanation));
+  }
 
   if (fields.length === 0) {
     return { error: "no_fields" as const };
@@ -244,6 +266,7 @@ export async function updateQuestion(
             qb.question_text,
             qb.options,
             qb.correct_answers,
+            qb.answer_explanation,
             qb.creator_id,
             creator.full_name AS creator_name
        FROM question_bank qb
