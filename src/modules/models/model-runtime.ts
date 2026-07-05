@@ -16,6 +16,27 @@ export const buildExperimentScopedModelPath = (
   `exp${experimentId}-student${studentId}-${modelType}${phase === "production" ? "-production" : ""}.pkl`,
 );
 
+export const buildGuidedTrainingArtifactDir = (
+  experimentId: number,
+  studentId: number,
+  modelType: ModelType,
+  sessionId: string,
+): string => path.join(
+  PY_DIR,
+  "guided_training",
+  `exp${experimentId}-student${studentId}-${modelType}-${sessionId}`,
+);
+
+export const buildGuidedTrainingStatePath = (
+  experimentId: number,
+  studentId: number,
+  modelType: ModelType,
+  sessionId: string,
+): string => path.join(
+  buildGuidedTrainingArtifactDir(experimentId, studentId, modelType, sessionId),
+  "state.pkl",
+);
+
 export const buildModelExecutionLockName = (
   experimentId: number,
   modelType: ModelType,

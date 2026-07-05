@@ -4,6 +4,7 @@
 model_csv
 __pycache__
 /py/trained_models
+/py/guided_training
 venv
 *demo*
 uploads

@@ -28,6 +28,42 @@ const predictExperimentModel = mock(async () => ({
   status: "success",
   results: { predictions: [] },
 }));
+const createOrResumeGuidedTrainingSession = mock(async () => ({
+  session_id: "guided-1",
+  experiment_id: 990002,
+  model_type: "ma",
+  status: "ready",
+  current_step_id: "prepare_data",
+  next_step_id: "prepare_data",
+  steps: [],
+  step_outputs: {},
+  result: null,
+  error_message: null,
+}));
+const getGuidedTrainingSession = mock(async () => ({
+  session_id: "guided-1",
+  experiment_id: 990002,
+  model_type: "ma",
+  status: "ready",
+  current_step_id: "prepare_data",
+  next_step_id: "prepare_data",
+  steps: [],
+  step_outputs: {},
+  result: null,
+  error_message: null,
+}));
+const runGuidedTrainingStep = mock(async () => ({
+  session_id: "guided-1",
+  experiment_id: 990002,
+  model_type: "ma",
+  status: "completed",
+  current_step_id: null,
+  next_step_id: null,
+  steps: [],
+  step_outputs: {},
+  result: { status: "success", results: { metrics: { rmse: 1, mae: 1, r2: 0.9 } } },
+  error_message: null,
+}));
 const acquireModelSlot = mock(async () => ({ connection: {} as never, name: "slot:1" }));
 const releaseModelSlot = mock(async () => {});
 const acquireModelExecutionLock = mock(async () => ({ connection: {} as never, name: "exec:1" }));
@@ -52,6 +88,9 @@ mock.module("../../../src/modules/models/models.service", () => ({
   getReusableProductionModelArtifactResult,
   prepareExperimentModelForProduction,
   predictExperimentModel,
+  createOrResumeGuidedTrainingSession,
+  getGuidedTrainingSession,
+  runGuidedTrainingStep,
   acquireModelSlot,
   releaseModelSlot,
   acquireModelExecutionLock,
@@ -104,6 +143,16 @@ const requestJson = async (path: string, body: Record<string, unknown>) => {
   });
 };
 
+const requestGet = async (path: string) => {
+  const headers = await createAuthHeaders();
+  return app.request(path, { headers });
+};
+
+const requestPost = async (path: string) => {
+  const headers = await createAuthHeaders();
+  return app.request(path, { method: "POST", headers });
+};
+
 const readNdjson = async (response: Response) => {
   const text = await response.text();
   return text
@@ -134,6 +183,48 @@ describe("models controller", () => {
     predictExperimentModel.mockResolvedValue({
       status: "success",
       results: { predictions: [] },
+    });
+
+    createOrResumeGuidedTrainingSession.mockReset();
+    createOrResumeGuidedTrainingSession.mockResolvedValue({
+      session_id: "guided-1",
+      experiment_id: 990002,
+      model_type: "ma",
+      status: "ready",
+      current_step_id: "prepare_data",
+      next_step_id: "prepare_data",
+      steps: [],
+      step_outputs: {},
+      result: null,
+      error_message: null,
+    });
+
+    getGuidedTrainingSession.mockReset();
+    getGuidedTrainingSession.mockResolvedValue({
+      session_id: "guided-1",
+      experiment_id: 990002,
+      model_type: "ma",
+      status: "ready",
+      current_step_id: "prepare_data",
+      next_step_id: "prepare_data",
+      steps: [],
+      step_outputs: {},
+      result: null,
+      error_message: null,
+    });
+
+    runGuidedTrainingStep.mockReset();
+    runGuidedTrainingStep.mockResolvedValue({
+      session_id: "guided-1",
+      experiment_id: 990002,
+      model_type: "ma",
+      status: "completed",
+      current_step_id: null,
+      next_step_id: null,
+      steps: [],
+      step_outputs: {},
+      result: { status: "success", results: { metrics: { rmse: 1, mae: 1, r2: 0.9 } } },
+      error_message: null,
     });
 
     acquireModelSlot.mockReset();
@@ -282,6 +373,60 @@ describe("models controller", () => {
     expect(trainModel).toHaveBeenCalledWith("lstm", 20240002, expect.objectContaining({
       lstmFeatures: JSON.stringify(["价格指数", "外部,指标"]),
     }));
+  });
+
+  test("creates guided training sessions without acquiring the controller training slot", async () => {
+    const response = await requestJson("/api/v1/models/ma/guided-training/sessions", buildTrainBody());
+    const data = await response.json();
+
+    expect(response.status).toBe(200);
+    expect(data).toEqual({
+      session_id: "guided-1",
+      experiment_id: 990002,
+      model_type: "ma",
+      status: "ready",
+      current_step_id: "prepare_data",
+      next_step_id: "prepare_data",
+      steps: [],
+      step_outputs: {},
+      result: null,
+      error_message: null,
+    });
+    expect(createOrResumeGuidedTrainingSession).toHaveBeenCalledWith(
+      "ma",
+      20240002,
+      expect.objectContaining({ experiment_id: 990002, moving_average_window: 4 }),
+    );
+    expect(acquireModelExecutionLock).not.toHaveBeenCalled();
+    expect(acquireModelSlot).not.toHaveBeenCalled();
+  });
+
+  test("gets a guided training session for the current student", async () => {
+    const response = await requestGet("/api/v1/models/ma/guided-training/sessions/guided-1");
+    const data = await response.json();
+
+    expect(response.status).toBe(200);
+    expect(data.session_id).toBe("guided-1");
+    expect(getGuidedTrainingSession).toHaveBeenCalledWith("ma", 20240002, "guided-1");
+  });
+
+  test("runs the requested guided training step", async () => {
+    const response = await requestPost("/api/v1/models/ma/guided-training/sessions/guided-1/steps/forecast/run");
+    const data = await response.json();
+
+    expect(response.status).toBe(200);
+    expect(data.status).toBe("completed");
+    expect(runGuidedTrainingStep).toHaveBeenCalledWith("ma", 20240002, "guided-1", "forecast");
+  });
+
+  test("maps guided training busy errors to 429", async () => {
+    runGuidedTrainingStep.mockRejectedValueOnce(new ModelValidationError("模型服务繁忙，请稍后再试"));
+
+    const response = await requestPost("/api/v1/models/ma/guided-training/sessions/guided-1/steps/forecast/run");
+    const data = await response.json();
+
+    expect(response.status).toBe(429);
+    expect(data).toEqual({ error: "模型服务繁忙，请稍后再试" });
   });
 
   test("streams training progress and the final result", async () => {
