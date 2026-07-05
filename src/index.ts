@@ -19,14 +19,16 @@ import { quizzesController } from "./modules/quizzes";
 import { reportsController } from "./modules/reports";
 import { getPdfQueueStats, holdPdfQueueSlotForTest } from "./modules/reports/reports.service";
 import { modelsController } from "./modules/models";
-import { cleanupExpiredGuidedTrainingSessions } from "./modules/models/models.service";
+import { cleanupExpiredGuidedTrainingSessions, cleanupStaleModelArtifacts } from "./modules/models/models.service";
 import { classesController } from "./modules/classes";
 import { classMembersController } from "./modules/class-members";
 import { datasetsController } from "./modules/datasets";
 import { experimentsController } from "./modules/experiments";
 import { classGradesController } from "./modules/class-grades";
+import { cleanupExpiredExportFiles } from "./modules/class-grades/class-grades.service";
 import { usersController } from "./modules/users";
 import { academicTermsController } from "./modules/academic-terms";
+import { cleanupStaleUploadTempFiles } from "./utils/runtime-cleanup";
 
 // --- Hono App Initialization ---
 const app = new Hono();
@@ -540,8 +542,8 @@ app.onError((err, c) => {
   return c.json({ error: "服务器内部错误" }, 500);
 });
 
-const GUIDED_TRAINING_CLEANUP_INTERVAL_MS = 24 * 60 * 60 * 1000;
-let guidedTrainingCleanupTimer: ReturnType<typeof setInterval> | null = null;
+const RUNTIME_DISK_CLEANUP_INTERVAL_MS = 24 * 60 * 60 * 1000;
+let runtimeDiskCleanupTimer: ReturnType<typeof setInterval> | null = null;
 
 const longRunningModelPathPattern = /^\/api\/v1\/models\/[^/]+\/(training(?:\/stream)?|prepare-production|predict|guided-training\/sessions\/[^/]+\/steps\/[^/]+\/run)$/;
 
@@ -567,20 +569,63 @@ export async function runGuidedTrainingSessionCleanup(trigger = "manual") {
   }
 }
 
+const runCleanupStep = async <T>(
+  trigger: string,
+  name: string,
+  cleanup: () => Promise<T>,
+): Promise<T | null> => {
+  try {
+    const result = await cleanup();
+    logger.info({ trigger, cleanup: name, result }, "运行时磁盘清理完成");
+    return result;
+  } catch (error) {
+    logger.warn(
+      {
+        trigger,
+        cleanup: name,
+        err: error instanceof Error ? { message: error.message, stack: error.stack } : { message: String(error) },
+      },
+      "运行时磁盘清理失败",
+    );
+    return null;
+  }
+};
+
+export async function runRuntimeDiskCleanup(trigger = "manual") {
+  const guidedTraining = await runGuidedTrainingSessionCleanup(trigger);
+  const exportFiles = await runCleanupStep(trigger, "export-files", cleanupExpiredExportFiles);
+  const uploadTempFiles = await runCleanupStep(trigger, "upload-temp-files", cleanupStaleUploadTempFiles);
+  const modelArtifacts = await runCleanupStep(trigger, "model-artifacts", cleanupStaleModelArtifacts);
+
+  return {
+    guidedTraining,
+    exportFiles,
+    uploadTempFiles,
+    modelArtifacts,
+  };
+}
+
+export function startRuntimeDiskCleanupSchedule() {
+  if (runtimeDiskCleanupTimer) {
+    return;
+  }
+
+  if (
+    process.env.DISABLE_RUNTIME_DISK_CLEANUP_TIMER === "1"
+    || process.env.DISABLE_GUIDED_TRAINING_CLEANUP_TIMER === "1"
+  ) {
+    logger.info("运行时磁盘定时清理已通过环境变量禁用");
+    return;
+  }
+
+  runtimeDiskCleanupTimer = setInterval(() => {
+    void runRuntimeDiskCleanup("interval");
+  }, RUNTIME_DISK_CLEANUP_INTERVAL_MS);
+  runtimeDiskCleanupTimer.unref?.();
+}
+
 export function startGuidedTrainingSessionCleanupSchedule() {
-  if (guidedTrainingCleanupTimer) {
-    return;
-  }
-
-  if (process.env.DISABLE_GUIDED_TRAINING_CLEANUP_TIMER === "1") {
-    logger.info("guided training 过期会话定时清理已通过环境变量禁用");
-    return;
-  }
-
-  guidedTrainingCleanupTimer = setInterval(() => {
-    void runGuidedTrainingSessionCleanup("interval");
-  }, GUIDED_TRAINING_CLEANUP_INTERVAL_MS);
-  guidedTrainingCleanupTimer.unref?.();
+  startRuntimeDiskCleanupSchedule();
 }
 
 const resolveBunIdleTimeoutSeconds = () => {
@@ -673,8 +718,8 @@ export async function runServerStartupPreflight() {
     process.exit(1);
   }
 
-  await runGuidedTrainingSessionCleanup("startup");
-  startGuidedTrainingSessionCleanupSchedule();
+  await runRuntimeDiskCleanup("startup");
+  startRuntimeDiskCleanupSchedule();
 }
 
 if (import.meta.main) {

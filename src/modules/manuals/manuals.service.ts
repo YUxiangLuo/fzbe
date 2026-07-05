@@ -43,20 +43,33 @@ export async function uploadManual(input: UploadManualInput) {
   const uploadPath = path.resolve(uploadsRoot, "manuals", uniqueFilename);
   await Bun.write(uploadPath, file);
 
-  const [result] = await pool.query<ResultSetHeader>(
-    "INSERT INTO experiment_manuals (file_name, file_path, description, uploader_id) VALUES (?, ?, ?, ?)",
-    [fileName, uploadPath, description || null, uploaderId],
-  );
+  const connection = await pool.getConnection();
+  try {
+    await connection.beginTransaction();
 
-  const [rows] = await pool.query<ManualRow[]>(
-    `SELECT m.*, u.full_name as uploader_name
-     FROM experiment_manuals m
-     LEFT JOIN users u ON m.uploader_id = u.user_id
-     WHERE m.manual_id = ?`,
-    [result.insertId],
-  );
+    const [result] = await connection.query<ResultSetHeader>(
+      "INSERT INTO experiment_manuals (file_name, file_path, description, uploader_id) VALUES (?, ?, ?, ?)",
+      [fileName, uploadPath, description || null, uploaderId],
+    );
 
-  return normalizeManualRow(rows[0]!);
+    const [rows] = await connection.query<ManualRow[]>(
+      `SELECT m.*, u.full_name as uploader_name
+       FROM experiment_manuals m
+       LEFT JOIN users u ON m.uploader_id = u.user_id
+       WHERE m.manual_id = ?`,
+      [result.insertId],
+    );
+
+    const manual = normalizeManualRow(rows[0]!);
+    await connection.commit();
+    return manual;
+  } catch (error) {
+    await connection.rollback().catch(() => {});
+    await rm(uploadPath, { force: true }).catch(() => {});
+    throw error;
+  } finally {
+    connection.release();
+  }
 }
 
 export async function getAllManuals() {

@@ -108,6 +108,20 @@ export const PYTHON_RUNTIME_CONFIG = {
 } as const;
 
 // ============================================
+// 磁盘清理保留期
+// ============================================
+export const CLEANUP_RETENTION = {
+  /** 导出的 ZIP/CSV 下载文件默认保留 7 天 */
+  EXPORT_FILES_MS: (parsePositiveIntegerEnv("EXPORT_FILE_RETENTION_DAYS") ?? 7) * 24 * 60 * 60 * 1000,
+  /** 上传临时目录中的残留文件默认保留 24 小时 */
+  TEMP_FILES_MS: (parsePositiveIntegerEnv("TEMP_FILE_RETENTION_HOURS") ?? 24) * 60 * 60 * 1000,
+  /** guided training 无 DB 记录的孤儿目录默认保留 24 小时，避开创建会话的短暂窗口 */
+  GUIDED_TRAINING_ORPHAN_MS: (parsePositiveIntegerEnv("GUIDED_TRAINING_ORPHAN_RETENTION_HOURS") ?? 24) * 60 * 60 * 1000,
+  /** 普通模型产物默认保留 30 天；仅清理已完成、无记录或长期无活动的实验产物 */
+  MODEL_ARTIFACTS_MS: (parsePositiveIntegerEnv("MODEL_ARTIFACT_RETENTION_DAYS") ?? 30) * 24 * 60 * 60 * 1000,
+} as const;
+
+// ============================================
 // 数据库连接池
 // ============================================
 /**

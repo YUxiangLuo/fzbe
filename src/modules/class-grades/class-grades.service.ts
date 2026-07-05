@@ -3,10 +3,13 @@ import os from "node:os";
 import { access, copyFile, mkdtemp, rm, mkdir } from "node:fs/promises";
 import type { RowDataPacket, ResultSetHeader, Pool, PoolConnection } from "mysql2/promise";
 import { pool } from "../../config";
+import { CLEANUP_RETENTION } from "../../utils/constants";
+import { cleanupDirectoryEntriesOlderThan } from "../../utils/disk-cleanup";
 import { EXP_FLOW_FIELDS, EXPERIMENT_GRADE_FIELDS, EXPERIMENT_GRADE_MUTABLE_FIELDS, type GradeReportInput, type UpdateGradeWeightsInput } from "./class-grades.schema";
 
 const STEP_COUNT = 7;
 const EXPORTS_DIR = path.resolve(import.meta.dir, "../../../uploads", "exports");
+const GENERATED_EXPORT_FILE_PATTERN = /^class-\d+-(?:reports|grades)-\d+\.(?:zip|csv)$/;
 
 const TOP_LEVEL_WEIGHT_FIELDS = [
   "exp_flow_weight",
@@ -643,6 +646,17 @@ export async function exportReportCsv(classId: number) {
   await Bun.write(exportFilePath, csvContent);
 
   return { data: { file_path: `exports/${exportFileName}` } };
+}
+
+export async function cleanupExpiredExportFiles(
+  options: { now?: Date; maxAgeMs?: number; directory?: string } = {},
+) {
+  return cleanupDirectoryEntriesOlderThan(options.directory ?? EXPORTS_DIR, {
+    now: options.now,
+    maxAgeMs: options.maxAgeMs ?? CLEANUP_RETENTION.EXPORT_FILES_MS,
+    entryKind: "file",
+    namePattern: GENERATED_EXPORT_FILE_PATTERN,
+  });
 }
 
 type RawStepEvent = { event_id: number; experiment_id: number; student_id: number; step_order: number; event_type: "STARTED" | "COMPLETED"; event_timestamp: unknown };

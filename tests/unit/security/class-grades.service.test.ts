@@ -1,9 +1,13 @@
 import { describe, expect, test } from "bun:test";
+import { mkdtemp, readdir, rm, utimes, writeFile } from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
 
 import { EXP_FLOW_FIELDS } from "../../../src/modules/class-grades/class-grades.schema";
 import {
   buildGradeCsvLines,
   buildCsvContent,
+  cleanupExpiredExportFiles,
   computeExperimentScores,
   validateGradeWeightTotals,
 } from "../../../src/modules/class-grades/class-grades.service";
@@ -30,6 +34,39 @@ describe("buildCsvContent", () => {
 
     expect(content.startsWith("\uFEFF")).toBe(true);
     expect(content).toBe("\uFEFFa,b\r\n1,2\r\n");
+  });
+});
+
+describe("cleanupExpiredExportFiles", () => {
+  test("removes only expired generated export files", async () => {
+    const exportsDir = await mkdtemp(path.join(os.tmpdir(), "fangzhen-export-cleanup-test-"));
+    const classId = Date.now();
+    const oldExport = path.join(exportsDir, `class-${classId}-reports-1000.zip`);
+    const freshExport = path.join(exportsDir, `class-${classId}-grades-2000.csv`);
+    const unrelated = path.join(exportsDir, `manual-${classId}.csv`);
+
+    await writeFile(oldExport, "old");
+    await writeFile(freshExport, "fresh");
+    await writeFile(unrelated, "manual");
+    await utimes(oldExport, new Date("2026-07-04T00:00:00.000Z"), new Date("2026-07-04T00:00:00.000Z"));
+    await utimes(freshExport, new Date("2026-07-05T00:00:00.000Z"), new Date("2026-07-05T00:00:00.000Z"));
+    await utimes(unrelated, new Date("2026-07-04T00:00:00.000Z"), new Date("2026-07-04T00:00:00.000Z"));
+
+    try {
+      const result = await cleanupExpiredExportFiles({
+        directory: exportsDir,
+        now: new Date("2026-07-05T00:00:00.000Z"),
+        maxAgeMs: 60_000,
+      });
+
+      const remaining = await readdir(exportsDir);
+      expect(result.deletedEntries).toBeGreaterThanOrEqual(1);
+      expect(remaining).not.toContain(path.basename(oldExport));
+      expect(remaining).toContain(path.basename(freshExport));
+      expect(remaining).toContain(path.basename(unrelated));
+    } finally {
+      await rm(exportsDir, { recursive: true, force: true });
+    }
   });
 });
 

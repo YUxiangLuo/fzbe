@@ -1,11 +1,12 @@
 import path from "path";
 import fs from "fs";
 import crypto from "crypto";
+import type { Stats } from "node:fs";
 import type { PoolConnection, RowDataPacket } from "mysql2/promise";
 import { pool } from "../../config";
 import logger from "../../utils/logger";
 import type { ModelType, TrainInput } from "./models.schema";
-import { TIMEOUTS, CONCURRENCY_LIMITS, PYTHON_RUNTIME_CONFIG } from "../../utils/constants";
+import { TIMEOUTS, CONCURRENCY_LIMITS, PYTHON_RUNTIME_CONFIG, CLEANUP_RETENTION } from "../../utils/constants";
 import { PY_DIR, resolvePythonExecutable } from "../../utils/python";
 import { CsvEncodingError, readCsvRows } from "../../utils/csv-processor";
 import {
@@ -522,6 +523,10 @@ interface GuidedTrainingSessionRow extends RowDataPacket {
 interface GuidedTrainingCleanupRow extends RowDataPacket {
   session_id: string;
   artifact_dir: string;
+}
+
+interface StaleModelExperimentEligibilityRow extends RowDataPacket {
+  can_delete: 0 | 1 | boolean | string;
 }
 
 export class ModelValidationError extends Error {
@@ -1084,8 +1089,10 @@ const removeGuidedTrainingArtifactDir = (artifactDir: string) => {
 const deleteGuidedTrainingSession = async (
   row: Pick<GuidedTrainingSessionRow, "session_id" | "artifact_dir">,
 ) => {
+  let canDeleteSessionRow = false;
   try {
     removeGuidedTrainingArtifactDir(row.artifact_dir);
+    canDeleteSessionRow = true;
   } catch (error) {
     logger.warn(
       {
@@ -1093,8 +1100,12 @@ const deleteGuidedTrainingSession = async (
         sessionId: row.session_id,
         artifactDir: row.artifact_dir,
       },
-      "删除 guided training 工件目录失败，将继续删除失效会话记录",
+      "删除 guided training 工件目录失败，将保留会话记录以便后续重试",
     );
+  }
+
+  if (!canDeleteSessionRow) {
+    return false;
   }
 
   await pool.query(
@@ -1102,10 +1113,71 @@ const deleteGuidedTrainingSession = async (
       WHERE session_id = ?`,
     [row.session_id],
   );
+  return true;
+};
+
+const cleanupOrphanGuidedTrainingArtifactDirs = async (
+  now: Date,
+  maxAgeMs: number,
+) => {
+  let entries: string[];
+  try {
+    entries = fs.readdirSync(GUIDED_TRAINING_ROOT);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+      return 0;
+    }
+    throw error;
+  }
+
+  let deletedArtifactDirs = 0;
+  for (const entry of entries) {
+    const artifactDir = path.join(GUIDED_TRAINING_ROOT, entry);
+    let stats: Stats;
+    try {
+      stats = fs.statSync(artifactDir);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
+        logger.warn({ err: error, artifactDir }, "读取 guided training 工件目录状态失败");
+      }
+      continue;
+    }
+
+    if (!stats.isDirectory() || now.getTime() - stats.mtimeMs < maxAgeMs) {
+      continue;
+    }
+
+    const [rows] = await pool.query<RowDataPacket[]>(
+      `SELECT session_id
+         FROM model_guided_training_sessions
+        WHERE artifact_dir = ?
+        LIMIT 1`,
+      [artifactDir],
+    );
+    if (rows.length > 0) {
+      continue;
+    }
+
+    try {
+      if (removeGuidedTrainingArtifactDir(artifactDir)) {
+        deletedArtifactDirs += 1;
+      }
+    } catch (error) {
+      logger.warn(
+        {
+          err: error instanceof Error ? { message: error.message, stack: error.stack } : { message: String(error) },
+          artifactDir,
+        },
+        "清理 orphan guided training 工件目录失败",
+      );
+    }
+  }
+
+  return deletedArtifactDirs;
 };
 
 export async function cleanupExpiredGuidedTrainingSessions(
-  options: { now?: Date; limit?: number } = {},
+  options: { now?: Date; limit?: number; orphanMaxAgeMs?: number } = {},
 ) {
   const now = options.now ?? new Date();
   const rawLimit = options.limit ?? GUIDED_TRAINING_CLEANUP_BATCH_SIZE;
@@ -1113,23 +1185,27 @@ export async function cleanupExpiredGuidedTrainingSessions(
     ? Math.min(rawLimit, GUIDED_TRAINING_CLEANUP_BATCH_SIZE)
     : GUIDED_TRAINING_CLEANUP_BATCH_SIZE;
 
+  const expirationCutoffExpression = options.now ? "?" : "NOW()";
+  const expirationCutoffParams = options.now ? [options.now] : [];
   const [rows] = await pool.query<GuidedTrainingCleanupRow[]>(
     `SELECT session_id,
             artifact_dir
        FROM model_guided_training_sessions
       WHERE expires_at IS NOT NULL
-        AND expires_at <= ?
+        AND expires_at <= ${expirationCutoffExpression}
       ORDER BY expires_at ASC
       LIMIT ${limit}`,
-    [now],
+    expirationCutoffParams,
   );
 
   let deletedArtifactDirs = 0;
+  const sessionIdsToDelete: string[] = [];
   for (const row of rows) {
     try {
       if (removeGuidedTrainingArtifactDir(row.artifact_dir)) {
         deletedArtifactDirs += 1;
       }
+      sessionIdsToDelete.push(row.session_id);
     } catch (error) {
       logger.warn(
         {
@@ -1142,18 +1218,22 @@ export async function cleanupExpiredGuidedTrainingSessions(
     }
   }
 
-  if (rows.length > 0) {
-    const sessionIds = rows.map((row) => row.session_id);
-    const placeholders = sessionIds.map(() => "?").join(", ");
+  if (sessionIdsToDelete.length > 0) {
+    const placeholders = sessionIdsToDelete.map(() => "?").join(", ");
     await pool.query(
       `DELETE FROM model_guided_training_sessions
         WHERE session_id IN (${placeholders})`,
-      sessionIds,
+      sessionIdsToDelete,
     );
   }
 
+  deletedArtifactDirs += await cleanupOrphanGuidedTrainingArtifactDirs(
+    now,
+    options.orphanMaxAgeMs ?? CLEANUP_RETENTION.GUIDED_TRAINING_ORPHAN_MS,
+  );
+
   return {
-    deletedSessions: rows.length,
+    deletedSessions: sessionIdsToDelete.length,
     deletedArtifactDirs,
   };
 }
@@ -2353,7 +2433,10 @@ export async function createOrResumeGuidedTrainingSession(
           },
           "已完成 guided training 会话缺少可复用工件，将删除会话并重新创建",
         );
-        await deleteGuidedTrainingSession(existingSession);
+        const deletedSession = await deleteGuidedTrainingSession(existingSession);
+        if (!deletedSession) {
+          throw new ModelValidationError("旧的分阶段训练会话工件清理失败，请稍后重试");
+        }
       }
     } else {
       return buildGuidedTrainingSessionPayload(existingSession);
@@ -2787,6 +2870,152 @@ export function cleanupExperimentModelArtifacts(experimentId: number, studentId:
   if (deleted > 0) {
     logger.info({ experimentId, studentId, deleted }, "已清理实验模型产物");
   }
+}
+
+interface ModelArtifactGroup {
+  experimentId: number;
+  studentId: number;
+  prefix: string;
+  files: string[];
+  newestMtimeMs: number;
+}
+
+const MODEL_ARTIFACT_PREFIX_PATTERN = /^exp(\d+)-student(\d+)-/;
+
+const toCleanupAgeSeconds = (maxAgeMs: number) => Math.max(1, Math.ceil(maxAgeMs / 1000));
+
+const isDbTruthy = (value: unknown) =>
+  value === true
+  || value === 1
+  || value === "1"
+  || value === BigInt(1);
+
+const shouldDeleteStaleModelArtifactGroup = async (
+  group: ModelArtifactGroup,
+  maxAgeSeconds: number,
+) => {
+  const [rows] = await pool.query<StaleModelExperimentEligibilityRow[]>(
+    `SELECT CASE
+              WHEN status = 'Completed' THEN 1
+              WHEN TIMESTAMPDIFF(
+                SECOND,
+                GREATEST(
+                  COALESCE(last_activity_at, CAST('1970-01-01 00:00:00' AS DATETIME)),
+                  COALESCE(completion_time, CAST('1970-01-01 00:00:00' AS DATETIME)),
+                  COALESCE(start_time, CAST('1970-01-01 00:00:00' AS DATETIME))
+                ),
+                NOW()
+              ) >= ? THEN 1
+              ELSE 0
+            END AS can_delete
+       FROM experiment_status
+      WHERE experiment_id = ?
+        AND student_id = ?
+      LIMIT 1`,
+    [maxAgeSeconds, group.experimentId, group.studentId],
+  );
+
+  if (!rows[0]) return true;
+  return isDbTruthy(rows[0].can_delete);
+};
+
+export async function cleanupStaleModelArtifacts(
+  options: { now?: Date; maxAgeMs?: number } = {},
+) {
+  const trainedModelsDir = path.join(PY_DIR, "trained_models");
+  const now = options.now ?? new Date();
+  const maxAgeMs = options.maxAgeMs ?? CLEANUP_RETENTION.MODEL_ARTIFACTS_MS;
+  const cutoffMs = now.getTime() - maxAgeMs;
+  const maxAgeSeconds = toCleanupAgeSeconds(maxAgeMs);
+  const result = {
+    scannedGroups: 0,
+    deletedGroups: 0,
+    deletedFiles: 0,
+    failedFiles: 0,
+  };
+
+  let entries: string[];
+  try {
+    entries = fs.readdirSync(trainedModelsDir);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+      return result;
+    }
+    throw error;
+  }
+
+  const groups = new Map<string, ModelArtifactGroup>();
+  for (const entry of entries) {
+    const match = MODEL_ARTIFACT_PREFIX_PATTERN.exec(entry);
+    if (!match) continue;
+
+    const filePath = path.join(trainedModelsDir, entry);
+    let stats: Stats;
+    try {
+      stats = fs.statSync(filePath);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
+        logger.warn({ err: error, file: entry }, "读取模型产物状态失败");
+      }
+      continue;
+    }
+    if (!stats.isFile()) continue;
+
+    const prefix = match[0]!;
+    const existing = groups.get(prefix);
+    if (existing) {
+      existing.files.push(entry);
+      existing.newestMtimeMs = Math.max(existing.newestMtimeMs, stats.mtimeMs);
+    } else {
+      groups.set(prefix, {
+        experimentId: Number(match[1]),
+        studentId: Number(match[2]),
+        prefix,
+        files: [entry],
+        newestMtimeMs: stats.mtimeMs,
+      });
+    }
+  }
+
+  for (const group of groups.values()) {
+    if (group.newestMtimeMs > cutoffMs) {
+      continue;
+    }
+
+    result.scannedGroups += 1;
+    if (!await shouldDeleteStaleModelArtifactGroup(group, maxAgeSeconds)) {
+      continue;
+    }
+
+    let deletedInGroup = 0;
+    for (const file of group.files) {
+      try {
+        fs.unlinkSync(path.join(trainedModelsDir, file));
+        deletedInGroup += 1;
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
+          result.failedFiles += 1;
+          logger.warn({ err: error, file }, "删除过期模型产物失败");
+        }
+      }
+    }
+
+    if (deletedInGroup > 0) {
+      result.deletedGroups += 1;
+      result.deletedFiles += deletedInGroup;
+      logger.info(
+        {
+          experimentId: group.experimentId,
+          studentId: group.studentId,
+          prefix: group.prefix,
+          deletedFiles: deletedInGroup,
+        },
+        "已清理过期模型产物组",
+      );
+    }
+  }
+
+  return result;
 }
 
 export async function predictExperimentModel(
