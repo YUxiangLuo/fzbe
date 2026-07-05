@@ -9,6 +9,7 @@ import {
   buildCsvContent,
   cleanupExpiredExportFiles,
   computeExperimentScores,
+  isReportPdfAvailable,
   validateGradeWeightTotals,
 } from "../../../src/modules/class-grades/class-grades.service";
 
@@ -66,6 +67,38 @@ describe("cleanupExpiredExportFiles", () => {
       expect(remaining).toContain(path.basename(unrelated));
     } finally {
       await rm(exportsDir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("isReportPdfAvailable", () => {
+  test("returns true only when the report PDF exists on disk", async () => {
+    const reportsDir = await mkdtemp(path.join(os.tmpdir(), "fangzhen-report-file-test-"));
+    const existingReport = path.join(reportsDir, "report.pdf");
+    const missingReport = path.join(reportsDir, "missing.pdf");
+
+    await writeFile(existingReport, "%PDF-1.4\n%%EOF\n");
+
+    try {
+      await expect(isReportPdfAvailable(existingReport)).resolves.toBe(true);
+      await expect(isReportPdfAvailable(missingReport)).resolves.toBe(false);
+      await expect(isReportPdfAvailable(null)).resolves.toBe(false);
+    } finally {
+      await rm(reportsDir, { recursive: true, force: true });
+    }
+  });
+
+  test("matches the served reports directory when the stored absolute path is stale", async () => {
+    const reportsDir = await mkdtemp(path.join(os.tmpdir(), "fangzhen-served-report-test-"));
+    const staleReportPath = path.join(os.tmpdir(), `stale-fangzhen-${Date.now()}`, "served-report.pdf");
+    const servedReportPath = path.join(reportsDir, path.basename(staleReportPath));
+
+    await writeFile(servedReportPath, "%PDF-1.4\n%%EOF\n");
+
+    try {
+      await expect(isReportPdfAvailable(staleReportPath, { reportsDir })).resolves.toBe(true);
+    } finally {
+      await rm(reportsDir, { recursive: true, force: true });
     }
   });
 });

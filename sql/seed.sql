@@ -1,7 +1,7 @@
 -- --------------------------------------------------------
 -- Virtual Simulation System Seed Data File
 -- Test data for development and testing
--- Default passwords: students use username, teachers/assistants use phone number
+-- Default passwords: students use username, teachers/assistants use 111111
 -- --------------------------------------------------------
 
 -- Clear existing data (in reverse order of dependencies)

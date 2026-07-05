@@ -1,6 +1,9 @@
 -- Teacher1 presentation data
 -- Generated deterministic classes/students/progress/grades for teacher1 (user_id=101).
+-- Teacher login is seeded by sql/seed.sql as teacher1 / 111111.
 -- Student password for inserted accounts: Student@2026
+-- Recommended entrypoint: bun run seed:teacher1:presentation --force.
+-- Raw SQL imports seed database rows only; the entrypoint also creates local report PDFs.
 -- This script is idempotent for the reserved class IDs 9001-9005 and student IDs 20255001-20255256.
 START TRANSACTION;
 DELETE FROM classes WHERE class_id BETWEEN 9001 AND 9005;
@@ -3759,6 +3762,40 @@ INSERT INTO experiment_step_events (experiment_id, student_id, step_order, event
 (800256,20255256,6,'COMPLETED','2026-06-24 18:15:00'),
 (800256,20255256,7,'STARTED','2026-06-24 19:20:00'),
 (800256,20255256,7,'COMPLETED','2026-06-24 20:25:00');
+
+-- Keep log durations in sync with the step events shown in the teacher portal.
+UPDATE experiment_status es
+JOIN (
+  SELECT paired.experiment_id,
+         paired.student_id,
+         MIN(paired.started_at) AS first_started_at,
+         MAX(COALESCE(paired.completed_at, paired.started_at)) AS last_event_at,
+         SUM(
+           CASE
+             WHEN paired.started_at IS NOT NULL AND paired.completed_at IS NOT NULL
+               THEN GREATEST(TIMESTAMPDIFF(SECOND, paired.started_at, paired.completed_at), 0)
+             ELSE 0
+           END
+         ) AS active_seconds
+    FROM (
+      SELECT experiment_id,
+             student_id,
+             step_order,
+             MIN(CASE WHEN event_type = 'STARTED' THEN event_timestamp END) AS started_at,
+             MAX(CASE WHEN event_type = 'COMPLETED' THEN event_timestamp END) AS completed_at
+        FROM experiment_step_events
+       WHERE experiment_id BETWEEN 800001 AND 800256
+         AND student_id BETWEEN 20255001 AND 20255256
+       GROUP BY experiment_id, student_id, step_order
+    ) paired
+   GROUP BY paired.experiment_id, paired.student_id
+) ev ON ev.experiment_id = es.experiment_id AND ev.student_id = es.student_id
+   SET es.start_time = ev.first_started_at,
+       es.last_activity_at = ev.last_event_at,
+       es.completion_time = CASE WHEN es.status = 'Completed' THEN ev.last_event_at ELSE NULL END,
+       es.total_active_duration_seconds = COALESCE(ev.active_seconds, 0)
+ WHERE es.experiment_id BETWEEN 800001 AND 800256
+   AND es.student_id BETWEEN 20255001 AND 20255256;
 COMMIT;
 
 -- Verification queries

@@ -141,7 +141,7 @@ classGradesController.get("/api/v1/classes/:classId/report-archive", jwtAuth, zV
     const result = await exportReportArchive(parseInt(classId, 10));
     if ("error" in result) {
       if (result.error === "no_reports") return c.json({ error: "未找到该班级的有效报告（可能是因为学生尚未提交或报告已被驳回）" }, 404);
-      return c.json({ error: "没有可下载的报告文件" }, 404);
+      return c.json({ error: "报告记录存在，但服务器上没有可下载的 PDF 文件" }, 404);
     }
     return c.json(result.data);
   } catch (error) { return handleUnexpectedError(c, error, "导出报告失败"); }

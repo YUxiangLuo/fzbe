@@ -9,6 +9,7 @@ import { EXP_FLOW_FIELDS, EXPERIMENT_GRADE_FIELDS, EXPERIMENT_GRADE_MUTABLE_FIEL
 
 const STEP_COUNT = 7;
 const EXPORTS_DIR = path.resolve(import.meta.dir, "../../../uploads", "exports");
+const REPORTS_DIR = path.resolve(import.meta.dir, "../../../uploads", "reports");
 const GENERATED_EXPORT_FILE_PATTERN = /^class-\d+-(?:reports|grades)-\d+\.(?:zip|csv)$/;
 
 const TOP_LEVEL_WEIGHT_FIELDS = [
@@ -21,6 +22,24 @@ const TOP_LEVEL_WEIGHT_FIELDS = [
 function toPublicReportPath(filePath: string | null | undefined): string | null {
   if (!filePath) return null;
   return `reports/${path.basename(filePath)}`;
+}
+
+export async function isReportPdfAvailable(
+  filePath: string | null | undefined,
+  options: { reportsDir?: string } = {},
+): Promise<boolean> {
+  if (!filePath) return false;
+  const servedPath = path.resolve(options.reportsDir ?? REPORTS_DIR, path.basename(filePath));
+  const candidates = Array.from(new Set([filePath, servedPath]));
+
+  for (const candidate of candidates) {
+    try {
+      await access(candidate);
+      return true;
+    } catch {}
+  }
+
+  return false;
 }
 
 type Queryable = Pool | PoolConnection;
@@ -226,8 +245,9 @@ export async function getClassReports(classId: number) {
     LEFT JOIN experiment_grade eg ON eg.student_id = latest.student_id AND eg.experiment_id = latest.experiment_id
     LEFT JOIN users grader ON er.graded_by = grader.user_id WHERE e.class_id = ? ORDER BY u.username ASC`, [classId, classId]);
 
-  return reportRows.map((row) => {
+  return await Promise.all(reportRows.map(async (row) => {
     const sanitizedRow: Record<string, unknown> = { ...row };
+    const pdfFilePath = sanitizedRow.pdf_file_path as string | null | undefined;
     const gradePayload: Record<string, unknown> = {};
     let hasGrade = false;
     for (const column of EXPERIMENT_GRADE_FIELDS) {
@@ -239,10 +259,11 @@ export async function getClassReports(classId: number) {
     }
     return {
       ...sanitizedRow,
-      pdf_file_path: toPublicReportPath(sanitizedRow.pdf_file_path as string | null | undefined),
+      pdf_file_path: toPublicReportPath(pdfFilePath),
+      pdf_file_available: await isReportPdfAvailable(pdfFilePath),
       experiment_grade: hasGrade ? gradePayload : null,
     };
-  });
+  }));
 }
 
 export async function gradeReport(reportId: number, userId: number, userRole: string, input: GradeReportInput) {
@@ -299,6 +320,7 @@ export async function gradeReport(reportId: number, userId: number, userRole: st
       data: {
         ...updatedReport,
         pdf_file_path: toPublicReportPath(updatedReport?.pdf_file_path as string | null | undefined),
+        pdf_file_available: await isReportPdfAvailable(updatedReport?.pdf_file_path as string | null | undefined),
         experiment_grade: experimentGradeResponse,
       },
     };

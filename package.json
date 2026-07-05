@@ -25,6 +25,7 @@
     "db:migrate:quiz-answer-snapshots": "bun run scripts/migrate-quiz-answer-snapshots.ts",
     "db:migrate:question-answer-explanations": "bun run scripts/migrate-question-answer-explanations.ts",
     "db:migrate:guided-training": "bun run scripts/migrate-guided-training-sessions.ts",
+    "seed:teacher1:presentation": "bun run scripts/seed-teacher1-presentation.ts",
     "seed:parallel:assets": "bun run scripts/seed-parallel-assets.ts",
     "seed:parallel:scenario": "bun run scripts/seed-parallel-scenarios.ts",
     "seed:parallel:report-burst": "bun run scripts/seed-parallel-report-burst.ts",
