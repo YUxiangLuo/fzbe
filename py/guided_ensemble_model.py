@@ -858,11 +858,10 @@ def _run_boosting(step_id: str, args, state: Dict[str, Any]) -> Dict[str, Any]:
         stage_coefficients = state["stage_coefficients"]
         y_true_eval = np.asarray(parsed_data.y[eval_range], dtype=float)
         if not model_chain:
-            state["base_model_states"] = {}
-            state["final_eval_preds"] = np.zeros(len(eval_range), dtype=float)
-            state["eval_y_true"] = y_true_eval.tolist()
-            state["stage_eval_summaries"] = []
-            return {"model_chain": [], "stage_count": 0}
+            raise ValueError(
+                "[DATA] Boosting 未能选出任何有效阶段：所有候选基础模型在验证段的预测均无效，"
+                "无法降低残差 RMSE。请检查所选数据区间的质量，或调整基础模型参数后重试。"
+            )
 
         final_eval_preds = np.zeros(len(eval_range), dtype=float)
         residual_full_train = np.asarray(parsed_data.y[train_range], dtype=float).copy()

@@ -41,6 +41,8 @@ const createReadStream = mock(() => {
 const readdirSync = mock(() => []);
 const unlinkSync = mock(() => {});
 const copyFileSync = mock((_: string, __: string) => {});
+const mkdirSync = mock((_: string, __?: unknown) => undefined);
+const rmSync = mock((_: string, __?: unknown) => undefined);
 const spawnMock = mock((_: string[], __: Record<string, unknown>) => ({
   stdout: new ReadableStream({
     start(controller) {
@@ -85,12 +87,16 @@ mock.module("fs", () => ({
     readdirSync,
     unlinkSync,
     copyFileSync,
+    mkdirSync,
+    rmSync,
   },
   existsSync,
   createReadStream,
   readdirSync,
   unlinkSync,
   copyFileSync,
+  mkdirSync,
+  rmSync,
 }));
 
 mock.module(pythonModulePath, () => ({
@@ -102,6 +108,7 @@ const {
   trainModel,
   runPythonModel,
   createOrResumeGuidedTrainingSession,
+  cleanupExpiredGuidedTrainingSessions,
   prepareExperimentModelForProduction,
   predictExperimentModel,
   ModelAccessError,
@@ -153,6 +160,8 @@ describe("models service", () => {
     readdirSync.mockClear();
     unlinkSync.mockClear();
     copyFileSync.mockClear();
+    mkdirSync.mockClear();
+    rmSync.mockClear();
     spawnMock.mockClear();
     (Bun as { spawn: typeof Bun.spawn }).spawn = spawnMock as typeof Bun.spawn;
   });
@@ -362,6 +371,121 @@ describe("models service", () => {
     );
     expect(unlinkSync).not.toHaveBeenCalledWith(productionModelPath);
     expect(spawnMock).not.toHaveBeenCalled();
+  });
+
+  test("recreates a completed guided session when its reusable artifact is missing", async () => {
+    const requestBody = {
+      experiment_id: 990002,
+      selected_industry: "制造业",
+      selected_company: "样本企业",
+      selected_product: "样本产品",
+      data_window_train_start_index: 0,
+      data_window_train_end_index: 11,
+      data_window_evaluate_start_index: 12,
+      data_window_evaluate_end_index: 17,
+      moving_average_window: 4,
+    };
+    const expiredArtifactDir = "/tmp/fangzhen-py/guided_training/exp990002-student20240002-ma-guided-expired";
+    const freshArtifactDir = "/tmp/fangzhen-py/guided_training/exp990002-student20240002-ma-guided-fresh";
+    const stepPlan = JSON.stringify([
+      {
+        id: "prepare_data",
+        label: "确认训练材料",
+        description: "检查训练输入。",
+        actionLabel: "校验数据",
+      },
+    ]);
+
+    const completedSessionRow = {
+      session_id: "guided-expired",
+      experiment_id: 990002,
+      student_id: 20240002,
+      model_type: "ma",
+      request_hash: "request-hash",
+      request_payload: JSON.stringify(requestBody),
+      status: "completed",
+      current_step_id: null,
+      completed_step_ids: JSON.stringify(["prepare_data"]),
+      step_outputs: JSON.stringify({ prepare_data: { ok: true } }),
+      step_plan: stepPlan,
+      result_payload: JSON.stringify({
+        status: "success",
+        results: { metrics: { rmse: 1, mae: 1, r2: 0.9 } },
+      }),
+      artifact_dir: expiredArtifactDir,
+      error_message: null,
+    };
+    const freshSessionRow = {
+      ...completedSessionRow,
+      session_id: "guided-fresh",
+      status: "ready",
+      current_step_id: "prepare_data",
+      completed_step_ids: JSON.stringify([]),
+      step_outputs: JSON.stringify({}),
+      result_payload: null,
+      artifact_dir: freshArtifactDir,
+    };
+
+    poolQuery.mockReset();
+    poolQuery
+      .mockResolvedValueOnce([[buildExperimentContextRow()]])
+      .mockResolvedValueOnce([[completedSessionRow]])
+      .mockResolvedValueOnce([[]])
+      .mockResolvedValueOnce([[]])
+      .mockResolvedValueOnce([[freshSessionRow]]);
+    existsSync.mockReturnValue(false);
+
+    const session = await createOrResumeGuidedTrainingSession("ma", 20240002, requestBody);
+
+    expect(session.session_id).toBe("guided-fresh");
+    expect(session.status).toBe("ready");
+    expect(copyFileSync).not.toHaveBeenCalled();
+    expect(rmSync).toHaveBeenCalledWith(
+      expiredArtifactDir,
+      { recursive: true, force: true },
+    );
+    expect(mkdirSync).toHaveBeenCalledWith(
+      expect.stringContaining("/tmp/fangzhen-py/guided_training/exp990002-student20240002-ma-"),
+      { recursive: true },
+    );
+    expect(poolQuery.mock.calls.some(([sql]) =>
+      String(sql).includes("DELETE FROM model_guided_training_sessions"),
+    )).toBe(true);
+    expect(poolQuery.mock.calls.some(([sql]) =>
+      String(sql).includes("INSERT INTO model_guided_training_sessions"),
+    )).toBe(true);
+  });
+
+  test("cleans up expired guided sessions and only removes guided artifact directories", async () => {
+    const safeArtifactDir = "/tmp/fangzhen-py/guided_training/exp990002-student20240002-ma-expired";
+    const unsafeArtifactDir = "/tmp/fangzhen-py/trained_models/not-a-guided-session";
+
+    poolQuery.mockReset();
+    poolQuery
+      .mockResolvedValueOnce([[
+        { session_id: "expired-safe", artifact_dir: safeArtifactDir },
+        { session_id: "expired-unsafe", artifact_dir: unsafeArtifactDir },
+      ]])
+      .mockResolvedValueOnce([[]]);
+
+    const result = await cleanupExpiredGuidedTrainingSessions({
+      now: new Date("2026-07-05T00:00:00.000Z"),
+      limit: 50,
+    });
+
+    expect(result).toEqual({
+      deletedSessions: 2,
+      deletedArtifactDirs: 1,
+    });
+    expect(rmSync).toHaveBeenCalledTimes(1);
+    expect(rmSync).toHaveBeenCalledWith(
+      safeArtifactDir,
+      { recursive: true, force: true },
+    );
+    expect(poolQuery.mock.calls[1]?.[1]).toEqual([
+      "expired-safe",
+      "expired-unsafe",
+    ]);
   });
 
   test("rejects production preparation when an ensemble is incomplete", async () => {

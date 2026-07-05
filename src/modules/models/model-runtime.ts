@@ -4,6 +4,7 @@ import { PY_DIR } from "../../utils/python";
 
 const LOCK_NAMESPACE = "fangzhen-model";
 export type ModelArtifactPhase = "backtest" | "production";
+export const GUIDED_TRAINING_ROOT = path.join(PY_DIR, "guided_training");
 
 export const buildExperimentScopedModelPath = (
   experimentId: number,
@@ -22,8 +23,7 @@ export const buildGuidedTrainingArtifactDir = (
   modelType: ModelType,
   sessionId: string,
 ): string => path.join(
-  PY_DIR,
-  "guided_training",
+  GUIDED_TRAINING_ROOT,
   `exp${experimentId}-student${studentId}-${modelType}-${sessionId}`,
 );
 

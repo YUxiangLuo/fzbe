@@ -19,6 +19,7 @@ import { quizzesController } from "./modules/quizzes";
 import { reportsController } from "./modules/reports";
 import { getPdfQueueStats, holdPdfQueueSlotForTest } from "./modules/reports/reports.service";
 import { modelsController } from "./modules/models";
+import { cleanupExpiredGuidedTrainingSessions } from "./modules/models/models.service";
 import { classesController } from "./modules/classes";
 import { classMembersController } from "./modules/class-members";
 import { datasetsController } from "./modules/datasets";
@@ -539,7 +540,48 @@ app.onError((err, c) => {
   return c.json({ error: "服务器内部错误" }, 500);
 });
 
-const longRunningModelPathPattern = /^\/api\/v1\/models\/[^/]+\/(training(?:\/stream)?|prepare-production|predict)$/;
+const GUIDED_TRAINING_CLEANUP_INTERVAL_MS = 24 * 60 * 60 * 1000;
+let guidedTrainingCleanupTimer: ReturnType<typeof setInterval> | null = null;
+
+const longRunningModelPathPattern = /^\/api\/v1\/models\/[^/]+\/(training(?:\/stream)?|prepare-production|predict|guided-training\/sessions\/[^/]+\/steps\/[^/]+\/run)$/;
+
+export async function runGuidedTrainingSessionCleanup(trigger = "manual") {
+  try {
+    const result = await cleanupExpiredGuidedTrainingSessions();
+    if (result.deletedSessions > 0 || result.deletedArtifactDirs > 0) {
+      logger.info(
+        { trigger, ...result },
+        "已清理过期 guided training 会话",
+      );
+    }
+    return result;
+  } catch (error) {
+    logger.warn(
+      {
+        trigger,
+        err: error instanceof Error ? { message: error.message, stack: error.stack } : { message: String(error) },
+      },
+      "清理过期 guided training 会话失败",
+    );
+    return null;
+  }
+}
+
+export function startGuidedTrainingSessionCleanupSchedule() {
+  if (guidedTrainingCleanupTimer) {
+    return;
+  }
+
+  if (process.env.DISABLE_GUIDED_TRAINING_CLEANUP_TIMER === "1") {
+    logger.info("guided training 过期会话定时清理已通过环境变量禁用");
+    return;
+  }
+
+  guidedTrainingCleanupTimer = setInterval(() => {
+    void runGuidedTrainingSessionCleanup("interval");
+  }, GUIDED_TRAINING_CLEANUP_INTERVAL_MS);
+  guidedTrainingCleanupTimer.unref?.();
+}
 
 const resolveBunIdleTimeoutSeconds = () => {
   const rawValue = process.env.BUN_IDLE_TIMEOUT_SECONDS?.trim() || "255";
@@ -630,6 +672,9 @@ export async function runServerStartupPreflight() {
     );
     process.exit(1);
   }
+
+  await runGuidedTrainingSessionCleanup("startup");
+  startGuidedTrainingSessionCleanupSchedule();
 }
 
 if (import.meta.main) {

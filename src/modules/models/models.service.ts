@@ -9,6 +9,7 @@ import { TIMEOUTS, CONCURRENCY_LIMITS, PYTHON_RUNTIME_CONFIG } from "../../utils
 import { PY_DIR, resolvePythonExecutable } from "../../utils/python";
 import { CsvEncodingError, readCsvRows } from "../../utils/csv-processor";
 import {
+  GUIDED_TRAINING_ROOT,
   buildGuidedTrainingArtifactDir,
   buildGuidedTrainingStatePath,
   buildExperimentScopedModelPath,
@@ -18,6 +19,7 @@ import {
 
 const TRAINING_TIMEOUT = TIMEOUTS.MODEL_TRAINING;
 const MAX_CONCURRENT_MODEL_JOBS = CONCURRENCY_LIMITS.MAX_CONCURRENT_MODEL_JOBS;
+const GUIDED_TRAINING_CLEANUP_BATCH_SIZE = 500;
 
 function buildPythonModelProcessEnv(): Record<string, string> {
   const modelThreads = String(PYTHON_RUNTIME_CONFIG.MODEL_PROCESS_THREADS);
@@ -515,6 +517,11 @@ interface GuidedTrainingSessionRow extends RowDataPacket {
   result_payload: unknown;
   artifact_dir: string;
   error_message: string | null;
+}
+
+interface GuidedTrainingCleanupRow extends RowDataPacket {
+  session_id: string;
+  artifact_dir: string;
 }
 
 export class ModelValidationError extends Error {
@@ -1041,12 +1048,115 @@ const restoreGuidedSessionBacktestArtifact = async (
   const sourceModelPath = getGuidedSessionModelPath(row.artifact_dir, row.model_type);
   const backtestModelPath = getBacktestModelPath(row.experiment_id, row.student_id, row.model_type);
 
+  if (!(await hasReusableSavedModelArtifact(row.model_type, sourceModelPath))) {
+    throw new ModelNotFoundError("分阶段训练产物已过期或已被清理，请重新开始分阶段训练");
+  }
+
   await copyModelArtifact(row.model_type, sourceModelPath, backtestModelPath);
   if (options.invalidateProductionArtifact) {
     invalidateProductionArtifact(row.experiment_id, row.student_id, row.model_type);
   }
   return backtestModelPath;
 };
+
+const isPathInsideDirectory = (candidatePath: string, rootDirectory: string) => {
+  const resolvedCandidate = path.resolve(candidatePath);
+  const resolvedRoot = path.resolve(rootDirectory);
+  const relativePath = path.relative(resolvedRoot, resolvedCandidate);
+  return relativePath.length > 0
+    && !relativePath.startsWith("..")
+    && !path.isAbsolute(relativePath);
+};
+
+const removeGuidedTrainingArtifactDir = (artifactDir: string) => {
+  if (!isPathInsideDirectory(artifactDir, GUIDED_TRAINING_ROOT)) {
+    logger.warn(
+      { artifactDir, guidedTrainingRoot: GUIDED_TRAINING_ROOT },
+      "跳过不安全的 guided training 工件目录清理",
+    );
+    return false;
+  }
+
+  fs.rmSync(artifactDir, { recursive: true, force: true });
+  return true;
+};
+
+const deleteGuidedTrainingSession = async (
+  row: Pick<GuidedTrainingSessionRow, "session_id" | "artifact_dir">,
+) => {
+  try {
+    removeGuidedTrainingArtifactDir(row.artifact_dir);
+  } catch (error) {
+    logger.warn(
+      {
+        err: error instanceof Error ? { message: error.message, stack: error.stack } : { message: String(error) },
+        sessionId: row.session_id,
+        artifactDir: row.artifact_dir,
+      },
+      "删除 guided training 工件目录失败，将继续删除失效会话记录",
+    );
+  }
+
+  await pool.query(
+    `DELETE FROM model_guided_training_sessions
+      WHERE session_id = ?`,
+    [row.session_id],
+  );
+};
+
+export async function cleanupExpiredGuidedTrainingSessions(
+  options: { now?: Date; limit?: number } = {},
+) {
+  const now = options.now ?? new Date();
+  const rawLimit = options.limit ?? GUIDED_TRAINING_CLEANUP_BATCH_SIZE;
+  const limit = Number.isInteger(rawLimit) && rawLimit > 0
+    ? Math.min(rawLimit, GUIDED_TRAINING_CLEANUP_BATCH_SIZE)
+    : GUIDED_TRAINING_CLEANUP_BATCH_SIZE;
+
+  const [rows] = await pool.query<GuidedTrainingCleanupRow[]>(
+    `SELECT session_id,
+            artifact_dir
+       FROM model_guided_training_sessions
+      WHERE expires_at IS NOT NULL
+        AND expires_at <= ?
+      ORDER BY expires_at ASC
+      LIMIT ${limit}`,
+    [now],
+  );
+
+  let deletedArtifactDirs = 0;
+  for (const row of rows) {
+    try {
+      if (removeGuidedTrainingArtifactDir(row.artifact_dir)) {
+        deletedArtifactDirs += 1;
+      }
+    } catch (error) {
+      logger.warn(
+        {
+          err: error instanceof Error ? { message: error.message, stack: error.stack } : { message: String(error) },
+          sessionId: row.session_id,
+          artifactDir: row.artifact_dir,
+        },
+        "清理过期 guided training 工件目录失败",
+      );
+    }
+  }
+
+  if (rows.length > 0) {
+    const sessionIds = rows.map((row) => row.session_id);
+    const placeholders = sessionIds.map(() => "?").join(", ");
+    await pool.query(
+      `DELETE FROM model_guided_training_sessions
+        WHERE session_id IN (${placeholders})`,
+      sessionIds,
+    );
+  }
+
+  return {
+    deletedSessions: rows.length,
+    deletedArtifactDirs,
+  };
+}
 
 const stableJsonStringify = (value: unknown): string => {
   if (Array.isArray(value)) {
@@ -2227,9 +2337,27 @@ export async function createOrResumeGuidedTrainingSession(
       existingSession.status = "ready";
     }
     if (existingSession.status === "completed") {
-      await restoreGuidedSessionBacktestArtifact(existingSession);
+      try {
+        await restoreGuidedSessionBacktestArtifact(existingSession);
+        return buildGuidedTrainingSessionPayload(existingSession);
+      } catch (error) {
+        if (!(error instanceof ModelNotFoundError)) {
+          throw error;
+        }
+
+        logger.warn(
+          {
+            sessionId: existingSession.session_id,
+            artifactDir: existingSession.artifact_dir,
+            modelType,
+          },
+          "已完成 guided training 会话缺少可复用工件，将删除会话并重新创建",
+        );
+        await deleteGuidedTrainingSession(existingSession);
+      }
+    } else {
+      return buildGuidedTrainingSessionPayload(existingSession);
     }
-    return buildGuidedTrainingSessionPayload(existingSession);
   }
 
   const sessionId = crypto.randomUUID();
