@@ -109,9 +109,14 @@ interface ExperimentRow extends RowDataPacket {
 
 interface ReportRow extends RowDataPacket {
   report_id: number;
+  experiment_id: number;
+  student_id: number;
   status: string;
+  submitted_at: Date | string | null;
+  grade: number | null;
   feedback: string | null;
   pdf_file_path?: string | null;
+  graded_by: number | null;
 }
 
 function toPublicReportPath(filePath: string | null | undefined): string | null {
@@ -443,7 +448,7 @@ export async function getLatestReportStatus(studentId: number) {
   );
 
   if (!latestExperiment) {
-    return { is_rejected: false };
+    return { is_rejected: false, has_report: false };
   }
 
   const [[report]] = await pool.query<ReportRow[]>(
@@ -451,18 +456,23 @@ export async function getLatestReportStatus(studentId: number) {
     [latestExperiment.experiment_id, studentId],
   );
 
-  if (report && report.status === "rejected") {
+  if (!report) {
     return {
-      is_rejected: true,
+      is_rejected: false,
+      has_report: false,
       experiment: latestExperiment,
-      report: {
-        ...report,
-        pdf_file_path: toPublicReportPath(report.pdf_file_path),
-      },
     };
   }
 
-  return { is_rejected: false };
+  return {
+    is_rejected: report.status === "rejected",
+    has_report: true,
+    experiment: latestExperiment,
+    report: {
+      ...report,
+      pdf_file_path: toPublicReportPath(report.pdf_file_path),
+    },
+  };
 }
 
 export { HTMLSanitizationError };

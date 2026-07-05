@@ -121,7 +121,7 @@ mock.module("puppeteer-core", () => ({
   default: { launch },
 }));
 
-const { submitReport } = await import(freshReportsServiceModulePath);
+const { submitReport, getLatestReportStatus } = await import(freshReportsServiceModulePath);
 
 type MockExperimentRow = {
   experiment_id: number;
@@ -240,6 +240,31 @@ const buildExperiment = (
   ...overrides,
 });
 
+const buildLatestExperimentStatus = (overrides: Record<string, unknown> = {}) => ({
+  experiment_id: 990021,
+  student_id: 20241002,
+  status: "Completed",
+  current_step: 8,
+  start_time: "2026-03-01T08:00:00.000Z",
+  last_activity_at: "2026-03-01T10:00:00.000Z",
+  completion_time: "2026-03-01T11:00:00.000Z",
+  ...overrides,
+});
+
+const buildReportStatusRow = (overrides: Record<string, unknown> = {}) => ({
+  report_id: 880021,
+  experiment_id: 990021,
+  student_id: 20241002,
+  report_content: "# report",
+  pdf_file_path: "/srv/fz/uploads/reports/student-report.pdf",
+  status: "submitted",
+  submitted_at: "2026-03-01T11:30:00.000Z",
+  grade: null,
+  feedback: null,
+  graded_by: null,
+  ...overrides,
+});
+
 const listGeneratedReports = async (experimentId: number, studentId: number) => {
   const entries = await readdir(reportUploadsDir);
   return entries.filter((entry) => entry.startsWith(`report-exp${experimentId}-student${studentId}-`));
@@ -275,6 +300,102 @@ describe("reports service", () => {
 
   afterEach(async () => {
     await rm(reportUploadsDir, { recursive: true, force: true });
+  });
+
+  test("returns no-report status when the student has no experiment", async () => {
+    poolQuery.mockImplementation(async (sql: string) => {
+      if (sql.includes("FROM experiment_status")) return [[]];
+      throw new Error(`Unexpected SQL in no experiment status test: ${sql}`);
+    });
+
+    await expect(getLatestReportStatus(20241002)).resolves.toEqual({
+      is_rejected: false,
+      has_report: false,
+    });
+  });
+
+  test("returns latest experiment with no-report status before report submission", async () => {
+    const latestExperiment = buildLatestExperimentStatus({ status: "In Progress", current_step: 5 });
+    poolQuery.mockImplementation(async (sql: string) => {
+      if (sql.includes("FROM experiment_status")) return [[latestExperiment]];
+      if (sql.includes("FROM experiment_reports")) return [[]];
+      throw new Error(`Unexpected SQL in no report status test: ${sql}`);
+    });
+
+    await expect(getLatestReportStatus(20241002)).resolves.toEqual({
+      is_rejected: false,
+      has_report: false,
+      experiment: latestExperiment,
+    });
+  });
+
+  test("returns submitted latest report status without marking it rejected", async () => {
+    const latestExperiment = buildLatestExperimentStatus();
+    const report = buildReportStatusRow({ status: "submitted" });
+    poolQuery.mockImplementation(async (sql: string) => {
+      if (sql.includes("FROM experiment_status")) return [[latestExperiment]];
+      if (sql.includes("FROM experiment_reports")) return [[report]];
+      throw new Error(`Unexpected SQL in submitted status test: ${sql}`);
+    });
+
+    await expect(getLatestReportStatus(20241002)).resolves.toEqual({
+      is_rejected: false,
+      has_report: true,
+      experiment: latestExperiment,
+      report: {
+        ...report,
+        pdf_file_path: "reports/student-report.pdf",
+      },
+    });
+  });
+
+  test("returns graded latest report status with grade and feedback", async () => {
+    const latestExperiment = buildLatestExperimentStatus();
+    const report = buildReportStatusRow({
+      status: "graded",
+      grade: 91,
+      feedback: "报告结构完整，误差分析充分。",
+      graded_by: 101,
+    });
+    poolQuery.mockImplementation(async (sql: string) => {
+      if (sql.includes("FROM experiment_status")) return [[latestExperiment]];
+      if (sql.includes("FROM experiment_reports")) return [[report]];
+      throw new Error(`Unexpected SQL in graded status test: ${sql}`);
+    });
+
+    await expect(getLatestReportStatus(20241002)).resolves.toEqual({
+      is_rejected: false,
+      has_report: true,
+      experiment: latestExperiment,
+      report: {
+        ...report,
+        pdf_file_path: "reports/student-report.pdf",
+      },
+    });
+  });
+
+  test("keeps rejected latest report status compatible with the old flag", async () => {
+    const latestExperiment = buildLatestExperimentStatus();
+    const report = buildReportStatusRow({
+      status: "rejected",
+      feedback: "请补充关键图表。",
+      pdf_file_path: null,
+    });
+    poolQuery.mockImplementation(async (sql: string) => {
+      if (sql.includes("FROM experiment_status")) return [[latestExperiment]];
+      if (sql.includes("FROM experiment_reports")) return [[report]];
+      throw new Error(`Unexpected SQL in rejected status test: ${sql}`);
+    });
+
+    await expect(getLatestReportStatus(20241002)).resolves.toEqual({
+      is_rejected: true,
+      has_report: true,
+      experiment: latestExperiment,
+      report: {
+        ...report,
+        pdf_file_path: null,
+      },
+    });
   });
 
   test("rejects ineligible experiments before launching Puppeteer", async () => {
