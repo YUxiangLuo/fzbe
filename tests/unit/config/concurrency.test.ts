@@ -14,15 +14,22 @@ const CONFIG_ENV_NAMES = [
   "DB_CONNECTION_LIMIT",
   "PYTHON_MODEL_THREADS",
   "TF_NUM_INTEROP_THREADS",
+  "AUTH_LOGIN_RATE_LIMIT_WINDOW_MS",
+  "AUTH_LOGIN_RATE_LIMIT_MAX_PER_IP",
+  "AUTH_LOGIN_RATE_LIMIT_MAX_PER_ACCOUNT",
+  "AUTH_REGISTER_RATE_LIMIT_WINDOW_MS",
+  "AUTH_REGISTER_RATE_LIMIT_MAX_PER_IP",
+  "AUTH_REGISTER_RATE_LIMIT_MAX_PER_ACCOUNT",
 ] as const;
 
 const SNAPSHOT_SCRIPT = `
-import { CONCURRENCY_LIMITS, DB_POOL_CONFIG, PYTHON_RUNTIME_CONFIG, TIMEOUTS } from "./src/utils/constants.ts";
+import { CONCURRENCY_LIMITS, DB_POOL_CONFIG, PYTHON_RUNTIME_CONFIG, RATE_LIMITS, TIMEOUTS } from "./src/utils/constants.ts";
 
 console.log(JSON.stringify({
   CONCURRENCY_LIMITS,
   DB_POOL_CONFIG,
   PYTHON_RUNTIME_CONFIG,
+  RATE_LIMITS,
   TIMEOUTS,
 }));
 `;
@@ -42,6 +49,14 @@ interface ConstantsSnapshot {
   PYTHON_RUNTIME_CONFIG: {
     MODEL_PROCESS_THREADS: number;
     TF_INTER_OP_THREADS: number;
+  };
+  RATE_LIMITS: {
+    AUTH_LOGIN_WINDOW_MS: number;
+    AUTH_LOGIN_MAX_PER_IP: number;
+    AUTH_LOGIN_MAX_PER_ACCOUNT: number;
+    AUTH_REGISTER_WINDOW_MS: number;
+    AUTH_REGISTER_MAX_PER_IP: number;
+    AUTH_REGISTER_MAX_PER_ACCOUNT: number;
   };
   TIMEOUTS: {
     PDF_QUEUE: number;
@@ -85,7 +100,7 @@ async function loadConstantsSnapshot(
 
 describe("concurrency safeguards", () => {
   test("defaults are sized for a 64-core / 50-student classroom deployment", async () => {
-    const { CONCURRENCY_LIMITS, PYTHON_RUNTIME_CONFIG, TIMEOUTS } =
+    const { CONCURRENCY_LIMITS, PYTHON_RUNTIME_CONFIG, RATE_LIMITS, TIMEOUTS } =
       await loadConstantsSnapshot();
 
     expect(CONCURRENCY_LIMITS.DEFAULT_MODEL_JOB_CAP).toBe(50);
@@ -97,6 +112,12 @@ describe("concurrency safeguards", () => {
     expect(TIMEOUTS.PDF_GENERATION).toBe(30_000);
     expect(PYTHON_RUNTIME_CONFIG.MODEL_PROCESS_THREADS).toBe(1);
     expect(PYTHON_RUNTIME_CONFIG.TF_INTER_OP_THREADS).toBe(1);
+    expect(RATE_LIMITS.AUTH_LOGIN_WINDOW_MS).toBe(15 * 60 * 1000);
+    expect(RATE_LIMITS.AUTH_LOGIN_MAX_PER_IP).toBe(100);
+    expect(RATE_LIMITS.AUTH_LOGIN_MAX_PER_ACCOUNT).toBe(10);
+    expect(RATE_LIMITS.AUTH_REGISTER_WINDOW_MS).toBe(60 * 60 * 1000);
+    expect(RATE_LIMITS.AUTH_REGISTER_MAX_PER_IP).toBe(50);
+    expect(RATE_LIMITS.AUTH_REGISTER_MAX_PER_ACCOUNT).toBe(3);
   });
 
   test("CONNECTION_LIMIT covers model advisory locks plus query headroom", async () => {
@@ -116,7 +137,13 @@ describe("concurrency safeguards", () => {
   });
 
   test("explicit environment values override concurrency, timeout, database, and Python defaults", async () => {
-    const { CONCURRENCY_LIMITS, DB_POOL_CONFIG, PYTHON_RUNTIME_CONFIG, TIMEOUTS } =
+    const {
+      CONCURRENCY_LIMITS,
+      DB_POOL_CONFIG,
+      PYTHON_RUNTIME_CONFIG,
+      RATE_LIMITS,
+      TIMEOUTS,
+    } =
       await loadConstantsSnapshot({
         MAX_CONCURRENT_MODEL_JOBS: "37",
         MAX_CONCURRENT_PDF_JOBS: "9",
@@ -126,6 +153,12 @@ describe("concurrency safeguards", () => {
         DB_CONNECTION_LIMIT: "150",
         PYTHON_MODEL_THREADS: "2",
         TF_NUM_INTEROP_THREADS: "3",
+        AUTH_LOGIN_RATE_LIMIT_WINDOW_MS: "120000",
+        AUTH_LOGIN_RATE_LIMIT_MAX_PER_IP: "20",
+        AUTH_LOGIN_RATE_LIMIT_MAX_PER_ACCOUNT: "5",
+        AUTH_REGISTER_RATE_LIMIT_WINDOW_MS: "600000",
+        AUTH_REGISTER_RATE_LIMIT_MAX_PER_IP: "10",
+        AUTH_REGISTER_RATE_LIMIT_MAX_PER_ACCOUNT: "2",
       });
 
     expect(CONCURRENCY_LIMITS.MAX_CONCURRENT_MODEL_JOBS).toBe(37);
@@ -137,6 +170,12 @@ describe("concurrency safeguards", () => {
     expect(DB_POOL_CONFIG.CONNECTION_LIMIT).toBe(150);
     expect(PYTHON_RUNTIME_CONFIG.MODEL_PROCESS_THREADS).toBe(2);
     expect(PYTHON_RUNTIME_CONFIG.TF_INTER_OP_THREADS).toBe(3);
+    expect(RATE_LIMITS.AUTH_LOGIN_WINDOW_MS).toBe(120_000);
+    expect(RATE_LIMITS.AUTH_LOGIN_MAX_PER_IP).toBe(20);
+    expect(RATE_LIMITS.AUTH_LOGIN_MAX_PER_ACCOUNT).toBe(5);
+    expect(RATE_LIMITS.AUTH_REGISTER_WINDOW_MS).toBe(600_000);
+    expect(RATE_LIMITS.AUTH_REGISTER_MAX_PER_IP).toBe(10);
+    expect(RATE_LIMITS.AUTH_REGISTER_MAX_PER_ACCOUNT).toBe(2);
   });
 
   test("legacy concurrency environment names remain supported", async () => {
@@ -157,5 +196,9 @@ describe("concurrency safeguards", () => {
     await expect(loadConstantsSnapshot({ PDF_QUEUE_TIMEOUT_MS: "30s" })).rejects.toThrow(
       "PDF_QUEUE_TIMEOUT_MS must be a positive integer",
     );
+
+    await expect(
+      loadConstantsSnapshot({ AUTH_LOGIN_RATE_LIMIT_MAX_PER_ACCOUNT: "0" }),
+    ).rejects.toThrow("AUTH_LOGIN_RATE_LIMIT_MAX_PER_ACCOUNT must be a positive integer");
   });
 });

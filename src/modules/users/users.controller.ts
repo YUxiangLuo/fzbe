@@ -15,6 +15,7 @@ import {
   resetStudentPassword, deleteUser, batchDeleteUsers
 } from "./users.service";
 import { resolveAcademicTermId } from "../academic-terms";
+import { enforceSelfRegistrationRateLimit } from "../auth/auth.rate-limit";
 
 const usersController = new Hono();
 
@@ -28,6 +29,9 @@ usersController.post("/api/v1/users/register/:role", zValidator("param", rolePar
   try {
     const { role } = c.req.valid("param");
     const body = await c.req.json();
+    const rateLimitResponse = enforceSelfRegistrationRateLimit(c, body);
+    if (rateLimitResponse) return rateLimitResponse;
+
     const result = await registerSelfUser(role, body);
     if ("error" in result) {
       if (result.error === "validation") return c.json({ error: "验证失败", details: result.details }, 400);

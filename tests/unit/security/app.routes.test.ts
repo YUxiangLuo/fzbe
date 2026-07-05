@@ -106,6 +106,24 @@ describe("app route smoke tests", () => {
     expect(payload).not.toHaveProperty("data");
   });
 
+  test("keeps null self-registration JSON as a validation error", async () => {
+    const app = await getApp();
+    const response = await app.fetch(
+      new Request("http://localhost/api/v1/users/register/Student", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: "null",
+      }),
+    );
+
+    expect(response.status).toBe(400);
+    const payload = await response.json();
+    expect(payload).toHaveProperty("error", "验证失败");
+    expect(payload).not.toHaveProperty("data");
+  });
+
   test("returns the application-level 404 payload for unknown routes", async () => {
     const app = await getApp();
     const response = await app.fetch(

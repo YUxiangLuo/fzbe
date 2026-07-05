@@ -148,6 +148,24 @@ export const DB_POOL_CONFIG = {
 } as const;
 
 // ============================================
+// 认证限流
+// ============================================
+export const RATE_LIMITS = {
+  /** 登录限流窗口。默认 15 分钟。 */
+  AUTH_LOGIN_WINDOW_MS: parsePositiveIntegerEnv("AUTH_LOGIN_RATE_LIMIT_WINDOW_MS") ?? 15 * 60 * 1000,
+  /** 单 IP 登录尝试上限。默认偏高，避免同一教室 NAT 误伤。 */
+  AUTH_LOGIN_MAX_PER_IP: parsePositiveIntegerEnv("AUTH_LOGIN_RATE_LIMIT_MAX_PER_IP") ?? 100,
+  /** 单账号登录尝试上限。 */
+  AUTH_LOGIN_MAX_PER_ACCOUNT: parsePositiveIntegerEnv("AUTH_LOGIN_RATE_LIMIT_MAX_PER_ACCOUNT") ?? 10,
+  /** 自助注册限流窗口。默认 1 小时。 */
+  AUTH_REGISTER_WINDOW_MS: parsePositiveIntegerEnv("AUTH_REGISTER_RATE_LIMIT_WINDOW_MS") ?? 60 * 60 * 1000,
+  /** 单 IP 自助注册上限。 */
+  AUTH_REGISTER_MAX_PER_IP: parsePositiveIntegerEnv("AUTH_REGISTER_RATE_LIMIT_MAX_PER_IP") ?? 50,
+  /** 单用户名自助注册上限。 */
+  AUTH_REGISTER_MAX_PER_ACCOUNT: parsePositiveIntegerEnv("AUTH_REGISTER_RATE_LIMIT_MAX_PER_ACCOUNT") ?? 3,
+} as const;
+
+// ============================================
 // 用户相关常量
 // ============================================
 export const USER_CONSTANTS = {

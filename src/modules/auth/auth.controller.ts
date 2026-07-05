@@ -2,6 +2,7 @@ import { Hono } from "hono";
 import { zValidator } from "@hono/zod-validator";
 import { loginSchema } from "./auth.schema";
 import { login } from "./auth.service";
+import { enforceLoginRateLimit } from "./auth.rate-limit";
 import { handleUnexpectedError } from "../../utils/error-handler";
 
 const authController = new Hono();
@@ -12,6 +13,9 @@ authController.post(
   async (c) => {
     try {
       const input = c.req.valid("json");
+      const rateLimitResponse = enforceLoginRateLimit(c, input);
+      if (rateLimitResponse) return rateLimitResponse;
+
       const result = await login(input);
 
       if (!result.success) {

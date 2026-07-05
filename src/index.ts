@@ -29,6 +29,11 @@ import { cleanupExpiredExportFiles } from "./modules/class-grades/class-grades.s
 import { usersController } from "./modules/users";
 import { academicTermsController } from "./modules/academic-terms";
 import { cleanupStaleUploadTempFiles } from "./utils/runtime-cleanup";
+import {
+  hasLegacyGuidedTrainingCleanupTimerDisable,
+  isRuntimeDiskCleanupTimerDisabled,
+  shouldSkipGuidedTrainingCleanupForTrigger,
+} from "./utils/runtime-cleanup-config";
 
 // --- Hono App Initialization ---
 const app = new Hono();
@@ -592,7 +597,9 @@ const runCleanupStep = async <T>(
 };
 
 export async function runRuntimeDiskCleanup(trigger = "manual") {
-  const guidedTraining = await runGuidedTrainingSessionCleanup(trigger);
+  const guidedTraining = shouldSkipGuidedTrainingCleanupForTrigger(trigger)
+    ? null
+    : await runGuidedTrainingSessionCleanup(trigger);
   const exportFiles = await runCleanupStep(trigger, "export-files", cleanupExpiredExportFiles);
   const uploadTempFiles = await runCleanupStep(trigger, "upload-temp-files", cleanupStaleUploadTempFiles);
   const modelArtifacts = await runCleanupStep(trigger, "model-artifacts", cleanupStaleModelArtifacts);
@@ -610,12 +617,13 @@ export function startRuntimeDiskCleanupSchedule() {
     return;
   }
 
-  if (
-    process.env.DISABLE_RUNTIME_DISK_CLEANUP_TIMER === "1"
-    || process.env.DISABLE_GUIDED_TRAINING_CLEANUP_TIMER === "1"
-  ) {
+  if (isRuntimeDiskCleanupTimerDisabled()) {
     logger.info("运行时磁盘定时清理已通过环境变量禁用");
     return;
+  }
+
+  if (hasLegacyGuidedTrainingCleanupTimerDisable()) {
+    logger.info("DISABLE_GUIDED_TRAINING_CLEANUP_TIMER 已废弃：仅跳过 interval 触发的 guided training 清理，其他运行时磁盘清理仍会执行");
   }
 
   runtimeDiskCleanupTimer = setInterval(() => {
