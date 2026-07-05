@@ -48,6 +48,7 @@ IMPLEMENTATION_NOTES = [
     "本系统先用时间顺序留出的验证段估计各基础模型残差均方误差（MSE），再按其倒数归一化为权重。",
     "这样既继承误差越小权重越高的逆方差思想，也会惩罚销量预测中常见的系统性高估或低估。",
     "所有基础模型最终会在完整训练区间重训，再用固定权重组合评估或未来预测。",
+    "预测值附带的 std_dev 是评估段残差的常数标准差，不随预测步长增长，与 ARIMA 随步长展宽的置信区间口径不同。",
 ]
 
 
@@ -861,7 +862,7 @@ def run(args) -> None:
     # Auto-select defaults based on weight_train size
     # (base models will be trained on weight_train in Phase 1, which is ~80-85% of train_range)
     train_size = te - ts + 1
-    weight_train_size = max(3, int(train_size * 0.85)) if train_size <= 15 else int(train_size * 0.8)
+    weight_train_size = _compute_phase1_train_size(train_size)
 
     # Use weight_train_size for parameter calculation to avoid phase 1 failures
     # Aligned with individual model auto-selection logic

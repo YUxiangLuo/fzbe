@@ -45,6 +45,8 @@ IMPLEMENTATION_NOTES = [
     "教科书 Stacking 用基础模型预测作为二级特征，再训练元学习器组合预测。",
     "本系统按时间顺序将训练区间拆成 Level-0 和 Level-1，避免普通 K 折交叉验证破坏时间序列顺序。",
     "元模型使用非负线性回归且无截距，并将系数归一化为权重；样本不足或共线性严重时回退为 inverse-MAE 权重。",
+    "训练数据较少或基础模型较多时，Level-1 样本数不足会触发 inverse-MAE 回退，此时 Stacking 实际退化为逆误差加权，具体策略与原因见 meta_model 字段。",
+    "预测值附带的 std_dev 是评估段残差的常数标准差，不随预测步长增长，与 ARIMA 随步长展宽的置信区间口径不同。",
 ]
 
 
@@ -977,7 +979,7 @@ def run(args) -> None:
     # Auto-select conservative defaults based on level0 training data size
     # (base models will be trained on level0 in Phase 1, which is ~80-85% of train_range)
     train_size = te - ts + 1
-    level0_size = max(3, int(train_size * 0.85)) if train_size <= 15 else int(train_size * 0.8)
+    level0_size = _compute_phase1_train_size(train_size)
 
     # Use level0_size for parameter calculation to avoid phase 1 failures
     # Align with individual model auto-selection logic

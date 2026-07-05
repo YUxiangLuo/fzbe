@@ -46,6 +46,7 @@ IMPLEMENTATION_NOTES = [
     "梯度提升在平方误差损失下等价于逐步拟合残差；本系统借鉴这一思想，但候选学习器是 MA、ES、ARIMA、LSTM 等时间序列模型。",
     "AdaBoost 通过样本权重实现错误关注；本系统的时间序列基础模型不支持样本权重，因此采用残差学习的加法模型。",
     "每一轮在候选模型中贪心选择最能降低验证残差 RMSE 的模型，并用学习率控制新增阶段贡献。",
+    "预测值附带的 std_dev 是评估段残差的常数标准差，不随预测步长增长，与 ARIMA 随步长展宽的置信区间口径不同。",
 ]
 
 
@@ -780,17 +781,13 @@ def train_and_evaluate(
             remove_member_model_artifact(result["model_name"], result["temp_model_file"])
 
     if not model_chain:
-        y_true_eval = np.asarray(parsed_data.y[eval_range], dtype=float)
-        timestamps = parsed_data.timestamps
-        metrics = {
-            "rmse": float("inf"),
-            "mae": float("inf"),
-            "mape": float("inf"),
-            "r2": float("-inf"),
-            "evaluate_indices": list(eval_range),
-            "evaluate_months": [timestamps[i] for i in eval_range] if timestamps else [],
-        }
-        return metrics, [], [], {}, y_true_eval.tolist(), [0.0] * len(y_true_eval), 0.0, search_summary
+        # 空链只会在所有候选模型的验证段预测都无效（RMSE 为 NaN 等）时出现。
+        # 不能带着 inf 指标返回：json.dumps 会输出非法 JSON 的 Infinity，
+        # 导致后端 JSON.parse 失败，学生只能看到"Python 输出无效"。
+        raise ValueError(
+            "[DATA] Boosting 未能选出任何有效阶段：所有候选基础模型在验证段的预测均无效，"
+            "无法降低残差 RMSE。请检查所选数据区间的质量，或调整基础模型参数后重试。"
+        )
 
     final_eval_preds = np.zeros(len(eval_range), dtype=float)
     residual_full_train = np.asarray(parsed_data.y[train_range], dtype=float).copy()
@@ -1085,7 +1082,7 @@ def run(args) -> None:
         raise ValueError("[VALIDATION] max_rounds must be >= 1")
 
     train_size = te - ts + 1
-    boost_train_size = max(3, int(train_size * 0.85)) if train_size <= 15 else int(train_size * 0.8)
+    boost_train_size = _compute_phase1_train_size(train_size)
     auto_window = max(3, min(12, boost_train_size // 4))
     auto_look_back = max(3, min(12, boost_train_size // 4))
     if boost_train_size <= 12:
