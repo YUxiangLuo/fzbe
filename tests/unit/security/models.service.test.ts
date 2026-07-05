@@ -40,6 +40,7 @@ const createReadStream = mock(() => {
 });
 const readdirSync = mock(() => []);
 const unlinkSync = mock(() => {});
+const copyFileSync = mock((_: string, __: string) => {});
 const spawnMock = mock((_: string[], __: Record<string, unknown>) => ({
   stdout: new ReadableStream({
     start(controller) {
@@ -83,11 +84,13 @@ mock.module("fs", () => ({
     createReadStream,
     readdirSync,
     unlinkSync,
+    copyFileSync,
   },
   existsSync,
   createReadStream,
   readdirSync,
   unlinkSync,
+  copyFileSync,
 }));
 
 mock.module(pythonModulePath, () => ({
@@ -98,6 +101,7 @@ mock.module(pythonModulePath, () => ({
 const {
   trainModel,
   runPythonModel,
+  createOrResumeGuidedTrainingSession,
   prepareExperimentModelForProduction,
   predictExperimentModel,
   ModelAccessError,
@@ -148,6 +152,7 @@ describe("models service", () => {
     createReadStream.mockClear();
     readdirSync.mockClear();
     unlinkSync.mockClear();
+    copyFileSync.mockClear();
     spawnMock.mockClear();
     (Bun as { spawn: typeof Bun.spawn }).spawn = spawnMock as typeof Bun.spawn;
   });
@@ -296,6 +301,67 @@ describe("models service", () => {
     });
 
     expect(createReadStream).not.toHaveBeenCalled();
+  });
+
+  test("restores the session-scoped guided artifact before reusing a completed session", async () => {
+    const requestBody = {
+      experiment_id: 990002,
+      selected_industry: "制造业",
+      selected_company: "样本企业",
+      selected_product: "样本产品",
+      data_window_train_start_index: 0,
+      data_window_train_end_index: 11,
+      data_window_evaluate_start_index: 12,
+      data_window_evaluate_end_index: 17,
+      moving_average_window: 4,
+    };
+    const artifactDir = "/tmp/fangzhen-py/guided_training/exp990002-student20240002-ma-guided-a";
+    const sessionModelPath = `${artifactDir}/ma.pkl`;
+    const productionModelPath = "/tmp/fangzhen-py/trained_models/exp990002-student20240002-ma-production.pkl";
+
+    poolQuery.mockReset();
+    poolQuery
+      .mockResolvedValueOnce([[buildExperimentContextRow()]])
+      .mockResolvedValueOnce([[
+        {
+          session_id: "guided-a",
+          experiment_id: 990002,
+          student_id: 20240002,
+          model_type: "ma",
+          request_hash: "request-hash",
+          request_payload: JSON.stringify(requestBody),
+          status: "completed",
+          current_step_id: null,
+          completed_step_ids: JSON.stringify([
+            "prepare_data",
+            "build_windows",
+            "forecast",
+            "estimate_residuals",
+            "evaluate_metrics",
+            "save_artifact",
+          ]),
+          step_outputs: JSON.stringify({ save_artifact: { metrics: { rmse: 1 } } }),
+          result_payload: JSON.stringify({
+            status: "success",
+            results: { metrics: { rmse: 1, mae: 1, r2: 0.9 } },
+          }),
+          artifact_dir: artifactDir,
+          error_message: null,
+        },
+      ]]);
+    existsSync.mockImplementation((filePath: string) =>
+      filePath === sessionModelPath || filePath === productionModelPath
+    );
+
+    const session = await createOrResumeGuidedTrainingSession("ma", 20240002, requestBody);
+
+    expect(session.status).toBe("completed");
+    expect(copyFileSync).toHaveBeenCalledWith(
+      sessionModelPath,
+      "/tmp/fangzhen-py/trained_models/exp990002-student20240002-ma.pkl",
+    );
+    expect(unlinkSync).not.toHaveBeenCalledWith(productionModelPath);
+    expect(spawnMock).not.toHaveBeenCalled();
   });
 
   test("rejects production preparation when an ensemble is incomplete", async () => {

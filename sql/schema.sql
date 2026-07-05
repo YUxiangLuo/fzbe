@@ -216,6 +216,37 @@ CREATE TABLE IF NOT EXISTS `experiment_step_events` (
   CONSTRAINT `chk_step_order` CHECK (`step_order` BETWEEN 1 AND 7)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
+CREATE TABLE IF NOT EXISTS `model_guided_training_sessions` (
+  `session_id` CHAR(36) PRIMARY KEY,
+  `experiment_id` INT NOT NULL,
+  `student_id` INT NOT NULL,
+  `model_type` ENUM('ma', 'es', 'arima', 'lstm', 'weighted_avg', 'stacking', 'boosting') NOT NULL,
+  `request_hash` CHAR(64) NOT NULL,
+  `request_payload` JSON NOT NULL,
+  `status` ENUM('ready', 'running', 'failed', 'completed') NOT NULL DEFAULT 'ready',
+  `current_step_id` VARCHAR(64) DEFAULT NULL,
+  `completed_step_ids` JSON NOT NULL,
+  `step_outputs` JSON NOT NULL,
+  `step_plan` JSON NOT NULL,
+  `result_payload` JSON DEFAULT NULL,
+  `artifact_dir` VARCHAR(1024) NOT NULL,
+  `error_message` TEXT DEFAULT NULL,
+  `created_at` TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  `updated_at` TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  `expires_at` TIMESTAMP NULL DEFAULT NULL,
+
+  FOREIGN KEY (`experiment_id`)
+    REFERENCES `experiment_status`(`experiment_id`)
+    ON DELETE CASCADE,
+  FOREIGN KEY (`student_id`)
+    REFERENCES `users`(`user_id`)
+    ON DELETE CASCADE,
+
+  UNIQUE KEY `uniq_guided_training_request` (`experiment_id`, `student_id`, `model_type`, `request_hash`),
+  INDEX `idx_guided_training_student` (`student_id`, `experiment_id`, `model_type`, `updated_at`),
+  INDEX `idx_guided_training_status` (`status`, `expires_at`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
 -- ========================================================
 -- 3. Assessment and Grading
 -- ========================================================
