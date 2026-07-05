@@ -23,6 +23,7 @@ FORECAST_STRATEGY = "recursive_roll_forward"
 IMPLEMENTATION_NOTES = [
     "教科书移动平均通常用最后一个窗口均值预测下一期。",
     "本系统预测多期未来销量时，将每期预测值滚入窗口继续递推，避免使用评估集或未来真实值。",
+    "预测值附带的 std_dev 是评估段残差的常数标准差，不随预测步长增长，与 ARIMA 随步长展宽的置信区间口径不同。",
 ]
 
 # Type alias for input flexibility
@@ -96,7 +97,9 @@ def _forecast_future(
 
     initial_history = list(history)[-window:]
     if len(initial_history) < window:
-        raise ValueError("[DATA] History is empty; cannot forecast.")
+        raise ValueError(
+            f"[DATA] History has {len(initial_history)} points, fewer than the moving average window ({window}); cannot forecast."
+        )
 
     history_buffer: deque[float] = deque(initial_history, maxlen=window)
     preds: List[float] = []
