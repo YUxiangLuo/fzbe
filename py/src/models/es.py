@@ -137,9 +137,9 @@ def _validate_training_args(y: ArrayLike, ts: int, te: int, es: int, ee: int, al
     if es <= te:
         log.error(f"Evaluation start {es} must be after training end {te}")
         raise ValueError(f"[VALIDATION] Evaluation start ({es}) must be after training end ({te}).")
-    if not (0.0 < alpha <= 1.0):
-        log.error(f"Alpha {alpha} must be in (0, 1]")
-        raise ValueError(f"[VALIDATION] Alpha must be in (0, 1], got {alpha}")
+    if not (0.0 < alpha < 1.0):
+        log.error(f"Alpha {alpha} must be in (0, 1)")
+        raise ValueError(f"[VALIDATION] Alpha must be in (0, 1), got {alpha}")
 
     # Additional helpful validations
     train_size = te - ts + 1
@@ -152,8 +152,8 @@ def _validate_fit_args(y: ArrayLike, ts: int, te: int, alpha: float) -> None:
 
     if not (0 <= ts <= te < n_total):
         raise ValueError(f"[VALIDATION] Invalid training range [{ts}, {te}], must be within [0, {n_total-1}]")
-    if not (0.0 < alpha <= 1.0):
-        raise ValueError(f"[VALIDATION] Alpha must be in (0, 1], got {alpha}")
+    if not (0.0 < alpha < 1.0):
+        raise ValueError(f"[VALIDATION] Alpha must be in (0, 1), got {alpha}")
 
 
 def run(args) -> None:

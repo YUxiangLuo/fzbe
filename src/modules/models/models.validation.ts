@@ -79,7 +79,7 @@ export const localizeTrainValidationIssue = (issue: ZodIssue): string => {
 
   if (issue.code === "too_big") {
     if (field === "exponential_smoothing_alpha") {
-      return "指数平滑系数必须小于等于 1";
+      return "指数平滑系数必须小于 1";
     }
   }
 

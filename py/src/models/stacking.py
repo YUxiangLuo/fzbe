@@ -452,8 +452,8 @@ def _validate_training_args(
         elif model_name == "es":
             if "alpha" not in params:
                 raise ValueError("[VALIDATION] ES requires 'alpha' parameter.")
-            if not (0 < params["alpha"] <= 1):
-                raise ValueError("[VALIDATION] ES alpha must be in (0, 1].")
+            if not (0 < params["alpha"] < 1):
+                raise ValueError("[VALIDATION] ES alpha must be in (0, 1).")
 
         elif model_name == "ma":
             if "window" not in params:

@@ -29,14 +29,14 @@ DEFAULT_PRODUCTION_FORECAST_HORIZON = 6
 METHOD_NAME = "LSTM 多变量销量预测"
 DIRECT_IMPLEMENTATION_NOTES = [
     "教科书 LSTM 定义的是带遗忘门、输入门和输出门的循环神经网络单元。",
-    "本系统采用两层 LSTM 加 Dense 输出层，隐藏单元数随数据维度和样本量动态选择。",
+    "本系统采用单层 LSTM + Dropout + L2 正则 + Dense 输出层，隐藏单元数随样本量自适应，以在小样本上抑制过拟合。",
     "为了服务未来多期销量预测，默认直接多步输出完整预测 horizon，减少递归预测的误差累积。",
     "训练中的 EarlyStopping 监控训练损失而非验证损失（教学数据过小，不再切分验证集），其作用是训练损失进入平台期即停止，并非教科书意义的验证集早停。",
     "预测值附带的 std_dev 是评估段残差的常数标准差，不随预测步长增长，与 ARIMA 随步长展宽的置信区间口径不同。",
 ]
 AUTOREGRESSIVE_IMPLEMENTATION_NOTES = [
     "教科书 LSTM 定义的是带遗忘门、输入门和输出门的循环神经网络单元。",
-    "本系统采用两层 LSTM 加 Dense 输出层，隐藏单元数随数据维度和样本量动态选择。",
+    "本系统采用单层 LSTM + Dropout + L2 正则 + Dense 输出层，隐藏单元数随样本量自适应，以在小样本上抑制过拟合。",
     "当训练数据不足以拟合直接多步输出时，系统回退为一步 LSTM 并递归预测未来多期。",
     "训练中的 EarlyStopping 监控训练损失而非验证损失（教学数据过小，不再切分验证集），其作用是训练损失进入平台期即停止，并非教科书意义的验证集早停。",
     "预测值附带的 std_dev 是评估段残差的常数标准差，不随预测步长增长，与 ARIMA 随步长展宽的置信区间口径不同。",
@@ -475,13 +475,16 @@ def _fit_direct_model(
         )
     log.info(f"Training dataset created: X shape={trainX.shape}, Y shape={trainY.shape}")
 
-    base_units = max(16, min(64, n_features_out * 4, max(16, len(trainX) * 4)))
-    secondary_units = max(8, base_units // 2)
-    dense_units = max(8, secondary_units)
+    from tensorflow.keras.layers import Dropout
+    from tensorflow.keras.regularizers import l2
+
+    # v2 架构：单层 LSTM + Dropout + L2 正则，隐藏单元数随样本量缩放。
+    # 教学数据通常仅约 20–40 个点，原两层大网络易过拟合；单层小网络+正则更稳健。
+    recurrent_units = int(max(8, min(32, len(trainX) * 2)))
+    dense_units = int(max(8, recurrent_units // 2))
     log.info(
-        "Building direct LSTM model: units=(%s,%s), dense=%s, horizon=%s, input_shape=(%s, %s)",
-        base_units,
-        secondary_units,
+        "Building direct LSTM (v2 single-layer) model: units=%s, dense=%s, horizon=%s, input_shape=(%s, %s)",
+        recurrent_units,
         dense_units,
         forecast_horizon,
         look_back,
@@ -490,8 +493,8 @@ def _fit_direct_model(
 
     model = Sequential([
         Input(shape=(look_back, n_features_out)),
-        KerasLSTM(base_units, return_sequences=True),
-        KerasLSTM(secondary_units),
+        KerasLSTM(recurrent_units, kernel_regularizer=l2(1e-4), recurrent_regularizer=l2(1e-4)),
+        Dropout(0.2),
         Dense(dense_units, activation="relu"),
         Dense(forecast_horizon),
     ])
@@ -557,13 +560,15 @@ def _fit_autoregressive_model(
         raise ValueError("[VALIDATION] Training range is too short for autoregressive LSTM.")
     log.info(f"Training dataset created: X shape={trainX.shape}, Y shape={trainY.shape}")
 
-    base_units = max(16, min(64, n_features_out * 4, max(16, len(trainX) * 4)))
-    secondary_units = max(8, base_units // 2)
-    dense_units = max(8, secondary_units)
+    from tensorflow.keras.layers import Dropout
+    from tensorflow.keras.regularizers import l2
+
+    # v2 架构：单层 LSTM + Dropout + L2 正则，隐藏单元数随样本量缩放（与直接多步模型一致）。
+    recurrent_units = int(max(8, min(32, len(trainX) * 2)))
+    dense_units = int(max(8, recurrent_units // 2))
     log.info(
-        "Building autoregressive LSTM model: units=(%s,%s), dense=%s, input_shape=(%s, %s)",
-        base_units,
-        secondary_units,
+        "Building autoregressive LSTM (v2 single-layer) model: units=%s, dense=%s, input_shape=(%s, %s)",
+        recurrent_units,
         dense_units,
         look_back,
         n_features_out,
@@ -571,8 +576,8 @@ def _fit_autoregressive_model(
 
     model = Sequential([
         Input(shape=(look_back, n_features_out)),
-        KerasLSTM(base_units, return_sequences=True),
-        KerasLSTM(secondary_units),
+        KerasLSTM(recurrent_units, kernel_regularizer=l2(1e-4), recurrent_regularizer=l2(1e-4)),
+        Dropout(0.2),
         Dense(dense_units, activation="relu"),
         Dense(1),
     ])
@@ -931,7 +936,7 @@ def run(args) -> None:
         if look_back_arg is not None:
             look_back = int(look_back_arg)
         else:
-            look_back = max(3, min(12, train_size // 4))
+            look_back = max(3, min(6, train_size // 4))
             log.info(f"Auto-selected look_back={look_back} based on train_size={train_size}")
 
         if epochs_arg is not None:
