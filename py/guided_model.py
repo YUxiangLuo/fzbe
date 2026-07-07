@@ -651,23 +651,17 @@ def _set_lstm_seed(seed: int = 42) -> None:
 
 
 def _build_lstm_model(config: Dict[str, Any]):
-    from tensorflow.keras.layers import LSTM as KerasLSTM
-    from tensorflow.keras.layers import Dense, Dropout, Input
-    from tensorflow.keras.models import Sequential
-    from tensorflow.keras.optimizers import Adam
-    from tensorflow.keras.regularizers import l2
+    # 直接复用 src/models/lstm.py 的架构构建器，确保 guided 与非 guided 路径不再分叉。
+    from models import lstm as lstm_module
 
-    # v2 架构：单层 LSTM + Dropout + L2 正则，与 src/models/lstm.py 保持一致。
-    model = Sequential([
-        Input(shape=(int(config["look_back"]), int(config["n_features_out"]))),
-        KerasLSTM(int(config["recurrent_units"]), kernel_regularizer=l2(1e-4), recurrent_regularizer=l2(1e-4)),
-        Dropout(0.2),
-        Dense(int(config["dense_units"]), activation="relu"),
-        Dense(int(config["forecast_horizon"])),
-    ])
-    optimizer = Adam(learning_rate=float(config["initial_learning_rate"]), clipnorm=1.0)
-    model.compile(loss="mean_squared_error", optimizer=optimizer)
-    return model
+    return lstm_module.build_lstm_network(
+        look_back=int(config["look_back"]),
+        n_features_out=int(config["n_features_out"]),
+        recurrent_units=int(config["recurrent_units"]),
+        dense_units=int(config["dense_units"]),
+        output_units=int(config["forecast_horizon"]),
+        learning_rate=float(config.get("initial_learning_rate", lstm_module.LSTM_INITIAL_LEARNING_RATE)),
+    )
 
 
 def _run_lstm(step_id: str, args, state: Dict[str, Any]) -> Dict[str, Any]:
@@ -753,9 +747,8 @@ def _run_lstm(step_id: str, args, state: Dict[str, Any]) -> Dict[str, Any]:
     if step_id == "build_model":
         train_x = state["train_x"]
         n_features_out = int(state["n_features_out"])
-        # v2：单层 LSTM，隐藏单元随样本量缩放，与 src/models/lstm.py 保持一致。
-        recurrent_units = int(max(8, min(32, len(train_x) * 2)))
-        dense_units = int(max(8, recurrent_units // 2))
+        # 复用 src/models/lstm.py 的单元数选择与超参，保持与非 guided 路径一致。
+        recurrent_units, dense_units = lstm.select_lstm_units(len(train_x))
         batch_size = max(1, min(8, len(train_x)))
         config = {
             "look_back": int(state["look_back"]),
@@ -764,8 +757,8 @@ def _run_lstm(step_id: str, args, state: Dict[str, Any]) -> Dict[str, Any]:
             "dense_units": dense_units,
             "forecast_horizon": int(state["forecast_horizon"]),
             "batch_size": batch_size,
-            "initial_learning_rate": 0.001,
-            "decay_rate": 0.98,
+            "initial_learning_rate": lstm.LSTM_INITIAL_LEARNING_RATE,
+            "decay_rate": lstm.LSTM_LR_DECAY_RATE,
         }
         state["model_config"] = config
         return config

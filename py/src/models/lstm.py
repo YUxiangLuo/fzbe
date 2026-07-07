@@ -46,6 +46,63 @@ AUTOREGRESSIVE_IMPLEMENTATION_NOTES = [
 ArrayLike = Union[List[float], np.ndarray]
 
 
+# ---------- shared LSTM v2 architecture (single source of truth) ----------
+# Both the standalone/ensemble path (this module) and the guided-training path
+# (guided_model.py) build the LSTM through these helpers, so the architecture and
+# hyper-parameters can never diverge between the two entry points again.
+LSTM_DROPOUT_RATE = 0.2
+LSTM_L2_REG = 1e-4
+LSTM_INITIAL_LEARNING_RATE = 0.001
+LSTM_LR_DECAY_RATE = 0.98
+
+
+def select_lstm_units(train_sample_count: int) -> Tuple[int, int]:
+    """Pick (recurrent_units, dense_units) scaled to the training-sample count.
+
+    Capacity is intentionally capped: teaching datasets (~20-40 points) overfit
+    large networks, so a small single layer plus regularization is more robust.
+    """
+    recurrent_units = int(max(8, min(32, train_sample_count * 2)))
+    dense_units = int(max(8, recurrent_units // 2))
+    return recurrent_units, dense_units
+
+
+def build_lstm_network(
+    look_back: int,
+    n_features_out: int,
+    recurrent_units: int,
+    dense_units: int,
+    output_units: int,
+    learning_rate: float = LSTM_INITIAL_LEARNING_RATE,
+):
+    """Build and compile the canonical v2 LSTM network.
+
+    Single LSTM layer (L2 on input & recurrent weights) + Dropout + ReLU Dense +
+    linear output. ``output_units`` is the forecast horizon for direct multi-step
+    models and 1 for autoregressive models.
+    """
+    from tensorflow.keras.layers import LSTM as KerasLSTM
+    from tensorflow.keras.layers import Dense, Dropout, Input
+    from tensorflow.keras.models import Sequential
+    from tensorflow.keras.optimizers import Adam
+    from tensorflow.keras.regularizers import l2
+
+    model = Sequential([
+        Input(shape=(int(look_back), int(n_features_out))),
+        KerasLSTM(
+            int(recurrent_units),
+            kernel_regularizer=l2(LSTM_L2_REG),
+            recurrent_regularizer=l2(LSTM_L2_REG),
+        ),
+        Dropout(LSTM_DROPOUT_RATE),
+        Dense(int(dense_units), activation="relu"),
+        Dense(int(output_units)),
+    ])
+    optimizer = Adam(learning_rate=float(learning_rate), clipnorm=1.0)
+    model.compile(loss="mean_squared_error", optimizer=optimizer)
+    return model
+
+
 # ---------- utilities ----------
 def _metadata_for_strategy(strategy: str) -> Tuple[str, List[str]]:
     if strategy == DIRECT_FORECAST_STRATEGY:
@@ -451,12 +508,7 @@ def _fit_direct_model(
     normalization: str,
     forecast_horizon: int,
 ):
-    from tensorflow.keras.layers import LSTM as KerasLSTM
-    from tensorflow.keras.layers import Dense
-    from tensorflow.keras.layers import Input
     from tensorflow.keras.callbacks import EarlyStopping, LearningRateScheduler
-    from tensorflow.keras.models import Sequential
-    from tensorflow.keras.optimizers import Adam
 
     df = parsed_data.df
     preprocessor, scaled_series = _build_preprocessor(parsed_data, feature_types, train_range, normalization)
@@ -475,13 +527,7 @@ def _fit_direct_model(
         )
     log.info(f"Training dataset created: X shape={trainX.shape}, Y shape={trainY.shape}")
 
-    from tensorflow.keras.layers import Dropout
-    from tensorflow.keras.regularizers import l2
-
-    # v2 架构：单层 LSTM + Dropout + L2 正则，隐藏单元数随样本量缩放。
-    # 教学数据通常仅约 20–40 个点，原两层大网络易过拟合；单层小网络+正则更稳健。
-    recurrent_units = int(max(8, min(32, len(trainX) * 2)))
-    dense_units = int(max(8, recurrent_units // 2))
+    recurrent_units, dense_units = select_lstm_units(len(trainX))
     log.info(
         "Building direct LSTM (v2 single-layer) model: units=%s, dense=%s, horizon=%s, input_shape=(%s, %s)",
         recurrent_units,
@@ -490,19 +536,10 @@ def _fit_direct_model(
         look_back,
         n_features_out,
     )
+    model = build_lstm_network(look_back, n_features_out, recurrent_units, dense_units, forecast_horizon)
 
-    model = Sequential([
-        Input(shape=(look_back, n_features_out)),
-        KerasLSTM(recurrent_units, kernel_regularizer=l2(1e-4), recurrent_regularizer=l2(1e-4)),
-        Dropout(0.2),
-        Dense(dense_units, activation="relu"),
-        Dense(forecast_horizon),
-    ])
-
-    initial_learning_rate = 0.001
-    decay_rate = 0.98
-    optimizer = Adam(learning_rate=initial_learning_rate, clipnorm=1.0)
-    model.compile(loss="mean_squared_error", optimizer=optimizer)
+    initial_learning_rate = LSTM_INITIAL_LEARNING_RATE
+    decay_rate = LSTM_LR_DECAY_RATE
 
     def lr_schedule(epoch):
         return initial_learning_rate * (decay_rate ** epoch)
@@ -542,12 +579,7 @@ def _fit_autoregressive_model(
     epochs: int,
     normalization: str,
 ):
-    from tensorflow.keras.layers import LSTM as KerasLSTM
-    from tensorflow.keras.layers import Dense
-    from tensorflow.keras.layers import Input
     from tensorflow.keras.callbacks import EarlyStopping, LearningRateScheduler
-    from tensorflow.keras.models import Sequential
-    from tensorflow.keras.optimizers import Adam
 
     df = parsed_data.df
     preprocessor, scaled_series = _build_preprocessor(parsed_data, feature_types, train_range, normalization)
@@ -560,12 +592,7 @@ def _fit_autoregressive_model(
         raise ValueError("[VALIDATION] Training range is too short for autoregressive LSTM.")
     log.info(f"Training dataset created: X shape={trainX.shape}, Y shape={trainY.shape}")
 
-    from tensorflow.keras.layers import Dropout
-    from tensorflow.keras.regularizers import l2
-
-    # v2 架构：单层 LSTM + Dropout + L2 正则，隐藏单元数随样本量缩放（与直接多步模型一致）。
-    recurrent_units = int(max(8, min(32, len(trainX) * 2)))
-    dense_units = int(max(8, recurrent_units // 2))
+    recurrent_units, dense_units = select_lstm_units(len(trainX))
     log.info(
         "Building autoregressive LSTM (v2 single-layer) model: units=%s, dense=%s, input_shape=(%s, %s)",
         recurrent_units,
@@ -573,19 +600,10 @@ def _fit_autoregressive_model(
         look_back,
         n_features_out,
     )
+    model = build_lstm_network(look_back, n_features_out, recurrent_units, dense_units, 1)
 
-    model = Sequential([
-        Input(shape=(look_back, n_features_out)),
-        KerasLSTM(recurrent_units, kernel_regularizer=l2(1e-4), recurrent_regularizer=l2(1e-4)),
-        Dropout(0.2),
-        Dense(dense_units, activation="relu"),
-        Dense(1),
-    ])
-
-    initial_learning_rate = 0.001
-    decay_rate = 0.98
-    optimizer = Adam(learning_rate=initial_learning_rate, clipnorm=1.0)
-    model.compile(loss="mean_squared_error", optimizer=optimizer)
+    initial_learning_rate = LSTM_INITIAL_LEARNING_RATE
+    decay_rate = LSTM_LR_DECAY_RATE
 
     def lr_schedule(epoch):
         return initial_learning_rate * (decay_rate ** epoch)
