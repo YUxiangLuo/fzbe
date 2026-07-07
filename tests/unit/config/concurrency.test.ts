@@ -38,6 +38,7 @@ interface ConstantsSnapshot {
   CONCURRENCY_LIMITS: {
     SYSTEM_PARALLELISM: number;
     DEFAULT_MODEL_JOB_CAP: number;
+    DEFAULT_PDF_JOB_CAP: number;
     MAX_CONCURRENT_MODEL_JOBS: number;
     MAX_CONCURRENT_PDF_JOBS: number;
   };
@@ -99,15 +100,18 @@ async function loadConstantsSnapshot(
 }
 
 describe("concurrency safeguards", () => {
-  test("defaults are sized for a 64-core / 50-student classroom deployment", async () => {
+  test("defaults are automatically sized from available CPU parallelism", async () => {
     const { CONCURRENCY_LIMITS, PYTHON_RUNTIME_CONFIG, RATE_LIMITS, TIMEOUTS } =
       await loadConstantsSnapshot();
 
     expect(CONCURRENCY_LIMITS.DEFAULT_MODEL_JOB_CAP).toBe(50);
+    expect(CONCURRENCY_LIMITS.DEFAULT_PDF_JOB_CAP).toBe(12);
     expect(CONCURRENCY_LIMITS.MAX_CONCURRENT_MODEL_JOBS).toBe(
       Math.min(CONCURRENCY_LIMITS.SYSTEM_PARALLELISM, 50),
     );
-    expect(CONCURRENCY_LIMITS.MAX_CONCURRENT_PDF_JOBS).toBe(12);
+    expect(CONCURRENCY_LIMITS.MAX_CONCURRENT_PDF_JOBS).toBe(
+      Math.min(12, Math.max(1, Math.ceil(CONCURRENCY_LIMITS.SYSTEM_PARALLELISM / 4))),
+    );
     expect(TIMEOUTS.PDF_QUEUE).toBe(60_000);
     expect(TIMEOUTS.PDF_GENERATION).toBe(30_000);
     expect(PYTHON_RUNTIME_CONFIG.MODEL_PROCESS_THREADS).toBe(1);

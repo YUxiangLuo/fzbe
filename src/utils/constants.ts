@@ -22,7 +22,12 @@ function parsePositiveIntegerEnv(name: string): number | null {
 
 const SYSTEM_PARALLELISM = Math.max(1, availableParallelism());
 const DEFAULT_MODEL_JOB_CAP = 50;
+const DEFAULT_PDF_JOB_CAP = 12;
 const DEFAULT_MAX_CONCURRENT_MODEL_JOBS = Math.min(SYSTEM_PARALLELISM, DEFAULT_MODEL_JOB_CAP);
+const DEFAULT_MAX_CONCURRENT_PDF_JOBS = Math.min(
+  DEFAULT_PDF_JOB_CAP,
+  Math.max(1, Math.ceil(SYSTEM_PARALLELISM / 4)),
+);
 
 // ============================================
 // 文件大小限制 (bytes)
@@ -84,13 +89,15 @@ const MAX_CONCURRENT_MODEL_JOBS =
 const MAX_CONCURRENT_PDF_JOBS =
   parsePositiveIntegerEnv("MAX_CONCURRENT_PDF_JOBS") ??
   parsePositiveIntegerEnv("PDF_CONCURRENCY") ??
-  12;
+  DEFAULT_MAX_CONCURRENT_PDF_JOBS;
 
 export const CONCURRENCY_LIMITS = {
   /** 当前系统可用并行度（通常等于可用 CPU 核/线程数） */
   SYSTEM_PARALLELISM,
   /** 默认模型任务上限；按 64 核 / 50 人课堂配置，超过 50 默认仍封顶，可用环境变量覆盖 */
   DEFAULT_MODEL_JOB_CAP,
+  /** 默认 PDF 任务上限；PDF/Chromium 更重，自动值按 CPU/4 估算并封顶 */
+  DEFAULT_PDF_JOB_CAP,
   /** 最大并发模型训练/生产准备/预测任务 */
   MAX_CONCURRENT_MODEL_JOBS,
   /** 最大并发 PDF 生成（Puppeteer）任务 */

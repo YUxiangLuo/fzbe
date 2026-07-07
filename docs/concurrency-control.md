@@ -12,14 +12,14 @@
 
 ## 目标场景
 
-默认配置面向一台 64 核、约 50 名学生同时上课使用的服务器。
+默认配置面向单台后端实例，按 `availableParallelism()` 看到的 CPU 可用并行度自动生成并发策略；64 核、约 50 名学生同时上课的服务器会自动得到 50 个模型槽位和 12 个 PDF 槽位。
 
 核心目标：
 
 - 模型训练、生产准备、预测不能无限启动 Python 子进程。
 - 数据库 advisory lock 不能耗尽连接池并造成死锁。
 - PDF 生成要限流，超过队列等待时间后让前端可重试。
-- 显式环境变量必须优先于自动计算，方便容器或 systemd CPU 限制场景部署。
+- 不配置并发环境变量时即可自动生成合理策略；显式环境变量仅用于确有需要的人工覆盖。
 
 ## 配置入口
 
@@ -29,7 +29,7 @@
 | --- | ---: | --- |
 | `MAX_CONCURRENT_MODEL_JOBS` | `min(availableParallelism(), 50)` | 全局模型任务槽位数。覆盖 `MODEL_CONCURRENCY`。 |
 | `MODEL_CONCURRENCY` | 无 | 旧环境变量名，仍兼容。仅在 `MAX_CONCURRENT_MODEL_JOBS` 未设置时生效。 |
-| `MAX_CONCURRENT_PDF_JOBS` | `12` | PDF/Puppeteer 并发生成数。覆盖 `PDF_CONCURRENCY`。 |
+| `MAX_CONCURRENT_PDF_JOBS` | `min(ceil(availableParallelism() / 4), 12)` | PDF/Puppeteer 并发生成数。覆盖 `PDF_CONCURRENCY`。 |
 | `PDF_CONCURRENCY` | 无 | 旧环境变量名，仍兼容。仅在 `MAX_CONCURRENT_PDF_JOBS` 未设置时生效。 |
 | `PDF_QUEUE_TIMEOUT_MS` | `60000` | PDF 队列等待超时。超时后接口返回 `503`。 |
 | `PDF_GENERATION_TIMEOUT_MS` | `30000` | 单个 `page.pdf()` 的生成超时。 |
@@ -46,7 +46,7 @@
 
 ```text
 MAX_CONCURRENT_MODEL_JOBS = min(64, 50) = 50
-MAX_CONCURRENT_PDF_JOBS = 12
+MAX_CONCURRENT_PDF_JOBS = min(ceil(64 / 4), 12) = 12
 PDF_QUEUE_TIMEOUT_MS = 60000
 PDF_GENERATION_TIMEOUT_MS = 30000
 PYTHON_MODEL_THREADS = 1
@@ -55,19 +55,9 @@ DB_QUERY_HEADROOM = max(40, ceil(50 / 2)) = 40
 DB_CONNECTION_LIMIT = 2 * 50 + 40 = 140
 ```
 
-生产部署建议显式写入关键值，避免容器、systemd 或 cgroup 让 `availableParallelism()` 看到的 CPU 数偏小：
+单实例生产部署建议优先保持这些并发环境变量未设置，让后端自动计算。只有当容器、systemd 或 cgroup 让 `availableParallelism()` 看到的 CPU 数不符合预期，或需要临时限流/扩容时，才显式覆盖。
 
-```env
-MAX_CONCURRENT_MODEL_JOBS=50
-MAX_CONCURRENT_PDF_JOBS=12
-PDF_QUEUE_TIMEOUT_MS=60000
-PDF_GENERATION_TIMEOUT_MS=30000
-DB_CONNECTION_LIMIT=140
-PYTHON_MODEL_THREADS=1
-TF_NUM_INTEROP_THREADS=1
-```
-
-数据库侧的 `max_connections` 必须大于等于 `DB_CONNECTION_LIMIT`。64 核课堂场景建议设置为 `200+`，给迁移、管理连接和临时排查留余量。
+数据库侧的 `max_connections` 必须大于等于自动计算出的 `DB_CONNECTION_LIMIT`。64 核课堂场景自动连接池为 `140`，建议数据库设置为 `200+`，给迁移、管理连接和临时排查留余量。
 
 ## 模型任务并发
 
@@ -177,7 +167,7 @@ await pdfSemaphore.acquire(TIMEOUTS.PDF_QUEUE);
 
 进入 PDF 生成槽位后，`page.pdf()` 本身还受 `PDF_GENERATION_TIMEOUT_MS` 控制。如果 PDF 生成失败，service 会清理本次生成的文件，并释放信号量。
 
-默认 `MAX_CONCURRENT_PDF_JOBS=12` 不是为了让 50 名学生同一秒全部生成 PDF，而是限制 Puppeteer 对 CPU 和 Chromium 进程的压力。50 人同时提交报告时，超出队列等待时间的请求可能返回 `503`，前端应提示学生稍后重试。
+默认 `MAX_CONCURRENT_PDF_JOBS=min(ceil(availableParallelism() / 4), 12)`，是为了让较小服务器自动降低 Puppeteer/Chromium 压力，而 64 核课堂服务器自动达到 12 个 PDF 槽位。50 人同时提交报告时，超出队列等待时间的请求可能返回 `503`，前端应提示学生稍后重试。
 
 ## 运行时观测
 
@@ -286,20 +276,16 @@ DB_CONNECTION_LIMIT=140
 
 ## 调参建议
 
-64 核 / 50 学生课堂建议从以下配置开始：
+单实例部署默认不需要配置并发参数。发布后先查看 `GET /api/v1/runtime-info`，确认自动计算结果符合服务器 CPU 数：
 
-```env
-MAX_CONCURRENT_MODEL_JOBS=50
-MAX_CONCURRENT_PDF_JOBS=12
-PDF_QUEUE_TIMEOUT_MS=60000
-PDF_GENERATION_TIMEOUT_MS=30000
-DB_CONNECTION_LIMIT=140
-PYTHON_MODEL_THREADS=1
-TF_NUM_INTEROP_THREADS=1
+```text
+MAX_CONCURRENT_MODEL_JOBS = min(availableParallelism(), 50)
+MAX_CONCURRENT_PDF_JOBS = min(ceil(availableParallelism() / 4), 12)
+DB_CONNECTION_LIMIT = 2 * MAX_CONCURRENT_MODEL_JOBS + max(40, ceil(MAX_CONCURRENT_MODEL_JOBS / 2))
 ```
 
-如果模型请求出现较多 `429`，先确认是否真的有超过 50 个模型任务同时运行，再考虑增加 `MAX_CONCURRENT_MODEL_JOBS`。增加模型并发时，必须同步提高 `DB_CONNECTION_LIMIT` 和数据库 `max_connections`。
+如果模型请求出现较多 `429`，先确认是否真的有超过自动槽位数的模型任务同时运行，再考虑显式增加 `MAX_CONCURRENT_MODEL_JOBS`。增加模型并发时，必须同步确认自动或显式的 `DB_CONNECTION_LIMIT` 和数据库 `max_connections` 足够。
 
-如果 PDF 提交出现较多 `503`，优先提高 `PDF_QUEUE_TIMEOUT_MS`，例如 `120000`。只有在确认 CPU、Chromium 进程数和响应时间都健康时，再把 `MAX_CONCURRENT_PDF_JOBS` 从 `12` 提高到 `16` 或 `20`。
+如果 PDF 提交出现较多 `503`，优先提高 `PDF_QUEUE_TIMEOUT_MS`，例如 `120000`。只有在确认 CPU、Chromium 进程数和响应时间都健康时，再显式提高 `MAX_CONCURRENT_PDF_JOBS`。
 
 如果服务器 CPU 被 Python 子进程打满，优先保持或降低 `PYTHON_MODEL_THREADS`，不要只降低 `MAX_CONCURRENT_MODEL_JOBS`。当前设计是多进程并发，每个进程少线程，比较适合课堂并发。
