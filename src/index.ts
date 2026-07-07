@@ -310,35 +310,112 @@ async function checkManualFileAccess(filename: string, role: UserRole): Promise<
 }
 
 const directFileResponsePathPattern = /^\/(?:manuals|datasets|reports|exports)\//;
-const defaultCors = cors();
+const CORS_ALLOW_HEADERS = ["Authorization", "Content-Type", "Range"];
+const CORS_EXPOSE_HEADERS = ["Content-Length", "Content-Range", "Content-Disposition", "Accept-Ranges", "ETag", "Last-Modified"];
+function normalizeConfiguredCorsOrigin(rawOrigin: string): string {
+  try {
+    const parsedUrl = new URL(rawOrigin);
+    if (!["http:", "https:"].includes(parsedUrl.protocol)) {
+      throw new Error("unsupported protocol");
+    }
+    if (parsedUrl.pathname !== "/" || parsedUrl.search || parsedUrl.hash) {
+      throw new Error("origin must not include path, query, or fragment");
+    }
+    return parsedUrl.origin;
+  } catch (error) {
+    throw new Error(`Invalid CORS_ALLOWED_ORIGINS origin "${rawOrigin}": ${error instanceof Error ? error.message : String(error)}`);
+  }
+}
+
+function normalizeRequestCorsOrigin(origin: string | undefined | null): string | null | undefined {
+  const trimmedOrigin = origin?.trim();
+  if (!trimmedOrigin) return undefined;
+  try {
+    const parsedUrl = new URL(trimmedOrigin);
+    if (!["http:", "https:"].includes(parsedUrl.protocol)) return null;
+    return parsedUrl.origin;
+  } catch {
+    return null;
+  }
+}
+
+const configuredCorsOrigins = (env.CORS_ALLOWED_ORIGINS ?? "")
+  .split(",")
+  .map((origin) => origin.trim())
+  .filter((origin) => origin.length > 0)
+  .map(normalizeConfiguredCorsOrigin);
+const corsAllowedOriginSet = new Set(configuredCorsOrigins);
+const isProductionRuntime = [process.env.NODE_ENV, process.env.BUN_ENV]
+  .some((value) => String(value ?? "").toLowerCase() === "production");
+
+if (isProductionRuntime && corsAllowedOriginSet.size === 0) {
+  throw new Error("CORS_ALLOWED_ORIGINS must be set in production");
+}
+
+function resolveCorsOrigin(origin: string | undefined | null): string | undefined {
+  const normalizedOrigin = normalizeRequestCorsOrigin(origin);
+  if (normalizedOrigin === null) return undefined;
+  if (!normalizedOrigin) return isProductionRuntime ? undefined : "*";
+  if (!isProductionRuntime && corsAllowedOriginSet.size === 0) return normalizedOrigin;
+  return corsAllowedOriginSet.has(normalizedOrigin) ? normalizedOrigin : undefined;
+}
+
+const defaultCors = cors({
+  origin: (origin) => resolveCorsOrigin(origin),
+  allowHeaders: CORS_ALLOW_HEADERS,
+  exposeHeaders: CORS_EXPOSE_HEADERS,
+});
 
 function isDirectFileResponsePath(pathname: string): boolean {
   return directFileResponsePathPattern.test(pathname);
 }
 
-function applyDirectFileCorsHeaders(headers: Headers): void {
-  headers.set("Access-Control-Allow-Origin", "*");
+function appendVaryOrigin(headers: Headers): void {
+  const currentVary = headers.get("Vary");
+  if (!currentVary) {
+    headers.set("Vary", "Origin");
+    return;
+  }
+  if (!currentVary.toLowerCase().split(",").map((value) => value.trim()).includes("origin")) {
+    headers.set("Vary", `${currentVary}, Origin`);
+  }
+}
+
+function isCorsOriginRejected(origin: string | undefined | null): boolean {
+  return Boolean(origin?.trim()) && resolveCorsOrigin(origin) === undefined;
+}
+
+function applyDirectFileCorsHeaders(headers: Headers, requestOrigin?: string | null): void {
+  const allowedOrigin = resolveCorsOrigin(requestOrigin);
+  if (allowedOrigin) {
+    headers.set("Access-Control-Allow-Origin", allowedOrigin);
+    appendVaryOrigin(headers);
+  }
   headers.set("Access-Control-Allow-Methods", "GET, HEAD, OPTIONS");
-  headers.set("Access-Control-Allow-Headers", "Authorization, Content-Type, Range");
-  headers.set("Access-Control-Expose-Headers", "Content-Length, Content-Range, Content-Disposition, Accept-Ranges, ETag, Last-Modified");
+  headers.set("Access-Control-Allow-Headers", CORS_ALLOW_HEADERS.join(", "));
+  headers.set("Access-Control-Expose-Headers", CORS_EXPOSE_HEADERS.join(", "));
 }
 
 // --- Global Middleware ---
 // app.use(timestampedLogger);
 app.use("*", async (c, next) => {
+  const requestOrigin = c.req.header("origin");
   if (!isDirectFileResponsePath(new URL(c.req.url).pathname)) {
     return defaultCors(c, next);
   }
 
   if (c.req.method === "OPTIONS") {
+    if (isCorsOriginRejected(requestOrigin)) {
+      return c.json({ error: "CORS origin not allowed" }, 403);
+    }
     const headers = new Headers();
-    applyDirectFileCorsHeaders(headers);
+    applyDirectFileCorsHeaders(headers, requestOrigin);
     headers.set("Content-Length", "0");
     return new Response(null, { status: 204, headers });
   }
 
   await next();
-  applyDirectFileCorsHeaders(c.res.headers);
+  applyDirectFileCorsHeaders(c.res.headers, requestOrigin);
 });
 app.use("*", async (c, next) => {
   await next();
