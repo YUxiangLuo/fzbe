@@ -652,14 +652,16 @@ def _set_lstm_seed(seed: int = 42) -> None:
 
 def _build_lstm_model(config: Dict[str, Any]):
     from tensorflow.keras.layers import LSTM as KerasLSTM
-    from tensorflow.keras.layers import Dense, Input
+    from tensorflow.keras.layers import Dense, Dropout, Input
     from tensorflow.keras.models import Sequential
     from tensorflow.keras.optimizers import Adam
+    from tensorflow.keras.regularizers import l2
 
+    # v2 架构：单层 LSTM + Dropout + L2 正则，与 src/models/lstm.py 保持一致。
     model = Sequential([
         Input(shape=(int(config["look_back"]), int(config["n_features_out"]))),
-        KerasLSTM(int(config["base_units"]), return_sequences=True),
-        KerasLSTM(int(config["secondary_units"])),
+        KerasLSTM(int(config["recurrent_units"]), kernel_regularizer=l2(1e-4), recurrent_regularizer=l2(1e-4)),
+        Dropout(0.2),
         Dense(int(config["dense_units"]), activation="relu"),
         Dense(int(config["forecast_horizon"])),
     ])
@@ -688,7 +690,7 @@ def _run_lstm(step_id: str, args, state: Dict[str, Any]) -> Dict[str, Any]:
         ts, te, es_idx, ee = _parse_common_ranges(args)
         train_size = te - ts + 1
         look_back_arg = getattr(args, "look_back", None)
-        look_back = int(look_back_arg) if look_back_arg is not None else max(3, min(12, train_size // 4))
+        look_back = int(look_back_arg) if look_back_arg is not None else max(3, min(6, train_size // 4))
         epochs_arg = getattr(args, "epochs", None)
         epochs = int(epochs_arg) if epochs_arg is not None else 20
         normalization = getattr(args, "normalization", None) or "minmax"
@@ -751,15 +753,14 @@ def _run_lstm(step_id: str, args, state: Dict[str, Any]) -> Dict[str, Any]:
     if step_id == "build_model":
         train_x = state["train_x"]
         n_features_out = int(state["n_features_out"])
-        base_units = max(16, min(64, n_features_out * 4, max(16, len(train_x) * 4)))
-        secondary_units = max(8, base_units // 2)
-        dense_units = max(8, secondary_units)
+        # v2：单层 LSTM，隐藏单元随样本量缩放，与 src/models/lstm.py 保持一致。
+        recurrent_units = int(max(8, min(32, len(train_x) * 2)))
+        dense_units = int(max(8, recurrent_units // 2))
         batch_size = max(1, min(8, len(train_x)))
         config = {
             "look_back": int(state["look_back"]),
             "n_features_out": n_features_out,
-            "base_units": base_units,
-            "secondary_units": secondary_units,
+            "recurrent_units": recurrent_units,
             "dense_units": dense_units,
             "forecast_horizon": int(state["forecast_horizon"]),
             "batch_size": batch_size,

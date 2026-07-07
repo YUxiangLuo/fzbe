@@ -138,7 +138,7 @@ def _build_model_params(
     lstm_context: str,
 ) -> Dict[str, Dict[str, Any]]:
     auto_window = max(3, min(12, phase_train_size // 4))
-    auto_look_back = max(3, min(12, phase_train_size // 4))
+    auto_look_back = max(3, min(6, phase_train_size // 4))
     auto_epochs = 20 if train_size <= 15 else 30
     model_params: Dict[str, Dict[str, Any]] = {}
 
