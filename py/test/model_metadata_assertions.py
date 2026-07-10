@@ -7,7 +7,7 @@ EXPECTED_METHOD_METADATA = {
     "es": {
         "method_name": "一次指数平滑",
         "forecast_strategy": "flat_simple_exponential_smoothing",
-        "note_fragments": ("一次指数平滑", "多步"),
+        "note_fragments": ("0 < alpha < 1", "一次指数平滑", "多步"),
     },
     "arima": {
         "method_name": "ARIMA 自动定阶",

@@ -29,6 +29,7 @@ from ensemble_utils import (
     persist_member_model_artifact,
 )
 from metrics import mae, mape, r2, rmse
+from model_defaults import resolve_lstm_look_back
 from model_info import attach_method_metadata, ensure_state_metadata
 from serialization import dump_model, load_model
 from subprocess_utils import (
@@ -984,7 +985,6 @@ def run(args) -> None:
     # Use level0_size for parameter calculation to avoid phase 1 failures
     # Align with individual model auto-selection logic
     auto_window = max(3, min(12, level0_size // 4))
-    auto_look_back = max(3, min(12, level0_size // 4))
 
     # ARIMA: use tiered approach like in arima.py
     if level0_size <= 12:
@@ -1033,7 +1033,10 @@ def run(args) -> None:
         feature_types[target_feature] = "numeric"
 
         lstm_params = {
-            "look_back": get_arg("look_back", auto_look_back, int),
+            "look_back": resolve_lstm_look_back(
+                level0_size,
+                get_arg("look_back", None, int),
+            ),
             "epochs": get_arg("epochs", auto_epochs, int),
             "feature_types": feature_types,
             "normalization": get_arg("normalization", "minmax"),

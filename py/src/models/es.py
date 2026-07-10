@@ -19,7 +19,7 @@ MODEL_TYPE = "es"
 METHOD_NAME = "一次指数平滑"
 FORECAST_STRATEGY = "flat_simple_exponential_smoothing"
 IMPLEMENTATION_NOTES = [
-    "本系统实现教科书中的一次指数平滑，平滑系数 alpha 满足 0 < alpha <= 1。",
+    "本系统实现教科书中的一次指数平滑，平滑系数 alpha 满足 0 < alpha < 1。",
     "一次指数平滑的多步未来销量预测为水平外推；趋势和季节性需要 Holt 或 Holt-Winters 扩展，本系统未在该模型中启用。",
     "预测值附带的 std_dev 是评估段残差的常数标准差，不随预测步长增长，与 ARIMA 随步长展宽的置信区间口径不同。",
 ]

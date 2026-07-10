@@ -1,4 +1,5 @@
 import { describe, test, expect } from "bun:test";
+import { parse as parseYaml } from "yaml";
 import {
   trainSchema,
   predictSchema,
@@ -82,6 +83,23 @@ describe("Models Schemas", () => {
       expect(result.success).toBe(false);
     });
 
+    test("should reject alpha equal to or above one for exponential smoothing training", () => {
+      for (const alpha of [1, 1.5]) {
+        const result = getTrainSchemaForModel("es").safeParse({
+          experiment_id: 12,
+          exponential_smoothing_alpha: alpha,
+        });
+
+        expect(result.success).toBe(false);
+      }
+
+      const nearUpperBound = getTrainSchemaForModel("es").safeParse({
+        experiment_id: 12,
+        exponential_smoothing_alpha: 0.999,
+      });
+      expect(nearUpperBound.success).toBe(true);
+    });
+
     test("should require model-specific params for ARIMA training", () => {
       const result = getTrainSchemaForModel("arima").safeParse({
         experiment_id: 12,
@@ -136,6 +154,26 @@ describe("Models Schemas", () => {
       });
 
       expect(result.success).toBe(false);
+    });
+  });
+
+  describe("OpenAPI exponential smoothing contract", () => {
+    test("should document alpha as strictly between zero and one in every request schema", async () => {
+      const openApi = parseYaml(
+        await Bun.file(new URL("../../../docs/openapi.yaml", import.meta.url)).text(),
+      );
+      const schemas = openApi.components.schemas;
+      const alphaSchemas = [
+        schemas.ModelTrainRequestBase.properties.exponential_smoothing_alpha,
+        schemas.ExponentialSmoothingTrainRequest.allOf[1].properties.exponential_smoothing_alpha,
+      ];
+
+      for (const alphaSchema of alphaSchemas) {
+        expect(alphaSchema.minimum).toBe(0);
+        expect(alphaSchema.exclusiveMinimum).toBe(true);
+        expect(alphaSchema.maximum).toBe(1);
+        expect(alphaSchema.exclusiveMaximum).toBe(true);
+      }
     });
   });
 

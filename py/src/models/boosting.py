@@ -28,6 +28,7 @@ from ensemble_utils import (
     remove_member_model_artifact,
 )
 from metrics import mae, mape, r2, rmse
+from model_defaults import resolve_lstm_look_back
 from model_info import attach_method_metadata, ensure_state_metadata
 from serialization import dump_model, load_model
 from subprocess_utils import (
@@ -1084,7 +1085,6 @@ def run(args) -> None:
     train_size = te - ts + 1
     boost_train_size = _compute_phase1_train_size(train_size)
     auto_window = max(3, min(12, boost_train_size // 4))
-    auto_look_back = max(3, min(12, boost_train_size // 4))
     if boost_train_size <= 12:
         auto_max_pq = 1
     elif boost_train_size <= 20:
@@ -1130,7 +1130,10 @@ def run(args) -> None:
         feature_types[target_feature] = "numeric"
 
         lstm_params = {
-            "look_back": get_arg("look_back", auto_look_back, int),
+            "look_back": resolve_lstm_look_back(
+                boost_train_size,
+                get_arg("look_back", None, int),
+            ),
             "epochs": get_arg("epochs", auto_epochs, int),
             "feature_types": feature_types,
             "normalization": get_arg("normalization", "minmax"),

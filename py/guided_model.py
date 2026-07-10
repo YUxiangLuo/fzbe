@@ -23,6 +23,7 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "src"
 from data_utils import infer_feature_types, load_data_from_json
 from logger import get_log_contents, log
 from metrics import mae, mape, r2, rmse
+from model_defaults import resolve_lstm_look_back
 from model_info import attach_method_metadata
 from serialization import dump_model
 
@@ -684,7 +685,7 @@ def _run_lstm(step_id: str, args, state: Dict[str, Any]) -> Dict[str, Any]:
         ts, te, es_idx, ee = _parse_common_ranges(args)
         train_size = te - ts + 1
         look_back_arg = getattr(args, "look_back", None)
-        look_back = int(look_back_arg) if look_back_arg is not None else max(3, min(6, train_size // 4))
+        look_back = resolve_lstm_look_back(train_size, look_back_arg)
         epochs_arg = getattr(args, "epochs", None)
         epochs = int(epochs_arg) if epochs_arg is not None else 20
         normalization = getattr(args, "normalization", None) or "minmax"

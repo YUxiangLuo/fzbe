@@ -32,6 +32,7 @@ from ensemble_utils import (
 )
 from logger import get_log_contents
 from metrics import mae, mape, r2, rmse
+from model_defaults import resolve_lstm_look_back
 from model_info import attach_method_metadata
 from serialization import dump_model
 from subprocess_utils import (
@@ -138,7 +139,6 @@ def _build_model_params(
     lstm_context: str,
 ) -> Dict[str, Dict[str, Any]]:
     auto_window = max(3, min(12, phase_train_size // 4))
-    auto_look_back = max(3, min(6, phase_train_size // 4))
     auto_epochs = 20 if train_size <= 15 else 30
     model_params: Dict[str, Dict[str, Any]] = {}
 
@@ -180,7 +180,10 @@ def _build_model_params(
         feature_types[target_feature] = "numeric"
 
         lstm_params = {
-            "look_back": _get_arg(args, "look_back", auto_look_back, int),
+            "look_back": resolve_lstm_look_back(
+                phase_train_size,
+                _get_arg(args, "look_back", None, int),
+            ),
             "epochs": _get_arg(args, "epochs", auto_epochs, int),
             "feature_types": feature_types,
             "normalization": _get_arg(args, "normalization", "minmax"),

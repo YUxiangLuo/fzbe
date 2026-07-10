@@ -19,6 +19,7 @@ from sklearn.preprocessing import MinMaxScaler, OneHotEncoder, StandardScaler
 from data_utils import ParsedData, infer_feature_types as infer_parsed_feature_types, load_data_from_json
 from logger import log, get_log_contents
 from metrics import mae, mape, r2, rmse
+from model_defaults import resolve_lstm_look_back
 from model_info import attach_method_metadata, ensure_state_metadata
 from serialization import dump_model, load_model
 
@@ -949,12 +950,10 @@ def run(args) -> None:
         look_back_arg = getattr(args, "look_back", None)
         epochs_arg = getattr(args, "epochs", None)
 
-        # Auto-select look_back and epochs based on training data size (for educational small datasets)
+        # Auto-select look_back from the shared rule; epochs defaults to a fixed 20.
         train_size = te - ts + 1
-        if look_back_arg is not None:
-            look_back = int(look_back_arg)
-        else:
-            look_back = max(3, min(6, train_size // 4))
+        look_back = resolve_lstm_look_back(train_size, look_back_arg)
+        if look_back_arg is None:
             log.info(f"Auto-selected look_back={look_back} based on train_size={train_size}")
 
         if epochs_arg is not None:
