@@ -37,7 +37,7 @@ const lstmFeaturesSchema = z.preprocess(normalizeLstmFeaturesInput, z.string().m
 const modelParamsSchema = z.object({
   moving_average_window: z.coerce.number().int().min(2).optional(),
   exponential_smoothing_alpha: z.coerce.number().gt(0).lt(1).optional(),
-  arimaD: z.coerce.number().int().min(0).optional(),
+  arimaD: z.coerce.number().int().min(0).max(2).optional(),
   lstmFeatures: lstmFeaturesSchema.optional(),
   lstmTargetFeature: z.string().min(1).optional(),
   lstmNormalization: z.enum(["minmax", "zscore"]).optional(),
@@ -110,7 +110,7 @@ const exponentialSmoothingTrainSchema = withRangeValidation(
 
 const arimaTrainSchema = withRangeValidation(
   trainSchemaBase.extend({
-    arimaD: z.coerce.number().int().min(0),
+    arimaD: z.coerce.number().int().min(0).max(2),
   }),
 );
 

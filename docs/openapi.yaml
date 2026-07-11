@@ -347,6 +347,7 @@ components:
         arimaD:
           type: integer
           minimum: 0
+          maximum: 2
         lstmFeatures:
           oneOf:
             - type: string
@@ -396,6 +397,7 @@ components:
             arimaD:
               type: integer
               minimum: 0
+              maximum: 2
 
     LstmTrainRequest:
       allOf:

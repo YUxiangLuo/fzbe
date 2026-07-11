@@ -347,8 +347,8 @@ def _validate_fit_args(sales: ArrayLike, ts: int, te: int, w: int) -> None:
 
     if not (0 <= ts <= te < n_total):
         raise ValueError(f"[VALIDATION] Invalid training range [{ts}, {te}], must be within [0, {n_total-1}]")
-    if w < 1:
-        raise ValueError(f"[VALIDATION] Window must be >= 1, got {w}")
+    if w < 2:
+        raise ValueError(f"[VALIDATION] Window must be >= 2, got {w}")
 
     train_size = te - ts + 1
     if train_size < w:
@@ -372,9 +372,9 @@ def _validate_training_args(sales: ArrayLike, ts: int, te: int, es: int, ee: int
     if es <= te:
         log.error(f"Evaluation start {es} must be after training end {te}")
         raise ValueError(f"[VALIDATION] Evaluation start ({es}) must be after training end ({te}).")
-    if w < 1:
-        log.error(f"Window {w} must be >= 1")
-        raise ValueError(f"[VALIDATION] Window must be >= 1, got {w}")
+    if w < 2:
+        log.error(f"Window {w} must be >= 2")
+        raise ValueError(f"[VALIDATION] Window must be >= 2, got {w}")
 
     # Additional helpful validations
     train_size = te - ts + 1

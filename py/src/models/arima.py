@@ -290,8 +290,14 @@ def train_and_evaluate(
     }
 
     # --- Evaluate the best model ---
-    log.info(f"Forecasting {len(eval_range)} steps for evaluation")
-    y_pred, conf_int = best_model.predict(n_periods=len(eval_range), return_conf_int=True)
+    # Forecast from the end of training and align to the evaluation indices, so a
+    # gap between the training and evaluation windows cannot shift the mapping.
+    forecast_steps = eval_range.stop - train_range.stop
+    forecast_offset = eval_range.start - train_range.stop
+    log.info(f"Forecasting {forecast_steps} steps for evaluation (offset={forecast_offset})")
+    y_pred, conf_int = best_model.predict(n_periods=forecast_steps, return_conf_int=True)
+    y_pred = y_pred[forecast_offset:]
+    conf_int = conf_int[forecast_offset:]
     y_true = y_eval.tolist()
 
     # Check convergence

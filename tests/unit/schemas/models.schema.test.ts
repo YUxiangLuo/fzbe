@@ -108,6 +108,26 @@ describe("Models Schemas", () => {
       expect(result.success).toBe(false);
     });
 
+    test("should reject ARIMA differencing orders outside zero to two", () => {
+      for (const arimaD of [-1, 3, 5]) {
+        const result = getTrainSchemaForModel("arima").safeParse({
+          experiment_id: 12,
+          arimaD,
+        });
+
+        expect(result.success).toBe(false);
+      }
+
+      for (const arimaD of [0, 1, 2]) {
+        const result = getTrainSchemaForModel("arima").safeParse({
+          experiment_id: 12,
+          arimaD,
+        });
+
+        expect(result.success).toBe(true);
+      }
+    });
+
     test("should require model-specific params for LSTM training", () => {
       const result = getTrainSchemaForModel("lstm").safeParse({
         experiment_id: 12,
@@ -173,6 +193,22 @@ describe("Models Schemas", () => {
         expect(alphaSchema.exclusiveMinimum).toBe(true);
         expect(alphaSchema.maximum).toBe(1);
         expect(alphaSchema.exclusiveMaximum).toBe(true);
+      }
+    });
+
+    test("should document arimaD as an integer between zero and two in every request schema", async () => {
+      const openApi = parseYaml(
+        await Bun.file(new URL("../../../docs/openapi.yaml", import.meta.url)).text(),
+      );
+      const schemas = openApi.components.schemas;
+      const arimaDSchemas = [
+        schemas.ModelTrainRequestBase.properties.arimaD,
+        schemas.ArimaTrainRequest.allOf[1].properties.arimaD,
+      ];
+
+      for (const arimaDSchema of arimaDSchemas) {
+        expect(arimaDSchema.minimum).toBe(0);
+        expect(arimaDSchema.maximum).toBe(2);
       }
     });
   });
