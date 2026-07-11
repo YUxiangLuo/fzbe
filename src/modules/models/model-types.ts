@@ -178,7 +178,7 @@ export const GUIDED_TRAINING_STEPS: Record<GuidedModelType, GuidedTrainingStepDe
     {
       id: "build_model",
       label: "确定网络结构",
-      description: "根据特征维度、样本量和预测跨度确定 LSTM 层、输出层、批大小和学习率计划。",
+      description: "构建单层 LSTM 加全连接输出层，隐藏单元数和批大小按训练样本量确定，学习率计划为固定策略。",
       actionLabel: "构建网络",
     },
     {
@@ -316,7 +316,7 @@ export const GUIDED_TRAINING_STEPS: Record<GuidedModelType, GuidedTrainingStepDe
     {
       id: "combine_evaluate",
       label: "累加阶段预测并评估",
-      description: "把各轮模型的预测按学习率累加，计算 Boosting 融合的最终误差指标。",
+      description: "累加各轮模型的预测（首轮系数为 1，后续轮按学习率缩放），计算 Boosting 融合的最终误差指标。",
       actionLabel: "组合评估",
     },
     {

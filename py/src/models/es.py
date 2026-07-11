@@ -97,8 +97,12 @@ def train_and_evaluate(
     )
     log.debug(f"Model fitted successfully")
 
-    log.info(f"Forecasting {len(eval_range)} steps for evaluation")
-    y_pred = model.forecast(len(eval_range))
+    # Forecast from the end of training and align to the evaluation indices, so a
+    # gap between the training and evaluation windows cannot shift the mapping.
+    forecast_steps = eval_range.stop - train_range.stop
+    forecast_offset = eval_range.start - train_range.stop
+    log.info(f"Forecasting {forecast_steps} steps for evaluation (offset={forecast_offset})")
+    y_pred = model.forecast(forecast_steps)[forecast_offset:]
     y_true = y_eval.tolist()
 
     residuals = np.array(y_true) - np.array(y_pred)
