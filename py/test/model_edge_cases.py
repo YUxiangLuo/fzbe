@@ -30,6 +30,7 @@ EXISTING_FULL_SCRIPTS = [
     "guided_ensemble_smoke.py",
     "lstm_look_back_defaults_smoke.py",
     "eval_gap_alignment_smoke.py",
+    "lstm_quality_regression.py",
     "lstm_feature_diagnostics.py",
     "designed_model_diagnostics.py",
     "medium_model_stress.py",

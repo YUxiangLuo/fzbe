@@ -11,6 +11,7 @@ For each of MA/ES/ARIMA this drives train_and_evaluate twice — once with a
 contiguous evaluation window covering the gap, once with the gapped window — and
 asserts the gapped predictions equal the tail of the contiguous ones.
 """
+import json
 import math
 import sys
 from pathlib import Path
@@ -53,7 +54,7 @@ def assert_aligned(label: str, contiguous_pred, gapped_pred) -> None:
             f"  contiguous[{GAP}:]: {contiguous_tail.tolist()}\n"
             f"  gapped:            {gapped.tolist()}"
         )
-    print(f"  ✅ {label}: gapped predictions equal contiguous[{GAP}:]")
+    print(f"  ✅ {label}: gapped predictions equal contiguous[{GAP}:]", file=sys.stderr)
 
 
 def check_ma(series: np.ndarray, months: list[str]) -> None:
@@ -90,11 +91,17 @@ def check_arima(series: np.ndarray, months: list[str]) -> None:
 
 def main() -> None:
     series, months = build_series()
-    print(f"Train {TRAIN_RANGE}, gapped eval {GAPPED_EVAL} (gap={GAP})")
+    print(f"Train {TRAIN_RANGE}, gapped eval {GAPPED_EVAL} (gap={GAP})", file=sys.stderr)
     check_ma(series, months)
     check_es(series, months)
     check_arima(series, months)
-    print("\n🎉 eval gap alignment smoke passed")
+    print("\n🎉 eval gap alignment smoke passed", file=sys.stderr)
+    print(json.dumps({
+        "status": "ok",
+        "models": ["ma", "es", "arima"],
+        "gap": GAP,
+        "evaluation_length": EVAL_LENGTH,
+    }))
 
 
 if __name__ == "__main__":

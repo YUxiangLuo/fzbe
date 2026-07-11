@@ -60,10 +60,12 @@ LSTM_LR_DECAY_RATE = 0.98
 def select_lstm_units(train_sample_count: int) -> Tuple[int, int]:
     """Pick (recurrent_units, dense_units) scaled to the training-sample count.
 
-    Capacity is intentionally capped: teaching datasets (~20-40 points) overfit
-    large networks, so a small single layer plus regularization is more robust.
+    Keep enough capacity for direct multi-horizon learning while bounding model
+    size on larger teaching datasets.  The direct dataset contains fewer samples
+    than the original series, so scaling from that count needs a wider factor
+    than a one-step model would use.
     """
-    recurrent_units = int(max(8, min(32, train_sample_count * 2)))
+    recurrent_units = int(max(16, min(80, train_sample_count * 5)))
     dense_units = int(max(8, recurrent_units // 2))
     return recurrent_units, dense_units
 
