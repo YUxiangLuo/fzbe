@@ -65,9 +65,15 @@ const { transformTrainingResult } = await import(freshModelsServiceModulePath);
 describe("model training result transformers", () => {
   test("keeps shared fields for simple models", () => {
     const transformed = transformTrainingResult("ma", {
-      metrics: { rmse: 1.2, mae: 0.8, r2: 0.91 },
+      metrics: { rmse: 1.2, mae: 0.8, mape: 7.1, r2: 0.91 },
       eval_y_true: [10, 12],
-      predictions: [{ prediction: 9.5 }, { prediction: 12.4 }],
+      predictions: [
+        { prediction: 9.5, std_dev: 0.7 },
+        { prediction: 12.4, std_dev: 0.7 },
+      ],
+      method_name: "递推移动平均",
+      forecast_strategy: "recursive_roll_forward",
+      implementation_notes: ["不使用评估集真实值递推。"],
       notes: ["ok"],
       saved_model: "/tmp/ma.pkl",
       logs: ["done"],
@@ -76,9 +82,13 @@ describe("model training result transformers", () => {
     expect(transformed).toEqual({
       status: "success",
       results: {
-        metrics: { rmse: 1.2, mae: 0.8, r2: 0.91 },
+        metrics: { rmse: 1.2, mae: 0.8, mape: 7.1, r2: 0.91 },
         eval_y_true: [10, 12],
         eval_predictions: [9.5, 12.4],
+        eval_std_devs: [0.7, 0.7],
+        method_name: "递推移动平均",
+        forecast_strategy: "recursive_roll_forward",
+        implementation_notes: ["不使用评估集真实值递推。"],
         notes: ["ok"],
         saved_model: "/tmp/ma.pkl",
         logs: ["done"],

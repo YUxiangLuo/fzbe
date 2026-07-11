@@ -21,6 +21,7 @@ from logger import log, get_log_contents
 from metrics import mae, mape, r2, rmse
 from model_defaults import resolve_lstm_look_back
 from model_info import attach_method_metadata, ensure_state_metadata
+from model_validation import validate_minimum_evaluation_points
 from serialization import dump_model, load_model
 
 MODEL_TYPE = "lstm"
@@ -33,14 +34,14 @@ DIRECT_IMPLEMENTATION_NOTES = [
     "本系统采用单层 LSTM + Dropout + L2 正则 + Dense 输出层，隐藏单元数随样本量自适应，以在小样本上抑制过拟合。",
     "为了服务未来多期销量预测，默认直接多步输出完整预测 horizon，减少递归预测的误差累积。",
     "训练中的 EarlyStopping 监控训练损失而非验证损失（教学数据过小，不再切分验证集），其作用是训练损失进入平台期即停止，并非教科书意义的验证集早停。",
-    "预测值附带的 std_dev 是评估段残差的常数标准差，不随预测步长增长，与 ARIMA 随步长展宽的置信区间口径不同。",
+    "预测值附带的 std_dev 是至少两个评估残差计算出的样本标准差（ddof=1），对各预测期保持常数；ARIMA 的区间会随步长展宽。",
 ]
 AUTOREGRESSIVE_IMPLEMENTATION_NOTES = [
     "教科书 LSTM 定义的是带遗忘门、输入门和输出门的循环神经网络单元。",
     "本系统采用单层 LSTM + Dropout + L2 正则 + Dense 输出层，隐藏单元数随样本量自适应，以在小样本上抑制过拟合。",
     "当训练数据不足以拟合直接多步输出时，系统回退为一步 LSTM 并递归预测未来多期。",
     "训练中的 EarlyStopping 监控训练损失而非验证损失（教学数据过小，不再切分验证集），其作用是训练损失进入平台期即停止，并非教科书意义的验证集早停。",
-    "预测值附带的 std_dev 是评估段残差的常数标准差，不随预测步长增长，与 ARIMA 随步长展宽的置信区间口径不同。",
+    "预测值附带的 std_dev 是至少两个评估残差计算出的样本标准差（ddof=1），对各预测期保持常数；ARIMA 的区间会随步长展宽。",
 ]
 
 # Type alias for input flexibility
@@ -1089,6 +1090,7 @@ def _validate_training_args(
     if es <= te:
         log.error(f"Evaluation start {es} must be after training end {te}")
         raise ValueError(f"[VALIDATION] Evaluation start ({es}) must be after training end ({te}).")
+    validate_minimum_evaluation_points(es, ee)
     if look_back < 1:
         log.error(f"look_back {look_back} must be >= 1")
         raise ValueError("[VALIDATION] look_back must be >= 1.")

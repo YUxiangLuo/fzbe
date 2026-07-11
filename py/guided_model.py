@@ -25,6 +25,7 @@ from logger import get_log_contents, log
 from metrics import mae, mape, r2, rmse
 from model_defaults import resolve_lstm_look_back
 from model_info import attach_method_metadata
+from model_validation import validate_minimum_evaluation_points
 from serialization import dump_model
 
 arima = None
@@ -309,18 +310,29 @@ def _run_es(step_id: str, args, state: Dict[str, Any]) -> Dict[str, Any]:
             optimized=False,
         )
         state["model"] = model
+        initial_level = float(model.params.get("initial_level", y_train[0] if len(y_train) else 0.0))
+        fitted_levels = np.asarray(model.level, dtype=float)
+        final_level = float(fitted_levels[-1]) if len(fitted_levels) else initial_level
         return {
             "alpha": float(state["alpha"]),
             "fitted_points": len(y_train),
-            "level": float(model.params.get("initial_level", y_train[0] if len(y_train) else 0.0)),
+            "initial_level": initial_level,
+            "final_level": final_level,
         }
 
     if step_id == "forecast":
-        _, eval_range = _state_ranges(state)
-        y_pred = state["model"].forecast(len(eval_range)).tolist()
+        train_range, eval_range = _state_ranges(state)
+        forecast_steps = eval_range.stop - train_range.stop
+        forecast_offset = eval_range.start - train_range.stop
+        all_predictions = np.asarray(state["model"].forecast(forecast_steps), dtype=float)
+        y_pred = all_predictions[forecast_offset:forecast_offset + len(eval_range)].tolist()
+        if len(y_pred) != len(eval_range):
+            raise ValueError("[VALIDATION] 无法为全部评估区间生成指数平滑预测。")
         state["y_pred"] = y_pred
         return {
             "predicted_points": len(y_pred),
+            "forecast_steps": forecast_steps,
+            "forecast_offset": forecast_offset,
             "preview": [float(value) for value in y_pred[:3]],
         }
 
@@ -438,6 +450,7 @@ def _run_arima(step_id: str, args, state: Dict[str, Any]) -> Dict[str, Any]:
             raise ValueError(f"[VALIDATION] Invalid eval range: [{es_idx},{ee}], must be within [0, {len(y)-1}]")
         if es_idx <= te:
             raise ValueError(f"[VALIDATION] Evaluation start ({es_idx}) must be after training end ({te}).")
+        validate_minimum_evaluation_points(es_idx, ee)
         effective_train_size = arima._validate_arima_train_size(train_size, d, "Training range")
 
         state.clear()
@@ -550,7 +563,20 @@ def _run_arima(step_id: str, args, state: Dict[str, Any]) -> Dict[str, Any]:
         y = np.asarray(state["y"])
         y_eval = y[eval_range]
         best_model = state["best_model"]
-        y_pred, conf_int = best_model.predict(n_periods=len(eval_range), return_conf_int=True)
+        forecast_steps = eval_range.stop - train_range.stop
+        forecast_offset = eval_range.start - train_range.stop
+        all_predictions, all_confidence_intervals = best_model.predict(
+            n_periods=forecast_steps,
+            return_conf_int=True,
+        )
+        y_pred = np.asarray(all_predictions, dtype=float)[
+            forecast_offset:forecast_offset + len(eval_range)
+        ]
+        conf_int = np.asarray(all_confidence_intervals, dtype=float)[
+            forecast_offset:forecast_offset + len(eval_range)
+        ]
+        if len(y_pred) != len(eval_range) or len(conf_int) != len(eval_range):
+            raise ValueError("[VALIDATION] 无法为全部评估区间生成 ARIMA 预测。")
         y_true = y_eval.tolist()
         converged = bool(best_model.arima_res_.mle_retvals.get("converged", False))
         state.update({
@@ -561,6 +587,8 @@ def _run_arima(step_id: str, args, state: Dict[str, Any]) -> Dict[str, Any]:
         })
         return {
             "predicted_points": len(y_true),
+            "forecast_steps": forecast_steps,
+            "forecast_offset": forecast_offset,
             "preview": [
                 {
                     "actual": float(actual),

@@ -48,6 +48,7 @@ const MODEL_TO_COMPLETION_PATCH: Record<ModelType, (results: Record<string, any>
     moving_average_window: 6,
     moving_average_metrics_rmse: results.metrics.rmse,
     moving_average_metrics_mae: results.metrics.mae,
+    moving_average_metrics_mape: results.metrics.mape,
     moving_average_metrics_r2: results.metrics.r2,
   }),
   es: (results) => ({
@@ -55,6 +56,7 @@ const MODEL_TO_COMPLETION_PATCH: Record<ModelType, (results: Record<string, any>
     exponential_smoothing_alpha: 0.35,
     exponential_smoothing_metrics_rmse: results.metrics.rmse,
     exponential_smoothing_metrics_mae: results.metrics.mae,
+    exponential_smoothing_metrics_mape: results.metrics.mape,
     exponential_smoothing_metrics_r2: results.metrics.r2,
   }),
   arima: (results) => ({
@@ -64,6 +66,7 @@ const MODEL_TO_COMPLETION_PATCH: Record<ModelType, (results: Record<string, any>
     arima_q: results.best_order?.q ?? null,
     arima_metrics_rmse: results.metrics.rmse,
     arima_metrics_mae: results.metrics.mae,
+    arima_metrics_mape: results.metrics.mape,
     arima_metrics_r2: results.metrics.r2,
   }),
   lstm: (results) => ({
@@ -73,6 +76,7 @@ const MODEL_TO_COMPLETION_PATCH: Record<ModelType, (results: Record<string, any>
     lstm_target_field: "销售数量",
     lstm_metrics_rmse: results.metrics.rmse,
     lstm_metrics_mae: results.metrics.mae,
+    lstm_metrics_mape: results.metrics.mape,
     lstm_metrics_r2: results.metrics.r2,
   }),
   weighted_avg: (results) => ({
@@ -80,6 +84,7 @@ const MODEL_TO_COMPLETION_PATCH: Record<ModelType, (results: Record<string, any>
     ensemble_weighted_base_models: BASE_MODELS,
     ensemble_weighted_metrics_rmse: results.metrics.rmse,
     ensemble_weighted_metrics_mae: results.metrics.mae,
+    ensemble_weighted_metrics_mape: results.metrics.mape,
     ensemble_weighted_metrics_r2: results.metrics.r2,
   }),
   stacking: (results) => ({
@@ -87,6 +92,7 @@ const MODEL_TO_COMPLETION_PATCH: Record<ModelType, (results: Record<string, any>
     ensemble_stacking_base_models: BASE_MODELS,
     ensemble_stacking_metrics_rmse: results.metrics.rmse,
     ensemble_stacking_metrics_mae: results.metrics.mae,
+    ensemble_stacking_metrics_mape: results.metrics.mape,
     ensemble_stacking_metrics_r2: results.metrics.r2,
   }),
   boosting: (results) => ({
@@ -94,6 +100,7 @@ const MODEL_TO_COMPLETION_PATCH: Record<ModelType, (results: Record<string, any>
     ensemble_boosting_base_models: BASE_MODELS,
     ensemble_boosting_metrics_rmse: results.metrics.rmse,
     ensemble_boosting_metrics_mae: results.metrics.mae,
+    ensemble_boosting_metrics_mape: results.metrics.mape,
     ensemble_boosting_metrics_r2: results.metrics.r2,
   }),
 };
@@ -242,12 +249,18 @@ function assertTrainingPayload(modelType: ModelType, payload: any) {
     throw new Error(`${modelType} training did not return success results: ${JSON.stringify(payload)}`);
   }
   const results = payload.results;
-  for (const metricKey of ["rmse", "mae", "r2"]) {
+  for (const metricKey of ["rmse", "mae", "mape", "r2"]) {
     assertFiniteNumber(results.metrics?.[metricKey], `${modelType}.metrics.${metricKey}`);
   }
   if (!Array.isArray(results.eval_y_true) || !Array.isArray(results.eval_predictions)) {
     throw new Error(`${modelType} training missing eval arrays`);
   }
+  if (!Array.isArray(results.eval_std_devs) || results.eval_std_devs.length !== 8) {
+    throw new Error(`${modelType} training missing aligned eval_std_devs`);
+  }
+  results.eval_std_devs.forEach((value: unknown, index: number) => {
+    assertFiniteNumber(value, `${modelType}.eval_std_devs[${index}]`);
+  });
   if (results.eval_y_true.length !== 8 || results.eval_predictions.length !== 8) {
     throw new Error(`${modelType} training eval length mismatch`);
   }

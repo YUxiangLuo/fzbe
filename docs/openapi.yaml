@@ -332,9 +332,11 @@ components:
         data_window_evaluate_start_index:
           type: integer
           minimum: 0
+          description: 评估区间起始索引；与结束索引组成的闭区间至少包含 2 个数据点
         data_window_evaluate_end_index:
           type: integer
           minimum: 0
+          description: 评估区间结束索引；与起始索引组成的闭区间至少包含 2 个数据点
         moving_average_window:
           type: integer
           minimum: 2
@@ -686,10 +688,12 @@ components:
           type: integer
           minimum: 0
           nullable: true
+          description: 评估区间起始索引；与结束索引组成的闭区间至少包含 2 个数据点
         data_window_evaluate_end_index:
           type: integer
           minimum: 0
           nullable: true
+          description: 评估区间结束索引；与起始索引组成的闭区间至少包含 2 个数据点
         moving_average_completed:
           type: boolean
           nullable: true
@@ -702,6 +706,10 @@ components:
           minimum: 0
           nullable: true
         moving_average_metrics_mae:
+          type: number
+          minimum: 0
+          nullable: true
+        moving_average_metrics_mape:
           type: number
           minimum: 0
           nullable: true
@@ -720,6 +728,10 @@ components:
           minimum: 0
           nullable: true
         exponential_smoothing_metrics_mae:
+          type: number
+          minimum: 0
+          nullable: true
+        exponential_smoothing_metrics_mape:
           type: number
           minimum: 0
           nullable: true
@@ -746,6 +758,10 @@ components:
           minimum: 0
           nullable: true
         arima_metrics_mae:
+          type: number
+          minimum: 0
+          nullable: true
+        arima_metrics_mape:
           type: number
           minimum: 0
           nullable: true
@@ -786,6 +802,10 @@ components:
           type: number
           minimum: 0
           nullable: true
+        lstm_metrics_mape:
+          type: number
+          minimum: 0
+          nullable: true
         lstm_metrics_r2:
           type: number
           nullable: true
@@ -805,6 +825,10 @@ components:
           minimum: 0
           nullable: true
         ensemble_weighted_metrics_mae:
+          type: number
+          minimum: 0
+          nullable: true
+        ensemble_weighted_metrics_mape:
           type: number
           minimum: 0
           nullable: true
@@ -830,6 +854,10 @@ components:
           type: number
           minimum: 0
           nullable: true
+        ensemble_boosting_metrics_mape:
+          type: number
+          minimum: 0
+          nullable: true
         ensemble_boosting_metrics_r2:
           type: number
           nullable: true
@@ -849,6 +877,10 @@ components:
           minimum: 0
           nullable: true
         ensemble_stacking_metrics_mae:
+          type: number
+          minimum: 0
+          nullable: true
+        ensemble_stacking_metrics_mape:
           type: number
           minimum: 0
           nullable: true

@@ -15,6 +15,7 @@ from data_utils import ParsedData, load_data_from_json
 from logger import log, get_log_contents
 from metrics import mae, mape, r2, rmse
 from model_info import attach_method_metadata, ensure_state_metadata
+from model_validation import validate_minimum_evaluation_points
 from serialization import dump_model, load_model
 
 MODEL_TYPE = "ma"
@@ -23,7 +24,7 @@ FORECAST_STRATEGY = "recursive_roll_forward"
 IMPLEMENTATION_NOTES = [
     "教科书移动平均通常用最后一个窗口均值预测下一期。",
     "本系统预测多期未来销量时，将每期预测值滚入窗口继续递推，避免使用评估集或未来真实值。",
-    "预测值附带的 std_dev 是评估段残差的常数标准差，不随预测步长增长，与 ARIMA 随步长展宽的置信区间口径不同。",
+    "预测值附带的 std_dev 是至少两个评估残差计算出的样本标准差（ddof=1），对各预测期保持常数；ARIMA 的区间会随步长展宽。",
 ]
 
 # Type alias for input flexibility
@@ -372,6 +373,7 @@ def _validate_training_args(sales: ArrayLike, ts: int, te: int, es: int, ee: int
     if es <= te:
         log.error(f"Evaluation start {es} must be after training end {te}")
         raise ValueError(f"[VALIDATION] Evaluation start ({es}) must be after training end ({te}).")
+    validate_minimum_evaluation_points(es, ee)
     if w < 2:
         log.error(f"Window {w} must be >= 2")
         raise ValueError(f"[VALIDATION] Window must be >= 2, got {w}")

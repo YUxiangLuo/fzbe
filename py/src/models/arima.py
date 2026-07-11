@@ -14,6 +14,7 @@ from data_utils import ParsedData, load_data_from_json
 from logger import log, get_log_contents
 from metrics import mae, mape, r2, rmse
 from model_info import attach_method_metadata, ensure_state_metadata
+from model_validation import validate_minimum_evaluation_points
 from serialization import dump_model, load_model
 
 MODEL_TYPE = "arima"
@@ -474,6 +475,7 @@ def run(args) -> None:
     if es <= te:
         log.error(f"Evaluation start {es} must be after training end {te}")
         raise ValueError(f"[VALIDATION] Evaluation start ({es}) must be after training end ({te}).")
+    validate_minimum_evaluation_points(es, ee)
 
     # Additional helpful validations
     train_size = te - ts + 1

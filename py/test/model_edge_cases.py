@@ -348,6 +348,59 @@ def run_contract_failure_cases(temp_path: Path) -> list[dict[str, str]]:
         ),
     ]
 
+    single_point_common_args = (
+        "--train-start",
+        "0",
+        "--train-end",
+        "11",
+        "--eval-start",
+        "12",
+        "--eval-end",
+        "12",
+    )
+    single_point_model_args = {
+        "ma": ("--window", "3"),
+        "es": ("--alpha", "0.35"),
+        "arima": ("--d", "1", "--max-p", "1", "--max-q", "1"),
+        "lstm": (
+            "--look-back",
+            "3",
+            "--epochs",
+            "1",
+            "--normalization",
+            "minmax",
+            "--lstm-target-feature",
+            TARGET_KEY,
+            "--lstm-features",
+            "价格指数",
+        ),
+        "weighted_avg": ("--models", "ma,es", "--window", "3", "--alpha", "0.35"),
+        "stacking": ("--models", "ma,es", "--window", "3", "--alpha", "0.35"),
+        "boosting": (
+            "--models",
+            "ma,es",
+            "--window",
+            "3",
+            "--alpha",
+            "0.35",
+            "--learning-rate",
+            "0.3",
+            "--max-rounds",
+            "2",
+        ),
+    }
+    for model_type, model_args in single_point_model_args.items():
+        failures.append(
+            expect_failure(
+                model_type,
+                data_json,
+                *single_point_common_args,
+                *model_args,
+                label=f"{model_type} one-point evaluation is rejected",
+                expected_tag="[VALIDATION]",
+            )
+        )
+
     ma_model_path = temp_path / "ma-edge.pkl"
     ma_output = invoke_model(
         "ma",

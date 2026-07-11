@@ -49,6 +49,50 @@ describe("Models Schemas", () => {
       expect(result.success).toBe(false);
     });
 
+    test("should reject one-point evaluation ranges for every model", () => {
+      const common = {
+        experiment_id: 12,
+        data_window_train_start_index: 0,
+        data_window_train_end_index: 11,
+        data_window_evaluate_start_index: 12,
+        data_window_evaluate_end_index: 12,
+      };
+      const modelPayloads = {
+        ma: { ...common, moving_average_window: 4 },
+        es: { ...common, exponential_smoothing_alpha: 0.35 },
+        arima: { ...common, arimaD: 1 },
+        lstm: {
+          ...common,
+          lstmFeatures: ["价格指数"],
+          lstmTargetFeature: "销售数量",
+          lstmNormalization: "minmax",
+        },
+        weighted_avg: { ...common, models: "ma,es" },
+        stacking: { ...common, models: "ma,es" },
+        boosting: { ...common, models: "ma,es" },
+      } as const;
+
+      for (const modelType of ALL_MODELS) {
+        const result = getTrainSchemaForModel(modelType).safeParse(modelPayloads[modelType]);
+        expect(result.success).toBe(false);
+        if (!result.success) {
+          expect(result.error.issues.some((issue) => issue.message.includes("至少需要 2 个数据点"))).toBe(true);
+        }
+      }
+    });
+
+    test("should accept a two-point evaluation range", () => {
+      const result = trainSchema.safeParse({
+        experiment_id: 12,
+        data_window_train_start_index: 0,
+        data_window_train_end_index: 11,
+        data_window_evaluate_start_index: 12,
+        data_window_evaluate_end_index: 13,
+      });
+
+      expect(result.success).toBe(true);
+    });
+
     test("should require model-specific params for moving average training", () => {
       const result = getTrainSchemaForModel("ma").safeParse({
         experiment_id: 12,

@@ -76,7 +76,7 @@ describe("auth service", () => {
     expect(result.user).toEqual({ role: "Student" });
     expect(typeof result.token).toBe("string");
 
-    const payload = await verify(result.token, "test-jwt-secret");
+    const payload = await verify(result.token, "test-jwt-secret", "HS256");
     expect(payload.sub).toBe(42);
     expect(payload.username).toBe("student001");
     expect(payload.role).toBe("Student");

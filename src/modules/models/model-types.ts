@@ -90,7 +90,7 @@ export const GUIDED_TRAINING_STEPS: Record<GuidedModelType, GuidedTrainingStepDe
     {
       id: "fit_model",
       label: "拟合平滑水平",
-      description: "用训练集销量和固定 α 更新指数平滑水平项，让近期观测对模型产生更高权重。",
+      description: "从初始水平开始，用训练集销量和固定 α 逐期更新平滑水平；步骤输出会分别展示初始水平和训练结束时的最终水平。",
       actionLabel: "拟合模型",
     },
     {
@@ -146,7 +146,7 @@ export const GUIDED_TRAINING_STEPS: Record<GuidedModelType, GuidedTrainingStepDe
     {
       id: "forecast",
       label: "预测评估区间",
-      description: "使用选定阶数的 ARIMA 模型预测评估区间，并生成置信区间作为不确定性参考。",
+      description: "从训练终点预测到评估终点，再按评估起点对齐所需 horizon，并同步截取置信区间作为不确定性参考。",
       actionLabel: "生成预测",
     },
     {
@@ -184,7 +184,7 @@ export const GUIDED_TRAINING_STEPS: Record<GuidedModelType, GuidedTrainingStepDe
     {
       id: "train_model",
       label: "训练神经网络",
-      description: "执行真实神经网络训练，使用学习率衰减和早停策略，让网络学习历史窗口与未来销量的关系。",
+      description: "执行真实神经网络训练，使用学习率衰减，并监控训练损失实施早停，让网络学习历史窗口与未来销量的关系。",
       actionLabel: "训练模型",
     },
     {
@@ -327,4 +327,3 @@ export const GUIDED_TRAINING_STEPS: Record<GuidedModelType, GuidedTrainingStepDe
     },
   ],
 };
-

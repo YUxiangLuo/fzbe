@@ -121,8 +121,16 @@ describe("Experiments Schemas", () => {
         moving_average_completed: true,
         moving_average_window: 5,
         moving_average_metrics_rmse: 0.5,
+        moving_average_metrics_mape: 4.25,
       });
       expect(result.success).toBe(true);
+    });
+
+    test("should reject negative MAPE metrics", () => {
+      const result = updateExperimentSchema.safeParse({
+        ensemble_stacking_metrics_mape: -0.1,
+      });
+      expect(result.success).toBe(false);
     });
 
     test("should reject non-integer moving average windows", () => {

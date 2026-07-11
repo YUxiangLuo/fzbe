@@ -2,6 +2,7 @@ import { z } from "zod";
 
 export const ALL_MODELS = ["ma", "es", "arima", "lstm", "stacking", "weighted_avg", "boosting"] as const;
 export type ModelType = (typeof ALL_MODELS)[number];
+export const MIN_EVALUATION_POINTS = 2;
 
 const baseDataSchema = z.object({
   experiment_id: z.coerce.number().int().min(1),
@@ -70,6 +71,25 @@ const withRangeValidation = <TSchema extends z.ZodTypeAny>(schema: TSchema) => {
         || Number((data as Record<string, unknown>).data_window_evaluate_start_index)
           <= Number((data as Record<string, unknown>).data_window_evaluate_end_index),
       { message: "评估起始索引必须小于等于评估结束索引", path: ["data_window_evaluate_end_index"] },
+    )
+    .refine(
+      (data) => {
+        if (typeof data !== "object" || data === null) return true;
+        const record = data as Record<string, unknown>;
+        if (
+          record.data_window_evaluate_start_index === undefined
+          || record.data_window_evaluate_end_index === undefined
+        ) {
+          return true;
+        }
+        const start = Number(record.data_window_evaluate_start_index);
+        const end = Number(record.data_window_evaluate_end_index);
+        return end < start || end - start + 1 >= MIN_EVALUATION_POINTS;
+      },
+      {
+        message: `评估区间至少需要 ${MIN_EVALUATION_POINTS} 个数据点`,
+        path: ["data_window_evaluate_end_index"],
+      },
     )
     .refine(
       (data) =>
@@ -158,8 +178,8 @@ export const prepareProductionSchema = z.object({
   experiment_id: z.coerce.number().int().min(1),
 });
 
-export function isModelType(value: string): value is ModelType {
-  return (ALL_MODELS as readonly string[]).includes(value);
+export function isModelType(value: unknown): value is ModelType {
+  return typeof value === "string" && (ALL_MODELS as readonly string[]).includes(value);
 }
 
 export type TrainInput = z.infer<typeof trainSchema>;

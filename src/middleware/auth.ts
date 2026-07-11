@@ -4,7 +4,7 @@ import type { Context, Next } from "hono";
 import { env } from "../config";
 import type { JwtPayload, UserRole } from "../types";
 
-export const jwtAuth = jwt({ secret: env.JWT_SECRET });
+export const jwtAuth = jwt({ secret: env.JWT_SECRET, alg: "HS256" });
 
 export const requireRoles = (...allowedRoles: UserRole[]) => {
   return createMiddleware(async (c: Context, next: Next) => {

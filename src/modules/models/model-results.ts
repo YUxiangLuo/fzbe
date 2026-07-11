@@ -5,6 +5,11 @@ interface TrainingMetricsPayload extends Record<string, unknown> {
   evaluate_months?: unknown;
 }
 
+interface TrainingPredictionPayload {
+  prediction?: unknown;
+  std_dev?: unknown;
+}
+
 const normalizeNumericArray = (value: unknown): number[] | undefined => {
   if (!Array.isArray(value)) return undefined;
   const normalized = value
@@ -56,11 +61,15 @@ export function transformTrainingResult(
     result.metrics && typeof result.metrics === "object"
       ? (result.metrics as TrainingMetricsPayload)
       : undefined;
+  const predictionPoints = Array.isArray(result.predictions)
+    ? (result.predictions as TrainingPredictionPayload[])
+    : [];
 
   const baseResults = {
     metrics: result.metrics,
     eval_y_true: result.eval_y_true,
-    eval_predictions: (result.predictions as { prediction: number }[] | undefined)?.map((p) => p.prediction) || [],
+    eval_predictions: predictionPoints.map((point) => point.prediction),
+    eval_std_devs: predictionPoints.map((point) => point.std_dev),
     evaluate_indices: normalizeNumericArray(metrics?.evaluate_indices),
     evaluate_months: normalizeStringArray(metrics?.evaluate_months),
     method_name: result.method_name,
@@ -85,4 +94,3 @@ export function transformTrainingResult(
 
   return finalResponse;
 }
-

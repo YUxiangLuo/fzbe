@@ -5,7 +5,7 @@ import type { Stats } from "node:fs";
 import type { RowDataPacket } from "mysql2/promise";
 import { pool } from "../../config";
 import logger from "../../utils/logger";
-import type { ModelType, TrainInput } from "./models.schema";
+import { MIN_EVALUATION_POINTS, type ModelType, type TrainInput } from "./models.schema";
 import { TIMEOUTS, CLEANUP_RETENTION } from "../../utils/constants";
 import { PY_DIR, resolvePythonExecutable } from "../../utils/python";
 import {
@@ -1063,6 +1063,17 @@ const getExperimentTrainingConfig = (
 
   if (experiment.data_window_evaluate_start_index > experiment.data_window_evaluate_end_index) {
     throw new ModelValidationError("实验记录中的评估数据窗口无效，请重新选择数据窗口后重试");
+  }
+
+  if (
+    experiment.data_window_evaluate_end_index
+      - experiment.data_window_evaluate_start_index
+      + 1
+    < MIN_EVALUATION_POINTS
+  ) {
+    throw new ModelValidationError(
+      `实验记录中的评估区间至少需要 ${MIN_EVALUATION_POINTS} 个数据点，请重新选择数据窗口后重试`,
+    );
   }
 
   if (experiment.data_window_evaluate_start_index <= experiment.data_window_train_end_index) {

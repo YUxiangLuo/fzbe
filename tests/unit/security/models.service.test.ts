@@ -365,6 +365,31 @@ describe("models service", () => {
     expect(createReadStream).not.toHaveBeenCalled();
   });
 
+  test("rejects training when the persisted evaluation range contains only one point", async () => {
+    poolQuery.mockResolvedValueOnce([[
+      buildExperimentContextRow({
+        data_window_evaluate_start_index: 12,
+        data_window_evaluate_end_index: 12,
+      }),
+    ]]);
+
+    await expect(
+      trainModel("ma", 20240002, {
+        experiment_id: 990002,
+        data_window_train_start_index: 0,
+        data_window_train_end_index: 11,
+        data_window_evaluate_start_index: 12,
+        data_window_evaluate_end_index: 12,
+        moving_average_window: 4,
+      }),
+    ).rejects.toMatchObject({
+      message: "实验记录中的评估区间至少需要 2 个数据点，请重新选择数据窗口后重试",
+    });
+
+    expect(createReadStream).not.toHaveBeenCalled();
+    expect(spawnMock).not.toHaveBeenCalled();
+  });
+
   test("restores the session-scoped guided artifact before reusing a completed session", async () => {
     const requestBody = {
       experiment_id: 990002,
@@ -709,14 +734,14 @@ describe("models service", () => {
         buildExperimentContextRow({
           data_window_train_end_index: 0,
           data_window_evaluate_start_index: 1,
-          data_window_evaluate_end_index: 1,
+          data_window_evaluate_end_index: 2,
         }),
       ]])
       .mockResolvedValueOnce([[
         buildExperimentContextRow({
           data_window_train_end_index: 0,
           data_window_evaluate_start_index: 1,
-          data_window_evaluate_end_index: 1,
+          data_window_evaluate_end_index: 2,
         }),
       ]])
       .mockResolvedValueOnce([[{ file_path: "/tmp/dataset.csv" }]]);
@@ -724,7 +749,7 @@ describe("models service", () => {
     existsSync.mockImplementation((filePath: string) => !filePath.includes("-weighted_avg-production.pkl"));
     createReadStream.mockImplementation(() =>
       Readable.from([
-        "月份,销售数量,价格指数,产能利用率\n2024-01,100,1.2,0.8\n2024-02,110,1.3,0.9\n",
+        "月份,销售数量,价格指数,产能利用率\n2024-01,100,1.2,0.8\n2024-02,110,1.3,0.9\n2024-03,120,1.4,1.0\n",
       ]) as unknown as ReturnType<typeof createReadStream>
     );
 
@@ -747,7 +772,7 @@ describe("models service", () => {
     expect(command).toContain("--save-model");
     expect(command).toContain("/tmp/fangzhen-py/trained_models/exp990002-student20240002-weighted_avg-production.pkl");
     expect(command).toContain("--train-end");
-    expect(command).toContain("1");
+    expect(command).toContain("2");
   });
 
   test("reuses an existing production artifact without invoking python", async () => {
@@ -774,14 +799,14 @@ describe("models service", () => {
         buildExperimentContextRow({
           data_window_train_end_index: 0,
           data_window_evaluate_start_index: 1,
-          data_window_evaluate_end_index: 1,
+          data_window_evaluate_end_index: 2,
         }),
       ]])
       .mockResolvedValueOnce([[
         buildExperimentContextRow({
           data_window_train_end_index: 0,
           data_window_evaluate_start_index: 1,
-          data_window_evaluate_end_index: 1,
+          data_window_evaluate_end_index: 2,
         }),
       ]])
       .mockResolvedValueOnce([[{ file_path: "/tmp/dataset.csv" }]]);
@@ -789,7 +814,7 @@ describe("models service", () => {
     existsSync.mockImplementation((filePath: string) => !filePath.includes("-ma-production.pkl"));
     createReadStream.mockImplementation(() =>
       Readable.from([
-        "月份,销售数量,价格指数,产能利用率\n2024-01,100,1.2,0.8\n2024-02,110,1.3,0.9\n",
+        "月份,销售数量,价格指数,产能利用率\n2024-01,100,1.2,0.8\n2024-02,110,1.3,0.9\n2024-03,120,1.4,1.0\n",
       ]) as unknown as ReturnType<typeof createReadStream>
     );
 
@@ -812,7 +837,7 @@ describe("models service", () => {
     expect(command).toContain("--save-model");
     expect(command).toContain("/tmp/fangzhen-py/trained_models/exp990002-student20240002-ma-production.pkl");
     expect(command).toContain("--train-end");
-    expect(command).toContain("1");
+    expect(command).toContain("2");
     expect(options).toMatchObject({
       cwd: "/tmp/fangzhen-py",
       stdout: "pipe",
@@ -885,21 +910,21 @@ describe("models service", () => {
         buildExperimentContextRow({
           data_window_train_end_index: 0,
           data_window_evaluate_start_index: 1,
-          data_window_evaluate_end_index: 1,
+          data_window_evaluate_end_index: 2,
         }),
       ]])
       .mockResolvedValueOnce([[
         buildExperimentContextRow({
           data_window_train_end_index: 0,
           data_window_evaluate_start_index: 1,
-          data_window_evaluate_end_index: 1,
+          data_window_evaluate_end_index: 2,
         }),
       ]])
       .mockResolvedValueOnce([[
         buildExperimentContextRow({
           data_window_train_end_index: 0,
           data_window_evaluate_start_index: 1,
-          data_window_evaluate_end_index: 1,
+          data_window_evaluate_end_index: 2,
         }),
       ]])
       .mockResolvedValueOnce([[{ file_path: "/tmp/dataset.csv" }]]);
@@ -912,7 +937,7 @@ describe("models service", () => {
     ));
     createReadStream.mockImplementation(() =>
       Readable.from([
-        "月份,销售数量,价格指数,产能利用率\n2024-01,100,1.2,0.8\n2024-02,110,1.3,0.9\n",
+        "月份,销售数量,价格指数,产能利用率\n2024-01,100,1.2,0.8\n2024-02,110,1.3,0.9\n2024-03,120,1.4,1.0\n",
       ]) as unknown as ReturnType<typeof createReadStream>
     );
     spawnMock

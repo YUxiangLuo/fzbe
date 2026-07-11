@@ -100,12 +100,14 @@ CREATE TABLE IF NOT EXISTS `experiment_status` (
   `moving_average_window` INT DEFAULT NULL,
   `moving_average_metrics_rmse` FLOAT DEFAULT NULL,
   `moving_average_metrics_mae` FLOAT DEFAULT NULL,
+  `moving_average_metrics_mape` FLOAT DEFAULT NULL,
   `moving_average_metrics_r2` FLOAT DEFAULT NULL,
 
   `exponential_smoothing_completed` BOOLEAN DEFAULT false,
   `exponential_smoothing_alpha` FLOAT DEFAULT NULL,
   `exponential_smoothing_metrics_rmse` FLOAT DEFAULT NULL,
   `exponential_smoothing_metrics_mae` FLOAT DEFAULT NULL,
+  `exponential_smoothing_metrics_mape` FLOAT DEFAULT NULL,
   `exponential_smoothing_metrics_r2` FLOAT DEFAULT NULL,
 
   `arima_completed` BOOLEAN DEFAULT false,
@@ -115,6 +117,7 @@ CREATE TABLE IF NOT EXISTS `experiment_status` (
   `arima_q` TINYINT DEFAULT NULL,
   `arima_metrics_rmse` FLOAT DEFAULT NULL,
   `arima_metrics_mae` FLOAT DEFAULT NULL,
+  `arima_metrics_mape` FLOAT DEFAULT NULL,
   `arima_metrics_r2` FLOAT DEFAULT NULL,
 
   -- ADF stationarity diagnostics JSON array
@@ -127,6 +130,7 @@ CREATE TABLE IF NOT EXISTS `experiment_status` (
   `lstm_target_field` VARCHAR(255) DEFAULT NULL,
   `lstm_metrics_rmse` FLOAT DEFAULT NULL,
   `lstm_metrics_mae` FLOAT DEFAULT NULL,
+  `lstm_metrics_mape` FLOAT DEFAULT NULL,
   `lstm_metrics_r2` FLOAT DEFAULT NULL,
 
   `ensemble_weighted_completed` BOOLEAN DEFAULT false,
@@ -134,6 +138,7 @@ CREATE TABLE IF NOT EXISTS `experiment_status` (
   `ensemble_weighted_base_models` JSON DEFAULT NULL,
   `ensemble_weighted_metrics_rmse` FLOAT DEFAULT NULL,
   `ensemble_weighted_metrics_mae` FLOAT DEFAULT NULL,
+  `ensemble_weighted_metrics_mape` FLOAT DEFAULT NULL,
   `ensemble_weighted_metrics_r2` FLOAT DEFAULT NULL,
 
   `ensemble_boosting_completed` BOOLEAN DEFAULT false,
@@ -141,6 +146,7 @@ CREATE TABLE IF NOT EXISTS `experiment_status` (
   `ensemble_boosting_base_models` JSON DEFAULT NULL,
   `ensemble_boosting_metrics_rmse` FLOAT DEFAULT NULL,
   `ensemble_boosting_metrics_mae` FLOAT DEFAULT NULL,
+  `ensemble_boosting_metrics_mape` FLOAT DEFAULT NULL,
   `ensemble_boosting_metrics_r2` FLOAT DEFAULT NULL,
 
   `ensemble_stacking_completed` BOOLEAN DEFAULT false,
@@ -148,6 +154,7 @@ CREATE TABLE IF NOT EXISTS `experiment_status` (
   `ensemble_stacking_base_models` JSON DEFAULT NULL,
   `ensemble_stacking_metrics_rmse` FLOAT DEFAULT NULL,
   `ensemble_stacking_metrics_mae` FLOAT DEFAULT NULL,
+  `ensemble_stacking_metrics_mape` FLOAT DEFAULT NULL,
   `ensemble_stacking_metrics_r2` FLOAT DEFAULT NULL,
 
   `selected_best_model` ENUM('ma', 'exp', 'arima', 'lstm', 'ensemble_weighted', 'ensemble_boosting', 'ensemble_stacking') DEFAULT NULL,

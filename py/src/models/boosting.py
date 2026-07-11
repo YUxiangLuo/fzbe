@@ -30,6 +30,7 @@ from ensemble_utils import (
 from metrics import mae, mape, r2, rmse
 from model_defaults import resolve_lstm_look_back
 from model_info import attach_method_metadata, ensure_state_metadata
+from model_validation import validate_minimum_evaluation_points
 from serialization import dump_model, load_model
 from subprocess_utils import (
     extract_predictions_from_result,
@@ -47,7 +48,7 @@ IMPLEMENTATION_NOTES = [
     "梯度提升在平方误差损失下等价于逐步拟合残差；本系统借鉴这一思想，但候选学习器是 MA、ES、ARIMA、LSTM 等时间序列模型。",
     "AdaBoost 通过样本权重实现错误关注；本系统的时间序列基础模型不支持样本权重，因此采用残差学习的加法模型。",
     "每一轮在候选模型中贪心选择最能降低验证残差 RMSE 的模型，并用学习率控制新增阶段贡献。",
-    "预测值附带的 std_dev 是评估段残差的常数标准差，不随预测步长增长，与 ARIMA 随步长展宽的置信区间口径不同。",
+    "预测值附带的 std_dev 是至少两个评估残差计算出的样本标准差（ddof=1），对各预测期保持常数；ARIMA 的区间会随步长展宽。",
 ]
 
 
@@ -524,6 +525,7 @@ def _validate_training_args(
         raise ValueError(f"[VALIDATION] Invalid eval range: [{es},{ee}], n_obs={n}")
     if es <= te:
         raise ValueError("[VALIDATION] eval_start must be > train_end.")
+    validate_minimum_evaluation_points(es, ee)
 
     for model_name in models_to_use:
         if model_name not in model_params:

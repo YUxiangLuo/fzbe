@@ -355,13 +355,17 @@ modelsController.get(
     if (!isModelType(modelTypeParam)) {
       return c.json({ error: "指定的模型类型无效" }, 400);
     }
+    const sessionId = c.req.param("session_id");
+    if (!sessionId) {
+      return c.json({ error: "分阶段训练会话 ID 无效" }, 400);
+    }
 
     const payload = c.get("jwtPayload") as JwtPayload;
     try {
       const session = await getGuidedTrainingSession(
         modelTypeParam,
         payload.sub,
-        c.req.param("session_id"),
+        sessionId,
       );
       return c.json(session);
     } catch (error: unknown) {
@@ -388,14 +392,19 @@ modelsController.post(
     if (!isModelType(modelTypeParam)) {
       return c.json({ error: "指定的模型类型无效" }, 400);
     }
+    const sessionId = c.req.param("session_id");
+    const stepId = c.req.param("step_id");
+    if (!sessionId || !stepId) {
+      return c.json({ error: "分阶段训练会话或步骤 ID 无效" }, 400);
+    }
 
     const payload = c.get("jwtPayload") as JwtPayload;
     try {
       const session = await runGuidedTrainingStep(
         modelTypeParam,
         payload.sub,
-        c.req.param("session_id"),
-        c.req.param("step_id"),
+        sessionId,
+        stepId,
       );
       return c.json(session);
     } catch (error: unknown) {

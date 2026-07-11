@@ -33,6 +33,7 @@ from ensemble_utils import (
 from metrics import mae, mape, r2, rmse
 from model_defaults import resolve_lstm_look_back
 from model_info import attach_method_metadata, ensure_state_metadata
+from model_validation import validate_minimum_evaluation_points
 from serialization import dump_model, load_model
 from subprocess_utils import (
     extract_predictions_from_result,
@@ -49,7 +50,7 @@ IMPLEMENTATION_NOTES = [
     "本系统先用时间顺序留出的验证段估计各基础模型残差均方误差（MSE），再按其倒数归一化为权重。",
     "这样既继承误差越小权重越高的逆方差思想，也会惩罚销量预测中常见的系统性高估或低估。",
     "所有基础模型最终会在完整训练区间重训，再用固定权重组合评估或未来预测。",
-    "预测值附带的 std_dev 是评估段残差的常数标准差，不随预测步长增长，与 ARIMA 随步长展宽的置信区间口径不同。",
+    "预测值附带的 std_dev 是至少两个评估残差计算出的样本标准差（ddof=1），对各预测期保持常数；ARIMA 的区间会随步长展宽。",
 ]
 
 
@@ -348,6 +349,7 @@ def _validate_training_args(
         raise ValueError(f"[VALIDATION] Invalid eval range: [{es},{ee}], n_obs={n}")
     if es <= te:
         raise ValueError("[VALIDATION] eval_start must be > train_end.")
+    validate_minimum_evaluation_points(es, ee)
 
     for model_name in models_to_use:
         if model_name not in model_params:

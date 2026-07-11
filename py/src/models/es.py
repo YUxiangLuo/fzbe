@@ -13,6 +13,7 @@ from data_utils import ParsedData, load_data_from_json
 from logger import log, get_log_contents
 from metrics import mae, mape, r2, rmse
 from model_info import attach_method_metadata, ensure_state_metadata
+from model_validation import validate_minimum_evaluation_points
 from serialization import dump_model, load_model
 
 MODEL_TYPE = "es"
@@ -21,7 +22,7 @@ FORECAST_STRATEGY = "flat_simple_exponential_smoothing"
 IMPLEMENTATION_NOTES = [
     "本系统实现教科书中的一次指数平滑，平滑系数 alpha 满足 0 < alpha < 1。",
     "一次指数平滑的多步未来销量预测为水平外推；趋势和季节性需要 Holt 或 Holt-Winters 扩展，本系统未在该模型中启用。",
-    "预测值附带的 std_dev 是评估段残差的常数标准差，不随预测步长增长，与 ARIMA 随步长展宽的置信区间口径不同。",
+    "预测值附带的 std_dev 是至少两个评估残差计算出的样本标准差（ddof=1），对各预测期保持常数；ARIMA 的区间会随步长展宽。",
 ]
 
 # Type alias for input flexibility
@@ -141,6 +142,7 @@ def _validate_training_args(y: ArrayLike, ts: int, te: int, es: int, ee: int, al
     if es <= te:
         log.error(f"Evaluation start {es} must be after training end {te}")
         raise ValueError(f"[VALIDATION] Evaluation start ({es}) must be after training end ({te}).")
+    validate_minimum_evaluation_points(es, ee)
     if not (0.0 < alpha < 1.0):
         log.error(f"Alpha {alpha} must be in (0, 1)")
         raise ValueError(f"[VALIDATION] Alpha must be in (0, 1), got {alpha}")

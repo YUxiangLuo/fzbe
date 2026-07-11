@@ -31,6 +31,7 @@ from ensemble_utils import (
 from metrics import mae, mape, r2, rmse
 from model_defaults import resolve_lstm_look_back
 from model_info import attach_method_metadata, ensure_state_metadata
+from model_validation import validate_minimum_evaluation_points
 from serialization import dump_model, load_model
 from subprocess_utils import (
     extract_predictions_from_result,
@@ -47,7 +48,7 @@ IMPLEMENTATION_NOTES = [
     "本系统按时间顺序将训练区间拆成 Level-0 和 Level-1，避免普通 K 折交叉验证破坏时间序列顺序。",
     "元模型使用非负线性回归且无截距，并将系数归一化为权重；样本不足或共线性严重时回退为 inverse-MAE 权重。",
     "训练数据较少或基础模型较多时，Level-1 样本数不足会触发 inverse-MAE 回退，此时 Stacking 实际退化为逆误差加权，具体策略与原因见 meta_model 字段。",
-    "预测值附带的 std_dev 是评估段残差的常数标准差，不随预测步长增长，与 ARIMA 随步长展宽的置信区间口径不同。",
+    "预测值附带的 std_dev 是至少两个评估残差计算出的样本标准差（ddof=1），对各预测期保持常数；ARIMA 的区间会随步长展宽。",
 ]
 
 
@@ -435,6 +436,7 @@ def _validate_training_args(
     # Eval must start after train
     if es <= te:
         raise ValueError("[VALIDATION] eval_start must be > train_end.")
+    validate_minimum_evaluation_points(es, ee)
 
     # Validate each model has required parameters
     for model_name in models_to_use:
