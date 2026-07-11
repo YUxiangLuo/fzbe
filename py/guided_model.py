@@ -282,7 +282,8 @@ def _run_es(step_id: str, args, state: Dict[str, Any]) -> Dict[str, Any]:
         y = parsed_data.y
         timestamps = parsed_data.timestamps or [str(i) for i in range(parsed_data.n_obs)]
         ts, te, es_idx, ee = _parse_common_ranges(args)
-        alpha = float(getattr(args, "alpha", 0.5))
+        alpha_arg = getattr(args, "alpha", None)
+        alpha = float(alpha_arg) if alpha_arg is not None else 0.5
         es._validate_training_args(y, ts, te, es_idx, ee, alpha)
         state.clear()
         state.update({
@@ -443,6 +444,7 @@ def _run_arima(step_id: str, args, state: Dict[str, Any]) -> Dict[str, Any]:
         d = int(args.d)
         train_size = te - ts + 1
         max_p, max_q = _resolve_arima_limits(train_size, getattr(args, "max_p", None), getattr(args, "max_q", None))
+        arima._validate_arima_search_args(d, max_p, max_q)
 
         if not (0 <= ts <= te < len(y)):
             raise ValueError(f"[VALIDATION] Invalid train range: [{ts},{te}], must be within [0, {len(y)-1}]")

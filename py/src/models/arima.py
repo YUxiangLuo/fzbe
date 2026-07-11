@@ -60,6 +60,14 @@ def _validate_arima_train_size(train_size: int, d: int, context: str) -> int:
     return effective_train_size
 
 
+def _validate_arima_search_args(d: int, max_p: int, max_q: int) -> None:
+    """Validate search bounds shared by standalone and guided training."""
+    if d < 0:
+        raise ValueError(f"[VALIDATION] d must be >= 0, got {d}")
+    if max_p < 0 or max_q < 0:
+        raise ValueError("[VALIDATION] max_p and max_q must be >= 0")
+
+
 def _run_auto_arima_search(
     y_train: np.ndarray,
     d: int,
@@ -161,10 +169,7 @@ def train_and_evaluate(
     """
     log.info(f"Starting ARIMA train_and_evaluate: d={d}, max_p={max_p}, max_q={max_q}, train_range={train_range}, eval_range={eval_range}")
 
-    if d < 0:
-        raise ValueError(f"[VALIDATION] d must be >= 0, got {d}")
-    if max_p < 0 or max_q < 0:
-        raise ValueError("[VALIDATION] max_p and max_q must be >= 0")
+    _validate_arima_search_args(d, max_p, max_q)
 
     y_train = y[train_range]
     y_eval = y[eval_range]
@@ -465,6 +470,7 @@ def run(args) -> None:
         if max_p_arg is None or max_q_arg is None:
             log.info(f"Auto-selected max_p={max_p}, max_q={max_q} for preventing overfitting")
     log.debug(f"Training params: d={d}, max_p={max_p}, max_q={max_q}")
+    _validate_arima_search_args(d, max_p, max_q)
 
     if not (0 <= ts <= te < len(y)):
         log.error(f"Invalid training range: [{ts}, {te}], data size: {len(y)}")
