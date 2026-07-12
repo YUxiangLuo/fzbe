@@ -37,9 +37,11 @@ export const buildGuidedTrainingStatePath = (
   "state.pkl",
 );
 
+/**
+ * 单实验单模型执行去重的按键锁 key（进程内 KeyedLock 使用）。
+ * 沿用旧 advisory lock 的命名格式，便于日志排查。
+ */
 export const buildModelExecutionLockName = (
   experimentId: number,
   modelType: ModelType,
 ): string => `${LOCK_NAMESPACE}:exp:${experimentId}:${modelType}`;
-
-export const buildModelSlotLockName = (slot: number): string => `${LOCK_NAMESPACE}:slot:${slot}`;

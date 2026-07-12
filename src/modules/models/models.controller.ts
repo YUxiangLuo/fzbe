@@ -173,7 +173,7 @@ modelsController.post(
         return c.json({ error: "同一模型正在训练或预测，请稍后再试" }, 409);
       }
 
-      slotLock = await acquireModelSlot();
+      slotLock = await acquireModelSlot("train");
       if (!slotLock) {
         return c.json({ error: "模型服务繁忙，请稍后再试" }, 429);
       }
@@ -250,7 +250,7 @@ modelsController.post(
         return c.json({ error: "同一模型正在训练或预测，请稍后再试" }, 409);
       }
 
-      slotLock = await acquireModelSlot();
+      slotLock = await acquireModelSlot("train");
       if (!slotLock) {
         await releaseModelExecutionLock(executionLock);
         executionLock = null;
@@ -463,7 +463,7 @@ modelsController.post(
         }
       }
 
-      slotLock = await acquireModelSlot();
+      slotLock = await acquireModelSlot("prepare");
       if (!slotLock) {
         return c.json({ error: "模型服务繁忙，请稍后再试" }, 429);
       }
@@ -544,7 +544,7 @@ modelsController.post(
         return c.json({ error: "同一模型正在训练或预测，请稍后再试" }, 409);
       }
 
-      slotLock = await acquireModelSlot();
+      slotLock = await acquireModelSlot("predict");
       if (!slotLock) {
         return c.json({ error: "模型服务繁忙，请稍后再试" }, 429);
       }

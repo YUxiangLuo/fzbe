@@ -21,9 +21,17 @@ function parsePositiveIntegerEnv(name: string): number | null {
 }
 
 const SYSTEM_PARALLELISM = Math.max(1, availableParallelism());
-const DEFAULT_MODEL_JOB_CAP = 50;
+const DEFAULT_TRAIN_JOB_CAP = 50;
+const DEFAULT_PREDICT_JOB_CAP = 50;
+const DEFAULT_PREPARE_JOB_CAP = 25;
 const DEFAULT_PDF_JOB_CAP = 12;
-const DEFAULT_MAX_CONCURRENT_MODEL_JOBS = Math.min(SYSTEM_PARALLELISM, DEFAULT_MODEL_JOB_CAP);
+// 训练/预测按满 CPU 封顶到 50；生产准备较少见，按 CPU 的一半封顶到 25。
+const DEFAULT_MAX_CONCURRENT_TRAIN_JOBS = Math.min(SYSTEM_PARALLELISM, DEFAULT_TRAIN_JOB_CAP);
+const DEFAULT_MAX_CONCURRENT_PREDICT_JOBS = Math.min(SYSTEM_PARALLELISM, DEFAULT_PREDICT_JOB_CAP);
+const DEFAULT_MAX_CONCURRENT_PREPARE_JOBS = Math.min(
+  DEFAULT_PREPARE_JOB_CAP,
+  Math.max(1, Math.ceil(SYSTEM_PARALLELISM / 2)),
+);
 const DEFAULT_MAX_CONCURRENT_PDF_JOBS = Math.min(
   DEFAULT_PDF_JOB_CAP,
   Math.max(1, Math.ceil(SYSTEM_PARALLELISM / 4)),
@@ -82,24 +90,38 @@ export const TIMEOUTS = {
 // ============================================
 // 并发限制
 // ============================================
-const MAX_CONCURRENT_MODEL_JOBS =
-  parsePositiveIntegerEnv("MAX_CONCURRENT_MODEL_JOBS") ??
-  parsePositiveIntegerEnv("MODEL_CONCURRENCY") ??
-  DEFAULT_MAX_CONCURRENT_MODEL_JOBS;
+// 训练、生产准备、预测、PDF 四种行为各自独立限流，互不挤占。
+// 每个行为只有一个对应的环境变量；未设置时使用该行为的自适应默认值。
+const MAX_CONCURRENT_TRAIN_JOBS =
+  parsePositiveIntegerEnv("MAX_CONCURRENT_TRAIN_JOBS") ??
+  DEFAULT_MAX_CONCURRENT_TRAIN_JOBS;
+const MAX_CONCURRENT_PREPARE_JOBS =
+  parsePositiveIntegerEnv("MAX_CONCURRENT_PREPARE_JOBS") ??
+  DEFAULT_MAX_CONCURRENT_PREPARE_JOBS;
+const MAX_CONCURRENT_PREDICT_JOBS =
+  parsePositiveIntegerEnv("MAX_CONCURRENT_PREDICT_JOBS") ??
+  DEFAULT_MAX_CONCURRENT_PREDICT_JOBS;
 const MAX_CONCURRENT_PDF_JOBS =
   parsePositiveIntegerEnv("MAX_CONCURRENT_PDF_JOBS") ??
-  parsePositiveIntegerEnv("PDF_CONCURRENCY") ??
   DEFAULT_MAX_CONCURRENT_PDF_JOBS;
 
 export const CONCURRENCY_LIMITS = {
   /** 当前系统可用并行度（通常等于可用 CPU 核/线程数） */
   SYSTEM_PARALLELISM,
-  /** 默认模型任务上限；按 64 核 / 50 人课堂配置，超过 50 默认仍封顶，可用环境变量覆盖 */
-  DEFAULT_MODEL_JOB_CAP,
+  /** 默认训练任务上限（含引导训练）；按 64 核 / 50 人课堂配置，封顶 50 */
+  DEFAULT_TRAIN_JOB_CAP,
+  /** 默认生产准备任务上限；较少见，按 CPU/2 估算并封顶 25 */
+  DEFAULT_PREPARE_JOB_CAP,
+  /** 默认预测任务上限；较轻量，封顶 50 */
+  DEFAULT_PREDICT_JOB_CAP,
   /** 默认 PDF 任务上限；PDF/Chromium 更重，自动值按 CPU/4 估算并封顶 */
   DEFAULT_PDF_JOB_CAP,
-  /** 最大并发模型训练/生产准备/预测任务 */
-  MAX_CONCURRENT_MODEL_JOBS,
+  /** 最大并发训练任务（引导训练共用此池） */
+  MAX_CONCURRENT_TRAIN_JOBS,
+  /** 最大并发生产准备任务 */
+  MAX_CONCURRENT_PREPARE_JOBS,
+  /** 最大并发预测任务 */
+  MAX_CONCURRENT_PREDICT_JOBS,
   /** 最大并发 PDF 生成（Puppeteer）任务 */
   MAX_CONCURRENT_PDF_JOBS,
 } as const;
@@ -132,24 +154,29 @@ export const CLEANUP_RETENTION = {
 // 数据库连接池
 // ============================================
 /**
- * 连接池大小必须 > 2 × MAX_CONCURRENT_MODEL_JOBS，否则会死锁：
- * 每个模型任务持有 2 个连接（执行锁 + 槽位锁），训练/预测逻辑还需要
- * 额外连接执行数据库查询。若连接池耗尽，查询等待连接释放，但连接被锁
- * 占用、锁又要等训练完成——形成循环等待。
+ * 并发限流改为进程内信号量后，模型任务不再持有任何 advisory lock 连接，
+ * 连接池不再需要满足旧的 "> 2 × 模型并发" 死锁约束。
  *
- * QUERY_HEADROOM：除了锁连接，其他模块（auth、experiments、reports 等）
- * 也共享同一连接池。默认取 max(40, modelJobs/2)，50 模型并发时连接池为 140。
+ * 现在连接池只需覆盖同时在途的数据库查询：最坏情况下四个池全部满载，
+ * 每个在跑的任务偶发一条查询，再加上其他模块（auth、experiments、reports 等）
+ * 的常规流量。因此按 "四池容量之和 + 查询余量" 保守估算。
+ *
+ * QUERY_HEADROOM：留给常规接口/事务的余量，默认 max(40, 池容量之和 / 4)。
  */
-const LOCK_CONNECTIONS = 2 * CONCURRENCY_LIMITS.MAX_CONCURRENT_MODEL_JOBS;
+const ACTIVE_JOB_CEILING =
+  CONCURRENCY_LIMITS.MAX_CONCURRENT_TRAIN_JOBS +
+  CONCURRENCY_LIMITS.MAX_CONCURRENT_PREPARE_JOBS +
+  CONCURRENCY_LIMITS.MAX_CONCURRENT_PREDICT_JOBS +
+  CONCURRENCY_LIMITS.MAX_CONCURRENT_PDF_JOBS;
 const QUERY_HEADROOM =
   parsePositiveIntegerEnv("DB_QUERY_HEADROOM") ??
-  Math.max(40, Math.ceil(CONCURRENCY_LIMITS.MAX_CONCURRENT_MODEL_JOBS / 2));
+  Math.max(40, Math.ceil(ACTIVE_JOB_CEILING / 4));
 const CONNECTION_LIMIT =
   parsePositiveIntegerEnv("DB_CONNECTION_LIMIT") ??
-  LOCK_CONNECTIONS + QUERY_HEADROOM;
+  ACTIVE_JOB_CEILING + QUERY_HEADROOM;
 
 export const DB_POOL_CONFIG = {
-  LOCK_CONNECTIONS,
+  ACTIVE_JOB_CEILING,
   QUERY_HEADROOM,
   CONNECTION_LIMIT,
 } as const;

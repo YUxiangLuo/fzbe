@@ -147,7 +147,6 @@ mock.module(modelRuntimeModulePath, () => ({
   ),
   buildModelExecutionLockName: (experimentId: number, modelType: string) =>
     `fangzhen-model:exp:${experimentId}:${modelType}`,
-  buildModelSlotLockName: (slot: number) => `fangzhen-model:slot:${slot}`,
 }));
 
 const {

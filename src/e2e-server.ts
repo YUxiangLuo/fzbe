@@ -1,5 +1,3 @@
-process.env.E2E_SERVER ??= "1";
-
 const { runServerStartupPreflight, serverConfig } = await import("./index");
 
 await runServerStartupPreflight();

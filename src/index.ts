@@ -17,9 +17,10 @@ import { manualsController } from "./modules/manuals";
 import { questionBankController } from "./modules/question-bank";
 import { quizzesController } from "./modules/quizzes";
 import { reportsController } from "./modules/reports";
-import { getPdfQueueStats, holdPdfQueueSlotForTest } from "./modules/reports/reports.service";
+import { getPdfQueueStats } from "./modules/reports/reports.service";
 import { modelsController } from "./modules/models";
 import { cleanupExpiredGuidedTrainingSessions, cleanupStaleModelArtifacts } from "./modules/models/models.service";
+import { getModelPoolStats } from "./modules/models/model-locks";
 import { classesController } from "./modules/classes";
 import { classMembersController } from "./modules/class-members";
 import { datasetsController } from "./modules/datasets";
@@ -459,10 +460,11 @@ app.get("/api/v1/runtime-info", (c) =>
     port: env.PORT,
     concurrency: {
       systemParallelism: CONCURRENCY_LIMITS.SYSTEM_PARALLELISM,
-      maxConcurrentModelJobs: CONCURRENCY_LIMITS.MAX_CONCURRENT_MODEL_JOBS,
+      maxConcurrentTrainJobs: CONCURRENCY_LIMITS.MAX_CONCURRENT_TRAIN_JOBS,
+      maxConcurrentPrepareJobs: CONCURRENCY_LIMITS.MAX_CONCURRENT_PREPARE_JOBS,
+      maxConcurrentPredictJobs: CONCURRENCY_LIMITS.MAX_CONCURRENT_PREDICT_JOBS,
       maxConcurrentPdfJobs: CONCURRENCY_LIMITS.MAX_CONCURRENT_PDF_JOBS,
       dbConnectionLimit: connectionLimit,
-      dbLockConnections: DB_POOL_CONFIG.LOCK_CONNECTIONS,
       dbQueryHeadroom: DB_POOL_CONFIG.QUERY_HEADROOM,
       pythonModelProcessThreads: PYTHON_RUNTIME_CONFIG.MODEL_PROCESS_THREADS,
       pythonTensorflowInterOpThreads: PYTHON_RUNTIME_CONFIG.TF_INTER_OP_THREADS,
@@ -471,21 +473,9 @@ app.get("/api/v1/runtime-info", (c) =>
       pdfQueueMs: TIMEOUTS.PDF_QUEUE,
       pdfGenerationMs: TIMEOUTS.PDF_GENERATION,
     },
+    modelPools: getModelPoolStats(),
     pdfQueue: getPdfQueueStats(),
   }));
-
-if (process.env.E2E_SERVER === "1") {
-  app.post("/api/v1/e2e/pdf-slot/hold", async (c) => {
-    const body = await c.req.json().catch(() => ({})) as { hold_ms?: unknown };
-    const holdMs = Number(body.hold_ms ?? 5_000);
-    if (!Number.isInteger(holdMs) || holdMs <= 0 || holdMs > 30_000) {
-      return c.json({ error: "hold_ms must be an integer between 1 and 30000" }, 400);
-    }
-
-    await holdPdfQueueSlotForTest(holdMs);
-    return c.json({ data: { held_ms: holdMs } });
-  });
-}
 
 app.get("/manuals/:filename", jwtAuth, async (c) => {
   const payload = c.get("jwtPayload") as JwtPayload;
@@ -756,18 +746,18 @@ async function readDatabaseMaxConnections(): Promise<number | null> {
 }
 
 export async function runServerStartupPreflight() {
-  // ---- 启动校验：连接池容量 vs. 并发模型任务 ----
-  const minRequired = DB_POOL_CONFIG.LOCK_CONNECTIONS + DB_POOL_CONFIG.QUERY_HEADROOM;
+  // ---- 启动校验：连接池容量下限 ----
+  // 并发限流已改为进程内信号量，模型任务不再占用连接，旧的 "> 2 × 模型并发" 死锁约束不再适用。
+  // 仅保留一个基本下限校验，避免连接池被显式配置得过小、连常规查询余量都不够。
+  const minRequired = DB_POOL_CONFIG.QUERY_HEADROOM;
   if (connectionLimit < minRequired) {
     logger.fatal(
       {
         connectionLimit,
-        maxConcurrentModelJobs: CONCURRENCY_LIMITS.MAX_CONCURRENT_MODEL_JOBS,
-        lockConnections: DB_POOL_CONFIG.LOCK_CONNECTIONS,
         queryHeadroom: DB_POOL_CONFIG.QUERY_HEADROOM,
         minRequired,
       },
-      "数据库连接池容量不足：connectionLimit 应至少为 2 × MAX_CONCURRENT_MODEL_JOBS + DB_QUERY_HEADROOM，否则并发训练时可能死锁或阻塞普通查询",
+      "数据库连接池容量不足：connectionLimit 应至少覆盖 DB_QUERY_HEADROOM，否则常规查询会被阻塞",
     );
     process.exit(1);
   }
@@ -776,8 +766,8 @@ export async function runServerStartupPreflight() {
     const databaseMaxConnections = await readDatabaseMaxConnections();
     if (databaseMaxConnections !== null && databaseMaxConnections < connectionLimit) {
       logger.fatal(
-        { connectionLimit, databaseMaxConnections, maxConcurrentModelJobs: CONCURRENCY_LIMITS.MAX_CONCURRENT_MODEL_JOBS },
-        "数据库 max_connections 小于后端连接池容量：请提高 MariaDB/MySQL max_connections，或降低 MAX_CONCURRENT_MODEL_JOBS/DB_CONNECTION_LIMIT",
+        { connectionLimit, databaseMaxConnections, dbQueryHeadroom: DB_POOL_CONFIG.QUERY_HEADROOM },
+        "数据库 max_connections 小于后端连接池容量：请提高 MariaDB/MySQL max_connections，或降低 DB_CONNECTION_LIMIT",
       );
       process.exit(1);
     }

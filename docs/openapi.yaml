@@ -1347,7 +1347,7 @@ paths:
       tags: [Runtime]
       summary: 获取后端运行时与并发配置
       operationId: getRuntimeInfo
-      description: 返回当前后端生效的数据库、模型/PDF 并发、超时和 PDF 队列瞬时状态，用于部署后核对与课堂监控。
+      description: 返回当前后端生效的数据库配置、训练/生产准备/预测/PDF 四个独立并发池的上限与瞬时状态、以及相关超时，用于部署后核对与课堂监控。
       security: []
       responses:
         '200':

@@ -4,10 +4,10 @@ import path from "node:path";
 const projectRoot = path.resolve(import.meta.dir, "../../..");
 
 const CONFIG_ENV_NAMES = [
-  "MAX_CONCURRENT_MODEL_JOBS",
-  "MODEL_CONCURRENCY",
+  "MAX_CONCURRENT_TRAIN_JOBS",
+  "MAX_CONCURRENT_PREPARE_JOBS",
+  "MAX_CONCURRENT_PREDICT_JOBS",
   "MAX_CONCURRENT_PDF_JOBS",
-  "PDF_CONCURRENCY",
   "PDF_QUEUE_TIMEOUT_MS",
   "PDF_GENERATION_TIMEOUT_MS",
   "DB_QUERY_HEADROOM",
@@ -37,13 +37,17 @@ console.log(JSON.stringify({
 interface ConstantsSnapshot {
   CONCURRENCY_LIMITS: {
     SYSTEM_PARALLELISM: number;
-    DEFAULT_MODEL_JOB_CAP: number;
+    DEFAULT_TRAIN_JOB_CAP: number;
+    DEFAULT_PREPARE_JOB_CAP: number;
+    DEFAULT_PREDICT_JOB_CAP: number;
     DEFAULT_PDF_JOB_CAP: number;
-    MAX_CONCURRENT_MODEL_JOBS: number;
+    MAX_CONCURRENT_TRAIN_JOBS: number;
+    MAX_CONCURRENT_PREPARE_JOBS: number;
+    MAX_CONCURRENT_PREDICT_JOBS: number;
     MAX_CONCURRENT_PDF_JOBS: number;
   };
   DB_POOL_CONFIG: {
-    LOCK_CONNECTIONS: number;
+    ACTIVE_JOB_CEILING: number;
     QUERY_HEADROOM: number;
     CONNECTION_LIMIT: number;
   };
@@ -100,18 +104,25 @@ async function loadConstantsSnapshot(
 }
 
 describe("concurrency safeguards", () => {
-  test("defaults are automatically sized from available CPU parallelism", async () => {
+  test("per-behavior defaults are automatically sized from available CPU parallelism", async () => {
     const { CONCURRENCY_LIMITS, PYTHON_RUNTIME_CONFIG, RATE_LIMITS, TIMEOUTS } =
       await loadConstantsSnapshot();
+    const sp = CONCURRENCY_LIMITS.SYSTEM_PARALLELISM;
 
-    expect(CONCURRENCY_LIMITS.DEFAULT_MODEL_JOB_CAP).toBe(50);
+    expect(CONCURRENCY_LIMITS.DEFAULT_TRAIN_JOB_CAP).toBe(50);
+    expect(CONCURRENCY_LIMITS.DEFAULT_PREDICT_JOB_CAP).toBe(50);
+    expect(CONCURRENCY_LIMITS.DEFAULT_PREPARE_JOB_CAP).toBe(25);
     expect(CONCURRENCY_LIMITS.DEFAULT_PDF_JOB_CAP).toBe(12);
-    expect(CONCURRENCY_LIMITS.MAX_CONCURRENT_MODEL_JOBS).toBe(
-      Math.min(CONCURRENCY_LIMITS.SYSTEM_PARALLELISM, 50),
+
+    expect(CONCURRENCY_LIMITS.MAX_CONCURRENT_TRAIN_JOBS).toBe(Math.min(sp, 50));
+    expect(CONCURRENCY_LIMITS.MAX_CONCURRENT_PREDICT_JOBS).toBe(Math.min(sp, 50));
+    expect(CONCURRENCY_LIMITS.MAX_CONCURRENT_PREPARE_JOBS).toBe(
+      Math.min(25, Math.max(1, Math.ceil(sp / 2))),
     );
     expect(CONCURRENCY_LIMITS.MAX_CONCURRENT_PDF_JOBS).toBe(
-      Math.min(12, Math.max(1, Math.ceil(CONCURRENCY_LIMITS.SYSTEM_PARALLELISM / 4))),
+      Math.min(12, Math.max(1, Math.ceil(sp / 4))),
     );
+
     expect(TIMEOUTS.PDF_QUEUE).toBe(60_000);
     expect(TIMEOUTS.PDF_GENERATION).toBe(30_000);
     expect(PYTHON_RUNTIME_CONFIG.MODEL_PROCESS_THREADS).toBe(1);
@@ -124,23 +135,22 @@ describe("concurrency safeguards", () => {
     expect(RATE_LIMITS.AUTH_REGISTER_MAX_PER_ACCOUNT).toBe(3);
   });
 
-  test("CONNECTION_LIMIT covers model advisory locks plus query headroom", async () => {
+  test("CONNECTION_LIMIT is decoupled from locks: sum of pool ceilings plus query headroom", async () => {
     const { CONCURRENCY_LIMITS, DB_POOL_CONFIG } = await loadConstantsSnapshot();
-    const expectedQueryHeadroom = Math.max(
-      40,
-      Math.ceil(CONCURRENCY_LIMITS.MAX_CONCURRENT_MODEL_JOBS / 2),
-    );
+    const expectedCeiling =
+      CONCURRENCY_LIMITS.MAX_CONCURRENT_TRAIN_JOBS +
+      CONCURRENCY_LIMITS.MAX_CONCURRENT_PREPARE_JOBS +
+      CONCURRENCY_LIMITS.MAX_CONCURRENT_PREDICT_JOBS +
+      CONCURRENCY_LIMITS.MAX_CONCURRENT_PDF_JOBS;
+    const expectedQueryHeadroom = Math.max(40, Math.ceil(expectedCeiling / 4));
 
-    expect(DB_POOL_CONFIG.LOCK_CONNECTIONS).toBe(
-      2 * CONCURRENCY_LIMITS.MAX_CONCURRENT_MODEL_JOBS,
-    );
+    expect(DB_POOL_CONFIG).not.toHaveProperty("LOCK_CONNECTIONS");
+    expect(DB_POOL_CONFIG.ACTIVE_JOB_CEILING).toBe(expectedCeiling);
     expect(DB_POOL_CONFIG.QUERY_HEADROOM).toBe(expectedQueryHeadroom);
-    expect(DB_POOL_CONFIG.CONNECTION_LIMIT).toBe(
-      DB_POOL_CONFIG.LOCK_CONNECTIONS + DB_POOL_CONFIG.QUERY_HEADROOM,
-    );
+    expect(DB_POOL_CONFIG.CONNECTION_LIMIT).toBe(expectedCeiling + expectedQueryHeadroom);
   });
 
-  test("explicit environment values override concurrency, timeout, database, and Python defaults", async () => {
+  test("explicit per-behavior environment values override each pool independently", async () => {
     const {
       CONCURRENCY_LIMITS,
       DB_POOL_CONFIG,
@@ -149,7 +159,9 @@ describe("concurrency safeguards", () => {
       TIMEOUTS,
     } =
       await loadConstantsSnapshot({
-        MAX_CONCURRENT_MODEL_JOBS: "37",
+        MAX_CONCURRENT_TRAIN_JOBS: "37",
+        MAX_CONCURRENT_PREPARE_JOBS: "11",
+        MAX_CONCURRENT_PREDICT_JOBS: "22",
         MAX_CONCURRENT_PDF_JOBS: "9",
         PDF_QUEUE_TIMEOUT_MS: "70000",
         PDF_GENERATION_TIMEOUT_MS: "45000",
@@ -165,11 +177,13 @@ describe("concurrency safeguards", () => {
         AUTH_REGISTER_RATE_LIMIT_MAX_PER_ACCOUNT: "2",
       });
 
-    expect(CONCURRENCY_LIMITS.MAX_CONCURRENT_MODEL_JOBS).toBe(37);
+    expect(CONCURRENCY_LIMITS.MAX_CONCURRENT_TRAIN_JOBS).toBe(37);
+    expect(CONCURRENCY_LIMITS.MAX_CONCURRENT_PREPARE_JOBS).toBe(11);
+    expect(CONCURRENCY_LIMITS.MAX_CONCURRENT_PREDICT_JOBS).toBe(22);
     expect(CONCURRENCY_LIMITS.MAX_CONCURRENT_PDF_JOBS).toBe(9);
     expect(TIMEOUTS.PDF_QUEUE).toBe(70_000);
     expect(TIMEOUTS.PDF_GENERATION).toBe(45_000);
-    expect(DB_POOL_CONFIG.LOCK_CONNECTIONS).toBe(74);
+    expect(DB_POOL_CONFIG.ACTIVE_JOB_CEILING).toBe(37 + 11 + 22 + 9);
     expect(DB_POOL_CONFIG.QUERY_HEADROOM).toBe(44);
     expect(DB_POOL_CONFIG.CONNECTION_LIMIT).toBe(150);
     expect(PYTHON_RUNTIME_CONFIG.MODEL_PROCESS_THREADS).toBe(2);
@@ -182,19 +196,23 @@ describe("concurrency safeguards", () => {
     expect(RATE_LIMITS.AUTH_REGISTER_MAX_PER_ACCOUNT).toBe(2);
   });
 
-  test("legacy concurrency environment names remain supported", async () => {
+  test("each model pool is set independently by its own env var", async () => {
     const { CONCURRENCY_LIMITS } = await loadConstantsSnapshot({
-      MODEL_CONCURRENCY: "33",
-      PDF_CONCURRENCY: "7",
+      MAX_CONCURRENT_TRAIN_JOBS: "3",
     });
 
-    expect(CONCURRENCY_LIMITS.MAX_CONCURRENT_MODEL_JOBS).toBe(33);
-    expect(CONCURRENCY_LIMITS.MAX_CONCURRENT_PDF_JOBS).toBe(7);
+    // Only the train pool changes; the others keep their auto-sized defaults.
+    const sp = CONCURRENCY_LIMITS.SYSTEM_PARALLELISM;
+    expect(CONCURRENCY_LIMITS.MAX_CONCURRENT_TRAIN_JOBS).toBe(3);
+    expect(CONCURRENCY_LIMITS.MAX_CONCURRENT_PREPARE_JOBS).toBe(
+      Math.min(25, Math.max(1, Math.ceil(sp / 2))),
+    );
+    expect(CONCURRENCY_LIMITS.MAX_CONCURRENT_PREDICT_JOBS).toBe(Math.min(sp, 50));
   });
 
   test("invalid positive-integer environment values fail fast", async () => {
-    await expect(loadConstantsSnapshot({ MAX_CONCURRENT_MODEL_JOBS: "0" })).rejects.toThrow(
-      "MAX_CONCURRENT_MODEL_JOBS must be a positive integer",
+    await expect(loadConstantsSnapshot({ MAX_CONCURRENT_TRAIN_JOBS: "0" })).rejects.toThrow(
+      "MAX_CONCURRENT_TRAIN_JOBS must be a positive integer",
     );
 
     await expect(loadConstantsSnapshot({ PDF_QUEUE_TIMEOUT_MS: "30s" })).rejects.toThrow(

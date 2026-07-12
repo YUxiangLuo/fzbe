@@ -26,6 +26,22 @@ export class Semaphore {
     return this.running;
   }
 
+  get capacity(): number {
+    return this.max;
+  }
+
+  /**
+   * 非阻塞获取：有空位立即占用并返回 true，否则立即返回 false（不排队）。
+   * 用于模型任务池，对应旧的 `GET_LOCK(name, 0)` 立即失败语义（满则返回 429）。
+   */
+  tryAcquire(): boolean {
+    if (this.running < this.max) {
+      this.running++;
+      return true;
+    }
+    return false;
+  }
+
   async acquire(timeoutMs?: number): Promise<void> {
     if (this.running < this.max) {
       this.running++;

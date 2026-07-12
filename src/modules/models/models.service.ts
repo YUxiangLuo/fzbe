@@ -1581,7 +1581,7 @@ export async function runGuidedTrainingStep(
       throw new ModelValidationError("同一模型正在训练或预测，请稍后再试");
     }
 
-    slotLock = await acquireModelSlot();
+    slotLock = await acquireModelSlot("train");
     if (!slotLock) {
       throw new ModelValidationError("模型服务繁忙，请稍后再试");
     }

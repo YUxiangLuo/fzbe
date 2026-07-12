@@ -2,7 +2,6 @@ import { describe, expect, test } from "bun:test";
 import {
   buildExperimentScopedModelPath,
   buildModelExecutionLockName,
-  buildModelSlotLockName,
 } from "../../../src/modules/models/model-runtime";
 
 describe("model runtime helpers", () => {
@@ -17,9 +16,5 @@ describe("model runtime helpers", () => {
     expect(buildModelExecutionLockName(42, "weighted_avg")).toBe(
       "fangzhen-model:exp:42:weighted_avg",
     );
-  });
-
-  test("builds slot lock names scoped by slot number", () => {
-    expect(buildModelSlotLockName(2)).toBe("fangzhen-model:slot:2");
   });
 });

@@ -157,4 +157,51 @@ describe("Semaphore", () => {
   test("constructor rejects non-integer", () => {
     expect(() => new Semaphore(1.5)).toThrow("positive integer");
   });
+
+  test("capacity reports the configured max", () => {
+    expect(new Semaphore(3).capacity).toBe(3);
+  });
+
+  describe("tryAcquire (non-blocking)", () => {
+    test("succeeds while below capacity, fails when full", () => {
+      const sem = new Semaphore(2);
+
+      expect(sem.tryAcquire()).toBe(true);
+      expect(sem.tryAcquire()).toBe(true);
+      expect(sem.active).toBe(2);
+
+      // Full — must fail immediately without queueing.
+      expect(sem.tryAcquire()).toBe(false);
+      expect(sem.active).toBe(2);
+      expect(sem.pending).toBe(0);
+    });
+
+    test("a release frees exactly one tryAcquire slot", () => {
+      const sem = new Semaphore(1);
+
+      expect(sem.tryAcquire()).toBe(true);
+      expect(sem.tryAcquire()).toBe(false);
+
+      sem.release();
+      expect(sem.tryAcquire()).toBe(true);
+      expect(sem.tryAcquire()).toBe(false);
+    });
+
+    test("tryAcquire does not steal a slot from a queued acquire waiter", async () => {
+      const sem = new Semaphore(1);
+      expect(sem.tryAcquire()).toBe(true);
+
+      let waiterResolved = false;
+      const waiter = sem.acquire().then(() => { waiterResolved = true; });
+
+      // Releasing hands the slot to the queued waiter, so a subsequent tryAcquire fails.
+      sem.release();
+      expect(sem.tryAcquire()).toBe(false);
+
+      await waiter;
+      expect(waiterResolved).toBe(true);
+
+      sem.release();
+    });
+  });
 });

@@ -16,7 +16,10 @@ logger.info(
     timezone: databasePoolOptions.timezone,
     dateStrings: databasePoolOptions.dateStrings,
     ssl: Boolean(databasePoolOptions.ssl),
-    maxConcurrentModelJobs: CONCURRENCY_LIMITS.MAX_CONCURRENT_MODEL_JOBS,
+    maxConcurrentTrainJobs: CONCURRENCY_LIMITS.MAX_CONCURRENT_TRAIN_JOBS,
+    maxConcurrentPrepareJobs: CONCURRENCY_LIMITS.MAX_CONCURRENT_PREPARE_JOBS,
+    maxConcurrentPredictJobs: CONCURRENCY_LIMITS.MAX_CONCURRENT_PREDICT_JOBS,
+    maxConcurrentPdfJobs: CONCURRENCY_LIMITS.MAX_CONCURRENT_PDF_JOBS,
   },
   "Database connection pool created.",
 );
