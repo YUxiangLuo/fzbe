@@ -1,4 +1,4 @@
-import { Hono } from "hono";
+import { Hono, type Context } from "hono";
 import { jwtAuth, requireStudent } from "../../middleware";
 import { completeModelSchema, predictSchema, prepareProductionSchema, isModelType, getTrainSchemaForModel, type ModelType } from "./models.schema";
 import {
@@ -17,12 +17,12 @@ import {
   prepareExperimentModelForProduction,
   predictExperimentModel,
   completeExperimentModel,
-  acquireModelSlot,
-  releaseModelSlot,
+  acquireModelJobLocks,
+  releaseModelJobLocks,
   acquireModelExecutionLock,
+  acquireModelExecutionLockWithStatus,
   releaseModelExecutionLock,
-  acquireModelArtifactMutationLocks,
-  releaseModelArtifactMutationLocks,
+  type ModelJobLockHandle,
   ModelValidationError,
   ModelNotFoundError,
   ModelAccessError,
@@ -32,10 +32,16 @@ import {
 } from "./models.service";
 import { handleUnexpectedError } from "../../utils/error-handler";
 import type { JwtPayload } from "../../types";
-import { TIMEOUTS } from "../../utils/constants";
+import { CONCURRENCY_LIMITS, TIMEOUTS } from "../../utils/constants";
 
 const modelsController = new Hono();
 const SLOT_FREE_REUSABLE_PRODUCTION_MODEL_TYPES = new Set<ModelType>(["ma", "es", "arima", "lstm"]);
+const MODEL_CAPACITY_RETRY_AFTER = String(CONCURRENCY_LIMITS.MODEL_CAPACITY_RETRY_AFTER_SECONDS);
+
+const respondModelCapacity = (c: Context, message = "模型服务繁忙，请稍后再试") => {
+  c.header("Retry-After", MODEL_CAPACITY_RETRY_AFTER);
+  return c.json({ error: message }, 429);
+};
 
 type StreamSend = (event: object) => void;
 
@@ -177,19 +183,17 @@ modelsController.post(
 
     const body = validation.data;
 
-    let artifactLocks = null;
-    let slotLock = null;
+    let jobLocks: ModelJobLockHandle | null = null;
 
     try {
-      artifactLocks = await acquireModelArtifactMutationLocks(body.experiment_id, modelType);
-      if (!artifactLocks) {
+      const lockAcquisition = await acquireModelJobLocks(body.experiment_id, modelType);
+      if (lockAcquisition.status === "capacity") {
+        return respondModelCapacity(c);
+      }
+      if (lockAcquisition.status === "conflict") {
         return c.json({ error: "同一模型正在训练或预测，请稍后再试" }, 409);
       }
-
-      slotLock = await acquireModelSlot();
-      if (!slotLock) {
-        return c.json({ error: "模型服务繁忙，请稍后再试" }, 429);
-      }
+      jobLocks = lockAcquisition.locks;
 
       const result = await trainModel(modelType, payload.sub, body);
       return c.json(result);
@@ -201,7 +205,7 @@ modelsController.post(
         return c.json({ error: error.message, ...error.details }, 400);
       }
       if (error instanceof ModelCapacityError) {
-        return c.json({ error: error.message }, 429);
+        return respondModelCapacity(c, error.message);
       }
       if (error instanceof ModelConflictError || error instanceof ModelStaleAttemptError) {
         return c.json({ error: error.message }, 409);
@@ -220,8 +224,7 @@ modelsController.post(
       const message = err.message || `${modelType.toUpperCase()} 训练失败`;
       return handleUnexpectedError(c, error, message);
     } finally {
-      await releaseModelSlot(slotLock);
-      await releaseModelArtifactMutationLocks(artifactLocks);
+      await releaseModelJobLocks(jobLocks);
     }
   },
 );
@@ -260,24 +263,19 @@ modelsController.post(
     }
 
     const body = validation.data;
-    let artifactLocks = null;
-    let slotLock = null;
+    let jobLocks: ModelJobLockHandle | null = null;
 
     try {
-      artifactLocks = await acquireModelArtifactMutationLocks(body.experiment_id, modelType);
-      if (!artifactLocks) {
+      const lockAcquisition = await acquireModelJobLocks(body.experiment_id, modelType);
+      if (lockAcquisition.status === "capacity") {
+        return respondModelCapacity(c);
+      }
+      if (lockAcquisition.status === "conflict") {
         return c.json({ error: "同一模型正在训练或预测，请稍后再试" }, 409);
       }
-
-      slotLock = await acquireModelSlot();
-      if (!slotLock) {
-        await releaseModelArtifactMutationLocks(artifactLocks);
-        artifactLocks = null;
-        return c.json({ error: "模型服务繁忙，请稍后再试" }, 429);
-      }
+      jobLocks = lockAcquisition.locks;
     } catch (error) {
-      await releaseModelSlot(slotLock);
-      await releaseModelArtifactMutationLocks(artifactLocks);
+      await releaseModelJobLocks(jobLocks);
       return handleUnexpectedError(c, error, "启动训练流失败");
     }
 
@@ -307,8 +305,7 @@ modelsController.post(
         const normalizedError = normalizeTrainingStreamError(error, modelType);
         send({ type: "error", ...normalizedError });
       } finally {
-        await releaseModelSlot(slotLock);
-        await releaseModelArtifactMutationLocks(artifactLocks);
+        await releaseModelJobLocks(jobLocks);
       }
     });
   },
@@ -480,7 +477,7 @@ modelsController.post(
         return c.json({ error: error.message, ...error.details }, 400);
       }
       if (error instanceof ModelCapacityError) {
-        return c.json({ error: error.message }, 429);
+        return respondModelCapacity(c, error.message);
       }
       if (error instanceof ModelConflictError || error instanceof ModelStaleAttemptError) {
         return c.json({ error: error.message }, 409);
@@ -572,26 +569,38 @@ modelsController.post(
 
     const body = validation.data;
 
-    let executionLock = null;
-    let slotLock = null;
+    let cacheCheckLock = null;
+    let jobLocks: ModelJobLockHandle | null = null;
 
     try {
-      executionLock = await acquireModelExecutionLock(body.experiment_id, modelType);
-      if (!executionLock) {
-        return c.json({ error: "同一模型正在训练或预测，请稍后再试" }, 409);
-      }
-
       if (SLOT_FREE_REUSABLE_PRODUCTION_MODEL_TYPES.has(modelType)) {
+        const cacheLockAcquisition = await acquireModelExecutionLockWithStatus(
+          body.experiment_id,
+          modelType,
+        );
+        if (cacheLockAcquisition.status === "capacity") {
+          return respondModelCapacity(c);
+        }
+        if (cacheLockAcquisition.status === "conflict") {
+          return c.json({ error: "该实验已有模型任务在执行，请稍后再试" }, 409);
+        }
+        cacheCheckLock = cacheLockAcquisition.lock;
         const reusableArtifact = await getReusableProductionModelArtifactResult(modelType, payload.sub, body.experiment_id);
+        await releaseModelExecutionLock(cacheCheckLock);
+        cacheCheckLock = null;
         if (reusableArtifact) {
           return c.json(reusableArtifact);
         }
       }
 
-      slotLock = await acquireModelSlot();
-      if (!slotLock) {
-        return c.json({ error: "模型服务繁忙，请稍后再试" }, 429);
+      const lockAcquisition = await acquireModelJobLocks(body.experiment_id, modelType);
+      if (lockAcquisition.status === "capacity") {
+        return respondModelCapacity(c);
       }
+      if (lockAcquisition.status === "conflict") {
+        return c.json({ error: "该实验已有模型任务在执行，请稍后再试" }, 409);
+      }
+      jobLocks = lockAcquisition.locks;
 
       const result = await prepareExperimentModelForProduction(modelType, payload.sub, body.experiment_id);
       return c.json(result);
@@ -622,8 +631,8 @@ modelsController.post(
       const message = err.message || `${modelType.toUpperCase()} 生产模型准备失败`;
       return handleUnexpectedError(c, error, message);
     } finally {
-      await releaseModelSlot(slotLock);
-      await releaseModelExecutionLock(executionLock);
+      await releaseModelExecutionLock(cacheCheckLock);
+      await releaseModelJobLocks(jobLocks);
     }
   },
 );
@@ -663,19 +672,17 @@ modelsController.post(
 
     const body = validation.data;
 
-    let executionLock = null;
-    let slotLock = null;
+    let jobLocks: ModelJobLockHandle | null = null;
 
     try {
-      executionLock = await acquireModelExecutionLock(body.experiment_id, modelType);
-      if (!executionLock) {
+      const lockAcquisition = await acquireModelJobLocks(body.experiment_id, modelType);
+      if (lockAcquisition.status === "capacity") {
+        return respondModelCapacity(c);
+      }
+      if (lockAcquisition.status === "conflict") {
         return c.json({ error: "同一模型正在训练或预测，请稍后再试" }, 409);
       }
-
-      slotLock = await acquireModelSlot();
-      if (!slotLock) {
-        return c.json({ error: "模型服务繁忙，请稍后再试" }, 429);
-      }
+      jobLocks = lockAcquisition.locks;
 
       const result = await predictExperimentModel(
         modelType,
@@ -711,8 +718,7 @@ modelsController.post(
       const message = err.message || `${modelType.toUpperCase()} 预测失败`;
       return handleUnexpectedError(c, error, message);
     } finally {
-      await releaseModelSlot(slotLock);
-      await releaseModelExecutionLock(executionLock);
+      await releaseModelJobLocks(jobLocks);
     }
   },
 );

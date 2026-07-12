@@ -90,6 +90,8 @@ const MAX_CONCURRENT_PDF_JOBS =
   parsePositiveIntegerEnv("MAX_CONCURRENT_PDF_JOBS") ??
   parsePositiveIntegerEnv("PDF_CONCURRENCY") ??
   DEFAULT_MAX_CONCURRENT_PDF_JOBS;
+const MODEL_CAPACITY_RETRY_AFTER_SECONDS =
+  parsePositiveIntegerEnv("MODEL_CAPACITY_RETRY_AFTER_SECONDS") ?? 3;
 
 export const CONCURRENCY_LIMITS = {
   /** 当前系统可用并行度（通常等于可用 CPU 核/线程数） */
@@ -102,6 +104,8 @@ export const CONCURRENCY_LIMITS = {
   MAX_CONCURRENT_MODEL_JOBS,
   /** 最大并发 PDF 生成（Puppeteer）任务 */
   MAX_CONCURRENT_PDF_JOBS,
+  /** 模型槽位耗尽时建议客户端等待的秒数 */
+  MODEL_CAPACITY_RETRY_AFTER_SECONDS,
 } as const;
 
 // ============================================
@@ -161,13 +165,13 @@ export const RATE_LIMITS = {
   /** 登录限流窗口。默认 15 分钟。 */
   AUTH_LOGIN_WINDOW_MS: parsePositiveIntegerEnv("AUTH_LOGIN_RATE_LIMIT_WINDOW_MS") ?? 15 * 60 * 1000,
   /** 单 IP 登录尝试上限。默认偏高，避免同一教室 NAT 误伤。 */
-  AUTH_LOGIN_MAX_PER_IP: parsePositiveIntegerEnv("AUTH_LOGIN_RATE_LIMIT_MAX_PER_IP") ?? 100,
+  AUTH_LOGIN_MAX_PER_IP: parsePositiveIntegerEnv("AUTH_LOGIN_RATE_LIMIT_MAX_PER_IP") ?? 300,
   /** 单账号登录尝试上限。 */
   AUTH_LOGIN_MAX_PER_ACCOUNT: parsePositiveIntegerEnv("AUTH_LOGIN_RATE_LIMIT_MAX_PER_ACCOUNT") ?? 10,
   /** 自助注册限流窗口。默认 1 小时。 */
   AUTH_REGISTER_WINDOW_MS: parsePositiveIntegerEnv("AUTH_REGISTER_RATE_LIMIT_WINDOW_MS") ?? 60 * 60 * 1000,
   /** 单 IP 自助注册上限。 */
-  AUTH_REGISTER_MAX_PER_IP: parsePositiveIntegerEnv("AUTH_REGISTER_RATE_LIMIT_MAX_PER_IP") ?? 50,
+  AUTH_REGISTER_MAX_PER_IP: parsePositiveIntegerEnv("AUTH_REGISTER_RATE_LIMIT_MAX_PER_IP") ?? 150,
   /** 单用户名自助注册上限。 */
   AUTH_REGISTER_MAX_PER_ACCOUNT: parsePositiveIntegerEnv("AUTH_REGISTER_RATE_LIMIT_MAX_PER_ACCOUNT") ?? 3,
 } as const;

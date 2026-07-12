@@ -28,6 +28,7 @@
     "db:migrate:guided-training": "bun run scripts/migrate-guided-training-sessions.ts",
     "verify:guided-concurrency": "bun run scripts/verify-guided-training-concurrency.ts",
     "verify:guided-recovery": "bun run scripts/verify-guided-step-recovery.ts",
+    "verify:model-lock-burst": "bun run scripts/verify-model-lock-burst.ts",
     "db:migrate:model-mape": "bun run scripts/migrate-model-mape-metrics.ts",
     "seed:teacher1:presentation": "bun run scripts/seed-teacher1-presentation.ts",
     "seed:parallel:assets": "bun run scripts/seed-parallel-assets.ts",

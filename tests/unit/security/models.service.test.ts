@@ -103,12 +103,24 @@ const spawnMock = mock(defaultSpawnImplementation);
 const originalSpawn = Bun.spawn;
 const acquireModelExecutionLock = mock(async () => ({ connection: {} as never, name: "exec:1" }));
 const releaseModelExecutionLock = mock(async () => {});
+const acquireModelExecutionLockWithStatus = mock(async () => ({
+  status: "acquired" as const,
+  lock: { connection: {} as never, name: "exec:1" },
+}));
 const acquireModelArtifactMutationLocks = mock(async () => ([
   { connection: {} as never, name: "exec:1" },
 ]));
 const releaseModelArtifactMutationLocks = mock(async () => {});
 const acquireModelSlot = mock(async () => ({ connection: {} as never, name: "slot:1" }));
 const releaseModelSlot = mock(async () => {});
+const acquireModelJobLocks = mock(async () => ({
+  status: "acquired" as const,
+  locks: {
+    slotLock: { connection: {} as never, name: "slot:1" },
+    artifactLocks: [{ connection: {} as never, name: "exec:1" }],
+  },
+}));
+const releaseModelJobLocks = mock(async () => {});
 
 mock.module(configModulePath, () => ({
   env: {
@@ -205,11 +217,14 @@ mock.module(modelRuntimeModulePath, () => ({
 
 mock.module(modelLocksModulePath, () => ({
   acquireModelExecutionLock,
+  acquireModelExecutionLockWithStatus,
   releaseModelExecutionLock,
   acquireModelArtifactMutationLocks,
   releaseModelArtifactMutationLocks,
   acquireModelSlot,
   releaseModelSlot,
+  acquireModelJobLocks,
+  releaseModelJobLocks,
 }));
 
 const {
@@ -414,6 +429,8 @@ describe("models service", () => {
     releaseModelArtifactMutationLocks.mockClear();
     acquireModelSlot.mockClear();
     releaseModelSlot.mockClear();
+    acquireModelJobLocks.mockClear();
+    releaseModelJobLocks.mockClear();
     beginTransaction.mockClear();
     commit.mockClear();
     rollback.mockClear();

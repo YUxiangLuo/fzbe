@@ -51,7 +51,11 @@ mock.module(configModulePath, () => ({
 
 const {
   acquireModelArtifactMutationLocks,
+  acquireModelExecutionLock,
+  acquireModelJobLocks,
   releaseModelArtifactMutationLocks,
+  releaseModelExecutionLock,
+  releaseModelJobLocks,
 } = await import(`${modelLocksModulePath}?model-locks-test`);
 
 describe("model artifact mutation locks", () => {
@@ -82,6 +86,74 @@ describe("model artifact mutation locks", () => {
 
     expect(handles).toHaveLength(1);
     expect(lockNames).toEqual(["fangzhen-model:exp:42"]);
+
+    await releaseModelArtifactMutationLocks(handles);
+  });
+
+  test("acquires global capacity before retaining an experiment lock", async () => {
+    const acquisition = await acquireModelJobLocks(42, "ma");
+
+    expect(acquisition.status).toBe("acquired");
+    expect(lockNames).toEqual([
+      "fangzhen-model:slot:1",
+      "fangzhen-model:exp:42",
+    ]);
+
+    if (acquisition.status === "acquired") {
+      await releaseModelJobLocks(acquisition.locks);
+    }
+    expect(releaseNames).toEqual([
+      "fangzhen-model:exp:42",
+      "fangzhen-model:slot:1",
+    ]);
+  });
+
+  test("does not request an experiment lock when all global slots are busy", async () => {
+    lockResults.push(...Array.from({ length: 100 }, () => 0 as const));
+
+    const acquisition = await acquireModelJobLocks(42, "ma");
+
+    expect(acquisition).toEqual({ status: "capacity" });
+    expect(lockNames.length).toBeGreaterThan(1);
+    expect(lockNames.every((name) => name.startsWith("fangzhen-model:slot:"))).toBe(true);
+    expect(releasedConnections).toHaveLength(1);
+  });
+
+  test("releases the capacity slot when the experiment is busy", async () => {
+    lockResults.push(1, 0);
+
+    const acquisition = await acquireModelJobLocks(42, "ma");
+
+    expect(acquisition).toEqual({ status: "conflict" });
+    expect(lockNames).toEqual([
+      "fangzhen-model:slot:1",
+      "fangzhen-model:exp:42",
+    ]);
+    expect(releaseNames).toEqual(["fangzhen-model:slot:1"]);
+  });
+
+  test("bounds retained experiment locks and restores admission after release", async () => {
+    const handles = [];
+    while (true) {
+      const handle = await acquireModelExecutionLock(10_000 + handles.length, "ma");
+      if (!handle) break;
+      handles.push(handle);
+      expect(handles.length).toBeLessThan(100);
+    }
+
+    expect(handles.length).toBeGreaterThan(0);
+    expect(await acquireModelExecutionLock(99_999, "ma")).toBeNull();
+    const lockAttemptCount = lockNames.length;
+    expect(await acquireModelJobLocks(99_999, "ma")).toEqual({ status: "capacity" });
+    expect(lockNames).toHaveLength(lockAttemptCount);
+
+    const released = handles.pop()!;
+    await releaseModelExecutionLock(released);
+    const replacement = await acquireModelExecutionLock(99_999, "ma");
+    expect(replacement).not.toBeNull();
+
+    await releaseModelExecutionLock(replacement);
+    await Promise.all(handles.map((handle) => releaseModelExecutionLock(handle)));
   });
 
   test("returns null without retaining a connection when the experiment is busy", async () => {

@@ -12,7 +12,7 @@
 
 ## 目标场景
 
-默认配置面向单台后端实例，按 `availableParallelism()` 看到的 CPU 可用并行度自动生成并发策略；64 核、约 50 名学生同时上课的服务器会自动得到 50 个模型槽位和 12 个 PDF 槽位。
+默认配置面向单台后端实例，按 `availableParallelism()` 看到的 CPU 可用并行度自动生成并发策略；64 核服务器会自动得到 50 个模型槽位和 12 个 PDF 槽位。100 名学生同时点击模型步骤时，50 个请求进入执行，另外 50 个请求收到带 `Retry-After` 的容量响应，不能先占用实验锁连接。
 
 核心目标：
 
@@ -28,6 +28,7 @@
 | 配置项 | 默认值 | 说明 |
 | --- | ---: | --- |
 | `MAX_CONCURRENT_MODEL_JOBS` | `min(availableParallelism(), 50)` | 全局模型任务槽位数。覆盖 `MODEL_CONCURRENCY`。 |
+| `MODEL_CAPACITY_RETRY_AFTER_SECONDS` | `3` | 模型容量耗尽时返回的 `Retry-After` 秒数。 |
 | `MODEL_CONCURRENCY` | 无 | 旧环境变量名，仍兼容。仅在 `MAX_CONCURRENT_MODEL_JOBS` 未设置时生效。 |
 | `MAX_CONCURRENT_PDF_JOBS` | `min(ceil(availableParallelism() / 4), 12)` | PDF/Puppeteer 并发生成数。覆盖 `PDF_CONCURRENCY`。 |
 | `PDF_CONCURRENCY` | 无 | 旧环境变量名，仍兼容。仅在 `MAX_CONCURRENT_PDF_JOBS` 未设置时生效。 |
@@ -40,7 +41,7 @@
 
 所有这些环境变量都必须是正整数；非法值会在模块加载时直接报错。
 
-## 64 核 / 50 学生默认容量
+## 64 核 / 100 学生默认容量（50 个模型槽位）
 
 如果服务进程能通过 `availableParallelism()` 看到 64 核，默认计算为：
 
@@ -51,6 +52,7 @@ PDF_QUEUE_TIMEOUT_MS = 60000
 PDF_GENERATION_TIMEOUT_MS = 30000
 PYTHON_MODEL_THREADS = 1
 TF_NUM_INTEROP_THREADS = 1
+MODEL_CAPACITY_RETRY_AFTER_SECONDS = 3
 DB_QUERY_HEADROOM = max(40, ceil(50 / 2)) = 40
 DB_CONNECTION_LIMIT = 2 * 50 + 40 = 140
 ```
@@ -61,12 +63,13 @@ DB_CONNECTION_LIMIT = 2 * 50 + 40 = 140
 
 ## 模型任务并发
 
-模型接口有两层锁：
+模型计算接口使用两层数据库锁和一层本实例连接保护：
 
-1. 单实验单模型执行锁：`fangzhen-model:execution:{experimentId}:{modelType}`
-2. 全局模型槽位锁：`fangzhen-model:slot:{slotNumber}`
+1. 全局模型槽位锁：`fangzhen-model:slot:{slotNumber}`
+2. 单实验执行锁：`fangzhen-model:exp:{experimentId}`
+3. 本实例实验锁 admission 上限：`MAX_CONCURRENT_MODEL_JOBS`
 
-单实验单模型执行锁用于避免同一个学生的同一个模型被重复训练、准备或预测。拿不到该锁时，接口返回：
+训练、guided 步骤、生产准备和预测必须先取得全局槽位，再取得实验锁。容量外请求因此不会长期占用实验锁连接。单实验锁覆盖该实验的全部七种模型以及激活、完成和清理操作，避免基础模型变化与融合模型操作交叉执行。拿不到该锁时，接口返回：
 
 ```http
 409 Conflict
@@ -77,8 +80,14 @@ DB_CONNECTION_LIMIT = 2 * 50 + 40 = 140
 
 ```http
 429 Too Many Requests
+Retry-After: 3
+
 { "error": "模型服务繁忙，请稍后再试" }
 ```
+
+前端读取 `Retry-After` 后最多自动重试三次，使用指数退避和 0–25% 随机抖动。`409/429` 不消耗模型业务失败次数；自动尝试用尽后仍保留人工重试。
+
+课堂网络通常让全部学生共享一个 NAT 出口。默认登录限流因此为单 IP 每 15 分钟 300 次，自助注册为单 IP 每小时 150 次；单账号限制仍分别保持 10 次和 3 次，避免为了容纳 100 人而取消账号级防护。
 
 训练、生产准备、预测都会经过同一个全局模型槽位池。这里没有独立的“生产槽位”；生产准备只是因为可能启动 Python 子进程生成 production artifact，所以也需要占用全局模型槽位。模型任务结束后，无论成功、失败还是超时，controller 的 `finally` 都会释放槽位锁和执行锁。
 
@@ -86,7 +95,7 @@ DB_CONNECTION_LIMIT = 2 * 50 + 40 = 140
 
 基础模型 `ma`、`es`、`arima`、`lstm` 的 `prepare-production` 在拿到单实验单模型执行锁后，会先检查是否已经存在可复用的 production artifact。
 
-如果 artifact 可复用，接口直接返回：
+基础模型会先在实验锁内做一次快速缓存检查。如果 artifact 可复用，接口直接返回：
 
 ```json
 {
@@ -99,7 +108,7 @@ DB_CONNECTION_LIMIT = 2 * 50 + 40 = 140
 }
 ```
 
-这种路径不会占用全局模型槽位，也不会启动 Python 子进程。
+这种路径不会占用全局模型槽位，也不会启动 Python 子进程。缓存未命中时会先释放快速检查锁，再按“槽位 → 实验锁”的统一顺序重新准入，并在 service 层重新检查缓存。
 
 ensemble 模型不走这个槽位前置绕过逻辑。即使已有 cached artifact，`weighted_avg`、`boosting`、`stacking` 的 `prepare-production` 仍然先进入全局模型槽位，再由 service 层判断是否可复用。这样可以避免 ensemble 的 artifact 检查或派生逻辑绕过模型并发上限。
 
@@ -118,7 +127,7 @@ TF_NUM_INTEROP_THREADS
 TF_CPP_MIN_LOG_LEVEL
 ```
 
-默认 `PYTHON_MODEL_THREADS=1`，`TF_NUM_INTEROP_THREADS=1`。如果进程环境中已经显式设置了更具体的变量，例如 `OPENBLAS_NUM_THREADS=2`，则保留该显式值。
+默认 `PYTHON_MODEL_THREADS=1`，`TF_NUM_INTEROP_THREADS=1`。这两个项目配置是权威值，会覆盖 systemd、容器镜像或宿主机继承的 `OPENBLAS_NUM_THREADS` 等变量，避免隐藏的线程数把 50 个 Python 进程再次成倍放大。需要调线程时只修改这两个受校验的配置入口。
 
 ## 数据库连接池与启动前校验
 
@@ -127,7 +136,7 @@ TF_CPP_MIN_LOG_LEVEL
 - 执行锁连接
 - 槽位锁连接
 
-模型任务内部和其他接口还需要普通查询连接。如果连接池只够锁使用，可能出现锁占着连接、业务查询又等待连接释放的循环等待。
+模型任务内部和其他接口还需要普通查询连接。如果连接池只够锁使用，可能出现锁占着连接、业务查询又等待连接释放的循环等待。所有计算路径都先申请槽位，并且本实例同时持有的实验锁数被限制为模型槽位数，所以容量外请求不能侵占 `queryHeadroom`。
 
 因此连接池默认按下面公式计算：
 
@@ -167,7 +176,7 @@ await pdfSemaphore.acquire(TIMEOUTS.PDF_QUEUE);
 
 进入 PDF 生成槽位后，`page.pdf()` 本身还受 `PDF_GENERATION_TIMEOUT_MS` 控制。如果 PDF 生成失败，service 会清理本次生成的文件，并释放信号量。
 
-默认 `MAX_CONCURRENT_PDF_JOBS=min(ceil(availableParallelism() / 4), 12)`，是为了让较小服务器自动降低 Puppeteer/Chromium 压力，而 64 核课堂服务器自动达到 12 个 PDF 槽位。50 人同时提交报告时，超出队列等待时间的请求可能返回 `503`，前端应提示学生稍后重试。
+默认 `MAX_CONCURRENT_PDF_JOBS=min(ceil(availableParallelism() / 4), 12)`，是为了让较小服务器自动降低 Puppeteer/Chromium 压力，而 64 核课堂服务器自动达到 12 个 PDF 槽位。100 人同时提交会形成 9 批；最后一批约在 `8 × 单批耗时` 后开始。默认 60 秒队列要求单批尾延迟低于约 7.5 秒，否则部分请求会返回 `503`。应在目标服务器实测 PDF 尾延迟后再提高 `PDF_QUEUE_TIMEOUT_MS`，不直接增加 Chromium 并发。
 
 ## 运行时观测
 
@@ -183,6 +192,7 @@ await pdfSemaphore.acquire(TIMEOUTS.PDF_QUEUE);
       "systemParallelism": 64,
       "maxConcurrentModelJobs": 50,
       "maxConcurrentPdfJobs": 12,
+      "modelCapacityRetryAfterSeconds": 3,
       "dbConnectionLimit": 140,
       "dbLockConnections": 100,
       "dbQueryHeadroom": 40,
@@ -242,13 +252,24 @@ bun run e2e:shiyan:concurrency:pdf
 bun run e2e:shiyan:concurrency:ui
 ```
 
+不启动 Python、直接验证 100 个不同实验同时争抢 50 个槽位及数据库查询余量：
+
+```bash
+MAX_CONCURRENT_MODEL_JOBS=50 \
+DB_CONNECTION_LIMIT=140 \
+MODEL_LOCK_BURST_REQUESTS=100 \
+bun run verify:model-lock-burst
+```
+
+预期结果必须是 `50 acquired / 50 capacity / 0 conflicts`，并且持锁期间的 `SELECT 1` 能立即完成。该检查已接入后端 CI。
+
 64 核服务器 50 学生压力档：
 
 ```bash
 bun run e2e:shiyan:concurrency:server
 ```
 
-该压力档会使用并发测试学生 `20246001` 到 `20246050`，并显式设置：
+API/UI 压力档使用并发测试学生 `20246001` 到 `20246050` 验证容量内真实训练和 PDF；上述 `verify:model-lock-burst` 另行覆盖 100 个不同实验的容量外突发。压力档显式设置：
 
 ```env
 E2E_CONCURRENCY_MODEL_JOBS=50

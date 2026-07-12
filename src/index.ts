@@ -311,7 +311,7 @@ async function checkManualFileAccess(filename: string, role: UserRole): Promise<
 
 const directFileResponsePathPattern = /^\/(?:manuals|datasets|reports|exports)\//;
 const CORS_ALLOW_HEADERS = ["Authorization", "Content-Type", "Range"];
-const CORS_EXPOSE_HEADERS = ["Content-Length", "Content-Range", "Content-Disposition", "Accept-Ranges", "ETag", "Last-Modified"];
+const CORS_EXPOSE_HEADERS = ["Content-Length", "Content-Range", "Content-Disposition", "Accept-Ranges", "ETag", "Last-Modified", "Retry-After"];
 function normalizeConfiguredCorsOrigin(rawOrigin: string): string {
   try {
     const parsedUrl = new URL(rawOrigin);
@@ -461,6 +461,7 @@ app.get("/api/v1/runtime-info", (c) =>
       systemParallelism: CONCURRENCY_LIMITS.SYSTEM_PARALLELISM,
       maxConcurrentModelJobs: CONCURRENCY_LIMITS.MAX_CONCURRENT_MODEL_JOBS,
       maxConcurrentPdfJobs: CONCURRENCY_LIMITS.MAX_CONCURRENT_PDF_JOBS,
+      modelCapacityRetryAfterSeconds: CONCURRENCY_LIMITS.MODEL_CAPACITY_RETRY_AFTER_SECONDS,
       dbConnectionLimit: connectionLimit,
       dbLockConnections: DB_POOL_CONFIG.LOCK_CONNECTIONS,
       dbQueryHeadroom: DB_POOL_CONFIG.QUERY_HEADROOM,

@@ -30,9 +30,10 @@ import {
 } from "./model-errors";
 import {
   acquireModelArtifactMutationLocks,
-  acquireModelSlot,
+  acquireModelJobLocks,
   releaseModelArtifactMutationLocks,
-  releaseModelSlot,
+  releaseModelJobLocks,
+  type ModelJobLockHandle,
 } from "./model-locks";
 import {
   allPossiblePythonParams,
@@ -69,10 +70,16 @@ export {
 export {
   acquireModelArtifactMutationLocks,
   acquireModelExecutionLock,
+  acquireModelExecutionLockWithStatus,
+  acquireModelJobLocks,
   acquireModelSlot,
   releaseModelArtifactMutationLocks,
   releaseModelExecutionLock,
+  releaseModelJobLocks,
   releaseModelSlot,
+  type ModelJobLockHandle,
+  type ModelJobLockAcquisition,
+  type ModelExecutionLockAcquisition,
 } from "./model-locks";
 export { runPythonGuidedTrainingStep, runPythonModel, type ModelProgressEvent, type ModelProgressReporter } from "./model-python-runner";
 export { transformTrainingResult } from "./model-results";
@@ -2280,17 +2287,20 @@ export async function runGuidedTrainingStep(
     throw new ModelAccessError("权限不足：该训练会话不属于当前用户", 403);
   }
 
-  let artifactLocks = null;
-  let slotLock = null;
+  let jobLocks: ModelJobLockHandle | null = null;
   let attempt: GuidedTrainingAttempt | null = null;
   let stopHeartbeat: (() => Promise<void>) | null = null;
   let experimentStateVersion: number | null = null;
 
   try {
-    artifactLocks = await acquireModelArtifactMutationLocks(initialRow.experiment_id, modelType);
-    if (!artifactLocks) {
+    const lockAcquisition = await acquireModelJobLocks(initialRow.experiment_id, modelType);
+    if (lockAcquisition.status === "capacity") {
+      throw new ModelCapacityError("模型服务繁忙，请稍后重试");
+    }
+    if (lockAcquisition.status === "conflict") {
       throw new ModelConflictError("该实验已有模型任务在执行，请稍后重试");
     }
+    jobLocks = lockAcquisition.locks;
 
     const row = await fetchGuidedTrainingSessionRow(sessionId);
     if (!row || row.model_type !== modelType) {
@@ -2315,11 +2325,6 @@ export async function runGuidedTrainingStep(
     const nextStepId = getGuidedNextStepId(stepPlan, completedStepIds);
     if (stepId !== nextStepId) {
       throw new ModelValidationError("只能按训练流程顺序执行下一个阶段");
-    }
-
-    slotLock = await acquireModelSlot();
-    if (!slotLock) {
-      throw new ModelCapacityError("模型服务繁忙，请稍后重试");
     }
 
     attempt = await claimGuidedTrainingAttempt(row, stepId);
@@ -2497,8 +2502,7 @@ export async function runGuidedTrainingStep(
     if (stopHeartbeat) {
       await stopHeartbeat();
     }
-    await releaseModelSlot(slotLock);
-    await releaseModelArtifactMutationLocks(artifactLocks);
+    await releaseModelJobLocks(jobLocks);
   }
 }
 

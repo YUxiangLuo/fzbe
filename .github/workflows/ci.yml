@@ -93,5 +93,12 @@ jobs:
           bun run db:migrate:guided-training
           bun run verify:guided-concurrency
 
+      - name: Verify 100-request model admission burst
+        env:
+          MAX_CONCURRENT_MODEL_JOBS: "50"
+          DB_CONNECTION_LIMIT: "140"
+          MODEL_LOCK_BURST_REQUESTS: "100"
+        run: bun run verify:model-lock-burst
+
       - name: Audit dependencies
         run: bun audit

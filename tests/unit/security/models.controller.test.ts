@@ -86,10 +86,42 @@ const acquireModelSlot = mock(async () => ({ connection: {} as never, name: "slo
 const releaseModelSlot = mock(async () => {});
 const acquireModelExecutionLock = mock(async () => ({ connection: {} as never, name: "exec:1" }));
 const releaseModelExecutionLock = mock(async () => {});
+const acquireModelExecutionLockWithStatusImplementation = async () => {
+  const lock = await acquireModelExecutionLock();
+  return lock
+    ? { status: "acquired" as const, lock }
+    : { status: "conflict" as const };
+};
+const acquireModelExecutionLockWithStatus = mock(acquireModelExecutionLockWithStatusImplementation);
 const acquireModelArtifactMutationLocks = mock(async () => ([
   { connection: {} as never, name: "exec:1" },
 ]));
 const releaseModelArtifactMutationLocks = mock(async () => {});
+const acquireModelJobLocksImplementation = async (experimentId: number, modelType: ModelType) => {
+  const slotLock = await acquireModelSlot();
+  if (!slotLock) return { status: "capacity" as const };
+
+  const artifactLocks = await acquireModelArtifactMutationLocks(experimentId, modelType);
+  if (!artifactLocks) {
+    await releaseModelSlot(slotLock);
+    return { status: "conflict" as const };
+  }
+
+  return {
+    status: "acquired" as const,
+    locks: { slotLock, artifactLocks },
+  };
+};
+const acquireModelJobLocks = mock(acquireModelJobLocksImplementation);
+const releaseModelJobLocksImplementation = async (locks: {
+  slotLock: { connection: never; name: string };
+  artifactLocks: Array<{ connection: never; name: string }>;
+} | null) => {
+  if (!locks) return;
+  await releaseModelArtifactMutationLocks(locks.artifactLocks);
+  await releaseModelSlot(locks.slotLock);
+};
+const releaseModelJobLocks = mock(releaseModelJobLocksImplementation);
 
 class ModelValidationError extends Error {
   constructor(message: string, public details?: Record<string, unknown>) {
@@ -122,9 +154,12 @@ mock.module("../../../src/modules/models/models.service", () => ({
   acquireModelSlot,
   releaseModelSlot,
   acquireModelExecutionLock,
+  acquireModelExecutionLockWithStatus,
   releaseModelExecutionLock,
   acquireModelArtifactMutationLocks,
   releaseModelArtifactMutationLocks,
+  acquireModelJobLocks,
+  releaseModelJobLocks,
   ModelValidationError,
   ModelNotFoundError,
   ModelAccessError,
@@ -291,6 +326,9 @@ describe("models controller", () => {
     acquireModelExecutionLock.mockReset();
     acquireModelExecutionLock.mockResolvedValue({ connection: {} as never, name: "exec:1" });
 
+    acquireModelExecutionLockWithStatus.mockReset();
+    acquireModelExecutionLockWithStatus.mockImplementation(acquireModelExecutionLockWithStatusImplementation);
+
     releaseModelExecutionLock.mockReset();
     releaseModelExecutionLock.mockResolvedValue(undefined);
 
@@ -301,9 +339,15 @@ describe("models controller", () => {
 
     releaseModelArtifactMutationLocks.mockReset();
     releaseModelArtifactMutationLocks.mockResolvedValue(undefined);
+
+    acquireModelJobLocks.mockReset();
+    acquireModelJobLocks.mockImplementation(acquireModelJobLocksImplementation);
+
+    releaseModelJobLocks.mockReset();
+    releaseModelJobLocks.mockImplementation(releaseModelJobLocksImplementation);
   });
 
-  test("returns 409 when the artifact mutation lock set is unavailable", async () => {
+  test("returns 409 and releases the slot when the experiment lock is unavailable", async () => {
     acquireModelArtifactMutationLocks.mockResolvedValueOnce(null);
 
     const response = await requestJson("/api/v1/models/ma/training", buildTrainBody());
@@ -311,12 +355,11 @@ describe("models controller", () => {
 
     expect(response.status).toBe(409);
     expect(data).toEqual({ error: "同一模型正在训练或预测，请稍后再试" });
-    expect(acquireModelSlot).not.toHaveBeenCalled();
+    expect(acquireModelSlot).toHaveBeenCalledTimes(1);
+    expect(releaseModelSlot).toHaveBeenCalledTimes(1);
   });
 
-  test("returns 429 and releases the artifact mutation locks when no model slot is available", async () => {
-    const artifactLocks = [{ connection: {} as never, name: "exec:busy" }];
-    acquireModelArtifactMutationLocks.mockResolvedValueOnce(artifactLocks);
+  test("returns 429 before acquiring an experiment lock when no model slot is available", async () => {
     acquireModelSlot.mockResolvedValueOnce(null);
 
     const response = await requestJson("/api/v1/models/ma/training", buildTrainBody());
@@ -324,7 +367,8 @@ describe("models controller", () => {
 
     expect(response.status).toBe(429);
     expect(data).toEqual({ error: "模型服务繁忙，请稍后再试" });
-    expect(releaseModelArtifactMutationLocks).toHaveBeenCalledWith(artifactLocks);
+    expect(response.headers.get("retry-after")).toBe("3");
+    expect(acquireModelArtifactMutationLocks).not.toHaveBeenCalled();
   });
 
   test("maps ModelAccessError from training to the declared HTTP status", async () => {
@@ -543,6 +587,7 @@ describe("models controller", () => {
 
     expect(response.status).toBe(429);
     expect(data).toEqual({ error: "模型服务繁忙，请稍后重试" });
+    expect(response.headers.get("retry-after")).toBe("3");
   });
 
   test("marks only the currently active artifact revision as completed", async () => {
@@ -701,16 +746,14 @@ describe("models controller", () => {
     expect(trainModel).not.toHaveBeenCalled();
   });
 
-  test("releases artifact mutation locks when slot acquisition throws during training", async () => {
-    const artifactLocks = [{ connection: {} as never, name: "exec:throw" }];
-    acquireModelArtifactMutationLocks.mockResolvedValueOnce(artifactLocks);
+  test("does not acquire an experiment lock when slot acquisition throws during training", async () => {
     acquireModelSlot.mockRejectedValueOnce(new Error("slot acquisition failed"));
 
     const response = await requestJson("/api/v1/models/ma/training", buildTrainBody());
 
     expect(response.status).toBe(500);
-    expect(releaseModelArtifactMutationLocks).toHaveBeenCalledWith(artifactLocks);
-    expect(releaseModelSlot).toHaveBeenCalledWith(null);
+    expect(acquireModelArtifactMutationLocks).not.toHaveBeenCalled();
+    expect(releaseModelArtifactMutationLocks).not.toHaveBeenCalled();
   });
 
   test("returns a reusable base production artifact without acquiring a global model slot", async () => {
@@ -991,9 +1034,7 @@ describe("models controller", () => {
     expect(data.error).toContain("预测超时");
   });
 
-  test("releases the execution lock when slot acquisition throws during prediction", async () => {
-    const executionLock = { connection: {} as never, name: "exec:predict-throw" };
-    acquireModelExecutionLock.mockResolvedValueOnce(executionLock);
+  test("does not acquire an execution lock when slot acquisition throws during prediction", async () => {
     acquireModelSlot.mockRejectedValueOnce(new Error("slot acquisition failed"));
 
     const response = await requestJson("/api/v1/models/ma/predict", {
@@ -1002,8 +1043,8 @@ describe("models controller", () => {
     });
 
     expect(response.status).toBe(500);
-    expect(releaseModelExecutionLock).toHaveBeenCalledWith(executionLock);
-    expect(releaseModelSlot).toHaveBeenCalledWith(null);
+    expect(acquireModelExecutionLock).not.toHaveBeenCalled();
+    expect(releaseModelExecutionLock).not.toHaveBeenCalled();
   });
 
   test("rejects unsupported model types before invoking the service layer", async () => {

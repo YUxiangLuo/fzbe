@@ -157,7 +157,10 @@ describe("app route smoke tests", () => {
     expect(response.status).toBe(200);
     const payload = await response.json() as {
       data?: {
-        concurrency?: { maxConcurrentPdfJobs?: unknown };
+        concurrency?: {
+          maxConcurrentPdfJobs?: unknown;
+          modelCapacityRetryAfterSeconds?: unknown;
+        };
         timeouts?: { pdfQueueMs?: unknown; pdfGenerationMs?: unknown };
         pdfQueue?: Record<string, unknown>;
       };
@@ -170,6 +173,7 @@ describe("app route smoke tests", () => {
       queueTimeoutMs: payload.data?.timeouts?.pdfQueueMs,
       generationTimeoutMs: payload.data?.timeouts?.pdfGenerationMs,
     });
+    expect(payload.data?.concurrency?.modelCapacityRetryAfterSeconds).toBe(3);
   });
 
   test("forbids assistants without assigned classes from reading the question bank", async () => {

@@ -14,13 +14,16 @@ export function buildPythonModelProcessEnv(): Record<string, string> {
   const tfInterOpThreads = String(PYTHON_RUNTIME_CONFIG.TF_INTER_OP_THREADS);
 
   return {
-    OMP_NUM_THREADS: process.env.OMP_NUM_THREADS ?? modelThreads,
-    OPENBLAS_NUM_THREADS: process.env.OPENBLAS_NUM_THREADS ?? modelThreads,
-    MKL_NUM_THREADS: process.env.MKL_NUM_THREADS ?? modelThreads,
-    VECLIB_MAXIMUM_THREADS: process.env.VECLIB_MAXIMUM_THREADS ?? modelThreads,
-    NUMEXPR_NUM_THREADS: process.env.NUMEXPR_NUM_THREADS ?? modelThreads,
-    TF_NUM_INTRAOP_THREADS: process.env.TF_NUM_INTRAOP_THREADS ?? modelThreads,
-    TF_NUM_INTEROP_THREADS: process.env.TF_NUM_INTEROP_THREADS ?? tfInterOpThreads,
+    // These values are intentionally authoritative. Inherited service-manager
+    // or image defaults (for example OPENBLAS_NUM_THREADS=64) would otherwise
+    // multiply across every Python worker and defeat the global job limit.
+    OMP_NUM_THREADS: modelThreads,
+    OPENBLAS_NUM_THREADS: modelThreads,
+    MKL_NUM_THREADS: modelThreads,
+    VECLIB_MAXIMUM_THREADS: modelThreads,
+    NUMEXPR_NUM_THREADS: modelThreads,
+    TF_NUM_INTRAOP_THREADS: modelThreads,
+    TF_NUM_INTEROP_THREADS: tfInterOpThreads,
     TF_CPP_MIN_LOG_LEVEL: process.env.TF_CPP_MIN_LOG_LEVEL ?? "3",
   };
 }
