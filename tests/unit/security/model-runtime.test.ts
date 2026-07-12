@@ -1,21 +1,21 @@
 import { describe, expect, test } from "bun:test";
 import {
-  buildExperimentScopedModelPath,
+  buildVersionedModelArtifactPath,
   buildModelExecutionLockName,
   buildModelSlotLockName,
 } from "../../../src/modules/models/model-runtime";
 
 describe("model runtime helpers", () => {
-  test("builds experiment-scoped model artifact paths", () => {
-    const result = buildExperimentScopedModelPath(42, 7, "lstm");
+  test("builds immutable versioned model artifact paths", () => {
+    const result = buildVersionedModelArtifactPath(42, 7, "lstm", "revision-1");
 
     expect(result).toContain("trained_models");
-    expect(result.endsWith("exp42-student7-lstm.pkl")).toBe(true);
+    expect(result.endsWith("exp42-student7-lstm-backtest-revision-1.pkl")).toBe(true);
   });
 
-  test("builds execution lock names scoped by experiment and model", () => {
+  test("builds one execution lock name for the whole experiment", () => {
     expect(buildModelExecutionLockName(42, "weighted_avg")).toBe(
-      "fangzhen-model:exp:42:weighted_avg",
+      "fangzhen-model:exp:42",
     );
   });
 

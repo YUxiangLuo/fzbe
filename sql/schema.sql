@@ -77,6 +77,8 @@ CREATE TABLE IF NOT EXISTS `class_assistants` (
 CREATE TABLE IF NOT EXISTS `experiment_status` (
   `experiment_id` INT AUTO_INCREMENT PRIMARY KEY,
   `student_id` INT NOT NULL,
+  `state_version` BIGINT UNSIGNED NOT NULL DEFAULT 0,
+  `training_input_version` BIGINT UNSIGNED NOT NULL DEFAULT 0,
   `status` ENUM('Not Started', 'In Progress', 'Completed') DEFAULT 'Not Started',
 
   -- Default value is 0, indicating no steps have been completed yet
@@ -238,6 +240,11 @@ CREATE TABLE IF NOT EXISTS `model_guided_training_sessions` (
   `result_payload` JSON DEFAULT NULL,
   `artifact_dir` VARCHAR(1024) NOT NULL,
   `error_message` TEXT DEFAULT NULL,
+  `training_input_version` BIGINT UNSIGNED NOT NULL DEFAULT 0,
+  `run_token` CHAR(36) DEFAULT NULL,
+  `run_version` BIGINT UNSIGNED NOT NULL DEFAULT 0,
+  `lease_expires_at` DATETIME(3) DEFAULT NULL,
+  `last_heartbeat_at` DATETIME(3) DEFAULT NULL,
   `created_at` TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
   `updated_at` TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
   `expires_at` TIMESTAMP NULL DEFAULT NULL,
@@ -251,7 +258,31 @@ CREATE TABLE IF NOT EXISTS `model_guided_training_sessions` (
 
   UNIQUE KEY `uniq_guided_training_request` (`experiment_id`, `student_id`, `model_type`, `request_hash`),
   INDEX `idx_guided_training_student` (`student_id`, `experiment_id`, `model_type`, `updated_at`),
-  INDEX `idx_guided_training_status` (`status`, `expires_at`)
+  INDEX `idx_guided_training_status` (`status`, `expires_at`),
+  INDEX `idx_guided_training_lease` (`status`, `lease_expires_at`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+CREATE TABLE IF NOT EXISTS `experiment_model_artifacts` (
+  `experiment_id` INT NOT NULL,
+  `student_id` INT NOT NULL,
+  `model_type` ENUM('ma', 'es', 'arima', 'lstm', 'weighted_avg', 'stacking', 'boosting') NOT NULL,
+  `revision_token` CHAR(36) NOT NULL,
+  `training_input_version` BIGINT UNSIGNED NOT NULL,
+  `source_session_id` CHAR(36) DEFAULT NULL,
+  `backtest_artifact_path` VARCHAR(1024) NOT NULL,
+  `request_payload` JSON NOT NULL,
+  `result_payload` JSON NOT NULL,
+  `production_artifact_path` VARCHAR(1024) DEFAULT NULL,
+  `production_revision_token` CHAR(36) DEFAULT NULL,
+  `activated_at` DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+  `updated_at` DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3),
+
+  PRIMARY KEY (`experiment_id`, `model_type`),
+  INDEX `idx_experiment_model_artifact_student` (`student_id`, `experiment_id`),
+  INDEX `idx_experiment_model_artifact_session` (`source_session_id`),
+  FOREIGN KEY (`experiment_id`) REFERENCES `experiment_status` (`experiment_id`) ON DELETE CASCADE,
+  FOREIGN KEY (`student_id`) REFERENCES `users` (`user_id`) ON DELETE CASCADE,
+  FOREIGN KEY (`source_session_id`) REFERENCES `model_guided_training_sessions` (`session_id`) ON DELETE RESTRICT
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
 -- ========================================================

@@ -113,6 +113,7 @@ export const createExperimentSchema = z.object({
 });
 
 export const updateExperimentSchema = z.object({
+  state_version: z.preprocess(numberPreprocess, z.number().int().nonnegative()),
   status: z.enum(STATUS_VALUES).optional(),
   current_step: optionalInt(1, 7),
   ...optionalFields,

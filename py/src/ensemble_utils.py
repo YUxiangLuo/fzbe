@@ -10,6 +10,7 @@ import tempfile
 from typing import Any, Dict, List, Literal, Tuple
 
 from data_utils import ParsedData, build_numeric_subprocess_records, build_subprocess_records
+from durable_io import fsync_file, fsync_parent_directory
 from serialization import dump_model, load_model
 from subprocess_utils import (
     extract_predictions_from_result,
@@ -71,6 +72,30 @@ def remove_member_model_artifact(model_name: str, model_path: str) -> None:
             os.remove(keras_path)
 
 
+def _copy_artifact_atomically(source_path: str, destination_path: str) -> None:
+    """Publish a complete copy and make the directory entry crash-durable."""
+
+    if os.path.abspath(source_path) == os.path.abspath(destination_path):
+        return
+
+    destination_dir = os.path.dirname(destination_path)
+    os.makedirs(destination_dir, exist_ok=True)
+    fd, temp_path = tempfile.mkstemp(
+        prefix=f".{os.path.basename(destination_path)}.",
+        suffix=".tmp",
+        dir=destination_dir,
+    )
+    os.close(fd)
+    try:
+        shutil.copy2(source_path, temp_path)
+        fsync_file(temp_path)
+        os.replace(temp_path, destination_path)
+        fsync_parent_directory(destination_path)
+    finally:
+        if os.path.exists(temp_path):
+            os.remove(temp_path)
+
+
 def persist_member_model_artifact(
     model_name: str,
     source_model_path: str,
@@ -78,22 +103,39 @@ def persist_member_model_artifact(
     *,
     move_source: bool,
 ) -> None:
-    os.makedirs(os.path.dirname(destination_model_path), exist_ok=True)
-    transfer = shutil.move if move_source else shutil.copy2
-    transfer(source_model_path, destination_model_path)
-
-    if model_name != "lstm":
+    if os.path.abspath(source_model_path) == os.path.abspath(destination_model_path):
         return
 
-    lstm_state = load_model(destination_model_path)
-    source_keras_path = lstm_state.get("keras_model_path")
-    if not source_keras_path or not os.path.exists(source_keras_path):
-        raise FileNotFoundError(f"LSTM Keras model file not found at {source_keras_path}")
+    source_keras_path = None
+    destination_keras_path = None
+    if model_name == "lstm":
+        lstm_state = load_model(source_model_path)
+        source_keras_path = lstm_state.get("keras_model_path")
+        if not source_keras_path or not os.path.exists(source_keras_path):
+            raise FileNotFoundError(f"LSTM Keras model file not found at {source_keras_path}")
 
-    destination_keras_path = os.path.splitext(destination_model_path)[0] + "_keras_model.h5"
-    transfer(source_keras_path, destination_keras_path)
-    lstm_state["keras_model_path"] = destination_keras_path
-    dump_model(lstm_state, destination_model_path)
+        destination_keras_path = os.path.splitext(destination_model_path)[0] + "_keras_model.h5"
+        _copy_artifact_atomically(source_keras_path, destination_keras_path)
+        lstm_state["keras_model_path"] = destination_keras_path
+        dump_model(lstm_state, destination_model_path)
+    else:
+        _copy_artifact_atomically(source_model_path, destination_model_path)
+
+    # A move is intentionally implemented as durable copy-then-delete. If the
+    # process dies before deletion, recovery sees a harmless duplicate instead
+    # of a missing source and an incomplete destination.
+    if move_source:
+        if os.path.exists(source_model_path):
+            os.remove(source_model_path)
+            fsync_parent_directory(source_model_path)
+        if (
+            source_keras_path
+            and destination_keras_path
+            and os.path.abspath(source_keras_path) != os.path.abspath(destination_keras_path)
+            and os.path.exists(source_keras_path)
+        ):
+            os.remove(source_keras_path)
+            fsync_parent_directory(source_keras_path)
 
 
 def fit_and_predict_from_source_model(

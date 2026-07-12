@@ -6,15 +6,16 @@ const LOCK_NAMESPACE = "fangzhen-model";
 export type ModelArtifactPhase = "backtest" | "production";
 export const GUIDED_TRAINING_ROOT = path.join(PY_DIR, "guided_training");
 
-export const buildExperimentScopedModelPath = (
+export const buildVersionedModelArtifactPath = (
   experimentId: number,
   studentId: number,
   modelType: ModelType,
+  revisionToken: string,
   phase: ModelArtifactPhase = "backtest",
 ): string => path.join(
   PY_DIR,
   "trained_models",
-  `exp${experimentId}-student${studentId}-${modelType}${phase === "production" ? "-production" : ""}.pkl`,
+  `exp${experimentId}-student${studentId}-${modelType}-${phase}-${revisionToken}.pkl`,
 );
 
 export const buildGuidedTrainingArtifactDir = (
@@ -39,7 +40,7 @@ export const buildGuidedTrainingStatePath = (
 
 export const buildModelExecutionLockName = (
   experimentId: number,
-  modelType: ModelType,
-): string => `${LOCK_NAMESPACE}:exp:${experimentId}:${modelType}`;
+  _modelType?: ModelType,
+): string => `${LOCK_NAMESPACE}:exp:${experimentId}`;
 
 export const buildModelSlotLockName = (slot: number): string => `${LOCK_NAMESPACE}:slot:${slot}`;

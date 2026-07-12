@@ -2,7 +2,7 @@ import path from "path";
 import fs from "fs";
 import crypto from "crypto";
 import type { Stats } from "node:fs";
-import type { RowDataPacket } from "mysql2/promise";
+import type { PoolConnection, ResultSetHeader, RowDataPacket } from "mysql2/promise";
 import { pool } from "../../config";
 import logger from "../../utils/logger";
 import {
@@ -17,10 +17,17 @@ import {
   GUIDED_TRAINING_ROOT,
   buildGuidedTrainingArtifactDir,
   buildGuidedTrainingStatePath,
-  buildExperimentScopedModelPath,
+  buildVersionedModelArtifactPath,
 } from "./model-runtime";
 import { loadDatasetFromDb } from "./model-datasets";
-import { ModelAccessError, ModelNotFoundError, ModelValidationError } from "./model-errors";
+import {
+  ModelAccessError,
+  ModelCapacityError,
+  ModelConflictError,
+  ModelNotFoundError,
+  ModelStaleAttemptError,
+  ModelValidationError,
+} from "./model-errors";
 import {
   acquireModelArtifactMutationLocks,
   acquireModelSlot,
@@ -51,7 +58,14 @@ import {
 } from "./model-types";
 
 export { loadDatasetFromDb } from "./model-datasets";
-export { ModelAccessError, ModelNotFoundError, ModelValidationError } from "./model-errors";
+export {
+  ModelAccessError,
+  ModelCapacityError,
+  ModelConflictError,
+  ModelNotFoundError,
+  ModelStaleAttemptError,
+  ModelValidationError,
+} from "./model-errors";
 export {
   acquireModelArtifactMutationLocks,
   acquireModelExecutionLock,
@@ -66,10 +80,14 @@ export type { GuidedTrainingSessionPayload, GuidedTrainingStepDefinition } from 
 
 const TRAINING_TIMEOUT = TIMEOUTS.MODEL_TRAINING;
 const GUIDED_TRAINING_CLEANUP_BATCH_SIZE = 500;
+const GUIDED_STEP_LEASE_SECONDS = 90;
+const GUIDED_STEP_HEARTBEAT_INTERVAL_MS = 30_000;
 
 interface ExperimentOwnershipRow extends RowDataPacket {
   student_id: number;
   status: string;
+  state_version: number | string;
+  training_input_version: number | string;
 }
 
 interface ExperimentModelContextRow extends ExperimentOwnershipRow {
@@ -123,10 +141,17 @@ interface GuidedTrainingSessionRow extends RowDataPacket {
   result_payload: unknown;
   artifact_dir: string;
   error_message: string | null;
+  training_input_version: number | string;
+  run_token: string | null;
+  run_version: number;
+  lease_expires_at: Date | string | null;
+  last_heartbeat_at: Date | string | null;
 }
 
 interface GuidedTrainingCleanupRow extends RowDataPacket {
   session_id: string;
+  experiment_id: number;
+  model_type: GuidedModelType;
   artifact_dir: string;
 }
 
@@ -134,10 +159,32 @@ interface StaleModelExperimentEligibilityRow extends RowDataPacket {
   can_delete: 0 | 1 | boolean | string;
 }
 
-async function assertExperimentModelAccess(experimentId: number, studentId: number) {
-  const [rows] = await pool.query<ExperimentModelContextRow[]>(
+interface ActiveModelArtifactRow extends RowDataPacket {
+  experiment_id: number;
+  student_id: number;
+  model_type: ModelType;
+  revision_token: string;
+  training_input_version: number | string;
+  source_session_id: string | null;
+  backtest_artifact_path: string;
+  request_payload: unknown;
+  result_payload: unknown;
+  production_artifact_path: string | null;
+  production_revision_token: string | null;
+}
+
+async function assertExperimentModelAccess(
+  experimentId: number,
+  studentId: number,
+  connection?: PoolConnection,
+  forUpdate = false,
+) {
+  const queryable = connection ?? pool;
+  const [rows] = await queryable.query<ExperimentModelContextRow[]>(
     `SELECT student_id,
             status,
+            state_version,
+            training_input_version,
             selected_industry,
             selected_company,
             selected_product,
@@ -163,7 +210,8 @@ async function assertExperimentModelAccess(experimentId: number, studentId: numb
             ensemble_stacking_base_models
        FROM experiment_status
       WHERE experiment_id = ?
-      LIMIT 1`,
+      LIMIT 1
+      ${forUpdate ? "FOR UPDATE" : ""}`,
     [experimentId],
   );
 
@@ -185,6 +233,11 @@ async function assertExperimentModelAccess(experimentId: number, studentId: numb
 
 const hasDefinedValue = <T>(value: T | null | undefined): value is T => value !== null && value !== undefined;
 
+const isDuplicateKeyError = (error: unknown) => {
+  const dbError = error as { code?: unknown; errno?: unknown };
+  return dbError?.code === "ER_DUP_ENTRY" || dbError?.errno === 1062;
+};
+
 const isBaseModelType = (modelType: ModelType): modelType is BaseModelType => {
   return BASE_MODEL_TYPES.has(modelType);
 };
@@ -193,27 +246,10 @@ const isEnsembleModelType = (modelType: ModelType): modelType is Extract<ModelTy
   return ENSEMBLE_MODEL_TYPES.has(modelType);
 };
 
-const getBacktestModelPath = (experimentId: number, studentId: number, modelType: ModelType) =>
-  buildExperimentScopedModelPath(experimentId, studentId, modelType, "backtest");
-
-const getProductionModelPath = (experimentId: number, studentId: number, modelType: ModelType) =>
-  buildExperimentScopedModelPath(experimentId, studentId, modelType, "production");
-
 const getLstmSidecarPath = (modelPath: string) => modelPath.replace(/\.pkl$/, "_keras_model.h5");
 
 const getGuidedSessionModelPath = (artifactDir: string, modelType: GuidedModelType) =>
   path.join(artifactDir, `${modelType}.pkl`);
-
-const getGuidedBacktestSourceMarkerPath = (modelPath: string) => `${modelPath}.guided-session`;
-
-const readGuidedBacktestSourceMarker = (modelPath: string) => {
-  const markerPath = getGuidedBacktestSourceMarkerPath(modelPath);
-  try {
-    return fs.readFileSync(markerPath, "utf8").trim();
-  } catch {
-    return null;
-  }
-};
 
 const removeFileIfExists = (filePath: string) => {
   if (!fs.existsSync(filePath)) {
@@ -250,7 +286,6 @@ const removeSiblingArtifactsByPrefix = (modelPath: string) => {
 
 const invalidateArtifactAtPath = (modelType: ModelType, modelPath: string) => {
   removeFileIfExists(modelPath);
-  removeFileIfExists(getGuidedBacktestSourceMarkerPath(modelPath));
   if (modelType === "lstm") {
     removeFileIfExists(getLstmSidecarPath(modelPath));
     return;
@@ -259,10 +294,6 @@ const invalidateArtifactAtPath = (modelType: ModelType, modelPath: string) => {
   if (isEnsembleModelType(modelType)) {
     removeSiblingArtifactsByPrefix(modelPath);
   }
-};
-
-const invalidateProductionArtifact = (experimentId: number, studentId: number, modelType: ModelType) => {
-  invalidateArtifactAtPath(modelType, getProductionModelPath(experimentId, studentId, modelType));
 };
 
 const commonDownstreamStateResetValues: Record<string, unknown> = {
@@ -344,11 +375,37 @@ const modelStateResetValues: Record<ModelType, Record<string, unknown>> = {
   },
 };
 
-const invalidateExperimentStateAfterBacktestChange = async (
-  experimentId: number,
-  studentId: number,
+const toFiniteMetric = (value: unknown) => (
+  typeof value === "number" && Number.isFinite(value) ? value : null
+);
+
+const toFrontendBaseModelIds = (models: string | undefined) => {
+  const aliases: Record<string, string> = {
+    ma: "moving_average",
+    es: "exponential_smoothing",
+    arima: "arima",
+    lstm: "lstm",
+  };
+  return (models ?? "")
+    .split(",")
+    .map((model) => model.trim())
+    .filter((model) => model in aliases)
+    .map((model) => aliases[model]!);
+};
+
+const buildActivatedModelStateValues = (
   modelType: ModelType,
+  request: TrainInput,
+  result: ReturnType<typeof transformTrainingResult>,
 ) => {
+  const resultValues = result.results as Record<string, unknown>;
+  const metrics = (resultValues.metrics ?? {}) as Record<string, unknown>;
+  const metricValues = {
+    rmse: toFiniteMetric(metrics.rmse),
+    mae: toFiniteMetric(metrics.mae),
+    mape: toFiniteMetric(metrics.mape),
+    r2: toFiniteMetric(metrics.r2),
+  };
   const resetValues: Record<string, unknown> = {
     ...modelStateResetValues[modelType],
     ...(isBaseModelType(modelType)
@@ -356,37 +413,254 @@ const invalidateExperimentStateAfterBacktestChange = async (
       : {}),
     ...commonDownstreamStateResetValues,
   };
-  const entries = Object.entries(resetValues);
-  const assignments = entries.map(([field]) => `\`${field}\` = ?`).join(", ");
 
-  await pool.query(
-    `UPDATE experiment_status
-        SET ${assignments},
-            last_activity_at = NOW()
-      WHERE experiment_id = ?
-        AND student_id = ?`,
-    [...entries.map(([, value]) => value), experimentId, studentId],
-  );
+  switch (modelType) {
+    case "ma":
+      return {
+        ...resetValues,
+        moving_average_window: request.moving_average_window ?? null,
+        moving_average_metrics_rmse: metricValues.rmse,
+        moving_average_metrics_mae: metricValues.mae,
+        moving_average_metrics_mape: metricValues.mape,
+        moving_average_metrics_r2: metricValues.r2,
+      };
+    case "es":
+      return {
+        ...resetValues,
+        exponential_smoothing_alpha: request.exponential_smoothing_alpha ?? null,
+        exponential_smoothing_metrics_rmse: metricValues.rmse,
+        exponential_smoothing_metrics_mae: metricValues.mae,
+        exponential_smoothing_metrics_mape: metricValues.mape,
+        exponential_smoothing_metrics_r2: metricValues.r2,
+      };
+    case "arima": {
+      const bestOrder = (resultValues.best_order ?? {}) as Record<string, unknown>;
+      return {
+        ...resetValues,
+        arima_p: toFiniteMetric(bestOrder.p),
+        arima_d: request.arimaD ?? null,
+        arima_q: toFiniteMetric(bestOrder.q),
+        arima_metrics_rmse: metricValues.rmse,
+        arima_metrics_mae: metricValues.mae,
+        arima_metrics_mape: metricValues.mape,
+        arima_metrics_r2: metricValues.r2,
+      };
+    }
+    case "lstm":
+      return {
+        ...resetValues,
+        lstm_normalization: request.lstmNormalization ?? null,
+        lstm_features: JSON.stringify(normalizePersistedStringArray(request.lstmFeatures)),
+        lstm_target_field: request.lstmTargetFeature ?? null,
+        lstm_metrics_rmse: metricValues.rmse,
+        lstm_metrics_mae: metricValues.mae,
+        lstm_metrics_mape: metricValues.mape,
+        lstm_metrics_r2: metricValues.r2,
+      };
+    case "weighted_avg":
+      return {
+        ...resetValues,
+        ensemble_weighted_base_models: JSON.stringify(toFrontendBaseModelIds(request.models)),
+        ensemble_weighted_metrics_rmse: metricValues.rmse,
+        ensemble_weighted_metrics_mae: metricValues.mae,
+        ensemble_weighted_metrics_mape: metricValues.mape,
+        ensemble_weighted_metrics_r2: metricValues.r2,
+      };
+    case "boosting":
+      return {
+        ...resetValues,
+        ensemble_boosting_base_models: JSON.stringify(toFrontendBaseModelIds(request.models)),
+        ensemble_boosting_metrics_rmse: metricValues.rmse,
+        ensemble_boosting_metrics_mae: metricValues.mae,
+        ensemble_boosting_metrics_mape: metricValues.mape,
+        ensemble_boosting_metrics_r2: metricValues.r2,
+      };
+    case "stacking":
+      return {
+        ...resetValues,
+        ensemble_stacking_base_models: JSON.stringify(toFrontendBaseModelIds(request.models)),
+        ensemble_stacking_metrics_rmse: metricValues.rmse,
+        ensemble_stacking_metrics_mae: metricValues.mae,
+        ensemble_stacking_metrics_mape: metricValues.mape,
+        ensemble_stacking_metrics_r2: metricValues.r2,
+      };
+  }
 };
 
-const invalidateArtifactsAfterBacktestChange = async (
+const fetchActiveModelArtifact = async (
   experimentId: number,
   studentId: number,
   modelType: ModelType,
-) => {
-  await invalidateExperimentStateAfterBacktestChange(experimentId, studentId, modelType);
-  invalidateProductionArtifact(experimentId, studentId, modelType);
+  connection?: PoolConnection,
+): Promise<ActiveModelArtifactRow | null> => {
+  const sql = `SELECT experiment_id,
+                      student_id,
+                      model_type,
+                      revision_token,
+                      training_input_version,
+                      source_session_id,
+                      backtest_artifact_path,
+                      request_payload,
+                      result_payload,
+                      production_artifact_path,
+                      production_revision_token
+                 FROM experiment_model_artifacts
+                WHERE experiment_id = ?
+                  AND student_id = ?
+                  AND model_type = ?
+                LIMIT 1`;
+  const params = [experimentId, studentId, modelType];
+  const [rows] = connection
+    ? await connection.query<ActiveModelArtifactRow[]>(sql, params)
+    : await pool.query<ActiveModelArtifactRow[]>(sql, params);
+  return rows[0] ?? null;
+};
 
-  if (!isBaseModelType(modelType)) {
-    return;
+const activateModelArtifactInTransaction = async (
+  connection: PoolConnection,
+  options: {
+    experimentId: number;
+    studentId: number;
+    modelType: ModelType;
+    revisionToken: string;
+    sourceSessionId: string | null;
+    artifactPath: string;
+    request: TrainInput;
+    result: ReturnType<typeof transformTrainingResult>;
+    expectedTrainingInputVersion?: number;
+  },
+) => {
+  const {
+    experimentId,
+    studentId,
+    modelType,
+    revisionToken,
+    sourceSessionId,
+    artifactPath,
+    request,
+    result,
+    expectedTrainingInputVersion,
+  } = options;
+  const experiment = await assertExperimentModelAccess(
+    experimentId,
+    studentId,
+    connection,
+    true,
+  );
+  if (
+    expectedTrainingInputVersion !== undefined
+    && Number(experiment.training_input_version) !== expectedTrainingInputVersion
+  ) {
+    throw new ModelConflictError("训练期间实验输入已更新，本次结果未激活；请重新开始训练");
+  }
+  assertTrainingRequestMatchesExperiment(experiment, request);
+  const [currentRows] = await connection.query<ActiveModelArtifactRow[]>(
+    `SELECT experiment_id,
+            student_id,
+            model_type,
+            revision_token,
+            training_input_version,
+            source_session_id,
+            backtest_artifact_path,
+            request_payload,
+            result_payload,
+            production_artifact_path,
+            production_revision_token
+       FROM experiment_model_artifacts
+      WHERE experiment_id = ?
+        AND model_type = ?
+      LIMIT 1
+      FOR UPDATE`,
+    [experimentId, modelType],
+  );
+  const changed = currentRows[0]?.revision_token !== revisionToken;
+  if (
+    !changed
+    && Number(currentRows[0]?.training_input_version) === Number(experiment.training_input_version)
+  ) {
+    return {
+      changed: false,
+      stateVersion: Number(experiment.state_version),
+      trainingInputVersion: Number(experiment.training_input_version),
+    };
+  }
+  const stateValues = buildActivatedModelStateValues(modelType, request, result);
+  const stateEntries = Object.entries(stateValues);
+  const stateAssignments = stateEntries.map(([field]) => `\`${field}\` = ?`).join(", ");
+  const [stateResult] = await connection.query<ResultSetHeader>(
+    `UPDATE experiment_status
+        SET ${stateAssignments},
+            last_activity_at = NOW(),
+            state_version = state_version + 1
+      WHERE experiment_id = ?
+        AND student_id = ?`,
+    [...stateEntries.map(([, value]) => value), experimentId, studentId],
+  );
+  if (stateResult.affectedRows !== 1) {
+    throw new ModelAccessError("实验不存在或不属于当前用户", 404);
   }
 
-  for (const ensembleType of ENSEMBLE_MODEL_TYPES) {
-    invalidateArtifactAtPath(
-      ensembleType,
-      getBacktestModelPath(experimentId, studentId, ensembleType),
+  if (isBaseModelType(modelType)) {
+    await connection.query(
+      `DELETE FROM experiment_model_artifacts
+        WHERE experiment_id = ?
+          AND model_type IN ('weighted_avg', 'boosting', 'stacking')`,
+      [experimentId],
     );
-    invalidateProductionArtifact(experimentId, studentId, ensembleType);
+  }
+
+  await connection.query(
+    `INSERT INTO experiment_model_artifacts
+       (experiment_id,
+        student_id,
+        model_type,
+        revision_token,
+        training_input_version,
+        source_session_id,
+        backtest_artifact_path,
+        request_payload,
+        result_payload,
+        production_artifact_path,
+        production_revision_token,
+        activated_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, NOW(3))
+     ON DUPLICATE KEY UPDATE
+       student_id = VALUES(student_id),
+       revision_token = VALUES(revision_token),
+       training_input_version = VALUES(training_input_version),
+       source_session_id = VALUES(source_session_id),
+       backtest_artifact_path = VALUES(backtest_artifact_path),
+       request_payload = VALUES(request_payload),
+       result_payload = VALUES(result_payload),
+       production_artifact_path = NULL,
+       production_revision_token = NULL,
+       activated_at = NOW(3)`,
+    [
+      experimentId,
+      studentId,
+      modelType,
+      revisionToken,
+      Number(experiment.training_input_version),
+      sourceSessionId,
+      artifactPath,
+      JSON.stringify(request),
+      JSON.stringify(result),
+    ],
+  );
+
+  return {
+    changed,
+    stateVersion: Number(experiment.state_version) + 1,
+    trainingInputVersion: Number(experiment.training_input_version),
+  };
+};
+
+const assertActiveArtifactMatchesTrainingInput = (
+  experiment: ExperimentModelContextRow,
+  artifact: ActiveModelArtifactRow,
+) => {
+  if (Number(artifact.training_input_version) !== Number(experiment.training_input_version)) {
+    throw new ModelConflictError("实验训练输入已更新，当前模型产物不再匹配；请重新训练模型");
   }
 };
 
@@ -497,235 +771,6 @@ const hasReusableSavedModelArtifact = async (modelType: ModelType, modelPath: st
   return await hasCompleteEnsembleArtifact(modelPath);
 };
 
-const LSTM_ARTIFACT_COPY_SCRIPT = `
-import os
-import pickle
-import shutil
-import sys
-import tempfile
-
-source_model_path = sys.argv[1]
-destination_model_path = sys.argv[2]
-
-if not os.path.exists(source_model_path):
-    raise FileNotFoundError(f"source model not found: {source_model_path}")
-
-os.makedirs(os.path.dirname(destination_model_path), exist_ok=True)
-shutil.copy2(source_model_path, destination_model_path)
-
-with open(destination_model_path, "rb") as handle:
-    state = pickle.load(handle)
-
-source_keras_path = state.get("keras_model_path")
-if not source_keras_path:
-    source_keras_path = os.path.splitext(source_model_path)[0] + "_keras_model.h5"
-
-if not os.path.exists(source_keras_path):
-    raise FileNotFoundError(f"source keras model not found: {source_keras_path}")
-
-destination_keras_path = os.path.splitext(destination_model_path)[0] + "_keras_model.h5"
-shutil.copy2(source_keras_path, destination_keras_path)
-state["keras_model_path"] = destination_keras_path
-
-fd, temp_name = tempfile.mkstemp(
-    prefix=f".{os.path.basename(destination_model_path)}.",
-    suffix=".tmp",
-    dir=os.path.dirname(destination_model_path),
-)
-try:
-    with os.fdopen(fd, "wb") as handle:
-        pickle.dump(state, handle, protocol=pickle.HIGHEST_PROTOCOL)
-        handle.flush()
-        os.fsync(handle.fileno())
-    os.replace(temp_name, destination_model_path)
-finally:
-    if os.path.exists(temp_name):
-        try:
-            os.remove(temp_name)
-        except OSError:
-            pass
-`;
-
-const copyLstmModelArtifact = async (sourceModelPath: string, destinationModelPath: string) => {
-  const pythonExec = resolvePythonExecutable();
-  const proc = Bun.spawn([
-    pythonExec,
-    "-c",
-    LSTM_ARTIFACT_COPY_SCRIPT,
-    sourceModelPath,
-    destinationModelPath,
-  ], {
-    cwd: PY_DIR,
-    stdout: "pipe",
-    stderr: "pipe",
-    env: {
-      ...process.env,
-      ...buildPythonModelProcessEnv(),
-      PATH: `${path.dirname(pythonExec)}${path.delimiter}${process.env.PATH ?? ""}`,
-    },
-  });
-
-  const [, stderr] = await Promise.all([
-    new Response(proc.stdout).text(),
-    new Response(proc.stderr).text(),
-  ]);
-  await proc.exited;
-
-  if (proc.exitCode !== 0) {
-    logger.error(
-      { stderr: stderr.slice(0, 2000), sourceModelPath, destinationModelPath },
-      "恢复 guided LSTM 模型产物失败",
-    );
-    throw new Error("恢复 LSTM 模型产物失败");
-  }
-};
-
-const ENSEMBLE_ARTIFACT_COPY_SCRIPT = `
-import os
-import sys
-
-sys.path.insert(0, os.path.join(os.getcwd(), "src"))
-
-from ensemble_utils import get_member_model_path, persist_member_model_artifact
-from serialization import dump_model, load_model
-
-source_model_path = sys.argv[1]
-destination_model_path = sys.argv[2]
-
-if not os.path.exists(source_model_path):
-    raise FileNotFoundError(f"source model not found: {source_model_path}")
-
-state = load_model(source_model_path)
-if not isinstance(state, dict):
-    raise ValueError("invalid ensemble state")
-
-base_model_states = state.get("base_model_states")
-if not isinstance(base_model_states, dict):
-    raise ValueError("ensemble state is missing base_model_states")
-
-os.makedirs(os.path.dirname(destination_model_path), exist_ok=True)
-
-def persist_state(model_name, model_state, round_idx=None):
-    if not isinstance(model_state, dict):
-        return
-    source_member_path = model_state.get("model_file")
-    if not isinstance(source_member_path, str) or not source_member_path:
-        raise ValueError(f"missing member artifact for {model_name}")
-    destination_member_path = get_member_model_path(destination_model_path, model_name, round_idx)
-    persist_member_model_artifact(
-        model_name,
-        source_member_path,
-        destination_member_path,
-        move_source=False,
-    )
-    model_state["model_file"] = destination_member_path
-    model_state.pop("artifact_origin", None)
-
-for outer_name, model_info in base_model_states.items():
-    if isinstance(model_info, dict) and isinstance(model_info.get("models"), list):
-        for index, model_state in enumerate(model_info["models"]):
-            if not isinstance(model_state, dict):
-                continue
-            model_name = str(model_state.get("model_type") or outer_name)
-            round_value = model_state.get("round", index)
-            try:
-                round_idx = int(round_value)
-            except (TypeError, ValueError):
-                round_idx = index
-            persist_state(model_name, model_state, round_idx)
-    elif isinstance(model_info, dict):
-        model_name = str(model_info.get("model_type") or outer_name)
-        persist_state(model_name, model_info)
-
-dump_model(state, destination_model_path)
-`;
-
-const copyEnsembleModelArtifact = async (sourceModelPath: string, destinationModelPath: string) => {
-  const pythonExec = resolvePythonExecutable();
-  const proc = Bun.spawn([
-    pythonExec,
-    "-c",
-    ENSEMBLE_ARTIFACT_COPY_SCRIPT,
-    sourceModelPath,
-    destinationModelPath,
-  ], {
-    cwd: PY_DIR,
-    stdout: "pipe",
-    stderr: "pipe",
-    env: {
-      ...process.env,
-      ...buildPythonModelProcessEnv(),
-      PATH: `${path.dirname(pythonExec)}${path.delimiter}${process.env.PATH ?? ""}`,
-    },
-  });
-
-  const [, stderr] = await Promise.all([
-    new Response(proc.stdout).text(),
-    new Response(proc.stderr).text(),
-  ]);
-  await proc.exited;
-
-  if (proc.exitCode !== 0) {
-    logger.error(
-      { stderr: stderr.slice(0, 2000), sourceModelPath, destinationModelPath },
-      "恢复 guided 融合模型产物失败",
-    );
-    throw new Error("恢复融合模型产物失败");
-  }
-};
-
-const copyModelArtifact = async (
-  modelType: GuidedModelType,
-  sourceModelPath: string,
-  destinationModelPath: string,
-) => {
-  if (!fs.existsSync(sourceModelPath)) {
-    throw new ModelNotFoundError("分阶段训练模型产物已丢失，请重新训练");
-  }
-
-  fs.mkdirSync(path.dirname(destinationModelPath), { recursive: true });
-
-  if (modelType === "lstm") {
-    await copyLstmModelArtifact(sourceModelPath, destinationModelPath);
-    return;
-  }
-
-  if (isEnsembleModelType(modelType)) {
-    removeSiblingArtifactsByPrefix(destinationModelPath);
-    await copyEnsembleModelArtifact(sourceModelPath, destinationModelPath);
-    return;
-  }
-
-  fs.copyFileSync(sourceModelPath, destinationModelPath);
-};
-
-const restoreGuidedSessionBacktestArtifact = async (
-  row: GuidedTrainingSessionRow,
-  options: { invalidateProductionArtifact?: boolean } = {},
-) => {
-  assertGuidedTrainingSessionDependenciesCurrent(row);
-  const sourceModelPath = getGuidedSessionModelPath(row.artifact_dir, row.model_type);
-  const backtestModelPath = getBacktestModelPath(row.experiment_id, row.student_id, row.model_type);
-
-  if (!(await hasReusableSavedModelArtifact(row.model_type, sourceModelPath))) {
-    throw new ModelNotFoundError("分阶段训练产物已过期或已被清理，请重新开始分阶段训练");
-  }
-
-  const sourceMarkerPath = getGuidedBacktestSourceMarkerPath(backtestModelPath);
-  const alreadyRestoredFromThisSession = readGuidedBacktestSourceMarker(backtestModelPath) === row.session_id
-    && await hasReusableSavedModelArtifact(row.model_type, backtestModelPath);
-  if (alreadyRestoredFromThisSession) {
-    return { modelPath: backtestModelPath, changed: false };
-  }
-
-  if (options.invalidateProductionArtifact) {
-    await invalidateArtifactsAfterBacktestChange(row.experiment_id, row.student_id, row.model_type);
-  }
-  await copyModelArtifact(row.model_type, sourceModelPath, backtestModelPath);
-  fs.writeFileSync(sourceMarkerPath, row.session_id, "utf8");
-  return { modelPath: backtestModelPath, changed: true };
-};
-
 const isPathInsideDirectory = (candidatePath: string, rootDirectory: string) => {
   const resolvedCandidate = path.resolve(candidatePath);
   const resolvedRoot = path.resolve(rootDirectory);
@@ -749,33 +794,85 @@ const removeGuidedTrainingArtifactDir = (artifactDir: string) => {
 };
 
 const deleteGuidedTrainingSession = async (
-  row: Pick<GuidedTrainingSessionRow, "session_id" | "artifact_dir">,
+  row: GuidedTrainingSessionRow,
 ) => {
-  let canDeleteSessionRow = false;
+  let artifactLocks = null;
   try {
-    removeGuidedTrainingArtifactDir(row.artifact_dir);
-    canDeleteSessionRow = true;
-  } catch (error) {
-    logger.warn(
-      {
-        err: error instanceof Error ? { message: error.message, stack: error.stack } : { message: String(error) },
-        sessionId: row.session_id,
-        artifactDir: row.artifact_dir,
-      },
-      "删除 guided training 工件目录失败，将保留会话记录以便后续重试",
+    artifactLocks = await acquireModelArtifactMutationLocks(row.experiment_id, row.model_type);
+    if (!artifactLocks) {
+      throw new ModelConflictError("该实验已有模型任务在执行，请稍后重试");
+    }
+
+    const refreshedRow = await fetchGuidedTrainingSessionRow(row.session_id);
+    if (!refreshedRow) {
+      return true;
+    }
+    const modelPath = getGuidedSessionModelPath(
+      refreshedRow.artifact_dir,
+      refreshedRow.model_type,
     );
-  }
+    if (await hasReusableSavedModelArtifact(refreshedRow.model_type, modelPath)) {
+      return false;
+    }
 
-  if (!canDeleteSessionRow) {
-    return false;
-  }
+    const connection = await pool.getConnection();
+    try {
+      await connection.beginTransaction();
+      const [lockedRows] = await connection.query<RowDataPacket[]>(
+        `SELECT session_id
+           FROM model_guided_training_sessions
+          WHERE session_id = ?
+            AND status = 'completed'
+          LIMIT 1
+          FOR UPDATE`,
+        [row.session_id],
+      );
+      if (lockedRows.length === 0) {
+        await connection.rollback();
+        return false;
+      }
+      // Keep an invalid registry row as an explicit stale revision, but detach
+      // its source FK so the unusable session can be replaced safely.
+      await connection.query(
+        `UPDATE experiment_model_artifacts
+            SET source_session_id = NULL
+          WHERE source_session_id = ?`,
+        [row.session_id],
+      );
+      const [deleteResult] = await connection.query<ResultSetHeader>(
+        `DELETE FROM model_guided_training_sessions
+          WHERE session_id = ?
+            AND status = 'completed'`,
+        [row.session_id],
+      );
+      if (deleteResult.affectedRows !== 1) {
+        await connection.rollback();
+        return false;
+      }
+      await connection.commit();
+    } catch (error) {
+      await connection.rollback().catch(() => {});
+      throw error;
+    } finally {
+      connection.release();
+    }
 
-  await pool.query(
-    `DELETE FROM model_guided_training_sessions
-      WHERE session_id = ?`,
-    [row.session_id],
-  );
-  return true;
+    try {
+      removeGuidedTrainingArtifactDir(refreshedRow.artifact_dir);
+    } catch (error) {
+      logger.warn(
+        {
+          err: error instanceof Error ? { message: error.message, stack: error.stack } : { message: String(error) },
+          sessionId: row.session_id,
+          artifactDir: refreshedRow.artifact_dir,
+        },
+        "删除不可用 guided training 工件目录失败，后续将按 orphan 目录重试清理",
+      );
+    }
+    return true;
+  } finally {
+    await releaseModelArtifactMutationLocks(artifactLocks);
+  }
 };
 
 const cleanupOrphanGuidedTrainingArtifactDirs = async (
@@ -848,26 +945,62 @@ export async function cleanupExpiredGuidedTrainingSessions(
     : GUIDED_TRAINING_CLEANUP_BATCH_SIZE;
 
   const expirationCutoffExpression = options.now ? "?" : "NOW()";
-  const expirationCutoffParams = options.now ? [options.now] : [];
   const [rows] = await pool.query<GuidedTrainingCleanupRow[]>(
     `SELECT session_id,
+            experiment_id,
+            model_type,
             artifact_dir
        FROM model_guided_training_sessions
-      WHERE expires_at IS NOT NULL
+      WHERE (
+          status <> 'running'
+          OR lease_expires_at IS NULL
+          OR lease_expires_at <= ${expirationCutoffExpression}
+        )
+        AND expires_at IS NOT NULL
         AND expires_at <= ${expirationCutoffExpression}
+        AND NOT EXISTS (
+          SELECT 1
+            FROM experiment_model_artifacts active_artifact
+           WHERE active_artifact.source_session_id = model_guided_training_sessions.session_id
+        )
       ORDER BY expires_at ASC
       LIMIT ${limit}`,
-    expirationCutoffParams,
+    options.now ? [options.now, options.now] : [],
   );
 
   let deletedArtifactDirs = 0;
-  const sessionIdsToDelete: string[] = [];
+  let deletedSessions = 0;
   for (const row of rows) {
+    let artifactLocks = null;
     try {
+      artifactLocks = await acquireModelArtifactMutationLocks(row.experiment_id, row.model_type);
+      if (!artifactLocks) {
+        continue;
+      }
+      const [deleteResult] = await pool.query<ResultSetHeader>(
+        `DELETE FROM model_guided_training_sessions
+          WHERE session_id = ?
+            AND (
+              status <> 'running'
+              OR lease_expires_at IS NULL
+              OR lease_expires_at <= ${expirationCutoffExpression}
+            )
+            AND expires_at IS NOT NULL
+            AND expires_at <= ${expirationCutoffExpression}
+            AND NOT EXISTS (
+              SELECT 1
+                FROM experiment_model_artifacts active_artifact
+               WHERE active_artifact.source_session_id = model_guided_training_sessions.session_id
+            )`,
+        options.now ? [row.session_id, options.now, options.now] : [row.session_id],
+      );
+      if (deleteResult.affectedRows !== 1) {
+        continue;
+      }
+      deletedSessions += 1;
       if (removeGuidedTrainingArtifactDir(row.artifact_dir)) {
         deletedArtifactDirs += 1;
       }
-      sessionIdsToDelete.push(row.session_id);
     } catch (error) {
       logger.warn(
         {
@@ -877,16 +1010,9 @@ export async function cleanupExpiredGuidedTrainingSessions(
         },
         "清理过期 guided training 工件目录失败",
       );
+    } finally {
+      await releaseModelArtifactMutationLocks(artifactLocks);
     }
-  }
-
-  if (sessionIdsToDelete.length > 0) {
-    const placeholders = sessionIdsToDelete.map(() => "?").join(", ");
-    await pool.query(
-      `DELETE FROM model_guided_training_sessions
-        WHERE session_id IN (${placeholders})`,
-      sessionIdsToDelete,
-    );
   }
 
   deletedArtifactDirs += await cleanupOrphanGuidedTrainingArtifactDirs(
@@ -895,7 +1021,7 @@ export async function cleanupExpiredGuidedTrainingSessions(
   );
 
   return {
-    deletedSessions: sessionIdsToDelete.length,
+    deletedSessions,
     deletedArtifactDirs,
   };
 }
@@ -919,11 +1045,12 @@ const stableJsonStringify = (value: unknown): string => {
 const hashGuidedTrainingRequest = (
   modelType: GuidedModelType,
   body: TrainInput,
+  trainingInputVersion: number,
   dependencyRevisions?: unknown,
 ) =>
   crypto
     .createHash("sha256")
-    .update(stableJsonStringify({ modelType, body, dependencyRevisions }))
+    .update(stableJsonStringify({ modelType, body, trainingInputVersion, dependencyRevisions }))
     .digest("hex");
 
 const parseJsonColumn = <T>(value: unknown, fallback: T): T => {
@@ -1157,68 +1284,79 @@ const buildEnsemblePythonParams = (
   return pythonParams;
 };
 
-const buildAvailableBaseModelArtifactMap = (
+const buildAvailableBaseModelArtifactMap = async (
   experimentId: number,
   studentId: number,
   modelsValue: string,
-): Partial<Record<BaseModelType, string>> => {
+  expectedTrainingInputVersion: number,
+): Promise<Partial<Record<BaseModelType, string>>> => {
   const requestedModels = parseRequestedBaseModels(modelsValue);
   const availableModelFiles: Partial<Record<BaseModelType, string>> = {};
 
   for (const modelName of requestedModels) {
-    const modelPath = getBacktestModelPath(experimentId, studentId, modelName);
-    if (hasSavedModelArtifact(modelName, modelPath)) {
-      availableModelFiles[modelName] = modelPath;
+    const activeArtifact = await fetchActiveModelArtifact(experimentId, studentId, modelName);
+    if (
+      activeArtifact
+      && Number(activeArtifact.training_input_version) === expectedTrainingInputVersion
+      && await hasReusableSavedModelArtifact(modelName, activeArtifact.backtest_artifact_path)
+    ) {
+      availableModelFiles[modelName] = activeArtifact.backtest_artifact_path;
     }
   }
 
   return availableModelFiles;
 };
 
-const fingerprintArtifactFile = (filePath: string) => {
-  if (!fs.existsSync(filePath)) {
-    return null;
-  }
-
-  try {
-    return crypto.createHash("sha256").update(fs.readFileSync(filePath)).digest("hex");
-  } catch {
-    return "unreadable";
-  }
-};
-
-const buildEnsembleDependencyRevisions = (
+const buildGuidedDependencyRevisions = async (
   modelType: GuidedModelType,
   experimentId: number,
   studentId: number,
   modelsValue: string | undefined,
+  options: {
+    connection?: PoolConnection;
+    targetRevisionOverride?: string;
+  } = {},
 ) => {
-  if (!isEnsembleModelType(modelType) || !modelsValue) {
-    return undefined;
+  const activeTargetArtifact = options.targetRevisionOverride
+    ? null
+    : await fetchActiveModelArtifact(
+        experimentId,
+        studentId,
+        modelType,
+        options.connection,
+      );
+  const baseRevisions = [];
+  if (isEnsembleModelType(modelType) && modelsValue) {
+    for (const baseModelType of parseRequestedBaseModels(modelsValue)) {
+      const activeArtifact = await fetchActiveModelArtifact(
+        experimentId,
+        studentId,
+        baseModelType,
+        options.connection,
+      );
+      baseRevisions.push({
+        model_type: baseModelType,
+        revision_token: activeArtifact?.revision_token ?? null,
+      });
+    }
   }
-
-  return parseRequestedBaseModels(modelsValue).map((baseModelType) => {
-    const modelPath = getBacktestModelPath(experimentId, studentId, baseModelType);
-    return {
-      model_type: baseModelType,
-      model: fingerprintArtifactFile(modelPath),
-      sidecar: baseModelType === "lstm"
-        ? fingerprintArtifactFile(getLstmSidecarPath(modelPath))
-        : undefined,
-    };
-  });
+  return {
+    target_revision: options.targetRevisionOverride
+      ?? activeTargetArtifact?.revision_token
+      ?? null,
+    base_revisions: baseRevisions,
+  };
 };
 
-function assertGuidedTrainingSessionDependenciesCurrent(row: GuidedTrainingSessionRow) {
-  if (!isEnsembleModelType(row.model_type)) {
-    return;
-  }
-
+async function assertGuidedTrainingSessionDependenciesCurrent(row: GuidedTrainingSessionRow) {
   const body = parseJsonColumn<TrainInput>(row.request_payload, {} as TrainInput);
+  const experiment = await assertExperimentModelAccess(row.experiment_id, row.student_id);
+  const currentTrainingInputVersion = Number(experiment.training_input_version);
   const currentRequestHash = hashGuidedTrainingRequest(
     row.model_type,
     body,
-    buildEnsembleDependencyRevisions(
+    currentTrainingInputVersion,
+    await buildGuidedDependencyRevisions(
       row.model_type,
       row.experiment_id,
       row.student_id,
@@ -1227,7 +1365,7 @@ function assertGuidedTrainingSessionDependenciesCurrent(row: GuidedTrainingSessi
   );
 
   if (currentRequestHash !== row.request_hash) {
-    throw new ModelValidationError("融合模型依赖的基础模型已更新，请重新开始分阶段训练");
+    throw new ModelConflictError("实验训练输入或基础模型版本已更新，请重新开始分阶段训练");
   }
 }
 
@@ -1513,7 +1651,11 @@ const trimBoostingStepPlanAfterEarlyStop = (
 
 const buildGuidedTrainingSessionPayload = (
   row: GuidedTrainingSessionRow,
-  options: { backtestArtifactChanged?: boolean } = {},
+  options: {
+    backtestArtifactChanged?: boolean;
+    artifactRevision?: string | null;
+    experimentStateVersion?: number | null;
+  } = {},
 ): GuidedTrainingSessionPayload => {
   const completedStepIds = parseJsonColumn<string[]>(row.completed_step_ids, []);
   const stepOutputs = parseJsonColumn<Record<string, unknown>>(row.step_outputs, {});
@@ -1546,6 +1688,8 @@ const buildGuidedTrainingSessionPayload = (
     result,
     error_message: row.error_message,
     backtest_artifact_changed: options.backtestArtifactChanged === true,
+    artifact_revision: options.artifactRevision ?? null,
+    experiment_state_version: options.experimentStateVersion ?? null,
   };
 };
 
@@ -1566,7 +1710,12 @@ const fetchGuidedTrainingSessionRow = async (
             step_plan,
             result_payload,
             artifact_dir,
-            error_message
+            error_message,
+            training_input_version,
+            run_token,
+            run_version,
+            lease_expires_at,
+            last_heartbeat_at
        FROM model_guided_training_sessions
       WHERE session_id = ?
       LIMIT 1`,
@@ -1576,10 +1725,168 @@ const fetchGuidedTrainingSessionRow = async (
   return rows[0] ?? null;
 };
 
+interface GuidedTrainingAttempt {
+  token: string;
+  version: number;
+}
+
+const claimGuidedTrainingAttempt = async (
+  row: GuidedTrainingSessionRow,
+  stepId: string,
+): Promise<GuidedTrainingAttempt> => {
+  const token = crypto.randomUUID();
+  const currentVersion = Number(row.run_version ?? 0);
+  const [result] = await pool.query<ResultSetHeader>(
+    `UPDATE model_guided_training_sessions
+        SET status = 'running',
+            current_step_id = ?,
+            error_message = NULL,
+            run_token = ?,
+            run_version = run_version + 1,
+            last_heartbeat_at = NOW(3),
+            lease_expires_at = TIMESTAMPADD(SECOND, ?, NOW(3)),
+            expires_at = DATE_ADD(NOW(), INTERVAL 7 DAY)
+      WHERE session_id = ?
+        AND run_version = ?
+        AND (
+          status IN ('ready', 'failed')
+          OR (
+            status = 'running'
+            AND (lease_expires_at IS NULL OR lease_expires_at <= NOW(3))
+          )
+        )`,
+    [stepId, token, GUIDED_STEP_LEASE_SECONDS, row.session_id, currentVersion],
+  );
+
+  if (result.affectedRows !== 1) {
+    throw new ModelConflictError("该分阶段训练会话已有执行中的步骤，请稍后重试");
+  }
+
+  return { token, version: currentVersion + 1 };
+};
+
+const startGuidedTrainingHeartbeat = (
+  sessionId: string,
+  attempt: GuidedTrainingAttempt,
+) => {
+  let stopped = false;
+  let pendingHeartbeat = Promise.resolve();
+
+  const heartbeat = async () => {
+    if (stopped) return;
+    try {
+      const [result] = await pool.query<ResultSetHeader>(
+        `UPDATE model_guided_training_sessions
+            SET last_heartbeat_at = NOW(3),
+                lease_expires_at = TIMESTAMPADD(SECOND, ?, NOW(3))
+          WHERE session_id = ?
+            AND status = 'running'
+            AND run_token = ?
+            AND run_version = ?`,
+        [GUIDED_STEP_LEASE_SECONDS, sessionId, attempt.token, attempt.version],
+      );
+      if (result.affectedRows !== 1) {
+        logger.warn(
+          { sessionId, runVersion: attempt.version },
+          "guided training 租约已丢失，当前执行将不允许提交",
+        );
+      }
+    } catch (error) {
+      logger.warn(
+        { err: error, sessionId, runVersion: attempt.version },
+        "续期 guided training 租约失败",
+      );
+    }
+  };
+
+  const timer = setInterval(() => {
+    pendingHeartbeat = pendingHeartbeat.then(heartbeat, heartbeat);
+  }, GUIDED_STEP_HEARTBEAT_INTERVAL_MS);
+
+  return async () => {
+    if (stopped) return;
+    stopped = true;
+    clearInterval(timer);
+    await pendingHeartbeat;
+  };
+};
+
+const assertGuidedTrainingAttemptOwned = async (
+  sessionId: string,
+  attempt: GuidedTrainingAttempt,
+) => {
+  const [rows] = await pool.query<RowDataPacket[]>(
+    `SELECT session_id
+       FROM model_guided_training_sessions
+      WHERE session_id = ?
+        AND status = 'running'
+        AND run_token = ?
+        AND run_version = ?
+        AND lease_expires_at > NOW(3)
+      LIMIT 1`,
+    [sessionId, attempt.token, attempt.version],
+  );
+  if (rows.length !== 1) {
+    throw new ModelStaleAttemptError("分阶段训练执行权已转移，本次结果已丢弃");
+  }
+};
+
+const getGuidedPublicErrorMessage = (error: unknown) => {
+  if (
+    error instanceof ModelAccessError
+    || error instanceof ModelCapacityError
+    || error instanceof ModelConflictError
+    || error instanceof ModelNotFoundError
+    || error instanceof ModelStaleAttemptError
+    || error instanceof ModelValidationError
+  ) {
+    return error.message;
+  }
+
+  const message = error instanceof Error ? error.message : "";
+  if (message.startsWith("[PYTHON_VALIDATION]") || message.startsWith("[PYTHON_DATA]")) {
+    return message;
+  }
+  if (message.includes("超时") || message.includes("timed out")) {
+    return "分阶段训练执行超时，可以重试当前步骤";
+  }
+  return "分阶段训练执行失败，可以重试当前步骤";
+};
+
+const recordGuidedTrainingAttemptFailure = async (
+  sessionId: string,
+  stepId: string,
+  attempt: GuidedTrainingAttempt,
+  error: unknown,
+) => {
+  try {
+    await pool.query(
+      `UPDATE model_guided_training_sessions
+          SET status = 'failed',
+              current_step_id = ?,
+              error_message = ?,
+              run_token = NULL,
+              lease_expires_at = NULL,
+              last_heartbeat_at = NULL
+        WHERE session_id = ?
+          AND status = 'running'
+          AND run_token = ?
+          AND run_version = ?`,
+      [stepId, getGuidedPublicErrorMessage(error), sessionId, attempt.token, attempt.version],
+    );
+  } catch (recordError) {
+    logger.error(
+      { err: recordError, sessionId, stepId, runVersion: attempt.version },
+      "记录 guided training 失败状态时发生二次错误",
+    );
+  }
+};
+
 const buildGuidedTrainingPythonParams = async (
   modelType: GuidedModelType,
   studentId: number,
   body: TrainInput,
+  modelSaveLoc: string,
 ): Promise<Record<string, unknown>> => {
   const experiment = await assertExperimentModelAccess(body.experiment_id, studentId);
   assertTrainingRequestMatchesExperiment(experiment, body);
@@ -1609,7 +1916,6 @@ const buildGuidedTrainingPythonParams = async (
     throw new ModelValidationError("数据窗口索引超出范围", { dataset_size: allData.length });
   }
 
-  const modelSaveLoc = getBacktestModelPath(body.experiment_id, studentId, modelType);
   const pythonParams: Record<string, unknown> = {
     data: JSON.stringify(allData),
     trainStart: trainingConfig.data_window_train_start_index,
@@ -1629,7 +1935,12 @@ const buildGuidedTrainingPythonParams = async (
 
   Object.assign(pythonParams, derivedModelParams);
   if (isEnsembleModelType(modelType) && body.models) {
-    const baseModelArtifactMap = buildAvailableBaseModelArtifactMap(body.experiment_id, studentId, body.models);
+    const baseModelArtifactMap = await buildAvailableBaseModelArtifactMap(
+      body.experiment_id,
+      studentId,
+      body.models,
+      Number(experiment.training_input_version),
+    );
     if (Object.keys(baseModelArtifactMap).length > 0) {
       pythonParams.baseModelFiles = JSON.stringify(baseModelArtifactMap);
     }
@@ -1659,7 +1970,8 @@ export async function createOrResumeGuidedTrainingSession(
   const requestHash = hashGuidedTrainingRequest(
     modelType,
     body,
-    buildEnsembleDependencyRevisions(
+    Number(experiment.training_input_version),
+    await buildGuidedDependencyRevisions(
       modelType,
       body.experiment_id,
       studentId,
@@ -1680,7 +1992,12 @@ export async function createOrResumeGuidedTrainingSession(
             step_plan,
             result_payload,
             artifact_dir,
-            error_message
+            error_message,
+            training_input_version,
+            run_token,
+            run_version,
+            lease_expires_at,
+            last_heartbeat_at
        FROM model_guided_training_sessions
       WHERE experiment_id = ?
         AND student_id = ?
@@ -1692,15 +2009,6 @@ export async function createOrResumeGuidedTrainingSession(
 
   const existingSession = existingRows[0];
   if (existingSession) {
-    if (existingSession.status === "running") {
-      await pool.query(
-        `UPDATE model_guided_training_sessions
-            SET status = 'ready'
-          WHERE session_id = ?`,
-        [existingSession.session_id],
-      );
-      existingSession.status = "ready";
-    }
     if (existingSession.status === "completed") {
       const sourceModelPath = getGuidedSessionModelPath(existingSession.artifact_dir, modelType);
       if (await hasReusableSavedModelArtifact(modelType, sourceModelPath)) {
@@ -1717,7 +2025,11 @@ export async function createOrResumeGuidedTrainingSession(
       );
       const deletedSession = await deleteGuidedTrainingSession(existingSession);
       if (!deletedSession) {
-        throw new ModelValidationError("旧的分阶段训练会话工件清理失败，请稍后重试");
+        const refreshedSession = await fetchGuidedTrainingSessionRow(existingSession.session_id);
+        if (refreshedSession) {
+          return buildGuidedTrainingSessionPayload(refreshedSession);
+        }
+        throw new ModelConflictError("旧的分阶段训练会话状态已更新，请重试");
       }
     } else {
       return buildGuidedTrainingSessionPayload(existingSession);
@@ -1726,13 +2038,13 @@ export async function createOrResumeGuidedTrainingSession(
 
   const sessionId = crypto.randomUUID();
   const artifactDir = buildGuidedTrainingArtifactDir(body.experiment_id, studentId, modelType, sessionId);
-  fs.mkdirSync(artifactDir, { recursive: true });
 
   const completedStepIds: string[] = [];
   const stepPlan = buildGuidedTrainingStepPlan(modelType, body);
   const currentStepId = getGuidedNextStepId(stepPlan, completedStepIds);
-  await pool.query(
-    `INSERT INTO model_guided_training_sessions
+  try {
+    await pool.query(
+      `INSERT INTO model_guided_training_sessions
        (session_id,
         experiment_id,
         student_id,
@@ -1746,22 +2058,60 @@ export async function createOrResumeGuidedTrainingSession(
         step_plan,
         result_payload,
         artifact_dir,
+        training_input_version,
         expires_at)
-     VALUES (?, ?, ?, ?, ?, ?, 'ready', ?, ?, ?, ?, NULL, ?, DATE_ADD(NOW(), INTERVAL 7 DAY))`,
-    [
-      sessionId,
-      body.experiment_id,
-      studentId,
-      modelType,
-      requestHash,
-      JSON.stringify(body),
-      currentStepId,
-      JSON.stringify(completedStepIds),
-      JSON.stringify({}),
-      JSON.stringify(stepPlan),
-      artifactDir,
-    ],
-  );
+       VALUES (?, ?, ?, ?, ?, ?, 'ready', ?, ?, ?, ?, NULL, ?, ?, DATE_ADD(NOW(), INTERVAL 7 DAY))`,
+      [
+        sessionId,
+        body.experiment_id,
+        studentId,
+        modelType,
+        requestHash,
+        JSON.stringify(body),
+        currentStepId,
+        JSON.stringify(completedStepIds),
+        JSON.stringify({}),
+        JSON.stringify(stepPlan),
+        artifactDir,
+        Number(experiment.training_input_version),
+      ],
+    );
+  } catch (error) {
+    if (!isDuplicateKeyError(error)) throw error;
+
+    const [winnerRows] = await pool.query<GuidedTrainingSessionRow[]>(
+      `SELECT session_id,
+              experiment_id,
+              student_id,
+              model_type,
+              request_hash,
+              request_payload,
+              status,
+              current_step_id,
+              completed_step_ids,
+              step_outputs,
+              step_plan,
+              result_payload,
+              artifact_dir,
+              error_message,
+              training_input_version,
+              run_token,
+              run_version,
+              lease_expires_at,
+              last_heartbeat_at
+         FROM model_guided_training_sessions
+        WHERE experiment_id = ?
+          AND student_id = ?
+          AND model_type = ?
+          AND request_hash = ?
+        LIMIT 1`,
+      [body.experiment_id, studentId, modelType, requestHash],
+    );
+    if (winnerRows[0]) {
+      return buildGuidedTrainingSessionPayload(winnerRows[0]);
+    }
+    throw error;
+  }
 
   const row = await fetchGuidedTrainingSessionRow(sessionId);
   if (!row) {
@@ -1790,7 +2140,7 @@ export async function getGuidedTrainingSession(
   }
 
   await assertExperimentModelAccess(row.experiment_id, studentId);
-  assertGuidedTrainingSessionDependenciesCurrent(row);
+  await assertGuidedTrainingSessionDependenciesCurrent(row);
   return buildGuidedTrainingSessionPayload(row);
 }
 
@@ -1815,7 +2165,7 @@ export async function activateGuidedTrainingSession(
   try {
     artifactLocks = await acquireModelArtifactMutationLocks(initialRow.experiment_id, modelType);
     if (!artifactLocks) {
-      throw new ModelValidationError("同一模型正在训练或预测，请稍后再试");
+      throw new ModelConflictError("该实验已有模型任务在执行，请稍后重试");
     }
 
     await assertExperimentModelAccess(initialRow.experiment_id, studentId);
@@ -1827,11 +2177,84 @@ export async function activateGuidedTrainingSession(
       throw new ModelValidationError("只能激活已完成的分阶段训练会话");
     }
 
-    const restoredArtifact = await restoreGuidedSessionBacktestArtifact(row, {
-      invalidateProductionArtifact: true,
-    });
+    await assertGuidedTrainingSessionDependenciesCurrent(row);
+    const artifactPath = getGuidedSessionModelPath(row.artifact_dir, modelType);
+    if (!(await hasReusableSavedModelArtifact(modelType, artifactPath))) {
+      throw new ModelNotFoundError("分阶段训练产物已过期或已被清理，请重新开始分阶段训练");
+    }
+    const request = parseJsonColumn<TrainInput>(row.request_payload, {} as TrainInput);
+    const result = parseJsonColumn<ReturnType<typeof transformTrainingResult> | null>(
+      row.result_payload,
+      null,
+    );
+    if (!result) {
+      throw new ModelValidationError("分阶段训练结果不完整，无法激活");
+    }
+
+    const connection = await pool.getConnection();
+    let changed = false;
+    let experimentStateVersion: number | null = null;
+    try {
+      await connection.beginTransaction();
+      const [sessionRows] = await connection.query<RowDataPacket[]>(
+        `SELECT session_id
+           FROM model_guided_training_sessions
+          WHERE session_id = ?
+            AND student_id = ?
+            AND model_type = ?
+            AND status = 'completed'
+          LIMIT 1
+          FOR UPDATE`,
+        [sessionId, studentId, modelType],
+      );
+      if (sessionRows.length !== 1) {
+        throw new ModelConflictError("分阶段训练会话状态已变更，请刷新后重试");
+      }
+      const activation = await activateModelArtifactInTransaction(connection, {
+        experimentId: row.experiment_id,
+        studentId,
+        modelType,
+        revisionToken: sessionId,
+        sourceSessionId: sessionId,
+        artifactPath,
+        request,
+        result,
+        expectedTrainingInputVersion: Number(row.training_input_version),
+      });
+      changed = activation.changed;
+      experimentStateVersion = activation.stateVersion;
+      const activatedRequestHash = hashGuidedTrainingRequest(
+        modelType,
+        request,
+        activation.trainingInputVersion,
+        await buildGuidedDependencyRevisions(
+          modelType,
+          row.experiment_id,
+          studentId,
+          request.models,
+          { connection, targetRevisionOverride: sessionId },
+        ),
+      );
+      await connection.query(
+        `UPDATE model_guided_training_sessions
+            SET request_hash = ?,
+                training_input_version = ?,
+                expires_at = DATE_ADD(NOW(), INTERVAL 7 DAY)
+          WHERE session_id = ?`,
+        [activatedRequestHash, activation.trainingInputVersion, sessionId],
+      );
+      await connection.commit();
+    } catch (error) {
+      await connection.rollback().catch(() => {});
+      throw error;
+    } finally {
+      connection.release();
+    }
+
     return buildGuidedTrainingSessionPayload(row, {
-      backtestArtifactChanged: restoredArtifact.changed,
+      backtestArtifactChanged: changed,
+      artifactRevision: sessionId,
+      experimentStateVersion,
     });
   } finally {
     await releaseModelArtifactMutationLocks(artifactLocks);
@@ -1848,61 +2271,67 @@ export async function runGuidedTrainingStep(
     throw new ModelValidationError("当前模型暂不支持分阶段训练");
   }
 
-  const row = await fetchGuidedTrainingSessionRow(sessionId);
-  if (!row || row.model_type !== modelType) {
+  const initialRow = await fetchGuidedTrainingSessionRow(sessionId);
+  if (!initialRow || initialRow.model_type !== modelType) {
     throw new ModelNotFoundError("未找到分阶段训练会话");
   }
 
-  if (row.student_id !== studentId) {
+  if (initialRow.student_id !== studentId) {
     throw new ModelAccessError("权限不足：该训练会话不属于当前用户", 403);
-  }
-
-  assertGuidedTrainingSessionDependenciesCurrent(row);
-
-  if (row.status === "completed") {
-    return buildGuidedTrainingSessionPayload(row);
-  }
-
-  const body = parseJsonColumn<TrainInput>(row.request_payload, {} as TrainInput);
-  const completedStepIds = parseJsonColumn<string[]>(row.completed_step_ids, []);
-  if (completedStepIds.includes(stepId)) {
-    return buildGuidedTrainingSessionPayload(row);
-  }
-
-  const stepPlan = getGuidedTrainingSteps(row);
-  const nextStepId = getGuidedNextStepId(stepPlan, completedStepIds);
-  if (stepId !== nextStepId) {
-    throw new ModelValidationError("只能按训练流程顺序执行下一个阶段");
   }
 
   let artifactLocks = null;
   let slotLock = null;
-  let sessionMarkedRunning = false;
+  let attempt: GuidedTrainingAttempt | null = null;
+  let stopHeartbeat: (() => Promise<void>) | null = null;
+  let experimentStateVersion: number | null = null;
 
   try {
-    artifactLocks = await acquireModelArtifactMutationLocks(row.experiment_id, modelType);
+    artifactLocks = await acquireModelArtifactMutationLocks(initialRow.experiment_id, modelType);
     if (!artifactLocks) {
-      throw new ModelValidationError("同一模型正在训练或预测，请稍后再试");
+      throw new ModelConflictError("该实验已有模型任务在执行，请稍后重试");
+    }
+
+    const row = await fetchGuidedTrainingSessionRow(sessionId);
+    if (!row || row.model_type !== modelType) {
+      throw new ModelNotFoundError("未找到分阶段训练会话");
+    }
+    if (row.student_id !== studentId) {
+      throw new ModelAccessError("权限不足：该训练会话不属于当前用户", 403);
+    }
+    await assertGuidedTrainingSessionDependenciesCurrent(row);
+
+    if (row.status === "completed") {
+      return buildGuidedTrainingSessionPayload(row);
+    }
+
+    const body = parseJsonColumn<TrainInput>(row.request_payload, {} as TrainInput);
+    const completedStepIds = parseJsonColumn<string[]>(row.completed_step_ids, []);
+    if (completedStepIds.includes(stepId)) {
+      return buildGuidedTrainingSessionPayload(row);
+    }
+
+    const stepPlan = getGuidedTrainingSteps(row);
+    const nextStepId = getGuidedNextStepId(stepPlan, completedStepIds);
+    if (stepId !== nextStepId) {
+      throw new ModelValidationError("只能按训练流程顺序执行下一个阶段");
     }
 
     slotLock = await acquireModelSlot();
     if (!slotLock) {
-      throw new ModelValidationError("模型服务繁忙，请稍后再试");
+      throw new ModelCapacityError("模型服务繁忙，请稍后重试");
     }
 
-    await pool.query(
-      `UPDATE model_guided_training_sessions
-          SET status = 'running',
-              current_step_id = ?,
-              error_message = NULL
-        WHERE session_id = ?`,
-      [stepId, sessionId],
-    );
-    sessionMarkedRunning = true;
+    attempt = await claimGuidedTrainingAttempt(row, stepId);
+    stopHeartbeat = startGuidedTrainingHeartbeat(sessionId, attempt);
 
     const sessionModelPath = getGuidedSessionModelPath(row.artifact_dir, modelType);
-    const pythonParams = await buildGuidedTrainingPythonParams(modelType, studentId, body);
-    pythonParams.saveModel = sessionModelPath;
+    const pythonParams = await buildGuidedTrainingPythonParams(
+      modelType,
+      studentId,
+      body,
+      sessionModelPath,
+    );
     const stateFilePath = buildGuidedTrainingStatePath(row.experiment_id, studentId, modelType, sessionId);
     const pythonStepResult = await runPythonGuidedTrainingStep(
       modelType,
@@ -1911,6 +2340,7 @@ export async function runGuidedTrainingStep(
       stateFilePath,
       row.artifact_dir,
     );
+    await assertGuidedTrainingAttemptOwned(sessionId, attempt);
 
     const nextCompletedStepIds = [...completedStepIds, stepId];
     const stepOutputs = parseJsonColumn<Record<string, unknown>>(row.step_outputs, {});
@@ -1925,11 +2355,10 @@ export async function runGuidedTrainingStep(
     let transformedResult: ReturnType<typeof transformTrainingResult> | null = null;
     let backtestArtifactChanged = false;
     if (pythonStepResult.final_result) {
-      const restoredArtifact = await restoreGuidedSessionBacktestArtifact(row, {
-        invalidateProductionArtifact: true,
-      });
-      backtestArtifactChanged = restoredArtifact.changed;
-      pythonStepResult.final_result.saved_model = restoredArtifact.modelPath;
+      if (!(await hasReusableSavedModelArtifact(modelType, sessionModelPath))) {
+        throw new ModelNotFoundError("分阶段训练未生成完整的模型产物");
+      }
+      pythonStepResult.final_result.saved_model = sessionModelPath;
       transformedResult = transformTrainingResult(modelType, pythonStepResult.final_result);
     }
 
@@ -1938,47 +2367,136 @@ export async function runGuidedTrainingStep(
       ? null
       : getGuidedNextStepId(nextStepPlan, nextCompletedStepIds);
 
-    await pool.query(
-      `UPDATE model_guided_training_sessions
-          SET status = ?,
-              current_step_id = ?,
-              completed_step_ids = ?,
-              step_outputs = ?,
-              step_plan = ?,
-              result_payload = ?,
-              error_message = NULL
-        WHERE session_id = ?`,
-      [
+    await stopHeartbeat();
+    stopHeartbeat = null;
+    const buildCommitParams = (
+      requestHash: string,
+      trainingInputVersion: number,
+    ) => [
         status,
         currentStepId,
         JSON.stringify(nextCompletedStepIds),
         JSON.stringify(nextStepOutputs),
         JSON.stringify(nextStepPlan),
         transformedResult ? JSON.stringify(transformedResult) : null,
+        requestHash,
+        trainingInputVersion,
         sessionId,
-      ],
-    );
+        attempt!.token,
+        attempt!.version,
+      ];
+    const commitSql = `UPDATE model_guided_training_sessions
+                          SET status = ?,
+                              current_step_id = ?,
+                              completed_step_ids = ?,
+                              step_outputs = ?,
+                              step_plan = ?,
+                              result_payload = ?,
+                              request_hash = ?,
+                              training_input_version = ?,
+                              error_message = NULL,
+                              run_token = NULL,
+                              lease_expires_at = NULL,
+                              last_heartbeat_at = NULL,
+                              expires_at = DATE_ADD(NOW(), INTERVAL 7 DAY)
+                        WHERE session_id = ?
+                          AND status = 'running'
+                          AND run_token = ?
+                          AND run_version = ?
+                          AND lease_expires_at > NOW(3)`;
+
+    if (transformedResult) {
+      const connection = await pool.getConnection();
+      try {
+        await connection.beginTransaction();
+        const [ownershipRows] = await connection.query<RowDataPacket[]>(
+          `SELECT session_id
+             FROM model_guided_training_sessions
+            WHERE session_id = ?
+              AND status = 'running'
+              AND run_token = ?
+              AND run_version = ?
+              AND lease_expires_at > NOW(3)
+            LIMIT 1
+            FOR UPDATE`,
+          [sessionId, attempt.token, attempt.version],
+        );
+        if (ownershipRows.length !== 1) {
+          throw new ModelStaleAttemptError("分阶段训练执行权已转移，本次结果已丢弃");
+        }
+
+        const activation = await activateModelArtifactInTransaction(connection, {
+          experimentId: row.experiment_id,
+          studentId,
+          modelType,
+          revisionToken: sessionId,
+          sourceSessionId: sessionId,
+          artifactPath: sessionModelPath,
+          request: body,
+          result: transformedResult,
+          expectedTrainingInputVersion: Number(row.training_input_version),
+        });
+        backtestArtifactChanged = activation.changed;
+        experimentStateVersion = activation.stateVersion;
+        const activatedRequestHash = hashGuidedTrainingRequest(
+          modelType,
+          body,
+          activation.trainingInputVersion,
+          await buildGuidedDependencyRevisions(
+            modelType,
+            row.experiment_id,
+            studentId,
+            body.models,
+            { connection, targetRevisionOverride: sessionId },
+          ),
+        );
+        const [commitResult] = await connection.query<ResultSetHeader>(
+          commitSql,
+          buildCommitParams(activatedRequestHash, activation.trainingInputVersion),
+        );
+        if (commitResult.affectedRows !== 1) {
+          throw new ModelStaleAttemptError("分阶段训练执行权已转移，本次结果已丢弃");
+        }
+        await connection.commit();
+      } catch (error) {
+        await connection.rollback().catch(() => {});
+        throw error;
+      } finally {
+        connection.release();
+      }
+    } else {
+      const [commitResult] = await pool.query<ResultSetHeader>(
+        commitSql,
+        buildCommitParams(row.request_hash, Number(row.training_input_version)),
+      );
+      if (commitResult.affectedRows !== 1) {
+        throw new ModelStaleAttemptError("分阶段训练执行权已转移，本次结果已丢弃");
+      }
+    }
 
     const updatedRow = await fetchGuidedTrainingSessionRow(sessionId);
     if (!updatedRow) {
       throw new Error("分阶段训练会话已丢失");
     }
 
-    return buildGuidedTrainingSessionPayload(updatedRow, { backtestArtifactChanged });
+    return buildGuidedTrainingSessionPayload(updatedRow, {
+      backtestArtifactChanged,
+      artifactRevision: transformedResult ? sessionId : null,
+      experimentStateVersion,
+    });
   } catch (error) {
-    if (sessionMarkedRunning) {
-      const detail = error instanceof Error ? error.message : "分阶段训练执行失败";
-      await pool.query(
-        `UPDATE model_guided_training_sessions
-            SET status = 'failed',
-                current_step_id = ?,
-                error_message = ?
-          WHERE session_id = ?`,
-        [stepId, detail, sessionId],
-      );
+    if (stopHeartbeat) {
+      await stopHeartbeat();
+      stopHeartbeat = null;
+    }
+    if (attempt) {
+      await recordGuidedTrainingAttemptFailure(sessionId, stepId, attempt, error);
     }
     throw error;
   } finally {
+    if (stopHeartbeat) {
+      await stopHeartbeat();
+    }
     await releaseModelSlot(slotLock);
     await releaseModelArtifactMutationLocks(artifactLocks);
   }
@@ -2009,7 +2527,12 @@ export async function trainModel(
     ? buildEnsemblePythonParams(experiment, body)
     : {};
   if (isEnsembleModelType(modelType) && body.models) {
-    const baseModelArtifactMap = buildAvailableBaseModelArtifactMap(body.experiment_id, studentId, body.models);
+    const baseModelArtifactMap = await buildAvailableBaseModelArtifactMap(
+      body.experiment_id,
+      studentId,
+      body.models,
+      Number(experiment.training_input_version),
+    );
     if (Object.keys(baseModelArtifactMap).length > 0) {
       derivedModelParams.baseModelFiles = JSON.stringify(baseModelArtifactMap);
       reportModelProgress(progressReporter, {
@@ -2050,7 +2573,14 @@ export async function trainModel(
     message: "实验数据已加载，正在准备 Python 训练参数",
   });
 
-  const modelSaveLoc = getBacktestModelPath(body.experiment_id, studentId, modelType);
+  const revisionToken = crypto.randomUUID();
+  const modelSaveLoc = buildVersionedModelArtifactPath(
+    body.experiment_id,
+    studentId,
+    modelType,
+    revisionToken,
+    "backtest",
+  );
 
   const pythonParams: Record<string, unknown> = {
     data: JSON.stringify(allData),
@@ -2083,9 +2613,6 @@ export async function trainModel(
     source: "backend",
     message: "训练结果已生成，正在更新模型产物状态",
   });
-  removeFileIfExists(getGuidedBacktestSourceMarkerPath(modelSaveLoc));
-  await invalidateArtifactsAfterBacktestChange(body.experiment_id, studentId, modelType);
-
   reportModelProgress(progressReporter, {
     type: "phase",
     phase: "transform_result",
@@ -2093,7 +2620,36 @@ export async function trainModel(
     source: "backend",
     message: "正在整理评估指标、预测值和模型元数据",
   });
-  return transformTrainingResult(modelType, result);
+  if (!(await hasReusableSavedModelArtifact(modelType, modelSaveLoc))) {
+    throw new ModelNotFoundError("训练完成但未生成完整的模型产物");
+  }
+  const transformedResult = transformTrainingResult(modelType, result);
+  const connection = await pool.getConnection();
+  let experimentStateVersion: number | null = null;
+  try {
+    await connection.beginTransaction();
+    const activation = await activateModelArtifactInTransaction(connection, {
+      experimentId: body.experiment_id,
+      studentId,
+      modelType,
+      revisionToken,
+      sourceSessionId: null,
+      artifactPath: modelSaveLoc,
+      request: body,
+      result: transformedResult,
+      expectedTrainingInputVersion: Number(experiment.training_input_version),
+    });
+    experimentStateVersion = activation.stateVersion;
+    await connection.commit();
+  } catch (error) {
+    await connection.rollback().catch(() => {});
+    throw error;
+  } finally {
+    connection.release();
+  }
+  transformedResult.results.artifact_revision = revisionToken;
+  transformedResult.results.experiment_state_version = experimentStateVersion;
+  return transformedResult;
 }
 
 export async function getReusableProductionModelArtifactResult(
@@ -2107,19 +2663,99 @@ export async function getReusableProductionModelArtifactResult(
     validateLstmProductionFeasibility(getExperimentTrainingConfig(experiment));
   }
 
-  const productionModelPath = getProductionModelPath(experimentId, studentId, modelType);
-  if (!await hasReusableSavedModelArtifact(modelType, productionModelPath)) {
+  const activeArtifact = await fetchActiveModelArtifact(experimentId, studentId, modelType);
+  if (activeArtifact) {
+    assertActiveArtifactMatchesTrainingInput(experiment, activeArtifact);
+  }
+  if (
+    !activeArtifact
+    || activeArtifact.production_revision_token !== activeArtifact.revision_token
+    || !activeArtifact.production_artifact_path
+    || !await hasReusableSavedModelArtifact(modelType, activeArtifact.production_artifact_path)
+  ) {
     return null;
   }
 
   return {
     status: "success",
     results: {
-      saved_model: productionModelPath,
+      saved_model: activeArtifact.production_artifact_path,
       artifact_phase: "production",
       reused_existing: true,
+      artifact_revision: activeArtifact.revision_token,
     },
   };
+}
+
+export async function completeExperimentModel(
+  modelType: ModelType,
+  studentId: number,
+  experimentId: number,
+  artifactRevision: string,
+) {
+  const completedFields = {
+    ma: "moving_average_completed",
+    es: "exponential_smoothing_completed",
+    arima: "arima_completed",
+    lstm: "lstm_completed",
+    weighted_avg: "ensemble_weighted_completed",
+    boosting: "ensemble_boosting_completed",
+    stacking: "ensemble_stacking_completed",
+  } as const satisfies Record<ModelType, keyof ExperimentModelContextRow>;
+  const completedField = completedFields[modelType];
+  const connection = await pool.getConnection();
+  try {
+    await connection.beginTransaction();
+    const experiment = await assertExperimentModelAccess(
+      experimentId,
+      studentId,
+      connection,
+      true,
+    );
+    const activeArtifact = await fetchActiveModelArtifact(
+      experimentId,
+      studentId,
+      modelType,
+      connection,
+    );
+    if (!activeArtifact || activeArtifact.revision_token !== artifactRevision) {
+      throw new ModelConflictError("模型结果版本已更新，请刷新页面后重试");
+    }
+    assertActiveArtifactMatchesTrainingInput(experiment, activeArtifact);
+
+    if (normalizeBooleanFlag(experiment[completedField])) {
+      await connection.commit();
+      return {
+        status: "success",
+        artifact_revision: artifactRevision,
+        experiment_state_version: Number(experiment.state_version),
+      };
+    }
+
+    const [result] = await connection.query<ResultSetHeader>(
+      `UPDATE experiment_status
+          SET \`${completedField}\` = 1,
+              last_activity_at = NOW(),
+              state_version = state_version + 1
+        WHERE experiment_id = ?
+          AND student_id = ?`,
+      [experimentId, studentId],
+    );
+    if (result.affectedRows !== 1) {
+      throw new ModelConflictError("模型结果版本已更新，请刷新页面后重试");
+    }
+    await connection.commit();
+    return {
+      status: "success",
+      artifact_revision: artifactRevision,
+      experiment_state_version: Number(experiment.state_version) + 1,
+    };
+  } catch (error) {
+    await connection.rollback().catch(() => {});
+    throw error;
+  } finally {
+    connection.release();
+  }
 }
 
 export async function prepareExperimentModelForProduction(
@@ -2139,10 +2775,53 @@ export async function prepareExperimentModelForProduction(
   }
   const trainingConfig = getExperimentTrainingConfig(experiment);
 
-  const productionModelPath = getProductionModelPath(experimentId, studentId, modelType);
-  const backtestModelPath = getBacktestModelPath(experimentId, studentId, modelType);
-  if (!hasSavedModelArtifact(modelType, backtestModelPath)) {
+  const activeArtifact = await fetchActiveModelArtifact(experimentId, studentId, modelType);
+  if (activeArtifact) {
+    assertActiveArtifactMatchesTrainingInput(experiment, activeArtifact);
+  }
+  if (
+    !activeArtifact
+    || !await hasReusableSavedModelArtifact(modelType, activeArtifact.backtest_artifact_path)
+  ) {
     throw new ModelNotFoundError(`未找到该实验的已训练 ${modelType.toUpperCase()} 回测模型`);
+  }
+  const backtestModelPath = activeArtifact.backtest_artifact_path;
+  const productionAttemptToken = crypto.randomUUID();
+  const productionModelPath = buildVersionedModelArtifactPath(
+    experimentId,
+    studentId,
+    modelType,
+    `${activeArtifact.revision_token}-${productionAttemptToken}`,
+    "production",
+  );
+
+  const [claimResult] = await pool.query<ResultSetHeader>(
+    `UPDATE experiment_model_artifacts
+        SET production_artifact_path = NULL,
+            production_revision_token = ?
+      WHERE experiment_id = ?
+        AND student_id = ?
+        AND model_type = ?
+        AND revision_token = ?
+        AND training_input_version = ?
+        AND EXISTS (
+          SELECT 1
+            FROM experiment_status current_experiment
+           WHERE current_experiment.experiment_id = experiment_model_artifacts.experiment_id
+             AND current_experiment.student_id = experiment_model_artifacts.student_id
+             AND current_experiment.training_input_version = experiment_model_artifacts.training_input_version
+        )`,
+    [
+      productionAttemptToken,
+      experimentId,
+      studentId,
+      modelType,
+      activeArtifact.revision_token,
+      Number(activeArtifact.training_input_version),
+    ],
+  );
+  if (claimResult.affectedRows !== 1) {
+    throw new ModelStaleAttemptError("回测模型版本已更新，本次生产模型任务未启动");
   }
 
   const allData = await loadDatasetFromDb(
@@ -2155,8 +2834,6 @@ export async function prepareExperimentModelForProduction(
     throw new ModelValidationError("数据窗口索引超出范围", { dataset_size: allData.length });
   }
 
-  invalidateProductionArtifact(experimentId, studentId, modelType);
-
   const pythonParams: Record<string, unknown> = {
     data: JSON.stringify(allData),
     trainStart: trainingConfig.data_window_train_start_index,
@@ -2168,6 +2845,41 @@ export async function prepareExperimentModelForProduction(
   };
 
   await runPythonModel(modelType, pythonParams, TRAINING_TIMEOUT);
+  if (!(await hasReusableSavedModelArtifact(modelType, productionModelPath))) {
+    throw new ModelNotFoundError("生产预测模型准备完成但产物不完整");
+  }
+  const [updateResult] = await pool.query<ResultSetHeader>(
+    `UPDATE experiment_model_artifacts
+        SET production_artifact_path = ?,
+            production_revision_token = ?
+      WHERE experiment_id = ?
+        AND student_id = ?
+        AND model_type = ?
+        AND revision_token = ?
+        AND training_input_version = ?
+        AND production_revision_token = ?
+        AND EXISTS (
+          SELECT 1
+            FROM experiment_status current_experiment
+           WHERE current_experiment.experiment_id = experiment_model_artifacts.experiment_id
+             AND current_experiment.student_id = experiment_model_artifacts.student_id
+             AND current_experiment.training_input_version = experiment_model_artifacts.training_input_version
+        )`,
+    [
+      productionModelPath,
+      activeArtifact.revision_token,
+      experimentId,
+      studentId,
+      modelType,
+      activeArtifact.revision_token,
+      Number(activeArtifact.training_input_version),
+      productionAttemptToken,
+    ],
+  );
+  if (updateResult.affectedRows !== 1) {
+    invalidateArtifactAtPath(modelType, productionModelPath);
+    throw new ModelStaleAttemptError("回测模型版本已更新，本次生产模型结果已丢弃");
+  }
 
   return {
     status: "success",
@@ -2175,6 +2887,7 @@ export async function prepareExperimentModelForProduction(
       saved_model: productionModelPath,
       artifact_phase: "production",
       reused_existing: false,
+      artifact_revision: activeArtifact.revision_token,
     },
   };
 }
@@ -2322,10 +3035,45 @@ export async function cleanupStaleModelArtifacts(
       continue;
     }
 
+    const [activeArtifactRows] = await pool.query<RowDataPacket[]>(
+      `SELECT backtest_artifact_path,
+              production_artifact_path
+         FROM experiment_model_artifacts
+        WHERE experiment_id = ?
+          AND student_id = ?`,
+      [group.experimentId, group.studentId],
+    );
+    const referencedPaths = new Set<string>();
+    const referencedFamilyPrefixes: string[] = [];
+    const registerArtifactFamily = (artifactPath: string) => {
+      const resolvedArtifactPath = path.resolve(artifactPath);
+      const artifactDirectory = path.dirname(resolvedArtifactPath);
+      const artifactBaseName = path.basename(resolvedArtifactPath, ".pkl");
+      referencedPaths.add(resolvedArtifactPath);
+      referencedPaths.add(path.join(artifactDirectory, `${artifactBaseName}_keras_model.h5`));
+      referencedFamilyPrefixes.push(path.join(artifactDirectory, `${artifactBaseName}_base_`));
+    };
+    for (const activeArtifact of activeArtifactRows) {
+      if (typeof activeArtifact.backtest_artifact_path === "string") {
+        registerArtifactFamily(activeArtifact.backtest_artifact_path);
+      }
+      if (typeof activeArtifact.production_artifact_path === "string") {
+        registerArtifactFamily(activeArtifact.production_artifact_path);
+      }
+    }
+
     let deletedInGroup = 0;
     for (const file of group.files) {
+      const filePath = path.join(trainedModelsDir, file);
+      const resolvedFilePath = path.resolve(filePath);
+      if (
+        referencedPaths.has(resolvedFilePath)
+        || referencedFamilyPrefixes.some((prefix) => resolvedFilePath.startsWith(prefix))
+      ) {
+        continue;
+      }
       try {
-        fs.unlinkSync(path.join(trainedModelsDir, file));
+        fs.unlinkSync(filePath);
         deletedInGroup += 1;
       } catch (error) {
         if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
@@ -2365,14 +3113,32 @@ export async function predictExperimentModel(
     validateLstmProductionFeasibility(getExperimentTrainingConfig(experiment));
   }
 
-  const productionModelPath = getProductionModelPath(experimentId, studentId, modelType);
-  if (!await hasReusableSavedModelArtifact(modelType, productionModelPath)) {
+  let activeArtifact = await fetchActiveModelArtifact(experimentId, studentId, modelType);
+  if (activeArtifact) {
+    assertActiveArtifactMatchesTrainingInput(experiment, activeArtifact);
+  }
+  if (
+    !activeArtifact
+    || activeArtifact.production_revision_token !== activeArtifact.revision_token
+    || !activeArtifact.production_artifact_path
+    || !await hasReusableSavedModelArtifact(modelType, activeArtifact.production_artifact_path)
+  ) {
     await prepareExperimentModelForProduction(modelType, studentId, experimentId);
+    activeArtifact = await fetchActiveModelArtifact(experimentId, studentId, modelType);
+    if (activeArtifact) {
+      assertActiveArtifactMatchesTrainingInput(experiment, activeArtifact);
+    }
   }
 
-  if (!await hasReusableSavedModelArtifact(modelType, productionModelPath)) {
+  if (
+    !activeArtifact
+    || activeArtifact.production_revision_token !== activeArtifact.revision_token
+    || !activeArtifact.production_artifact_path
+    || !await hasReusableSavedModelArtifact(modelType, activeArtifact.production_artifact_path)
+  ) {
     throw new ModelNotFoundError(`未找到该实验的 ${modelType.toUpperCase()} 生产预测模型`);
   }
+  const productionModelPath = activeArtifact.production_artifact_path;
 
   const pythonParams = {
     loadModel: productionModelPath,
@@ -2381,6 +3147,16 @@ export async function predictExperimentModel(
   };
 
   const result = (await runPythonModel(modelType, pythonParams, TIMEOUTS.MODEL_PREDICTION)) as Record<string, unknown>;
+  const currentExperiment = await assertExperimentModelAccess(experimentId, studentId);
+  const currentArtifact = await fetchActiveModelArtifact(experimentId, studentId, modelType);
+  if (
+    !currentArtifact
+    || currentArtifact.revision_token !== activeArtifact.revision_token
+    || currentArtifact.production_revision_token !== activeArtifact.production_revision_token
+  ) {
+    throw new ModelStaleAttemptError("预测期间模型版本已更新，本次预测结果已丢弃");
+  }
+  assertActiveArtifactMatchesTrainingInput(currentExperiment, currentArtifact);
 
   return {
     status: "success",

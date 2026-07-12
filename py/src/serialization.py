@@ -21,6 +21,10 @@ import os
 import tempfile
 from typing import Any, Optional
 from pathlib import Path
+try:
+    from .durable_io import fsync_parent_directory
+except ImportError:  # Script entrypoints add py/src directly to sys.path.
+    from durable_io import fsync_parent_directory
 
 
 class SerializationError(Exception):
@@ -62,6 +66,7 @@ def dump_model(obj: Any, path: str) -> None:
             os.fsync(fh.fileno())
 
         os.replace(temp_path, target_path)
+        fsync_parent_directory(str(target_path))
         temp_path = None
     except (pickle.PicklingError, TypeError) as e:
         raise SerializationError(f"Failed to serialize object: {e}") from e

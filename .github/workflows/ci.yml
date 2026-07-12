@@ -1,0 +1,97 @@
+name: Backend CI
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: backend-ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  verify:
+    name: Typecheck, test, build, audit, and concurrency
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    services:
+      mariadb:
+        image: mariadb:11.8
+        env:
+          MARIADB_DATABASE: fz_guided_ci
+          MARIADB_USER: agent
+          MARIADB_PASSWORD: test-password
+          MARIADB_ROOT_PASSWORD: root-password
+        ports:
+          - 3306:3306
+        options: >-
+          --health-cmd="healthcheck.sh --connect --innodb_initialized"
+          --health-interval=5s
+          --health-timeout=5s
+          --health-retries=20
+
+    env:
+      DB_HOST: 127.0.0.1
+      DB_USER: agent
+      DB_PASSWORD: test-password
+      DB_DATABASE: fz_guided_ci
+      JWT_SECRET: ci-only-secret
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+
+      - name: Set up Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.3.14
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+
+      - name: Typecheck
+        run: bun run typecheck
+
+      - name: Run unit tests
+        run: bun test --isolate
+
+      - name: Build backend bundle
+        run: bun run build
+
+      - name: Check Python entrypoint syntax
+        run: >-
+          python -m py_compile
+          py/guided_model.py
+          py/guided_ensemble_model.py
+          py/src/durable_io.py
+          py/src/guided_session_lock.py
+          py/src/ensemble_utils.py
+          py/src/serialization.py
+          py/src/models/lstm.py
+
+      - name: Verify durable guided-step replay and workspace fencing
+        run: |
+          python -m venv py/venv
+          py/venv/bin/python -m pip install --disable-pip-version-check numpy pandas
+          bun run verify:guided-recovery
+
+      - name: Verify migration and real database concurrency fencing
+        run: |
+          bun run scripts/prepare-guided-concurrency-test-db.ts
+          bun run db:migrate:guided-training
+          bun run db:migrate:guided-training
+          bun run verify:guided-concurrency
+
+      - name: Audit dependencies
+        run: bun audit

@@ -1,6 +1,6 @@
 import { Hono } from "hono";
 import { jwtAuth, requireStudent } from "../../middleware";
-import { predictSchema, prepareProductionSchema, isModelType, getTrainSchemaForModel, type ModelType } from "./models.schema";
+import { completeModelSchema, predictSchema, prepareProductionSchema, isModelType, getTrainSchemaForModel, type ModelType } from "./models.schema";
 import {
   buildLocalizedPredictValidationDetails,
   buildLocalizedTrainValidationDetails,
@@ -16,6 +16,7 @@ import {
   getReusableProductionModelArtifactResult,
   prepareExperimentModelForProduction,
   predictExperimentModel,
+  completeExperimentModel,
   acquireModelSlot,
   releaseModelSlot,
   acquireModelExecutionLock,
@@ -25,6 +26,9 @@ import {
   ModelValidationError,
   ModelNotFoundError,
   ModelAccessError,
+  ModelCapacityError,
+  ModelConflictError,
+  ModelStaleAttemptError,
 } from "./models.service";
 import { handleUnexpectedError } from "../../utils/error-handler";
 import type { JwtPayload } from "../../types";
@@ -110,6 +114,12 @@ const normalizeTrainingStreamError = (error: unknown, modelType: ModelType) => {
   if (error instanceof ModelValidationError) {
     return { status: 400, message: error.message, details: error.details };
   }
+  if (error instanceof ModelCapacityError) {
+    return { status: 429, message: error.message };
+  }
+  if (error instanceof ModelConflictError || error instanceof ModelStaleAttemptError) {
+    return { status: 409, message: error.message };
+  }
 
   const err = error as Error;
   if (err.message?.includes("timed out") || err.message?.includes("超时")) {
@@ -189,6 +199,12 @@ modelsController.post(
       }
       if (error instanceof ModelValidationError) {
         return c.json({ error: error.message, ...error.details }, 400);
+      }
+      if (error instanceof ModelCapacityError) {
+        return c.json({ error: error.message }, 429);
+      }
+      if (error instanceof ModelConflictError || error instanceof ModelStaleAttemptError) {
+        return c.json({ error: error.message }, 409);
       }
       const err = error as Error;
       if (err.message?.includes("timed out") || err.message?.includes("超时")) {
@@ -341,6 +357,9 @@ modelsController.post(
       if (error instanceof ModelValidationError) {
         return c.json({ error: error.message, ...error.details }, 400);
       }
+      if (error instanceof ModelConflictError || error instanceof ModelStaleAttemptError) {
+        return c.json({ error: error.message }, 409);
+      }
       if (error instanceof ModelNotFoundError) {
         return c.json({ error: error.message }, 404);
       }
@@ -378,6 +397,9 @@ modelsController.get(
       if (error instanceof ModelValidationError) {
         return c.json({ error: error.message, ...error.details }, 400);
       }
+      if (error instanceof ModelConflictError || error instanceof ModelStaleAttemptError) {
+        return c.json({ error: error.message }, 409);
+      }
       if (error instanceof ModelNotFoundError) {
         return c.json({ error: error.message }, 404);
       }
@@ -413,10 +435,10 @@ modelsController.post(
         return c.json({ error: error.message }, error.status);
       }
       if (error instanceof ModelValidationError) {
-        if (error.message.includes("同一模型正在训练或预测")) {
-          return c.json({ error: error.message }, 409);
-        }
         return c.json({ error: error.message, ...error.details }, 400);
+      }
+      if (error instanceof ModelConflictError || error instanceof ModelStaleAttemptError) {
+        return c.json({ error: error.message }, 409);
       }
       if (error instanceof ModelNotFoundError) {
         return c.json({ error: error.message }, 404);
@@ -455,13 +477,13 @@ modelsController.post(
         return c.json({ error: error.message }, error.status);
       }
       if (error instanceof ModelValidationError) {
-        if (error.message.includes("模型服务繁忙")) {
-          return c.json({ error: error.message }, 429);
-        }
-        if (error.message.includes("同一模型正在训练或预测")) {
-          return c.json({ error: error.message }, 409);
-        }
         return c.json({ error: error.message, ...error.details }, 400);
+      }
+      if (error instanceof ModelCapacityError) {
+        return c.json({ error: error.message }, 429);
+      }
+      if (error instanceof ModelConflictError || error instanceof ModelStaleAttemptError) {
+        return c.json({ error: error.message }, 409);
       }
       if (error instanceof ModelNotFoundError) {
         return c.json({ error: error.message }, 404);
@@ -469,6 +491,57 @@ modelsController.post(
 
       const normalizedError = normalizeTrainingStreamError(error, modelTypeParam);
       return c.json({ error: normalizedError.message, details: normalizedError }, normalizedError.status as any);
+    }
+  },
+);
+
+modelsController.post(
+  "/api/v1/models/:model_type/complete",
+  jwtAuth,
+  requireStudent,
+  async (c) => {
+    const modelTypeParam = c.req.param("model_type");
+    if (!isModelType(modelTypeParam)) {
+      return c.json({ error: "指定的模型类型无效" }, 400);
+    }
+    let rawBody: unknown;
+    try {
+      rawBody = await c.req.json();
+    } catch {
+      return c.json({ error: "请求体必须是有效的 JSON" }, 400);
+    }
+    const validation = completeModelSchema.safeParse(rawBody);
+    if (!validation.success) {
+      return c.json({ error: "模型完成请求参数无效" }, 400);
+    }
+
+    const payload = c.get("jwtPayload") as JwtPayload;
+    let executionLock = null;
+    try {
+      executionLock = await acquireModelExecutionLock(
+        validation.data.experiment_id,
+        modelTypeParam,
+      );
+      if (!executionLock) {
+        return c.json({ error: "该实验已有模型任务在执行，请稍后重试" }, 409);
+      }
+      const result = await completeExperimentModel(
+        modelTypeParam,
+        payload.sub,
+        validation.data.experiment_id,
+        validation.data.artifact_revision,
+      );
+      return c.json(result);
+    } catch (error) {
+      if (error instanceof ModelAccessError) {
+        return c.json({ error: error.message }, error.status);
+      }
+      if (error instanceof ModelConflictError || error instanceof ModelStaleAttemptError) {
+        return c.json({ error: error.message }, 409);
+      }
+      return handleUnexpectedError(c, error, "标记模型完成失败");
+    } finally {
+      await releaseModelExecutionLock(executionLock);
     }
   },
 );
@@ -531,6 +604,9 @@ modelsController.post(
       }
       if (error instanceof ModelValidationError) {
         return c.json({ error: error.message, ...error.details }, 400);
+      }
+      if (error instanceof ModelConflictError || error instanceof ModelStaleAttemptError) {
+        return c.json({ error: error.message }, 409);
       }
       const err = error as Error;
       if (err.message?.includes("timed out") || err.message?.includes("超时")) {
@@ -617,6 +693,9 @@ modelsController.post(
       }
       if (error instanceof ModelValidationError) {
         return c.json({ error: error.message, ...error.details }, 400);
+      }
+      if (error instanceof ModelConflictError || error instanceof ModelStaleAttemptError) {
+        return c.json({ error: error.message }, 409);
       }
       const err = error as Error;
       if (err.message?.includes("timed out") || err.message?.includes("超时")) {

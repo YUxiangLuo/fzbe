@@ -66,6 +66,12 @@ experimentsController.put("/api/v1/experiment-runs/:experimentId", jwtAuth, requ
     if ("error" in result) {
       if (result.error === "not_found") return c.json({ error: "未找到实验状态" }, 404);
       if (result.error === "forbidden") return c.json({ error: "权限不足" }, 403);
+      if (result.error === "conflict") {
+        return c.json({
+          error: "实验状态已被其他请求更新，请基于最新状态重试",
+          current_state: result.currentState,
+        }, 409);
+      }
       if (result.error === "completed") return c.json({ error: "已完成的实验不允许继续修改" }, 400);
       if (result.error === "no_fields") return c.json({ error: "未提供更新字段" }, 400);
       if (result.error === "invalid_current_step") return c.json({ error: "current_step 不能为空" }, 400);

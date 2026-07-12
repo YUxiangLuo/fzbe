@@ -22,6 +22,8 @@ import numpy as np
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "src")))
 
 from data_utils import infer_feature_types, load_data_from_json
+from durable_io import fsync_parent_directory
+from guided_session_lock import guided_session_lock
 from ensemble_utils import (
     build_ensemble_subprocess_data,
     fit_and_predict_from_source_model,
@@ -57,6 +59,8 @@ def _format_known_error(exc: Exception):
         return f"[VALIDATION] {message[13:].strip()}".strip()
     if message.startswith("[DATA]"):
         return f"[DATA] {message[7:].strip()}".strip()
+    if message.startswith("[CONFLICT]"):
+        return f"[CONFLICT] {message[10:].strip()}".strip()
     return None
 
 
@@ -89,6 +93,7 @@ def _save_state(path: str, state: Dict[str, Any]) -> None:
         handle.flush()
         os.fsync(handle.fileno())
     os.replace(temp_path, path)
+    fsync_parent_directory(path)
 
 
 def _get_arg(args, name: str, default: Any = None, cast_type=None):
@@ -457,7 +462,9 @@ def _save_flat_ensemble_artifact(module, state: Dict[str, Any], extra_state: Dic
             model_name,
             source_file,
             perm_file,
-            move_source=model_state.get("artifact_origin") == "temporary_training",
+            # Preserve the previous snapshot's source until this guided step
+            # payload is durable, so a crash can replay the save step.
+            move_source=False,
         )
         model_state["model_file"] = perm_file
         model_state.pop("artifact_origin", None)
@@ -1025,7 +1032,7 @@ def _run_boosting(step_id: str, args, state: Dict[str, Any]) -> Dict[str, Any]:
                     model_name,
                     source_file,
                     perm_file,
-                    move_source=model_state.get("artifact_origin") == "temporary_training",
+                    move_source=False,
                 )
                 model_state["model_file"] = perm_file
                 model_state.pop("artifact_origin", None)
@@ -1097,33 +1104,33 @@ def main() -> None:
         if not args.data:
             raise ValueError("[DATA] stdin did not contain model input data.")
 
-    os.makedirs(args.artifact_dir, exist_ok=True)
-    state = _load_state(args.state_file)
-    completed_payloads = state.get("_completed_step_payloads", {})
-    cached_payload = completed_payloads.get(args.step_id) if isinstance(completed_payloads, dict) else None
-    if isinstance(cached_payload, dict):
-        print(json.dumps(cached_payload, ensure_ascii=False, indent=2 if args.pretty else None))
-        return
+    with guided_session_lock(args.artifact_dir):
+        state = _load_state(args.state_file)
+        completed_payloads = state.get("_completed_step_payloads", {})
+        cached_payload = completed_payloads.get(args.step_id) if isinstance(completed_payloads, dict) else None
+        if isinstance(cached_payload, dict):
+            print(json.dumps(cached_payload, ensure_ascii=False, indent=2 if args.pretty else None))
+            return
 
-    step_result = run_step(args.model_type, args.step_id, args, state)
+        step_result = run_step(args.model_type, args.step_id, args, state)
 
-    final_result = None
-    if isinstance(step_result, dict) and "final_result" in step_result:
-        final_result = step_result["final_result"]
-        output = step_result.get("output", {})
-    else:
-        output = step_result
+        final_result = None
+        if isinstance(step_result, dict) and "final_result" in step_result:
+            final_result = step_result["final_result"]
+            output = step_result.get("output", {})
+        else:
+            output = step_result
 
-    payload = {
-        "step_id": args.step_id,
-        "output": _jsonable(output),
-    }
-    if final_result is not None:
-        payload["final_result"] = _jsonable(final_result)
+        payload = {
+            "step_id": args.step_id,
+            "output": _jsonable(output),
+        }
+        if final_result is not None:
+            payload["final_result"] = _jsonable(final_result)
 
-    state.setdefault("_completed_step_payloads", {})[args.step_id] = payload
-    _save_state(args.state_file, state)
-    print(json.dumps(payload, ensure_ascii=False, indent=2 if args.pretty else None))
+        state.setdefault("_completed_step_payloads", {})[args.step_id] = payload
+        _save_state(args.state_file, state)
+        print(json.dumps(payload, ensure_ascii=False, indent=2 if args.pretty else None))
 
 
 if __name__ == "__main__":
@@ -1132,7 +1139,6 @@ if __name__ == "__main__":
     except Exception as exc:
         known_error = _format_known_error(exc)
         if known_error:
-            print(known_error, file=sys.stderr)
-        else:
-            print(f"[PYTHON_ERROR] {exc}", file=sys.stderr)
+            print(known_error, file=sys.stderr, flush=True)
+            sys.exit(1)
         raise

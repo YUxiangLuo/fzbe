@@ -179,6 +179,11 @@ export const prepareProductionSchema = z.object({
   experiment_id: z.coerce.number().int().min(1),
 });
 
+export const completeModelSchema = z.object({
+  experiment_id: z.coerce.number().int().min(1),
+  artifact_revision: z.string().uuid(),
+});
+
 export function isModelType(value: unknown): value is ModelType {
   return typeof value === "string" && (ALL_MODELS as readonly string[]).includes(value);
 }

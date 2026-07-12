@@ -5,7 +5,7 @@ import { prepareStudentExperimentUpdate } from "./experiment-update-policy";
 
 const BOOLEAN_FIELDS = new Set(["moving_average_completed", "exponential_smoothing_completed", "arima_completed", "lstm_completed", "ensemble_weighted_completed", "ensemble_boosting_completed", "ensemble_stacking_completed", "quiz_about_model_completed", "quiz_about_plan_completed", "production_plan_completed"]);
 const JSON_FIELDS = new Set(["selected_base_models", "selected_ensemble_models", "arima_adf_stationarity", "lstm_features", "ensemble_weighted_base_models", "ensemble_boosting_base_models", "ensemble_stacking_base_models", "production_mps_table", "production_forecast_results"]);
-const INTEGER_FIELDS = new Set(["experiment_id", "student_id", "highest_completed_step", "current_step", "data_window_train_start_index", "data_window_train_end_index", "data_window_evaluate_start_index", "data_window_evaluate_end_index", "moving_average_window", "arima_p", "arima_d", "arima_q", "production_forecast_periods", "production_capacity", "production_custom_capacity", "total_active_duration_seconds"]);
+const INTEGER_FIELDS = new Set(["experiment_id", "student_id", "state_version", "highest_completed_step", "current_step", "data_window_train_start_index", "data_window_train_end_index", "data_window_evaluate_start_index", "data_window_evaluate_end_index", "moving_average_window", "arima_p", "arima_d", "arima_q", "production_forecast_periods", "production_capacity", "production_custom_capacity", "total_active_duration_seconds"]);
 const FLOAT_FIELDS = new Set(["moving_average_metrics_rmse", "moving_average_metrics_mae", "moving_average_metrics_mape", "moving_average_metrics_r2", "exponential_smoothing_alpha", "exponential_smoothing_metrics_rmse", "exponential_smoothing_metrics_mae", "exponential_smoothing_metrics_mape", "exponential_smoothing_metrics_r2", "arima_metrics_rmse", "arima_metrics_mae", "arima_metrics_mape", "arima_metrics_r2", "lstm_metrics_rmse", "lstm_metrics_mae", "lstm_metrics_mape", "lstm_metrics_r2", "ensemble_weighted_metrics_rmse", "ensemble_weighted_metrics_mae", "ensemble_weighted_metrics_mape", "ensemble_weighted_metrics_r2", "ensemble_boosting_metrics_rmse", "ensemble_boosting_metrics_mae", "ensemble_boosting_metrics_mape", "ensemble_boosting_metrics_r2", "ensemble_stacking_metrics_rmse", "ensemble_stacking_metrics_mae", "ensemble_stacking_metrics_mape", "ensemble_stacking_metrics_r2", "production_initial_inventory", "production_target_service_level", "production_safety_stock_z_score"]);
 const datetimeFields = new Set(["start_time", "last_activity_at", "completion_time"]);
 const BASE_MODEL_SELECTION_ORDER = ["moving_average", "exponential_smoothing", "arima", "lstm"] as const;
@@ -37,6 +37,36 @@ const MODEL_SELECTION_JSON_FIELDS = new Set([
   "ensemble_boosting_base_models",
   "ensemble_stacking_base_models",
 ]);
+const TRAINING_INPUT_FIELDS = new Set([
+  "selected_industry",
+  "selected_company",
+  "selected_product",
+  "data_window_train_start_index",
+  "data_window_train_end_index",
+  "data_window_evaluate_start_index",
+  "data_window_evaluate_end_index",
+  "moving_average_window",
+  "exponential_smoothing_alpha",
+  "arima_d",
+  "lstm_normalization",
+  "lstm_features",
+  "lstm_target_field",
+  "ensemble_weighted_base_models",
+  "ensemble_boosting_base_models",
+  "ensemble_stacking_base_models",
+]);
+const TRAINING_MODEL_FIELD_PREFIXES = [
+  "moving_average_",
+  "exponential_smoothing_",
+  "arima_",
+  "lstm_",
+  "ensemble_weighted_",
+  "ensemble_boosting_",
+  "ensemble_stacking_",
+] as const;
+const isTrainingInputField = (field: string) =>
+  TRAINING_INPUT_FIELDS.has(field)
+  || TRAINING_MODEL_FIELD_PREFIXES.some((prefix) => field.startsWith(prefix));
 
 function normalizeSelectionArray<TSelection extends string>(
   value: unknown,
@@ -285,12 +315,30 @@ export async function updateExperiment(experimentId: number, studentId: number, 
       return preparedUpdate;
     }
 
+    if (Number(row.state_version) !== data.state_version) {
+      await connection.rollback();
+      return {
+        error: "conflict" as const,
+        currentState: normalizeExperimentRow(row),
+      };
+    }
+
     const columns = Object.keys(preparedUpdate.data);
     const assignments = columns.map((col) => `${col} = ?`).join(", ");
+    const trainingInputVersionAssignment = columns.some(isTrainingInputField)
+      ? ", training_input_version = training_input_version + 1"
+      : "";
     const values = columns.map((key) => preparedUpdate.data[key]);
     values.push(experimentId);
 
-    await connection.query(`UPDATE experiment_status SET ${assignments} WHERE experiment_id = ?`, values);
+    await connection.query(
+      `UPDATE experiment_status
+          SET ${assignments},
+              state_version = state_version + 1
+              ${trainingInputVersionAssignment}
+        WHERE experiment_id = ?`,
+      values,
+    );
 
     const [[updatedRow]] = await connection.query<RowDataPacket[]>(
       "SELECT * FROM experiment_status WHERE experiment_id = ? LIMIT 1",

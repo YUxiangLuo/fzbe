@@ -21,6 +21,8 @@ import numpy as np
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "src")))
 
 from data_utils import infer_feature_types, load_data_from_json
+from durable_io import fsync_file, fsync_parent_directory
+from guided_session_lock import guided_session_lock
 from logger import get_log_contents, log
 from metrics import mae, mape, r2, rmse
 from model_defaults import resolve_lstm_look_back
@@ -61,6 +63,8 @@ def _format_known_error(exc: Exception):
         return f"[VALIDATION] {message[13:].strip()}".strip()
     if message.startswith("[DATA]"):
         return f"[DATA] {message[7:].strip()}".strip()
+    if message.startswith("[CONFLICT]"):
+        return f"[CONFLICT] {message[10:].strip()}".strip()
     return None
 
 
@@ -95,6 +99,7 @@ def _save_state(path: str, state: Dict[str, Any]) -> None:
         handle.flush()
         os.fsync(handle.fileno())
     os.replace(temp_path, path)
+    fsync_parent_directory(path)
 
 
 def _month_labels(timestamps: List[str], range_value: range) -> List[str]:
@@ -834,7 +839,9 @@ def _run_lstm(step_id: str, args, state: Dict[str, Any]) -> Dict[str, Any]:
         temp_keras_model_path = os.path.join(args.artifact_dir, f"lstm_trained_keras_model.tmp-{os.getpid()}.h5")
         try:
             model.save(temp_keras_model_path)
+            fsync_file(temp_keras_model_path)
             os.replace(temp_keras_model_path, keras_model_path)
+            fsync_parent_directory(keras_model_path)
         finally:
             if os.path.exists(temp_keras_model_path):
                 try:
@@ -966,7 +973,9 @@ def _run_lstm(step_id: str, args, state: Dict[str, Any]) -> Dict[str, Any]:
             temp_keras_model_path = os.path.splitext(save_path)[0] + f"_keras_model.tmp-{os.getpid()}.h5"
             try:
                 shutil.copy2(state["trained_keras_model_path"], temp_keras_model_path)
+                fsync_file(temp_keras_model_path)
                 os.replace(temp_keras_model_path, keras_model_path)
+                fsync_parent_directory(keras_model_path)
             finally:
                 if os.path.exists(temp_keras_model_path):
                     try:
@@ -1051,33 +1060,33 @@ def main() -> None:
         if not args.data:
             raise ValueError("[DATA] stdin did not contain model input data.")
 
-    os.makedirs(args.artifact_dir, exist_ok=True)
-    state = _load_state(args.state_file)
-    completed_payloads = state.get("_completed_step_payloads", {})
-    cached_payload = completed_payloads.get(args.step_id) if isinstance(completed_payloads, dict) else None
-    if isinstance(cached_payload, dict):
-        print(json.dumps(cached_payload, ensure_ascii=False, indent=2 if args.pretty else None))
-        return
+    with guided_session_lock(args.artifact_dir):
+        state = _load_state(args.state_file)
+        completed_payloads = state.get("_completed_step_payloads", {})
+        cached_payload = completed_payloads.get(args.step_id) if isinstance(completed_payloads, dict) else None
+        if isinstance(cached_payload, dict):
+            print(json.dumps(cached_payload, ensure_ascii=False, indent=2 if args.pretty else None))
+            return
 
-    step_result = run_step(args.model_type, args.step_id, args, state)
+        step_result = run_step(args.model_type, args.step_id, args, state)
 
-    final_result = None
-    if isinstance(step_result, dict) and "final_result" in step_result:
-        final_result = step_result["final_result"]
-        output = step_result.get("output", {})
-    else:
-        output = step_result
+        final_result = None
+        if isinstance(step_result, dict) and "final_result" in step_result:
+            final_result = step_result["final_result"]
+            output = step_result.get("output", {})
+        else:
+            output = step_result
 
-    payload = {
-        "step_id": args.step_id,
-        "output": _jsonable(output),
-    }
-    if final_result is not None:
-        payload["final_result"] = _jsonable(final_result)
+        payload = {
+            "step_id": args.step_id,
+            "output": _jsonable(output),
+        }
+        if final_result is not None:
+            payload["final_result"] = _jsonable(final_result)
 
-    state.setdefault("_completed_step_payloads", {})[args.step_id] = payload
-    _save_state(args.state_file, state)
-    print(json.dumps(payload, ensure_ascii=False, indent=2 if args.pretty else None))
+        state.setdefault("_completed_step_payloads", {})[args.step_id] = payload
+        _save_state(args.state_file, state)
+        print(json.dumps(payload, ensure_ascii=False, indent=2 if args.pretty else None))
 
 
 if __name__ == "__main__":

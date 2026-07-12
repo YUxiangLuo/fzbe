@@ -3,6 +3,7 @@ import fs from "fs";
 import logger from "../../utils/logger";
 import { PYTHON_RUNTIME_CONFIG, TIMEOUTS } from "../../utils/constants";
 import { PY_DIR, resolvePythonExecutable } from "../../utils/python";
+import { ModelConflictError } from "./model-errors";
 
 const TRAINING_TIMEOUT = TIMEOUTS.MODEL_TRAINING;
 const GUIDED_ENSEMBLE_MODEL_TYPES = new Set(["weighted_avg", "boosting", "stacking"]);
@@ -72,6 +73,7 @@ const extractPythonTaggedError = (stderr: string): Error | null => {
   const markers = [
     { marker: "[VALIDATION]", prefix: "[PYTHON_VALIDATION]" },
     { marker: "[DATA]", prefix: "[PYTHON_DATA]" },
+    { marker: "[CONFLICT]", prefix: "[PYTHON_CONFLICT]" },
   ] as const;
 
   const lines = stderr
@@ -88,6 +90,9 @@ const extractPythonTaggedError = (stderr: string): Error | null => {
       }
 
       const detail = line.slice(markerIndex + marker.length).trim();
+      if (marker === "[CONFLICT]") {
+        return new ModelConflictError(detail || "分阶段训练工作区正在被其他进程使用");
+      }
       return new Error(`${prefix} ${detail}`.trim());
     }
   }

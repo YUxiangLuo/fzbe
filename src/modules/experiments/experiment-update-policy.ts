@@ -22,6 +22,7 @@ export type StudentExperimentUpdatePreparationResult =
 export const MANAGED_EXPERIMENT_UPDATE_FIELDS = new Set([
   "experiment_id",
   "student_id",
+  "state_version",
   "status",
   "start_time",
   "completion_time",

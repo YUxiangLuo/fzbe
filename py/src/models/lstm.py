@@ -17,6 +17,7 @@ from sklearn.preprocessing import MinMaxScaler, OneHotEncoder, StandardScaler
 
 # Import shared utilities
 from data_utils import ParsedData, infer_feature_types as infer_parsed_feature_types, load_data_from_json
+from durable_io import fsync_file, fsync_parent_directory
 from logger import log, get_log_contents
 from metrics import mae, mape, r2, rmse
 from model_defaults import resolve_lstm_look_back
@@ -816,7 +817,9 @@ def run(args) -> None:
         temp_keras_model_path = os.path.splitext(save_path)[0] + f"_keras_model.tmp-{os.getpid()}.h5"
         try:
             model.save(temp_keras_model_path)
+            fsync_file(temp_keras_model_path)
             os.replace(temp_keras_model_path, keras_model_path)
+            fsync_parent_directory(keras_model_path)
         finally:
             if os.path.exists(temp_keras_model_path):
                 try:
@@ -1000,7 +1003,9 @@ def run(args) -> None:
             log.debug(f"Saving Keras model to temporary path {temp_keras_model_path}")
             try:
                 model.save(temp_keras_model_path)
+                fsync_file(temp_keras_model_path)
                 os.replace(temp_keras_model_path, keras_model_path)
+                fsync_parent_directory(keras_model_path)
             finally:
                 if os.path.exists(temp_keras_model_path):
                     try:

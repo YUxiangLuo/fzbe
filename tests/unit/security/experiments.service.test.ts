@@ -85,6 +85,7 @@ describe("experiments service", () => {
     ]);
 
     const result = await updateExperiment(990002, 20240002, {
+      state_version: 0,
       selected_company: "企业A",
     });
 
@@ -163,6 +164,7 @@ describe("experiments service", () => {
           experiment_id: 990002,
           student_id: 20240002,
           status: "In Progress",
+          state_version: 0,
           start_time: "2026-03-08T09:00:00.000Z",
           last_activity_at: "2026-03-08T09:30:00.000Z",
           total_active_duration_seconds: 120,
@@ -184,13 +186,14 @@ describe("experiments service", () => {
       ]);
 
     const result = await updateExperiment(990002, 20240002, {
+      state_version: 0,
       selected_base_models: ["ma", "lstm"],
       selected_ensemble_models: ["ensemble_weighted"],
       ensemble_weighted_base_models: ["ma", "es"],
     });
 
     const updateCall = connectionQuery.mock.calls[1];
-    expect(updateCall?.[0]).toContain("UPDATE experiment_status SET");
+    expect(updateCall?.[0]).toMatch(/UPDATE experiment_status\s+SET/);
     expect(updateCall?.[1]).toEqual(expect.arrayContaining([
       JSON.stringify(["moving_average", "lstm"]),
       JSON.stringify(["weighted_ensemble"]),
@@ -212,6 +215,7 @@ describe("experiments service", () => {
           experiment_id: 990002,
           student_id: 20240002,
           status: "In Progress",
+          state_version: 0,
           start_time: "2026-03-08T09:00:00.000Z",
           last_activity_at: "2026-03-08T09:30:00.000Z",
           total_active_duration_seconds: 120,
@@ -229,6 +233,7 @@ describe("experiments service", () => {
       ]);
 
     await updateExperiment(990002, 20240002, {
+      state_version: 0,
       selected_base_models: "ma lstm" as never,
       selected_ensemble_models: "ensemble_weighted" as never,
     });
@@ -238,5 +243,36 @@ describe("experiments service", () => {
       JSON.stringify(["moving_average", "lstm"]),
       JSON.stringify(["weighted_ensemble"]),
     ]));
+  });
+
+  test("rejects stale experiment writes with the current authoritative state", async () => {
+    connectionQuery.mockResolvedValueOnce([[
+      {
+        experiment_id: 990002,
+        student_id: 20240002,
+        state_version: 3,
+        status: "In Progress",
+        selected_company: "新企业",
+        start_time: "2026-03-08T09:00:00.000Z",
+        last_activity_at: "2026-03-08T09:30:00.000Z",
+        total_active_duration_seconds: 120,
+      },
+    ]]);
+
+    const result = await updateExperiment(990002, 20240002, {
+      state_version: 2,
+      selected_company: "旧页面企业",
+    });
+
+    expect(result).toEqual({
+      error: "conflict",
+      currentState: expect.objectContaining({
+        state_version: 3,
+        selected_company: "新企业",
+      }),
+    });
+    expect(connectionQuery).toHaveBeenCalledTimes(1);
+    expect(rollback).toHaveBeenCalledTimes(1);
+    expect(commit).not.toHaveBeenCalled();
   });
 });

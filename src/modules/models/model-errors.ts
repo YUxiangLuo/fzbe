@@ -11,4 +11,15 @@ export class ModelAccessError extends Error {
   }
 }
 
+export class ModelConflictError extends Error {
+  readonly code = "MODEL_CONFLICT";
+}
+
+export class ModelCapacityError extends Error {
+  readonly code = "MODEL_CAPACITY";
+}
+
+export class ModelStaleAttemptError extends Error {
+  readonly code = "MODEL_STALE_ATTEMPT";
+}
 

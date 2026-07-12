@@ -4,7 +4,6 @@ import logger from "../../utils/logger";
 import { CONCURRENCY_LIMITS } from "../../utils/constants";
 import type { ModelType } from "./models.schema";
 import { buildModelExecutionLockName, buildModelSlotLockName } from "./model-runtime";
-import { BASE_MODEL_TYPES, ENSEMBLE_MODEL_TYPES } from "./model-types";
 
 const MAX_CONCURRENT_MODEL_JOBS = CONCURRENCY_LIMITS.MAX_CONCURRENT_MODEL_JOBS;
 
@@ -19,6 +18,10 @@ export interface AdvisoryLockHandle {
 
 function safeRelease(conn: PoolConnection) {
   try { conn.release(); } catch { /* connection may already be destroyed */ }
+}
+
+function safeDestroy(conn: PoolConnection) {
+  try { conn.destroy(); } catch { /* destruction is best-effort */ }
 }
 
 async function acquireAdvisoryLock(name: string): Promise<AdvisoryLockHandle | null> {
@@ -37,7 +40,9 @@ async function acquireAdvisoryLock(name: string): Promise<AdvisoryLockHandle | n
     safeRelease(connection);
     return null;
   } catch (error) {
-    safeRelease(connection);
+    // GET_LOCK may have succeeded before the response was lost. Never return
+    // a connection with unknown lock ownership to the pool.
+    safeDestroy(connection);
     throw error;
   }
 }
@@ -47,12 +52,18 @@ async function releaseAdvisoryLock(handle: AdvisoryLockHandle | null | undefined
     return;
   }
 
+  let connectionReusable = true;
   try {
     await handle.connection.query("SELECT RELEASE_LOCK(?)", [handle.name]);
   } catch (error) {
+    connectionReusable = false;
     logger.warn({ err: error, lock: handle.name }, "释放数据库 advisory lock 失败");
+    // It must never be returned to the pool while it may still own a named lock.
+    safeDestroy(handle.connection);
   } finally {
-    safeRelease(handle.connection);
+    if (connectionReusable) {
+      safeRelease(handle.connection);
+    }
   }
 }
 
@@ -75,7 +86,8 @@ export const acquireModelSlot = async (): Promise<AdvisoryLockHandle | null> => 
     safeRelease(connection);
     return null;
   } catch (error) {
-    safeRelease(connection);
+    // One of the slot attempts may have succeeded before the response failed.
+    safeDestroy(connection);
     throw error;
   }
 };
@@ -95,35 +107,12 @@ export const releaseModelExecutionLock = async (handle: AdvisoryLockHandle | nul
   await releaseAdvisoryLock(handle);
 };
 
-const getArtifactMutationLockTypes = (modelType: ModelType): ModelType[] => {
-  const lockTypes = BASE_MODEL_TYPES.has(modelType)
-    ? [modelType, ...ENSEMBLE_MODEL_TYPES]
-    : [modelType];
-
-  return [...new Set(lockTypes)].sort();
-};
-
 export const acquireModelArtifactMutationLocks = async (
   experimentId: number,
   modelType: ModelType,
 ): Promise<AdvisoryLockHandle[] | null> => {
-  const acquiredLocks: AdvisoryLockHandle[] = [];
-
-  try {
-    for (const lockModelType of getArtifactMutationLockTypes(modelType)) {
-      const lock = await acquireModelExecutionLock(experimentId, lockModelType);
-      if (!lock) {
-        await Promise.all(acquiredLocks.map((handle) => releaseAdvisoryLock(handle)));
-        return null;
-      }
-      acquiredLocks.push(lock);
-    }
-
-    return acquiredLocks;
-  } catch (error) {
-    await Promise.all(acquiredLocks.map((handle) => releaseAdvisoryLock(handle)));
-    throw error;
-  }
+  const lock = await acquireModelExecutionLock(experimentId, modelType);
+  return lock ? [lock] : null;
 };
 
 export const releaseModelArtifactMutationLocks = async (

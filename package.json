@@ -11,6 +11,7 @@
   "scripts": {
     "dev": "bun --watch src/index.ts",
     "start": "bun run src/index.ts",
+    "build": "bun build src/index.ts --target bun --outdir dist",
     "typecheck": "bunx tsc --noEmit",
     "lint": "bunx tsc --noEmit --pretty false",
     "test": "bun test --isolate",
@@ -25,6 +26,8 @@
     "db:migrate:quiz-answer-snapshots": "bun run scripts/migrate-quiz-answer-snapshots.ts",
     "db:migrate:question-answer-explanations": "bun run scripts/migrate-question-answer-explanations.ts",
     "db:migrate:guided-training": "bun run scripts/migrate-guided-training-sessions.ts",
+    "verify:guided-concurrency": "bun run scripts/verify-guided-training-concurrency.ts",
+    "verify:guided-recovery": "bun run scripts/verify-guided-step-recovery.ts",
     "db:migrate:model-mape": "bun run scripts/migrate-model-mape-metrics.ts",
     "seed:teacher1:presentation": "bun run scripts/seed-teacher1-presentation.ts",
     "seed:parallel:assets": "bun run scripts/seed-parallel-assets.ts",

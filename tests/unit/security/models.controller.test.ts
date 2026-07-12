@@ -77,6 +77,11 @@ const runGuidedTrainingStep = mock(async () => ({
   result: { status: "success", results: { metrics: { rmse: 1, mae: 1, r2: 0.9 } } },
   error_message: null,
 }));
+const completeExperimentModel = mock(async () => ({
+  status: "success",
+  artifact_revision: "11111111-1111-4111-8111-111111111111",
+  experiment_state_version: 5,
+}));
 const acquireModelSlot = mock(async () => ({ connection: {} as never, name: "slot:1" }));
 const releaseModelSlot = mock(async () => {});
 const acquireModelExecutionLock = mock(async () => ({ connection: {} as never, name: "exec:1" }));
@@ -100,6 +105,10 @@ class ModelAccessError extends Error {
   }
 }
 
+class ModelCapacityError extends Error {}
+class ModelConflictError extends Error {}
+class ModelStaleAttemptError extends Error {}
+
 mock.module("../../../src/modules/models/models.service", () => ({
   trainModel,
   getReusableProductionModelArtifactResult,
@@ -109,6 +118,7 @@ mock.module("../../../src/modules/models/models.service", () => ({
   getGuidedTrainingSession,
   activateGuidedTrainingSession,
   runGuidedTrainingStep,
+  completeExperimentModel,
   acquireModelSlot,
   releaseModelSlot,
   acquireModelExecutionLock,
@@ -118,6 +128,9 @@ mock.module("../../../src/modules/models/models.service", () => ({
   ModelValidationError,
   ModelNotFoundError,
   ModelAccessError,
+  ModelCapacityError,
+  ModelConflictError,
+  ModelStaleAttemptError,
 }));
 
 const { default: modelsController } = await import("../../../src/modules/models/models.controller");
@@ -262,6 +275,13 @@ describe("models controller", () => {
       error_message: null,
     });
 
+    completeExperimentModel.mockReset();
+    completeExperimentModel.mockResolvedValue({
+      status: "success",
+      artifact_revision: "11111111-1111-4111-8111-111111111111",
+      experiment_state_version: 5,
+    });
+
     acquireModelSlot.mockReset();
     acquireModelSlot.mockResolvedValue({ connection: {} as never, name: "slot:1" });
 
@@ -317,6 +337,16 @@ describe("models controller", () => {
     expect(data).toEqual({ error: "权限不足：该实验不属于当前用户" });
     expect(releaseModelSlot).toHaveBeenCalledTimes(1);
     expect(releaseModelArtifactMutationLocks).toHaveBeenCalledTimes(1);
+  });
+
+  test("maps a stale direct-training activation to 409", async () => {
+    trainModel.mockRejectedValueOnce(
+      new ModelStaleAttemptError("训练期间模型版本已更新，本次结果已丢弃"),
+    );
+
+    const response = await requestJson("/api/v1/models/ma/training", buildTrainBody());
+
+    expect(response.status).toBe(409);
   });
 
   test("maps python validation failures from training to 400", async () => {
@@ -445,6 +475,19 @@ describe("models controller", () => {
     expect(acquireModelSlot).not.toHaveBeenCalled();
   });
 
+  test("maps guided-session creation cleanup conflicts to 409", async () => {
+    createOrResumeGuidedTrainingSession.mockRejectedValueOnce(
+      new ModelConflictError("该实验已有模型任务在执行，请稍后重试"),
+    );
+
+    const response = await requestJson(
+      "/api/v1/models/ma/guided-training/sessions",
+      buildTrainBody(),
+    );
+
+    expect(response.status).toBe(409);
+  });
+
   test("gets a guided training session for the current student", async () => {
     const response = await requestGet("/api/v1/models/ma/guided-training/sessions/guided-1");
     const data = await response.json();
@@ -452,6 +495,16 @@ describe("models controller", () => {
     expect(response.status).toBe(200);
     expect(data.session_id).toBe("guided-1");
     expect(getGuidedTrainingSession).toHaveBeenCalledWith("ma", 20240002, "guided-1");
+  });
+
+  test("maps an invalidated guided-session lookup to 409", async () => {
+    getGuidedTrainingSession.mockRejectedValueOnce(
+      new ModelConflictError("实验训练输入或基础模型版本已更新，请重新开始分阶段训练"),
+    );
+
+    const response = await requestGet("/api/v1/models/ma/guided-training/sessions/guided-1");
+
+    expect(response.status).toBe(409);
   });
 
   test("activates a completed guided training session explicitly", async () => {
@@ -465,7 +518,7 @@ describe("models controller", () => {
 
   test("maps a busy guided activation to 409", async () => {
     activateGuidedTrainingSession.mockRejectedValueOnce(
-      new ModelValidationError("同一模型正在训练或预测，请稍后再试"),
+      new ModelConflictError("该实验已有模型任务在执行，请稍后重试"),
     );
 
     const response = await requestPost("/api/v1/models/ma/guided-training/sessions/guided-1/activate");
@@ -483,13 +536,50 @@ describe("models controller", () => {
   });
 
   test("maps guided training busy errors to 429", async () => {
-    runGuidedTrainingStep.mockRejectedValueOnce(new ModelValidationError("模型服务繁忙，请稍后再试"));
+    runGuidedTrainingStep.mockRejectedValueOnce(new ModelCapacityError("模型服务繁忙，请稍后重试"));
 
     const response = await requestPost("/api/v1/models/ma/guided-training/sessions/guided-1/steps/forecast/run");
     const data = await response.json();
 
     expect(response.status).toBe(429);
-    expect(data).toEqual({ error: "模型服务繁忙，请稍后再试" });
+    expect(data).toEqual({ error: "模型服务繁忙，请稍后重试" });
+  });
+
+  test("marks only the currently active artifact revision as completed", async () => {
+    const revision = "11111111-1111-4111-8111-111111111111";
+    const response = await requestJson("/api/v1/models/ma/complete", {
+      experiment_id: 990002,
+      artifact_revision: revision,
+    });
+    const data = await response.json();
+
+    expect(response.status).toBe(200);
+    expect(data).toEqual({
+      status: "success",
+      artifact_revision: revision,
+      experiment_state_version: 5,
+    });
+    expect(acquireModelExecutionLock).toHaveBeenCalledWith(990002, "ma");
+    expect(completeExperimentModel).toHaveBeenCalledWith(
+      "ma",
+      20240002,
+      990002,
+      revision,
+    );
+    expect(releaseModelExecutionLock).toHaveBeenCalledTimes(1);
+  });
+
+  test("returns 409 and releases the lock for a stale completion revision", async () => {
+    completeExperimentModel.mockRejectedValueOnce(
+      new ModelConflictError("模型结果版本已更新，请刷新页面后重试"),
+    );
+    const response = await requestJson("/api/v1/models/ma/complete", {
+      experiment_id: 990002,
+      artifact_revision: "11111111-1111-4111-8111-111111111111",
+    });
+
+    expect(response.status).toBe(409);
+    expect(releaseModelExecutionLock).toHaveBeenCalledTimes(1);
   });
 
   test("streams training progress and the final result", async () => {
@@ -745,6 +835,18 @@ describe("models controller", () => {
     expect(data).toEqual({ error: "未找到该实验的已训练 MA 回测模型" });
   });
 
+  test("maps a fenced production preparation attempt to 409", async () => {
+    prepareExperimentModelForProduction.mockRejectedValueOnce(
+      new ModelStaleAttemptError("回测模型版本已更新，本次生产模型结果已丢弃"),
+    );
+
+    const response = await requestJson("/api/v1/models/ma/prepare-production", {
+      experiment_id: 990002,
+    });
+
+    expect(response.status).toBe(409);
+  });
+
   test("maps ModelNotFoundError from prediction to 404", async () => {
     predictExperimentModel.mockRejectedValueOnce(new ModelNotFoundError("未找到该实验的已训练 MA 模型"));
 
@@ -771,6 +873,19 @@ describe("models controller", () => {
 
     expect(response.status).toBe(400);
     expect(data).toEqual({ error: "移动平均基础模型尚未完成训练，无法准备生产预测模型" });
+  });
+
+  test("maps a fenced prediction result to 409", async () => {
+    predictExperimentModel.mockRejectedValueOnce(
+      new ModelStaleAttemptError("预测期间模型版本已更新，本次预测结果已丢弃"),
+    );
+
+    const response = await requestJson("/api/v1/models/ma/predict", {
+      experiment_id: 990002,
+      forecast_steps: 6,
+    });
+
+    expect(response.status).toBe(409);
   });
 
   test("returns localized field errors for missing prediction params", async () => {
