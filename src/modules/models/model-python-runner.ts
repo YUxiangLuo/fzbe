@@ -27,6 +27,7 @@ export function buildPythonModelProcessEnv(): Record<string, string> {
 export const allPossiblePythonParams: Record<string, string> = {
   // 通用参数（由 service 层手动设置）
   data: "data",
+  dataFile: "data-file",
   trainStart: "train-start",
   trainEnd: "train-end",
   evalStart: "eval-start",
@@ -497,4 +498,3 @@ export async function runPythonGuidedTrainingStep(
 
   return Promise.race([executionPromise, timeoutPromise]);
 }
-

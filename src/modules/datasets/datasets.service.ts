@@ -2,7 +2,7 @@ import path from "path";
 import { unlink, mkdir, rm } from "node:fs/promises";
 import type { RowDataPacket, ResultSetHeader } from "mysql2/promise";
 import { pool } from "../../config";
-import { CsvEncodingError, parseCsvSegments, getCsvHeaders, readCsvRows } from "../../utils/csv-processor";
+import { CsvEncodingError, CsvRowLimitError, parseCsvSegments, getCsvHeaders, readCsvRows } from "../../utils/csv-processor";
 import { validateFile, generateUniqueFilename, FileValidationError } from "../../utils/file-validator";
 import { logWarning } from "../../utils/error-handler";
 import { FILE_SIZE_LIMITS } from "../../utils/constants";
@@ -200,6 +200,9 @@ export async function uploadDataset(file: File, dataName: string, description?: 
         status: 400 as const,
         details: { message: error.message },
       };
+    }
+    if (error instanceof CsvRowLimitError) {
+      return { error: error.message, status: 400 as const };
     }
     throw error;
   } finally {

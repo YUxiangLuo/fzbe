@@ -84,6 +84,7 @@ CREATE TABLE IF NOT EXISTS `experiment_status` (
 
   -- Values range from 1-7, representing a total of seven steps
   `current_step` INT UNSIGNED NOT NULL DEFAULT 1,
+  `state_version` BIGINT UNSIGNED NOT NULL DEFAULT 0,
   `total_active_duration_seconds` INT UNSIGNED NOT NULL DEFAULT 0,
   `selected_industry` VARCHAR(255) DEFAULT NULL,
   `selected_company` VARCHAR(255) DEFAULT NULL,
@@ -222,6 +223,8 @@ CREATE TABLE IF NOT EXISTS `model_guided_training_sessions` (
   `student_id` INT NOT NULL,
   `model_type` ENUM('ma', 'es', 'arima', 'lstm', 'weighted_avg', 'stacking', 'boosting') NOT NULL,
   `request_hash` CHAR(64) NOT NULL,
+  `dataset_revision` CHAR(64) NOT NULL,
+  `runtime_revision` CHAR(64) NOT NULL,
   `request_payload` JSON NOT NULL,
   `status` ENUM('ready', 'running', 'failed', 'completed') NOT NULL DEFAULT 'ready',
   `current_step_id` VARCHAR(64) DEFAULT NULL,
@@ -231,6 +234,7 @@ CREATE TABLE IF NOT EXISTS `model_guided_training_sessions` (
   `result_payload` JSON DEFAULT NULL,
   `artifact_dir` VARCHAR(1024) NOT NULL,
   `error_message` TEXT DEFAULT NULL,
+  `experiment_state_version` BIGINT UNSIGNED DEFAULT NULL,
   `created_at` TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
   `updated_at` TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
   `expires_at` TIMESTAMP NULL DEFAULT NULL,
@@ -245,6 +249,42 @@ CREATE TABLE IF NOT EXISTS `model_guided_training_sessions` (
   UNIQUE KEY `uniq_guided_training_request` (`experiment_id`, `student_id`, `model_type`, `request_hash`),
   INDEX `idx_guided_training_student` (`student_id`, `experiment_id`, `model_type`, `updated_at`),
   INDEX `idx_guided_training_status` (`status`, `expires_at`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+CREATE TABLE IF NOT EXISTS `model_training_runs` (
+  `run_id` CHAR(36) PRIMARY KEY,
+  `session_id` CHAR(36) DEFAULT NULL,
+  `experiment_id` INT NOT NULL,
+  `student_id` INT NOT NULL,
+  `model_type` ENUM('ma', 'es', 'arima', 'lstm', 'weighted_avg', 'stacking', 'boosting') NOT NULL,
+  `request_hash` CHAR(64) NOT NULL,
+  `dataset_revision` CHAR(64) NOT NULL,
+  `runtime_revision` CHAR(64) NOT NULL,
+  `parameters` JSON NOT NULL,
+  `metrics` JSON NOT NULL,
+  `artifact_path` VARCHAR(1024) NOT NULL,
+  `production_artifact_path` VARCHAR(1024) DEFAULT NULL,
+  `is_active` BOOLEAN NOT NULL DEFAULT true,
+  `created_at` TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  `activated_at` TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+
+  FOREIGN KEY (`experiment_id`) REFERENCES `experiment_status`(`experiment_id`) ON DELETE CASCADE,
+  FOREIGN KEY (`student_id`) REFERENCES `users`(`user_id`) ON DELETE CASCADE,
+  FOREIGN KEY (`session_id`) REFERENCES `model_guided_training_sessions`(`session_id`) ON DELETE SET NULL,
+
+  UNIQUE KEY `uniq_model_training_run_session` (`session_id`),
+  INDEX `idx_model_training_run_active` (`experiment_id`, `student_id`, `model_type`, `is_active`),
+  INDEX `idx_model_training_run_request` (`experiment_id`, `student_id`, `model_type`, `request_hash`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+CREATE TABLE IF NOT EXISTS `model_training_run_dependencies` (
+  `run_id` CHAR(36) NOT NULL,
+  `base_model_type` ENUM('ma', 'es', 'arima', 'lstm') NOT NULL,
+  `base_run_id` CHAR(36) DEFAULT NULL,
+  PRIMARY KEY (`run_id`, `base_model_type`),
+  FOREIGN KEY (`run_id`) REFERENCES `model_training_runs`(`run_id`) ON DELETE CASCADE,
+  FOREIGN KEY (`base_run_id`) REFERENCES `model_training_runs`(`run_id`) ON DELETE SET NULL,
+  INDEX `idx_model_training_dependency_base` (`base_run_id`)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
 -- ========================================================

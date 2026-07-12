@@ -477,6 +477,10 @@ describe("reports service", () => {
     expect(rollback).toHaveBeenCalledTimes(1);
     expect(commit).toHaveBeenCalledTimes(1);
     expect(logger.warn).toHaveBeenCalledTimes(1);
+    const statusUpdateCall = connectionQuery.mock.calls.find(([sql]) =>
+      String(sql).includes("UPDATE experiment_status")
+    );
+    expect(statusUpdateCall?.[0]).toContain("state_version = state_version + 1");
     expect(await listGeneratedReports(990008, 20241002)).toHaveLength(1);
   });
 

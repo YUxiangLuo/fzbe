@@ -32,11 +32,17 @@ describe("Experiments Schemas", () => {
       expect(result.success).toBe(true);
     });
 
-    test("should accept status", () => {
+    test("should reject client-controlled status", () => {
       const result = createExperimentSchema.safeParse({
         status: "In Progress",
       });
-      expect(result.success).toBe(true);
+      expect(result.success).toBe(false);
+    });
+
+    test("should reject dependent workflow results on creation", () => {
+      expect(createExperimentSchema.safeParse({ selected_best_model: "ma" }).success).toBe(false);
+      expect(createExperimentSchema.safeParse({ production_plan_completed: true }).success).toBe(false);
+      expect(createExperimentSchema.safeParse({ moving_average_completed: true }).success).toBe(false);
     });
 
     test("should accept current_step", () => {
@@ -59,27 +65,31 @@ describe("Experiments Schemas", () => {
   describe("updateExperimentSchema", () => {
     test("should accept current_step update", () => {
       const result = updateExperimentSchema.safeParse({
+        expected_version: 0,
         current_step: 3,
       });
       expect(result.success).toBe(true);
     });
 
-    test("should accept status update", () => {
+    test("should reject status update", () => {
       const result = updateExperimentSchema.safeParse({
+        expected_version: 0,
         status: "In Progress",
       });
-      expect(result.success).toBe(true);
+      expect(result.success).toBe(false);
     });
 
-    test("should accept Completed status", () => {
+    test("should reject Completed status", () => {
       const result = updateExperimentSchema.safeParse({
+        expected_version: 0,
         status: "Completed",
       });
-      expect(result.success).toBe(true);
+      expect(result.success).toBe(false);
     });
 
     test("should reject invalid status", () => {
       const result = updateExperimentSchema.safeParse({
+        expected_version: 0,
         status: "invalid_status",
       });
       expect(result.success).toBe(false);
@@ -87,6 +97,7 @@ describe("Experiments Schemas", () => {
 
     test("should accept selection fields", () => {
       const result = updateExperimentSchema.safeParse({
+        expected_version: 0,
         selected_industry: "Manufacturing",
         selected_company: "ABC Corp",
         selected_product: "Widget A",
@@ -96,6 +107,7 @@ describe("Experiments Schemas", () => {
 
     test("should accept highest_completed_step", () => {
       const result = updateExperimentSchema.safeParse({
+        expected_version: 0,
         highest_completed_step: 5,
       });
       expect(result.success).toBe(true);
@@ -103,8 +115,8 @@ describe("Experiments Schemas", () => {
 
     test("should accept multiple fields together", () => {
       const result = updateExperimentSchema.safeParse({
+        expected_version: 0,
         current_step: 4,
-        status: "In Progress",
         selected_industry: "Retail",
         highest_completed_step: 3,
       });
@@ -116,17 +128,19 @@ describe("Experiments Schemas", () => {
       expect(result.success).toBe(false);
     });
 
-    test("should accept model metrics", () => {
+    test("should reject client-controlled model results", () => {
       const result = updateExperimentSchema.safeParse({
+        expected_version: 0,
         moving_average_completed: true,
         moving_average_window: 5,
         moving_average_metrics_rmse: 0.5,
       });
-      expect(result.success).toBe(true);
+      expect(result.success).toBe(false);
     });
 
     test("should reject non-integer moving average windows", () => {
       const result = updateExperimentSchema.safeParse({
+        expected_version: 0,
         moving_average_window: 2.5,
       });
       expect(result.success).toBe(false);
@@ -134,6 +148,7 @@ describe("Experiments Schemas", () => {
 
     test("should reject moving average windows below 2", () => {
       const result = updateExperimentSchema.safeParse({
+        expected_version: 0,
         moving_average_window: 1,
       });
       expect(result.success).toBe(false);
@@ -141,6 +156,7 @@ describe("Experiments Schemas", () => {
 
     test("should accept best model selection", () => {
       const result = updateExperimentSchema.safeParse({
+        expected_version: 0,
         selected_best_model: "lstm",
       });
       expect(result.success).toBe(true);

@@ -33,6 +33,7 @@ def main():
     
     # Add common arguments that all models might use
     parser.add_argument("--data", type=str, help="JSON string of input data")
+    parser.add_argument("--data-file", type=str, help="Path to a UTF-8 JSON input snapshot")
     parser.add_argument("--train-start", type=int, help="Training data start index")
     parser.add_argument("--train-end", type=int, help="Training data end index")
     parser.add_argument("--eval-start", type=int, help="Evaluation data start index")
@@ -70,6 +71,10 @@ def main():
     # Parse args. We need to parse unknown args because each model's run function
     # expects a Namespace object with all its specific args, even if not defined here.
     args, unknown = parser.parse_known_args()
+
+    if args.data_file:
+        with open(args.data_file, "r", encoding="utf-8") as handle:
+            args.data = handle.read()
 
     if args.model_type not in MODEL_MODULES:
         raise ValueError(f"Unknown model type: {args.model_type}")

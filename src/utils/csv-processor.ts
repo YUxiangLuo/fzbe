@@ -45,6 +45,13 @@ export class CsvEncodingError extends Error {
   }
 }
 
+export class CsvRowLimitError extends Error {
+  constructor(readonly maxRows: number) {
+    super(`CSV 数据行数不能超过 ${maxRows}`);
+    this.name = "CsvRowLimitError";
+  }
+}
+
 const CSV_DECODERS = ["utf-8", "gb18030"] as const;
 
 function normalizeCsvHeader(header: string): string {
@@ -80,12 +87,21 @@ export async function readCsvText(filePath: string): Promise<string> {
 export async function parseCsvFileRows(
   filePath: string,
   onRow: (row: Record<string, string>) => void,
+  options: { maxRows?: number } = {},
 ): Promise<void> {
   const csvText = await readCsvText(filePath);
 
   await new Promise<void>((resolve, reject) => {
-    createCsvParser(csvText)
-      .on("data", (row: Record<string, string>) => onRow(row))
+    let rowCount = 0;
+    const parser = createCsvParser(csvText)
+      .on("data", (row: Record<string, string>) => {
+        rowCount += 1;
+        if (options.maxRows && rowCount > options.maxRows) {
+          parser.destroy(new CsvRowLimitError(options.maxRows));
+          return;
+        }
+        onRow(row);
+      })
       .on("end", resolve)
       .on("error", reject);
   });
@@ -93,7 +109,7 @@ export async function parseCsvFileRows(
 
 export async function readCsvRows(filePath: string): Promise<Record<string, string>[]> {
   const rows: Record<string, string>[] = [];
-  await parseCsvFileRows(filePath, (row) => rows.push(row));
+  await parseCsvFileRows(filePath, (row) => rows.push(row), { maxRows: CSV_LIMITS.MAX_ROWS });
   return rows;
 }
 
@@ -197,7 +213,7 @@ export async function parseCsvSegments(
     }
 
     segment.rows.push(row);
-  });
+  }, { maxRows: CSV_LIMITS.MAX_ROWS });
 
   return segments;
 }

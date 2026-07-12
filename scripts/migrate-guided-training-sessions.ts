@@ -1,4 +1,8 @@
 import mysql from "mysql2/promise";
+import {
+  ensureGuidedTrainingIntegrityColumns,
+  hasColumn,
+} from "./model-training-migration-columns";
 
 const { DB_HOST, DB_USER, DB_PASSWORD, DB_DATABASE } = process.env;
 
@@ -25,6 +29,8 @@ try {
       student_id INT NOT NULL,
       model_type ENUM('ma', 'es', 'arima', 'lstm', 'weighted_avg', 'stacking', 'boosting') NOT NULL,
       request_hash CHAR(64) NOT NULL,
+      dataset_revision CHAR(64) NOT NULL,
+      runtime_revision CHAR(64) NOT NULL,
       request_payload JSON NOT NULL,
       status ENUM('ready', 'running', 'failed', 'completed') NOT NULL DEFAULT 'ready',
       current_step_id VARCHAR(64) DEFAULT NULL,
@@ -34,6 +40,7 @@ try {
       result_payload JSON DEFAULT NULL,
       artifact_dir VARCHAR(1024) NOT NULL,
       error_message TEXT DEFAULT NULL,
+      experiment_state_version BIGINT UNSIGNED DEFAULT NULL,
       created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
       updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
       expires_at TIMESTAMP NULL DEFAULT NULL,
@@ -56,18 +63,9 @@ try {
       MODIFY model_type ENUM('ma', 'es', 'arima', 'lstm', 'weighted_avg', 'stacking', 'boosting') NOT NULL
   `);
 
-  const [columns] = await connection.query(
-    `
-      SELECT COLUMN_NAME
-        FROM INFORMATION_SCHEMA.COLUMNS
-       WHERE TABLE_SCHEMA = DATABASE()
-         AND TABLE_NAME = 'model_guided_training_sessions'
-         AND COLUMN_NAME = 'step_plan'
-      LIMIT 1
-    `,
-  );
+  await ensureGuidedTrainingIntegrityColumns(connection);
 
-  if (!Array.isArray(columns) || columns.length === 0) {
+  if (!await hasColumn(connection, "model_guided_training_sessions", "step_plan")) {
     await connection.query(`
       ALTER TABLE model_guided_training_sessions
         ADD COLUMN step_plan JSON NULL AFTER step_outputs

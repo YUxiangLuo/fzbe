@@ -37,8 +37,14 @@ export interface GuidedTrainingSessionPayload {
     output?: unknown;
   }>;
   step_outputs: Record<string, unknown>;
-  result: { status: string; results: Record<string, unknown>; inferred_feature_types?: unknown } | null;
+  result: {
+    status: string;
+    results: Record<string, unknown>;
+    inferred_feature_types?: unknown;
+    experiment_state_patch?: Record<string, unknown>;
+  } | null;
   error_message: string | null;
+  experiment_state_version: number | null;
 }
 
 export const GUIDED_TRAINING_STEPS: Record<GuidedModelType, GuidedTrainingStepDefinition[]> = {
@@ -327,4 +333,3 @@ export const GUIDED_TRAINING_STEPS: Record<GuidedModelType, GuidedTrainingStepDe
     },
   ],
 };
-

@@ -177,6 +177,7 @@ components:
         series:
           type: array
           minItems: 4
+          maxItems: 5000
           items:
             $ref: '#/components/schemas/AdfPoint'
 
@@ -446,6 +447,7 @@ components:
         forecast_steps:
           type: integer
           minimum: 1
+          maximum: 12
 
     ModelPrepareProductionRequest:
       type: object
@@ -491,6 +493,10 @@ components:
           additionalProperties: true
         error_message:
           type: string
+          nullable: true
+        experiment_state_version:
+          type: integer
+          minimum: 0
           nullable: true
 
     GuidedTrainingSessionResponse:
@@ -631,7 +637,7 @@ components:
         description:
           type: string
 
-    ExperimentCreateRequest:
+    ExperimentStateRecord:
       type: object
       properties:
         status:
@@ -929,9 +935,256 @@ components:
           nullable: true
       additionalProperties: true
 
+    ExperimentStudentWritableFields:
+      type: object
+      description: 模型完成标志、训练指标、自动寻优参数、测验标志、状态和时间字段均由服务端管理，不接受客户端写入。
+      properties:
+        current_step:
+          type: integer
+          minimum: 1
+          maximum: 7
+        highest_completed_step:
+          type: integer
+          minimum: 0
+          maximum: 7
+        selected_industry:
+          type: string
+          nullable: true
+        selected_company:
+          type: string
+          nullable: true
+        selected_product:
+          type: string
+          nullable: true
+        selected_base_models:
+          type: array
+          items:
+            type: string
+        selected_ensemble_models:
+          type: array
+          items:
+            type: string
+        data_window_train_start_index:
+          type: integer
+          minimum: 0
+          nullable: true
+        data_window_train_end_index:
+          type: integer
+          minimum: 0
+          nullable: true
+        data_window_evaluate_start_index:
+          type: integer
+          minimum: 0
+          nullable: true
+        data_window_evaluate_end_index:
+          type: integer
+          minimum: 0
+          nullable: true
+        moving_average_window:
+          type: integer
+          minimum: 2
+          nullable: true
+        exponential_smoothing_alpha:
+          type: number
+          exclusiveMinimum: true
+          minimum: 0
+          maximum: 1
+          nullable: true
+        arima_d:
+          type: integer
+          minimum: 0
+          maximum: 2
+          nullable: true
+        arima_adf_stationarity:
+          type: array
+          nullable: true
+          items:
+            type: object
+            additionalProperties: true
+        lstm_normalization:
+          type: string
+          enum: [minmax, zscore]
+          nullable: true
+        lstm_features:
+          type: array
+          nullable: true
+          items:
+            type: string
+        lstm_target_field:
+          type: string
+          nullable: true
+        ensemble_weighted_base_models:
+          type: array
+          nullable: true
+          items:
+            type: string
+        ensemble_boosting_base_models:
+          type: array
+          nullable: true
+          items:
+            type: string
+        ensemble_stacking_base_models:
+          type: array
+          nullable: true
+          items:
+            type: string
+        selected_best_model:
+          type: string
+          enum: [ma, exp, arima, lstm, ensemble_weighted, ensemble_boosting, ensemble_stacking]
+          nullable: true
+        production_plan_completed:
+          type: boolean
+          nullable: true
+        production_forecast_periods:
+          type: integer
+          minimum: 1
+          nullable: true
+        production_initial_inventory:
+          type: number
+          minimum: 0
+          nullable: true
+        production_target_service_level:
+          type: number
+          minimum: 0
+          nullable: true
+        production_safety_stock_z_score:
+          type: number
+          nullable: true
+        production_mps_table:
+          type: array
+          nullable: true
+          items:
+            type: object
+            additionalProperties: true
+        production_forecast_results:
+          type: array
+          nullable: true
+          items:
+            type: object
+            additionalProperties: true
+        production_capacity_mode:
+          type: string
+          enum: [scenario, auto, custom]
+          nullable: true
+        production_capacity_scenario:
+          type: string
+          enum: [tight, normal, abundant]
+          nullable: true
+        production_capacity:
+          type: integer
+          minimum: 0
+          nullable: true
+        production_custom_capacity:
+          type: integer
+          minimum: 0
+          nullable: true
+
+    ExperimentCreateRequest:
+      type: object
+      description: 创建时仅接受初始选择、数据窗口和模型参数草稿；流程结果与生产计划字段必须在对应流程中生成。
+      additionalProperties: false
+      properties:
+        current_step:
+          type: integer
+          minimum: 1
+          maximum: 7
+        highest_completed_step:
+          type: integer
+          minimum: 0
+          maximum: 7
+        selected_industry:
+          type: string
+          nullable: true
+        selected_company:
+          type: string
+          nullable: true
+        selected_product:
+          type: string
+          nullable: true
+        selected_base_models:
+          type: array
+          items:
+            type: string
+        selected_ensemble_models:
+          type: array
+          items:
+            type: string
+        data_window_train_start_index:
+          type: integer
+          minimum: 0
+          nullable: true
+        data_window_train_end_index:
+          type: integer
+          minimum: 0
+          nullable: true
+        data_window_evaluate_start_index:
+          type: integer
+          minimum: 0
+          nullable: true
+        data_window_evaluate_end_index:
+          type: integer
+          minimum: 0
+          nullable: true
+        moving_average_window:
+          type: integer
+          minimum: 2
+          nullable: true
+        exponential_smoothing_alpha:
+          type: number
+          exclusiveMinimum: true
+          minimum: 0
+          maximum: 1
+          nullable: true
+        arima_d:
+          type: integer
+          minimum: 0
+          maximum: 2
+          nullable: true
+        arima_adf_stationarity:
+          type: array
+          nullable: true
+          items:
+            type: object
+            additionalProperties: true
+        lstm_normalization:
+          type: string
+          enum: [minmax, zscore]
+          nullable: true
+        lstm_features:
+          type: array
+          nullable: true
+          items:
+            type: string
+        lstm_target_field:
+          type: string
+          nullable: true
+        ensemble_weighted_base_models:
+          type: array
+          nullable: true
+          items:
+            type: string
+        ensemble_boosting_base_models:
+          type: array
+          nullable: true
+          items:
+            type: string
+        ensemble_stacking_base_models:
+          type: array
+          nullable: true
+          items:
+            type: string
+
     ExperimentUpdateRequest:
       allOf:
-        - $ref: '#/components/schemas/ExperimentCreateRequest'
+        - $ref: '#/components/schemas/ExperimentStudentWritableFields'
+        - type: object
+          required: [expected_version]
+          minProperties: 2
+          properties:
+            expected_version:
+              type: integer
+              minimum: 0
+              description: 最近一次读取到的 state_version；不匹配时返回 409。
 
     ExperimentEventRequest:
       type: object
@@ -1429,6 +1682,18 @@ paths:
                 $ref: '#/components/schemas/ErrorResponse'
         '401':
           description: 未授权
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '403':
+          description: 权限不足（仅 Student）
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '429':
+          description: 模型计算容量已满
           content:
             application/json:
               schema:
@@ -3261,10 +3526,11 @@ paths:
                 $ref: '#/components/schemas/ErrorResponse'
 
   /api/v1/experiment-runs/{experimentId}:
-    put:
+    patch:
       tags: [Experiments]
-      summary: 更新实验状态
+      summary: 增量更新实验状态
       operationId: updateExperiment
+      description: 仅发送发生变化的学生可写字段，并通过 expected_version 执行乐观并发控制。模型训练结果只能由训练接口写入。
       security:
         - bearerAuth: []
       parameters:
@@ -3296,6 +3562,12 @@ paths:
                 $ref: '#/components/schemas/ErrorResponse'
         '404':
           description: 实验不存在
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '409':
+          description: state_version 冲突，响应包含最新 current 状态
           content:
             application/json:
               schema:

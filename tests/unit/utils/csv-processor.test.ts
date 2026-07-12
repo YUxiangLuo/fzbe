@@ -4,9 +4,11 @@ import os from "node:os";
 import path from "node:path";
 import {
   CsvEncodingError,
+  CsvRowLimitError,
   decodeCsvBuffer,
   getCsvHeaders,
   parseCsvSegments,
+  parseCsvFileRows,
   processCsvFile,
 } from "../../../src/utils/csv-processor";
 
@@ -85,5 +87,17 @@ describe("csv processor encoding", () => {
 
     const segments = await parseCsvSegments(filePath);
     expect([...segments.keys()]).toEqual(["制造业|样本企业|样本产品"]);
+  });
+
+  test("stops parsing as soon as the configured row limit is exceeded", async () => {
+    const filePath = await writeTempCsv("value\n1\n2\n3\n");
+    const seenRows: string[] = [];
+
+    await expect(parseCsvFileRows(
+      filePath,
+      (row) => seenRows.push(row.value!),
+      { maxRows: 2 },
+    )).rejects.toBeInstanceOf(CsvRowLimitError);
+    expect(seenRows).toEqual(["1", "2"]);
   });
 });

@@ -103,6 +103,16 @@ def _parse_common_ranges(args) -> Tuple[int, int, int, int]:
     return int(args.train_start), int(args.train_end), int(args.eval_start), int(args.eval_end)
 
 
+def _read_data_json(args) -> str:
+    data_file = getattr(args, "data_file", None)
+    if data_file:
+        with open(data_file, "r", encoding="utf-8") as handle:
+            return handle.read()
+    if args.data:
+        return args.data
+    raise ValueError("[DATA] 训练数据快照缺失。")
+
+
 def _state_ranges(state: Dict[str, Any]) -> Tuple[range, range]:
     train = state["train_range"]
     evaluate = state["evaluate_range"]
@@ -114,7 +124,7 @@ def _state_ranges(state: Dict[str, Any]) -> Tuple[range, range]:
 
 def _run_ma(step_id: str, args, state: Dict[str, Any]) -> Dict[str, Any]:
     if step_id == "prepare_data":
-        parsed_data = load_data_from_json(args.data)
+        parsed_data = load_data_from_json(_read_data_json(args))
         y = parsed_data.y
         timestamps = parsed_data.timestamps or [str(i) for i in range(parsed_data.n_obs)]
         ts, te, es_idx, ee = _parse_common_ranges(args)
@@ -276,7 +286,7 @@ def _run_ma(step_id: str, args, state: Dict[str, Any]) -> Dict[str, Any]:
 
 def _run_es(step_id: str, args, state: Dict[str, Any]) -> Dict[str, Any]:
     if step_id == "prepare_data":
-        parsed_data = load_data_from_json(args.data)
+        parsed_data = load_data_from_json(_read_data_json(args))
         y = parsed_data.y
         timestamps = parsed_data.timestamps or [str(i) for i in range(parsed_data.n_obs)]
         ts, te, es_idx, ee = _parse_common_ranges(args)
@@ -423,7 +433,7 @@ def _resolve_arima_limits(train_size: int, max_p_arg: Any, max_q_arg: Any) -> Tu
 
 def _run_arima(step_id: str, args, state: Dict[str, Any]) -> Dict[str, Any]:
     if step_id == "prepare_data":
-        parsed_data = load_data_from_json(args.data)
+        parsed_data = load_data_from_json(_read_data_json(args))
         y = parsed_data.y
         timestamps = parsed_data.timestamps or [str(i) for i in range(parsed_data.n_obs)]
         ts, te, es_idx, ee = _parse_common_ranges(args)
@@ -674,7 +684,7 @@ def _run_lstm(step_id: str, args, state: Dict[str, Any]) -> Dict[str, Any]:
         feature_keys = lstm._parse_feature_key_list(getattr(args, "lstm_features", None))
         target_key = getattr(args, "lstm_target_feature", None)
         feature_types_override = json.loads(getattr(args, "feature_types", None) or "{}")
-        parsed_data = load_data_from_json(args.data, target_key=target_key, feature_keys=feature_keys)
+        parsed_data = load_data_from_json(_read_data_json(args), target_key=target_key, feature_keys=feature_keys)
         months = parsed_data.timestamps or [str(i) for i in range(parsed_data.n_obs)]
         inferred_feature_types = infer_feature_types(
             parsed_data,
@@ -999,6 +1009,7 @@ def main() -> None:
     parser.add_argument("--state-file", required=True)
     parser.add_argument("--artifact-dir", required=True)
     parser.add_argument("--data", type=str)
+    parser.add_argument("--data-file", type=str)
     parser.add_argument("--train-start", type=int)
     parser.add_argument("--train-end", type=int)
     parser.add_argument("--eval-start", type=int)

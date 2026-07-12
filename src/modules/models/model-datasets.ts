@@ -1,6 +1,6 @@
 import type { RowDataPacket } from "mysql2/promise";
 import { pool } from "../../config";
-import { CsvEncodingError, readCsvRows } from "../../utils/csv-processor";
+import { CsvEncodingError, CsvRowLimitError, readCsvRows } from "../../utils/csv-processor";
 import { ModelValidationError } from "./model-errors";
 
 interface SegmentRow extends RowDataPacket {
@@ -24,10 +24,9 @@ export async function loadDatasetFromDb(
   try {
     return await readCsvRows(segmentRows[0]!.file_path);
   } catch (error) {
-    if (error instanceof CsvEncodingError) {
+    if (error instanceof CsvEncodingError || error instanceof CsvRowLimitError) {
       throw new ModelValidationError(error.message);
     }
     throw error;
   }
 }
-

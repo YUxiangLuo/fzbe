@@ -85,6 +85,7 @@ describe("experiments service", () => {
     ]);
 
     const result = await updateExperiment(990002, 20240002, {
+      expected_version: 0,
       selected_company: "企业A",
     });
 
@@ -93,6 +94,57 @@ describe("experiments service", () => {
     expect(rollback).toHaveBeenCalledTimes(1);
     expect(commit).not.toHaveBeenCalled();
     expect(release).toHaveBeenCalledTimes(1);
+  });
+
+  test("rejects selecting a best model that has no authoritative completed run", async () => {
+    connectionQuery.mockResolvedValueOnce([
+      [{
+        experiment_id: 990002,
+        student_id: 20240002,
+        status: "In Progress",
+        state_version: 3,
+        moving_average_completed: 0,
+        start_time: "2026-03-08T09:00:00.000Z",
+        last_activity_at: "2026-03-08T09:30:00.000Z",
+        total_active_duration_seconds: 120,
+      }],
+    ]);
+
+    const result = await updateExperiment(990002, 20240002, {
+      expected_version: 3,
+      selected_best_model: "ma",
+    });
+
+    expect(result).toEqual({ error: "invalid_best_model" });
+    expect(rollback).toHaveBeenCalledTimes(1);
+    expect(commit).not.toHaveBeenCalled();
+    expect(connectionQuery).toHaveBeenCalledTimes(1);
+  });
+
+  test("rejects selecting a model in the same patch that invalidates its training result", async () => {
+    connectionQuery.mockResolvedValueOnce([
+      [{
+        experiment_id: 990002,
+        student_id: 20240002,
+        status: "In Progress",
+        state_version: 3,
+        moving_average_completed: 1,
+        moving_average_window: 6,
+        start_time: "2026-03-08T09:00:00.000Z",
+        last_activity_at: "2026-03-08T09:30:00.000Z",
+        total_active_duration_seconds: 120,
+      }],
+    ]);
+
+    const result = await updateExperiment(990002, 20240002, {
+      expected_version: 3,
+      moving_average_window: 7,
+      selected_best_model: "ma",
+    });
+
+    expect(result).toEqual({ error: "invalid_best_model" });
+    expect(rollback).toHaveBeenCalledTimes(1);
+    expect(commit).not.toHaveBeenCalled();
   });
 
   test("normalizes legacy model identifiers in experiment rows", () => {
@@ -166,8 +218,10 @@ describe("experiments service", () => {
           start_time: "2026-03-08T09:00:00.000Z",
           last_activity_at: "2026-03-08T09:30:00.000Z",
           total_active_duration_seconds: 120,
+          state_version: 0,
         }],
       ])
+      .mockResolvedValueOnce([{ affectedRows: 1 }])
       .mockResolvedValueOnce([{ affectedRows: 1 }])
       .mockResolvedValueOnce([
         [{
@@ -184,12 +238,15 @@ describe("experiments service", () => {
       ]);
 
     const result = await updateExperiment(990002, 20240002, {
+      expected_version: 0,
       selected_base_models: ["ma", "lstm"],
       selected_ensemble_models: ["ensemble_weighted"],
       ensemble_weighted_base_models: ["ma", "es"],
     });
 
-    const updateCall = connectionQuery.mock.calls[1];
+    const updateCall = connectionQuery.mock.calls.find(([sql]) =>
+      String(sql).includes("UPDATE experiment_status SET")
+    );
     expect(updateCall?.[0]).toContain("UPDATE experiment_status SET");
     expect(updateCall?.[1]).toEqual(expect.arrayContaining([
       JSON.stringify(["moving_average", "lstm"]),
@@ -215,6 +272,7 @@ describe("experiments service", () => {
           start_time: "2026-03-08T09:00:00.000Z",
           last_activity_at: "2026-03-08T09:30:00.000Z",
           total_active_duration_seconds: 120,
+          state_version: 0,
         }],
       ])
       .mockResolvedValueOnce([{ affectedRows: 1 }])
@@ -229,11 +287,14 @@ describe("experiments service", () => {
       ]);
 
     await updateExperiment(990002, 20240002, {
+      expected_version: 0,
       selected_base_models: "ma lstm" as never,
       selected_ensemble_models: "ensemble_weighted" as never,
     });
 
-    const updateCall = connectionQuery.mock.calls[1];
+    const updateCall = connectionQuery.mock.calls.find(([sql]) =>
+      String(sql).includes("UPDATE experiment_status SET")
+    );
     expect(updateCall?.[1]).toEqual(expect.arrayContaining([
       JSON.stringify(["moving_average", "lstm"]),
       JSON.stringify(["weighted_ensemble"]),

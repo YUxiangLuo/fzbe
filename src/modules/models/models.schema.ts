@@ -32,16 +32,16 @@ const normalizeLstmFeaturesInput = (value: unknown) => {
   return value;
 };
 
-const lstmFeaturesSchema = z.preprocess(normalizeLstmFeaturesInput, z.string().min(1));
+const lstmFeaturesSchema = z.preprocess(normalizeLstmFeaturesInput, z.string().min(1).max(20_000));
 
 const modelParamsSchema = z.object({
   moving_average_window: z.coerce.number().int().min(2).optional(),
   exponential_smoothing_alpha: z.coerce.number().gt(0).max(1).optional(),
-  arimaD: z.coerce.number().int().min(0).optional(),
+  arimaD: z.coerce.number().int().min(0).max(2).optional(),
   lstmFeatures: lstmFeaturesSchema.optional(),
-  lstmTargetFeature: z.string().min(1).optional(),
+  lstmTargetFeature: z.string().min(1).max(255).optional(),
   lstmNormalization: z.enum(["minmax", "zscore"]).optional(),
-  models: z.string().min(1).optional(),
+  models: z.string().min(1).max(64).optional(),
 });
 
 const trainSchemaBase = baseDataSchema
@@ -110,21 +110,21 @@ const exponentialSmoothingTrainSchema = withRangeValidation(
 
 const arimaTrainSchema = withRangeValidation(
   trainSchemaBase.extend({
-    arimaD: z.coerce.number().int().min(0),
+    arimaD: z.coerce.number().int().min(0).max(2),
   }),
 );
 
 const lstmTrainSchema = withRangeValidation(
   trainSchemaBase.extend({
     lstmFeatures: lstmFeaturesSchema,
-    lstmTargetFeature: z.string().min(1),
+    lstmTargetFeature: z.string().min(1).max(255),
     lstmNormalization: z.enum(["minmax", "zscore"]),
   }),
 );
 
 const ensembleTrainSchema = withRangeValidation(
   trainSchemaBase.extend({
-    models: z.string().min(1),
+    models: z.string().min(1).max(64),
   }),
 );
 
@@ -151,7 +151,7 @@ export function getTrainSchemaForModel(modelType: ModelType) {
 
 export const predictSchema = z.object({
   experiment_id: z.coerce.number().int().min(1),
-  forecast_steps: z.coerce.number().int().min(1),
+  forecast_steps: z.coerce.number().int().min(1).max(12),
 });
 
 export const prepareProductionSchema = z.object({
