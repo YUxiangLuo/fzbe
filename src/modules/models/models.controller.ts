@@ -11,6 +11,7 @@ import {
   trainModel,
   createOrResumeGuidedTrainingSession,
   getGuidedTrainingSession,
+  activateGuidedTrainingSession,
   runGuidedTrainingStep,
   getReusableProductionModelArtifactResult,
   prepareExperimentModelForProduction,
@@ -19,6 +20,8 @@ import {
   releaseModelSlot,
   acquireModelExecutionLock,
   releaseModelExecutionLock,
+  acquireModelArtifactMutationLocks,
+  releaseModelArtifactMutationLocks,
   ModelValidationError,
   ModelNotFoundError,
   ModelAccessError,
@@ -164,12 +167,12 @@ modelsController.post(
 
     const body = validation.data;
 
-    let executionLock = null;
+    let artifactLocks = null;
     let slotLock = null;
 
     try {
-      executionLock = await acquireModelExecutionLock(body.experiment_id, modelType);
-      if (!executionLock) {
+      artifactLocks = await acquireModelArtifactMutationLocks(body.experiment_id, modelType);
+      if (!artifactLocks) {
         return c.json({ error: "同一模型正在训练或预测，请稍后再试" }, 409);
       }
 
@@ -202,7 +205,7 @@ modelsController.post(
       return handleUnexpectedError(c, error, message);
     } finally {
       await releaseModelSlot(slotLock);
-      await releaseModelExecutionLock(executionLock);
+      await releaseModelArtifactMutationLocks(artifactLocks);
     }
   },
 );
@@ -241,24 +244,24 @@ modelsController.post(
     }
 
     const body = validation.data;
-    let executionLock = null;
+    let artifactLocks = null;
     let slotLock = null;
 
     try {
-      executionLock = await acquireModelExecutionLock(body.experiment_id, modelType);
-      if (!executionLock) {
+      artifactLocks = await acquireModelArtifactMutationLocks(body.experiment_id, modelType);
+      if (!artifactLocks) {
         return c.json({ error: "同一模型正在训练或预测，请稍后再试" }, 409);
       }
 
       slotLock = await acquireModelSlot();
       if (!slotLock) {
-        await releaseModelExecutionLock(executionLock);
-        executionLock = null;
+        await releaseModelArtifactMutationLocks(artifactLocks);
+        artifactLocks = null;
         return c.json({ error: "模型服务繁忙，请稍后再试" }, 429);
       }
     } catch (error) {
       await releaseModelSlot(slotLock);
-      await releaseModelExecutionLock(executionLock);
+      await releaseModelArtifactMutationLocks(artifactLocks);
       return handleUnexpectedError(c, error, "启动训练流失败");
     }
 
@@ -289,7 +292,7 @@ modelsController.post(
         send({ type: "error", ...normalizedError });
       } finally {
         await releaseModelSlot(slotLock);
-        await releaseModelExecutionLock(executionLock);
+        await releaseModelArtifactMutationLocks(artifactLocks);
       }
     });
   },
@@ -379,6 +382,46 @@ modelsController.get(
         return c.json({ error: error.message }, 404);
       }
       return handleUnexpectedError(c, error, "获取分阶段训练会话失败");
+    }
+  },
+);
+
+modelsController.post(
+  "/api/v1/models/:model_type/guided-training/sessions/:session_id/activate",
+  jwtAuth,
+  requireStudent,
+  async (c) => {
+    const modelTypeParam = c.req.param("model_type");
+    if (!isModelType(modelTypeParam)) {
+      return c.json({ error: "指定的模型类型无效" }, 400);
+    }
+    const sessionId = c.req.param("session_id");
+    if (!sessionId) {
+      return c.json({ error: "分阶段训练会话 ID 无效" }, 400);
+    }
+
+    const payload = c.get("jwtPayload") as JwtPayload;
+    try {
+      const session = await activateGuidedTrainingSession(
+        modelTypeParam,
+        payload.sub,
+        sessionId,
+      );
+      return c.json(session);
+    } catch (error: unknown) {
+      if (error instanceof ModelAccessError) {
+        return c.json({ error: error.message }, error.status);
+      }
+      if (error instanceof ModelValidationError) {
+        if (error.message.includes("同一模型正在训练或预测")) {
+          return c.json({ error: error.message }, 409);
+        }
+        return c.json({ error: error.message, ...error.details }, 400);
+      }
+      if (error instanceof ModelNotFoundError) {
+        return c.json({ error: error.message }, 404);
+      }
+      return handleUnexpectedError(c, error, "激活分阶段训练结果失败");
     }
   },
 );

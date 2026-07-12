@@ -28,6 +28,7 @@ const getPredictFieldLabel = (field: string) => PREDICT_FIELD_LABELS[field] ?? f
 
 type IssueWithInput = ZodIssue & { input?: unknown; expected?: string };
 type IssueWithMinimum = ZodIssue & { minimum?: number | bigint; inclusive?: boolean; origin?: string };
+type IssueWithMaximum = ZodIssue & { maximum?: number | bigint; inclusive?: boolean };
 
 const formatInvalidTypeMessage = (label: string) => `${label} 类型无效`;
 
@@ -134,6 +135,13 @@ export const localizePredictValidationIssue = (issue: ZodIssue): string => {
     }
 
     return formatMinimumMessage(label, issueWithMinimum.minimum, issueWithMinimum.inclusive);
+  }
+
+  if (issue.code === "too_big") {
+    const issueWithMaximum = issue as IssueWithMaximum;
+    if (field === "forecast_steps") {
+      return `预测步数必须小于等于 ${String(issueWithMaximum.maximum ?? 6)}`;
+    }
   }
 
   if (issue.code === "invalid_format") {

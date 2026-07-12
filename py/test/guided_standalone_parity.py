@@ -195,11 +195,17 @@ def train_guided(
     ]
 
     final_result = None
-    for step_id in STEP_SEQUENCES[model_type]:
+    for step_index, step_id in enumerate(STEP_SEQUENCES[model_type]):
         payload = run_json(
             [sys.executable, str(GUIDED_MODEL), model_type, step_id, *common_args],
             f"guided {model_type}/{step_id}",
         )
+        if step_index == 0:
+            retried_payload = run_json(
+                [sys.executable, str(GUIDED_MODEL), model_type, step_id, *common_args],
+                f"guided {model_type}/{step_id} retry",
+            )
+            assert_equal(payload, retried_payload, f"guided {model_type}.{step_id} retry")
         if "final_result" in payload:
             final_result = payload["final_result"]
     if not isinstance(final_result, dict):

@@ -39,6 +39,7 @@ export interface GuidedTrainingSessionPayload {
   step_outputs: Record<string, unknown>;
   result: { status: string; results: Record<string, unknown>; inferred_feature_types?: unknown } | null;
   error_message: string | null;
+  backtest_artifact_changed: boolean;
 }
 
 export const GUIDED_TRAINING_STEPS: Record<GuidedModelType, GuidedTrainingStepDefinition[]> = {

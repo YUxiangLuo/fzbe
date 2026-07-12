@@ -1024,6 +1024,7 @@ def main() -> None:
     parser.add_argument("--state-file", required=True)
     parser.add_argument("--artifact-dir", required=True)
     parser.add_argument("--data", type=str)
+    parser.add_argument("--data-stdin", action="store_true")
     parser.add_argument("--train-start", type=int)
     parser.add_argument("--train-end", type=int)
     parser.add_argument("--eval-start", type=int)
@@ -1043,8 +1044,21 @@ def main() -> None:
     parser.add_argument("--normalization", type=str, choices=["minmax", "zscore"])
     args, _ = parser.parse_known_args()
 
+    if args.data_stdin:
+        if args.data is not None:
+            raise ValueError("[VALIDATION] Use either --data or --data-stdin, not both.")
+        args.data = sys.stdin.read()
+        if not args.data:
+            raise ValueError("[DATA] stdin did not contain model input data.")
+
     os.makedirs(args.artifact_dir, exist_ok=True)
     state = _load_state(args.state_file)
+    completed_payloads = state.get("_completed_step_payloads", {})
+    cached_payload = completed_payloads.get(args.step_id) if isinstance(completed_payloads, dict) else None
+    if isinstance(cached_payload, dict):
+        print(json.dumps(cached_payload, ensure_ascii=False, indent=2 if args.pretty else None))
+        return
+
     step_result = run_step(args.model_type, args.step_id, args, state)
 
     final_result = None
@@ -1054,7 +1068,6 @@ def main() -> None:
     else:
         output = step_result
 
-    _save_state(args.state_file, state)
     payload = {
         "step_id": args.step_id,
         "output": _jsonable(output),
@@ -1062,6 +1075,8 @@ def main() -> None:
     if final_result is not None:
         payload["final_result"] = _jsonable(final_result)
 
+    state.setdefault("_completed_step_payloads", {})[args.step_id] = payload
+    _save_state(args.state_file, state)
     print(json.dumps(payload, ensure_ascii=False, indent=2 if args.pretty else None))
 
 

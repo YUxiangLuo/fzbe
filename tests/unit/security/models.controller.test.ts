@@ -52,6 +52,19 @@ const getGuidedTrainingSession = mock(async () => ({
   result: null,
   error_message: null,
 }));
+const activateGuidedTrainingSession = mock(async () => ({
+  session_id: "guided-1",
+  experiment_id: 990002,
+  model_type: "ma",
+  status: "completed",
+  current_step_id: null,
+  next_step_id: null,
+  steps: [],
+  step_outputs: {},
+  result: { status: "success", results: { metrics: { rmse: 1, mae: 1, r2: 0.9 } } },
+  error_message: null,
+  backtest_artifact_changed: true,
+}));
 const runGuidedTrainingStep = mock(async () => ({
   session_id: "guided-1",
   experiment_id: 990002,
@@ -68,6 +81,10 @@ const acquireModelSlot = mock(async () => ({ connection: {} as never, name: "slo
 const releaseModelSlot = mock(async () => {});
 const acquireModelExecutionLock = mock(async () => ({ connection: {} as never, name: "exec:1" }));
 const releaseModelExecutionLock = mock(async () => {});
+const acquireModelArtifactMutationLocks = mock(async () => ([
+  { connection: {} as never, name: "exec:1" },
+]));
+const releaseModelArtifactMutationLocks = mock(async () => {});
 
 class ModelValidationError extends Error {
   constructor(message: string, public details?: Record<string, unknown>) {
@@ -90,11 +107,14 @@ mock.module("../../../src/modules/models/models.service", () => ({
   predictExperimentModel,
   createOrResumeGuidedTrainingSession,
   getGuidedTrainingSession,
+  activateGuidedTrainingSession,
   runGuidedTrainingStep,
   acquireModelSlot,
   releaseModelSlot,
   acquireModelExecutionLock,
   releaseModelExecutionLock,
+  acquireModelArtifactMutationLocks,
+  releaseModelArtifactMutationLocks,
   ModelValidationError,
   ModelNotFoundError,
   ModelAccessError,
@@ -213,6 +233,21 @@ describe("models controller", () => {
       error_message: null,
     });
 
+    activateGuidedTrainingSession.mockReset();
+    activateGuidedTrainingSession.mockResolvedValue({
+      session_id: "guided-1",
+      experiment_id: 990002,
+      model_type: "ma",
+      status: "completed",
+      current_step_id: null,
+      next_step_id: null,
+      steps: [],
+      step_outputs: {},
+      result: { status: "success", results: { metrics: { rmse: 1, mae: 1, r2: 0.9 } } },
+      error_message: null,
+      backtest_artifact_changed: true,
+    });
+
     runGuidedTrainingStep.mockReset();
     runGuidedTrainingStep.mockResolvedValue({
       session_id: "guided-1",
@@ -238,10 +273,18 @@ describe("models controller", () => {
 
     releaseModelExecutionLock.mockReset();
     releaseModelExecutionLock.mockResolvedValue(undefined);
+
+    acquireModelArtifactMutationLocks.mockReset();
+    acquireModelArtifactMutationLocks.mockResolvedValue([
+      { connection: {} as never, name: "exec:1" },
+    ]);
+
+    releaseModelArtifactMutationLocks.mockReset();
+    releaseModelArtifactMutationLocks.mockResolvedValue(undefined);
   });
 
-  test("returns 409 when the experiment-scoped execution lock is unavailable", async () => {
-    acquireModelExecutionLock.mockResolvedValueOnce(null);
+  test("returns 409 when the artifact mutation lock set is unavailable", async () => {
+    acquireModelArtifactMutationLocks.mockResolvedValueOnce(null);
 
     const response = await requestJson("/api/v1/models/ma/training", buildTrainBody());
     const data = await response.json();
@@ -251,9 +294,9 @@ describe("models controller", () => {
     expect(acquireModelSlot).not.toHaveBeenCalled();
   });
 
-  test("returns 429 and releases the execution lock when no model slot is available", async () => {
-    const executionLock = { connection: {} as never, name: "exec:busy" };
-    acquireModelExecutionLock.mockResolvedValueOnce(executionLock);
+  test("returns 429 and releases the artifact mutation locks when no model slot is available", async () => {
+    const artifactLocks = [{ connection: {} as never, name: "exec:busy" }];
+    acquireModelArtifactMutationLocks.mockResolvedValueOnce(artifactLocks);
     acquireModelSlot.mockResolvedValueOnce(null);
 
     const response = await requestJson("/api/v1/models/ma/training", buildTrainBody());
@@ -261,7 +304,7 @@ describe("models controller", () => {
 
     expect(response.status).toBe(429);
     expect(data).toEqual({ error: "模型服务繁忙，请稍后再试" });
-    expect(releaseModelExecutionLock).toHaveBeenCalledWith(executionLock);
+    expect(releaseModelArtifactMutationLocks).toHaveBeenCalledWith(artifactLocks);
   });
 
   test("maps ModelAccessError from training to the declared HTTP status", async () => {
@@ -273,7 +316,7 @@ describe("models controller", () => {
     expect(response.status).toBe(403);
     expect(data).toEqual({ error: "权限不足：该实验不属于当前用户" });
     expect(releaseModelSlot).toHaveBeenCalledTimes(1);
-    expect(releaseModelExecutionLock).toHaveBeenCalledTimes(1);
+    expect(releaseModelArtifactMutationLocks).toHaveBeenCalledTimes(1);
   });
 
   test("maps python validation failures from training to 400", async () => {
@@ -397,6 +440,7 @@ describe("models controller", () => {
       20240002,
       expect.objectContaining({ experiment_id: 990002, moving_average_window: 4 }),
     );
+    expect(acquireModelArtifactMutationLocks).not.toHaveBeenCalled();
     expect(acquireModelExecutionLock).not.toHaveBeenCalled();
     expect(acquireModelSlot).not.toHaveBeenCalled();
   });
@@ -408,6 +452,25 @@ describe("models controller", () => {
     expect(response.status).toBe(200);
     expect(data.session_id).toBe("guided-1");
     expect(getGuidedTrainingSession).toHaveBeenCalledWith("ma", 20240002, "guided-1");
+  });
+
+  test("activates a completed guided training session explicitly", async () => {
+    const response = await requestPost("/api/v1/models/ma/guided-training/sessions/guided-1/activate");
+    const data = await response.json();
+
+    expect(response.status).toBe(200);
+    expect(data.backtest_artifact_changed).toBe(true);
+    expect(activateGuidedTrainingSession).toHaveBeenCalledWith("ma", 20240002, "guided-1");
+  });
+
+  test("maps a busy guided activation to 409", async () => {
+    activateGuidedTrainingSession.mockRejectedValueOnce(
+      new ModelValidationError("同一模型正在训练或预测，请稍后再试"),
+    );
+
+    const response = await requestPost("/api/v1/models/ma/guided-training/sessions/guided-1/activate");
+
+    expect(response.status).toBe(409);
   });
 
   test("runs the requested guided training step", async () => {
@@ -463,7 +526,7 @@ describe("models controller", () => {
       moving_average_window: 4,
     }), expect.any(Function));
     expect(releaseModelSlot).toHaveBeenCalledTimes(1);
-    expect(releaseModelExecutionLock).toHaveBeenCalledTimes(1);
+    expect(releaseModelArtifactMutationLocks).toHaveBeenCalledTimes(1);
   });
 
   test("does not expose raw Python stderr in training stream errors", async () => {
@@ -485,7 +548,7 @@ describe("models controller", () => {
     expect(JSON.stringify(events)).not.toContain("Traceback");
     expect(JSON.stringify(events)).not.toContain("/opt/fangzhen2");
     expect(releaseModelSlot).toHaveBeenCalledTimes(1);
-    expect(releaseModelExecutionLock).toHaveBeenCalledTimes(1);
+    expect(releaseModelArtifactMutationLocks).toHaveBeenCalledTimes(1);
   });
 
   test("returns localized field errors for missing moving-average params", async () => {
@@ -548,15 +611,15 @@ describe("models controller", () => {
     expect(trainModel).not.toHaveBeenCalled();
   });
 
-  test("releases the execution lock when slot acquisition throws during training", async () => {
-    const executionLock = { connection: {} as never, name: "exec:throw" };
-    acquireModelExecutionLock.mockResolvedValueOnce(executionLock);
+  test("releases artifact mutation locks when slot acquisition throws during training", async () => {
+    const artifactLocks = [{ connection: {} as never, name: "exec:throw" }];
+    acquireModelArtifactMutationLocks.mockResolvedValueOnce(artifactLocks);
     acquireModelSlot.mockRejectedValueOnce(new Error("slot acquisition failed"));
 
     const response = await requestJson("/api/v1/models/ma/training", buildTrainBody());
 
     expect(response.status).toBe(500);
-    expect(releaseModelExecutionLock).toHaveBeenCalledWith(executionLock);
+    expect(releaseModelArtifactMutationLocks).toHaveBeenCalledWith(artifactLocks);
     expect(releaseModelSlot).toHaveBeenCalledWith(null);
   });
 
@@ -751,19 +814,40 @@ describe("models controller", () => {
     expect(acquireModelExecutionLock).not.toHaveBeenCalled();
   });
 
-  test("maps python validation failures from prediction to 400", async () => {
-    predictExperimentModel.mockRejectedValueOnce(
-      new Error("[PYTHON_VALIDATION] Requested forecast_steps (20) exceeds the saved LSTM horizon (12)."),
-    );
-
-    const response = await requestJson("/api/v1/models/lstm/predict", {
+  test("rejects prediction horizons above the fixed six-step production contract", async () => {
+    const response = await requestJson("/api/v1/models/ma/predict", {
       experiment_id: 990002,
-      forecast_steps: 20,
+      forecast_steps: 7,
     });
     const data = await response.json();
 
     expect(response.status).toBe(400);
-    expect(data).toEqual({ error: "Requested forecast_steps (20) exceeds the saved LSTM horizon (12)." });
+    expect(data).toEqual({
+      error: "预测步数必须小于等于 6",
+      details: {
+        formErrors: [],
+        fieldErrors: {
+          forecast_steps: ["预测步数必须小于等于 6"],
+        },
+      },
+    });
+    expect(predictExperimentModel).not.toHaveBeenCalled();
+    expect(acquireModelExecutionLock).not.toHaveBeenCalled();
+  });
+
+  test("maps python validation failures from prediction to 400", async () => {
+    predictExperimentModel.mockRejectedValueOnce(
+      new Error("[PYTHON_VALIDATION] Saved LSTM model metadata is invalid."),
+    );
+
+    const response = await requestJson("/api/v1/models/lstm/predict", {
+      experiment_id: 990002,
+      forecast_steps: 6,
+    });
+    const data = await response.json();
+
+    expect(response.status).toBe(400);
+    expect(data).toEqual({ error: "Saved LSTM model metadata is invalid." });
   });
 
   test("maps python data failures from prediction to 400", async () => {
@@ -813,6 +897,7 @@ describe("models controller", () => {
 
     expect(response.status).toBe(400);
     expect(data).toEqual({ error: "指定的模型类型无效" });
+    expect(acquireModelArtifactMutationLocks).not.toHaveBeenCalled();
     expect(acquireModelExecutionLock).not.toHaveBeenCalled();
     expect(trainModel).not.toHaveBeenCalled();
   });

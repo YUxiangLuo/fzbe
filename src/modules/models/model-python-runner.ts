@@ -6,6 +6,7 @@ import { PY_DIR, resolvePythonExecutable } from "../../utils/python";
 
 const TRAINING_TIMEOUT = TIMEOUTS.MODEL_TRAINING;
 const GUIDED_ENSEMBLE_MODEL_TYPES = new Set(["weighted_avg", "boosting", "stacking"]);
+const MAX_PYTHON_OUTPUT_BYTES = 16 * 1024 * 1024;
 
 export function buildPythonModelProcessEnv(): Record<string, string> {
   const modelThreads = String(PYTHON_RUNTIME_CONFIG.MODEL_PROCESS_THREADS);
@@ -45,6 +46,24 @@ export const allPossiblePythonParams: Record<string, string> = {
   lstmTargetFeature: "lstm-target-feature",
   lstmNormalization: "normalization",
   models: "models",
+};
+
+const buildPythonArgs = (params: Record<string, unknown>) => {
+  let stdinPayload: string | undefined;
+  const args = Object.entries(params).flatMap(([key, value]) => {
+    if (key === "data" && typeof value === "string") {
+      stdinPayload = value;
+      return ["--data-stdin"];
+    }
+
+    const scriptKey = allPossiblePythonParams[key] || key;
+    const cliArg = `--${scriptKey}`;
+    if (typeof value === "boolean") return value ? [cliArg] : [];
+    if (Array.isArray(value)) return [cliArg, JSON.stringify(value)];
+    return [cliArg, String(value)];
+  });
+
+  return { args, stdinPayload };
 };
 
 const SETSID_PATH = process.platform === "win32" ? undefined : Bun.which("setsid");
@@ -242,13 +261,7 @@ export async function runPythonModel(
     throw new Error(`未找到 Python 入口脚本: ${scriptPath}`);
   }
 
-  const args = Object.entries(params).flatMap(([key, value]) => {
-    const scriptKey = allPossiblePythonParams[key] || key;
-    const cliArg = `--${scriptKey}`;
-    if (typeof value === "boolean") return value ? [cliArg] : [];
-    if (Array.isArray(value)) return [cliArg, JSON.stringify(value)];
-    return [cliArg, String(value)];
-  });
+  const { args, stdinPayload } = buildPythonArgs(params);
 
   const fullArgs = [modelType, ...args];
   const command = process.platform !== "win32" && SETSID_PATH
@@ -265,8 +278,10 @@ export async function runPythonModel(
 
   const proc = Bun.spawn(command, {
     cwd: PY_DIR,
+    stdin: stdinPayload === undefined ? "ignore" : new Blob([stdinPayload]),
     stdout: "pipe",
     stderr: "pipe",
+    maxBuffer: MAX_PYTHON_OUTPUT_BYTES,
     env: {
       ...process.env,
       ...buildPythonModelProcessEnv(),
@@ -397,13 +412,7 @@ export async function runPythonGuidedTrainingStep(
   }
 
   fs.mkdirSync(artifactDir, { recursive: true });
-  const args = Object.entries(params).flatMap(([key, value]) => {
-    const scriptKey = allPossiblePythonParams[key] || key;
-    const cliArg = `--${scriptKey}`;
-    if (typeof value === "boolean") return value ? [cliArg] : [];
-    if (Array.isArray(value)) return [cliArg, JSON.stringify(value)];
-    return [cliArg, String(value)];
-  });
+  const { args, stdinPayload } = buildPythonArgs(params);
 
   const fullArgs = [
     modelType,
@@ -420,8 +429,10 @@ export async function runPythonGuidedTrainingStep(
 
   const proc = Bun.spawn(command, {
     cwd: PY_DIR,
+    stdin: stdinPayload === undefined ? "ignore" : new Blob([stdinPayload]),
     stdout: "pipe",
     stderr: "pipe",
+    maxBuffer: MAX_PYTHON_OUTPUT_BYTES,
     env: {
       ...process.env,
       ...buildPythonModelProcessEnv(),
@@ -497,4 +508,3 @@ export async function runPythonGuidedTrainingStep(
 
   return Promise.race([executionPromise, timeoutPromise]);
 }
-

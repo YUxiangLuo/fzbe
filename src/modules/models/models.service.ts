@@ -5,7 +5,12 @@ import type { Stats } from "node:fs";
 import type { RowDataPacket } from "mysql2/promise";
 import { pool } from "../../config";
 import logger from "../../utils/logger";
-import { MIN_EVALUATION_POINTS, type ModelType, type TrainInput } from "./models.schema";
+import {
+  MAX_FORECAST_STEPS,
+  MIN_EVALUATION_POINTS,
+  type ModelType,
+  type TrainInput,
+} from "./models.schema";
 import { TIMEOUTS, CLEANUP_RETENTION } from "../../utils/constants";
 import { PY_DIR, resolvePythonExecutable } from "../../utils/python";
 import {
@@ -17,9 +22,9 @@ import {
 import { loadDatasetFromDb } from "./model-datasets";
 import { ModelAccessError, ModelNotFoundError, ModelValidationError } from "./model-errors";
 import {
-  acquireModelExecutionLock,
+  acquireModelArtifactMutationLocks,
   acquireModelSlot,
-  releaseModelExecutionLock,
+  releaseModelArtifactMutationLocks,
   releaseModelSlot,
 } from "./model-locks";
 import {
@@ -48,8 +53,10 @@ import {
 export { loadDatasetFromDb } from "./model-datasets";
 export { ModelAccessError, ModelNotFoundError, ModelValidationError } from "./model-errors";
 export {
+  acquireModelArtifactMutationLocks,
   acquireModelExecutionLock,
   acquireModelSlot,
+  releaseModelArtifactMutationLocks,
   releaseModelExecutionLock,
   releaseModelSlot,
 } from "./model-locks";
@@ -197,6 +204,17 @@ const getLstmSidecarPath = (modelPath: string) => modelPath.replace(/\.pkl$/, "_
 const getGuidedSessionModelPath = (artifactDir: string, modelType: GuidedModelType) =>
   path.join(artifactDir, `${modelType}.pkl`);
 
+const getGuidedBacktestSourceMarkerPath = (modelPath: string) => `${modelPath}.guided-session`;
+
+const readGuidedBacktestSourceMarker = (modelPath: string) => {
+  const markerPath = getGuidedBacktestSourceMarkerPath(modelPath);
+  try {
+    return fs.readFileSync(markerPath, "utf8").trim();
+  } catch {
+    return null;
+  }
+};
+
 const removeFileIfExists = (filePath: string) => {
   if (!fs.existsSync(filePath)) {
     return;
@@ -230,17 +248,145 @@ const removeSiblingArtifactsByPrefix = (modelPath: string) => {
   }
 };
 
-const invalidateProductionArtifact = (experimentId: number, studentId: number, modelType: ModelType) => {
-  const productionModelPath = getProductionModelPath(experimentId, studentId, modelType);
-  removeFileIfExists(productionModelPath);
-
+const invalidateArtifactAtPath = (modelType: ModelType, modelPath: string) => {
+  removeFileIfExists(modelPath);
+  removeFileIfExists(getGuidedBacktestSourceMarkerPath(modelPath));
   if (modelType === "lstm") {
-    removeFileIfExists(getLstmSidecarPath(productionModelPath));
+    removeFileIfExists(getLstmSidecarPath(modelPath));
     return;
   }
 
   if (isEnsembleModelType(modelType)) {
-    removeSiblingArtifactsByPrefix(productionModelPath);
+    removeSiblingArtifactsByPrefix(modelPath);
+  }
+};
+
+const invalidateProductionArtifact = (experimentId: number, studentId: number, modelType: ModelType) => {
+  invalidateArtifactAtPath(modelType, getProductionModelPath(experimentId, studentId, modelType));
+};
+
+const commonDownstreamStateResetValues: Record<string, unknown> = {
+  selected_best_model: null,
+  production_plan_completed: 0,
+  production_forecast_periods: null,
+  production_initial_inventory: null,
+  production_target_service_level: null,
+  production_safety_stock_z_score: null,
+  production_forecast_results: null,
+  production_mps_table: JSON.stringify([]),
+  production_capacity_mode: null,
+  production_capacity_scenario: null,
+  production_capacity: null,
+  production_custom_capacity: null,
+  quiz_about_plan_completed: 0,
+};
+
+const modelStateResetValues: Record<ModelType, Record<string, unknown>> = {
+  ma: {
+    moving_average_completed: 0,
+    moving_average_window: null,
+    moving_average_metrics_rmse: null,
+    moving_average_metrics_mae: null,
+    moving_average_metrics_mape: null,
+    moving_average_metrics_r2: null,
+  },
+  es: {
+    exponential_smoothing_completed: 0,
+    exponential_smoothing_alpha: null,
+    exponential_smoothing_metrics_rmse: null,
+    exponential_smoothing_metrics_mae: null,
+    exponential_smoothing_metrics_mape: null,
+    exponential_smoothing_metrics_r2: null,
+  },
+  arima: {
+    arima_completed: 0,
+    arima_p: null,
+    arima_d: null,
+    arima_q: null,
+    arima_metrics_rmse: null,
+    arima_metrics_mae: null,
+    arima_metrics_mape: null,
+    arima_metrics_r2: null,
+  },
+  lstm: {
+    lstm_completed: 0,
+    lstm_normalization: null,
+    lstm_features: JSON.stringify([]),
+    lstm_target_field: null,
+    lstm_metrics_rmse: null,
+    lstm_metrics_mae: null,
+    lstm_metrics_mape: null,
+    lstm_metrics_r2: null,
+  },
+  weighted_avg: {
+    ensemble_weighted_completed: 0,
+    ensemble_weighted_base_models: JSON.stringify([]),
+    ensemble_weighted_metrics_rmse: null,
+    ensemble_weighted_metrics_mae: null,
+    ensemble_weighted_metrics_mape: null,
+    ensemble_weighted_metrics_r2: null,
+  },
+  boosting: {
+    ensemble_boosting_completed: 0,
+    ensemble_boosting_base_models: JSON.stringify([]),
+    ensemble_boosting_metrics_rmse: null,
+    ensemble_boosting_metrics_mae: null,
+    ensemble_boosting_metrics_mape: null,
+    ensemble_boosting_metrics_r2: null,
+  },
+  stacking: {
+    ensemble_stacking_completed: 0,
+    ensemble_stacking_base_models: JSON.stringify([]),
+    ensemble_stacking_metrics_rmse: null,
+    ensemble_stacking_metrics_mae: null,
+    ensemble_stacking_metrics_mape: null,
+    ensemble_stacking_metrics_r2: null,
+  },
+};
+
+const invalidateExperimentStateAfterBacktestChange = async (
+  experimentId: number,
+  studentId: number,
+  modelType: ModelType,
+) => {
+  const resetValues: Record<string, unknown> = {
+    ...modelStateResetValues[modelType],
+    ...(isBaseModelType(modelType)
+      ? Object.assign({}, ...[...ENSEMBLE_MODEL_TYPES].map((ensembleType) => modelStateResetValues[ensembleType]))
+      : {}),
+    ...commonDownstreamStateResetValues,
+  };
+  const entries = Object.entries(resetValues);
+  const assignments = entries.map(([field]) => `\`${field}\` = ?`).join(", ");
+
+  await pool.query(
+    `UPDATE experiment_status
+        SET ${assignments},
+            last_activity_at = NOW()
+      WHERE experiment_id = ?
+        AND student_id = ?`,
+    [...entries.map(([, value]) => value), experimentId, studentId],
+  );
+};
+
+const invalidateArtifactsAfterBacktestChange = async (
+  experimentId: number,
+  studentId: number,
+  modelType: ModelType,
+) => {
+  await invalidateExperimentStateAfterBacktestChange(experimentId, studentId, modelType);
+  invalidateProductionArtifact(experimentId, studentId, modelType);
+
+  if (!isBaseModelType(modelType)) {
+    return;
+  }
+
+  for (const ensembleType of ENSEMBLE_MODEL_TYPES) {
+    invalidateArtifactAtPath(
+      ensembleType,
+      getBacktestModelPath(experimentId, studentId, ensembleType),
+    );
+    invalidateProductionArtifact(experimentId, studentId, ensembleType);
   }
 };
 
@@ -557,6 +703,7 @@ const restoreGuidedSessionBacktestArtifact = async (
   row: GuidedTrainingSessionRow,
   options: { invalidateProductionArtifact?: boolean } = {},
 ) => {
+  assertGuidedTrainingSessionDependenciesCurrent(row);
   const sourceModelPath = getGuidedSessionModelPath(row.artifact_dir, row.model_type);
   const backtestModelPath = getBacktestModelPath(row.experiment_id, row.student_id, row.model_type);
 
@@ -564,11 +711,19 @@ const restoreGuidedSessionBacktestArtifact = async (
     throw new ModelNotFoundError("分阶段训练产物已过期或已被清理，请重新开始分阶段训练");
   }
 
-  await copyModelArtifact(row.model_type, sourceModelPath, backtestModelPath);
-  if (options.invalidateProductionArtifact) {
-    invalidateProductionArtifact(row.experiment_id, row.student_id, row.model_type);
+  const sourceMarkerPath = getGuidedBacktestSourceMarkerPath(backtestModelPath);
+  const alreadyRestoredFromThisSession = readGuidedBacktestSourceMarker(backtestModelPath) === row.session_id
+    && await hasReusableSavedModelArtifact(row.model_type, backtestModelPath);
+  if (alreadyRestoredFromThisSession) {
+    return { modelPath: backtestModelPath, changed: false };
   }
-  return backtestModelPath;
+
+  if (options.invalidateProductionArtifact) {
+    await invalidateArtifactsAfterBacktestChange(row.experiment_id, row.student_id, row.model_type);
+  }
+  await copyModelArtifact(row.model_type, sourceModelPath, backtestModelPath);
+  fs.writeFileSync(sourceMarkerPath, row.session_id, "utf8");
+  return { modelPath: backtestModelPath, changed: true };
 };
 
 const isPathInsideDirectory = (candidatePath: string, rootDirectory: string) => {
@@ -761,10 +916,14 @@ const stableJsonStringify = (value: unknown): string => {
   return JSON.stringify(value);
 };
 
-const hashGuidedTrainingRequest = (modelType: GuidedModelType, body: TrainInput) =>
+const hashGuidedTrainingRequest = (
+  modelType: GuidedModelType,
+  body: TrainInput,
+  dependencyRevisions?: unknown,
+) =>
   crypto
     .createHash("sha256")
-    .update(stableJsonStringify({ modelType, body }))
+    .update(stableJsonStringify({ modelType, body, dependencyRevisions }))
     .digest("hex");
 
 const parseJsonColumn = <T>(value: unknown, fallback: T): T => {
@@ -823,6 +982,30 @@ const validateMovingAverageWindow = (
       moving_average_window: movingAverageWindow,
       training_length: trainingLength,
     });
+  }
+};
+
+const resolveAutomaticLstmLookBack = (trainingSize: number) =>
+  Math.max(3, Math.min(6, Math.floor(trainingSize / 4)));
+
+const validateLstmProductionFeasibility = (trainingConfig: ExperimentTrainingConfig) => {
+  const trainingSize =
+    trainingConfig.data_window_train_end_index - trainingConfig.data_window_train_start_index + 1;
+  const lookBack = resolveAutomaticLstmLookBack(trainingSize);
+  const productionTrainingSize =
+    trainingConfig.data_window_evaluate_end_index - trainingConfig.data_window_train_start_index + 1;
+  const minimumProductionTrainingSize = lookBack + MAX_FORECAST_STEPS;
+
+  if (productionTrainingSize < minimumProductionTrainingSize) {
+    throw new ModelValidationError(
+      `LSTM 生产预测固定为 ${MAX_FORECAST_STEPS} 期；当前数据在纳入评估区间后仅有 ${productionTrainingSize} 个训练点，至少需要 ${minimumProductionTrainingSize} 个`,
+      {
+        look_back: lookBack,
+        production_forecast_steps: MAX_FORECAST_STEPS,
+        production_training_size: productionTrainingSize,
+        minimum_production_training_size: minimumProductionTrainingSize,
+      },
+    );
   }
 };
 
@@ -991,6 +1174,62 @@ const buildAvailableBaseModelArtifactMap = (
 
   return availableModelFiles;
 };
+
+const fingerprintArtifactFile = (filePath: string) => {
+  if (!fs.existsSync(filePath)) {
+    return null;
+  }
+
+  try {
+    return crypto.createHash("sha256").update(fs.readFileSync(filePath)).digest("hex");
+  } catch {
+    return "unreadable";
+  }
+};
+
+const buildEnsembleDependencyRevisions = (
+  modelType: GuidedModelType,
+  experimentId: number,
+  studentId: number,
+  modelsValue: string | undefined,
+) => {
+  if (!isEnsembleModelType(modelType) || !modelsValue) {
+    return undefined;
+  }
+
+  return parseRequestedBaseModels(modelsValue).map((baseModelType) => {
+    const modelPath = getBacktestModelPath(experimentId, studentId, baseModelType);
+    return {
+      model_type: baseModelType,
+      model: fingerprintArtifactFile(modelPath),
+      sidecar: baseModelType === "lstm"
+        ? fingerprintArtifactFile(getLstmSidecarPath(modelPath))
+        : undefined,
+    };
+  });
+};
+
+function assertGuidedTrainingSessionDependenciesCurrent(row: GuidedTrainingSessionRow) {
+  if (!isEnsembleModelType(row.model_type)) {
+    return;
+  }
+
+  const body = parseJsonColumn<TrainInput>(row.request_payload, {} as TrainInput);
+  const currentRequestHash = hashGuidedTrainingRequest(
+    row.model_type,
+    body,
+    buildEnsembleDependencyRevisions(
+      row.model_type,
+      row.experiment_id,
+      row.student_id,
+      body.models,
+    ),
+  );
+
+  if (currentRequestHash !== row.request_hash) {
+    throw new ModelValidationError("融合模型依赖的基础模型已更新，请重新开始分阶段训练");
+  }
+}
 
 const assertTrainingRequestMatchesExperiment = (
   experiment: ExperimentModelContextRow,
@@ -1274,6 +1513,7 @@ const trimBoostingStepPlanAfterEarlyStop = (
 
 const buildGuidedTrainingSessionPayload = (
   row: GuidedTrainingSessionRow,
+  options: { backtestArtifactChanged?: boolean } = {},
 ): GuidedTrainingSessionPayload => {
   const completedStepIds = parseJsonColumn<string[]>(row.completed_step_ids, []);
   const stepOutputs = parseJsonColumn<Record<string, unknown>>(row.step_outputs, {});
@@ -1305,6 +1545,7 @@ const buildGuidedTrainingSessionPayload = (
     step_outputs: stepOutputs,
     result,
     error_message: row.error_message,
+    backtest_artifact_changed: options.backtestArtifactChanged === true,
   };
 };
 
@@ -1345,6 +1586,8 @@ const buildGuidedTrainingPythonParams = async (
   const trainingConfig = getExperimentTrainingConfig(experiment);
   if (modelType === "ma") {
     validateMovingAverageWindow(trainingConfig, body.moving_average_window);
+  } else if (modelType === "lstm") {
+    validateLstmProductionFeasibility(trainingConfig);
   }
   if (isEnsembleModelType(modelType)) {
     buildEnsemblePythonParams(experiment, body);
@@ -1409,9 +1652,20 @@ export async function createOrResumeGuidedTrainingSession(
   const trainingConfig = getExperimentTrainingConfig(experiment);
   if (modelType === "ma") {
     validateMovingAverageWindow(trainingConfig, body.moving_average_window);
+  } else if (modelType === "lstm") {
+    validateLstmProductionFeasibility(trainingConfig);
   }
 
-  const requestHash = hashGuidedTrainingRequest(modelType, body);
+  const requestHash = hashGuidedTrainingRequest(
+    modelType,
+    body,
+    buildEnsembleDependencyRevisions(
+      modelType,
+      body.experiment_id,
+      studentId,
+      body.models,
+    ),
+  );
   const [existingRows] = await pool.query<GuidedTrainingSessionRow[]>(
     `SELECT session_id,
             experiment_id,
@@ -1448,26 +1702,22 @@ export async function createOrResumeGuidedTrainingSession(
       existingSession.status = "ready";
     }
     if (existingSession.status === "completed") {
-      try {
-        await restoreGuidedSessionBacktestArtifact(existingSession);
+      const sourceModelPath = getGuidedSessionModelPath(existingSession.artifact_dir, modelType);
+      if (await hasReusableSavedModelArtifact(modelType, sourceModelPath)) {
         return buildGuidedTrainingSessionPayload(existingSession);
-      } catch (error) {
-        if (!(error instanceof ModelNotFoundError)) {
-          throw error;
-        }
+      }
 
-        logger.warn(
-          {
-            sessionId: existingSession.session_id,
-            artifactDir: existingSession.artifact_dir,
-            modelType,
-          },
-          "已完成 guided training 会话缺少可复用工件，将删除会话并重新创建",
-        );
-        const deletedSession = await deleteGuidedTrainingSession(existingSession);
-        if (!deletedSession) {
-          throw new ModelValidationError("旧的分阶段训练会话工件清理失败，请稍后重试");
-        }
+      logger.warn(
+        {
+          sessionId: existingSession.session_id,
+          artifactDir: existingSession.artifact_dir,
+          modelType,
+        },
+        "已完成 guided training 会话缺少可复用工件，将删除会话并重新创建",
+      );
+      const deletedSession = await deleteGuidedTrainingSession(existingSession);
+      if (!deletedSession) {
+        throw new ModelValidationError("旧的分阶段训练会话工件清理失败，请稍后重试");
       }
     } else {
       return buildGuidedTrainingSessionPayload(existingSession);
@@ -1540,10 +1790,52 @@ export async function getGuidedTrainingSession(
   }
 
   await assertExperimentModelAccess(row.experiment_id, studentId);
-  if (row.status === "completed") {
-    await restoreGuidedSessionBacktestArtifact(row);
-  }
+  assertGuidedTrainingSessionDependenciesCurrent(row);
   return buildGuidedTrainingSessionPayload(row);
+}
+
+export async function activateGuidedTrainingSession(
+  modelType: ModelType,
+  studentId: number,
+  sessionId: string,
+): Promise<GuidedTrainingSessionPayload> {
+  if (!isGuidedModelType(modelType)) {
+    throw new ModelValidationError("当前模型暂不支持分阶段训练");
+  }
+
+  const initialRow = await fetchGuidedTrainingSessionRow(sessionId);
+  if (!initialRow || initialRow.model_type !== modelType) {
+    throw new ModelNotFoundError("未找到分阶段训练会话");
+  }
+  if (initialRow.student_id !== studentId) {
+    throw new ModelAccessError("权限不足：该训练会话不属于当前用户", 403);
+  }
+
+  let artifactLocks = null;
+  try {
+    artifactLocks = await acquireModelArtifactMutationLocks(initialRow.experiment_id, modelType);
+    if (!artifactLocks) {
+      throw new ModelValidationError("同一模型正在训练或预测，请稍后再试");
+    }
+
+    await assertExperimentModelAccess(initialRow.experiment_id, studentId);
+    const row = await fetchGuidedTrainingSessionRow(sessionId);
+    if (!row || row.model_type !== modelType || row.student_id !== studentId) {
+      throw new ModelNotFoundError("未找到分阶段训练会话");
+    }
+    if (row.status !== "completed" || !row.result_payload) {
+      throw new ModelValidationError("只能激活已完成的分阶段训练会话");
+    }
+
+    const restoredArtifact = await restoreGuidedSessionBacktestArtifact(row, {
+      invalidateProductionArtifact: true,
+    });
+    return buildGuidedTrainingSessionPayload(row, {
+      backtestArtifactChanged: restoredArtifact.changed,
+    });
+  } finally {
+    await releaseModelArtifactMutationLocks(artifactLocks);
+  }
 }
 
 export async function runGuidedTrainingStep(
@@ -1565,8 +1857,9 @@ export async function runGuidedTrainingStep(
     throw new ModelAccessError("权限不足：该训练会话不属于当前用户", 403);
   }
 
+  assertGuidedTrainingSessionDependenciesCurrent(row);
+
   if (row.status === "completed") {
-    await restoreGuidedSessionBacktestArtifact(row);
     return buildGuidedTrainingSessionPayload(row);
   }
 
@@ -1582,13 +1875,13 @@ export async function runGuidedTrainingStep(
     throw new ModelValidationError("只能按训练流程顺序执行下一个阶段");
   }
 
-  let executionLock = null;
+  let artifactLocks = null;
   let slotLock = null;
   let sessionMarkedRunning = false;
 
   try {
-    executionLock = await acquireModelExecutionLock(row.experiment_id, modelType);
-    if (!executionLock) {
+    artifactLocks = await acquireModelArtifactMutationLocks(row.experiment_id, modelType);
+    if (!artifactLocks) {
       throw new ModelValidationError("同一模型正在训练或预测，请稍后再试");
     }
 
@@ -1630,11 +1923,13 @@ export async function runGuidedTrainingStep(
       : stepPlan;
 
     let transformedResult: ReturnType<typeof transformTrainingResult> | null = null;
+    let backtestArtifactChanged = false;
     if (pythonStepResult.final_result) {
-      const backtestModelPath = await restoreGuidedSessionBacktestArtifact(row, {
+      const restoredArtifact = await restoreGuidedSessionBacktestArtifact(row, {
         invalidateProductionArtifact: true,
       });
-      pythonStepResult.final_result.saved_model = backtestModelPath;
+      backtestArtifactChanged = restoredArtifact.changed;
+      pythonStepResult.final_result.saved_model = restoredArtifact.modelPath;
       transformedResult = transformTrainingResult(modelType, pythonStepResult.final_result);
     }
 
@@ -1669,7 +1964,7 @@ export async function runGuidedTrainingStep(
       throw new Error("分阶段训练会话已丢失");
     }
 
-    return buildGuidedTrainingSessionPayload(updatedRow);
+    return buildGuidedTrainingSessionPayload(updatedRow, { backtestArtifactChanged });
   } catch (error) {
     if (sessionMarkedRunning) {
       const detail = error instanceof Error ? error.message : "分阶段训练执行失败";
@@ -1685,7 +1980,7 @@ export async function runGuidedTrainingStep(
     throw error;
   } finally {
     await releaseModelSlot(slotLock);
-    await releaseModelExecutionLock(executionLock);
+    await releaseModelArtifactMutationLocks(artifactLocks);
   }
 }
 
@@ -1707,6 +2002,8 @@ export async function trainModel(
   const trainingConfig = getExperimentTrainingConfig(experiment);
   if (modelType === "ma") {
     validateMovingAverageWindow(trainingConfig, body.moving_average_window);
+  } else if (modelType === "lstm") {
+    validateLstmProductionFeasibility(trainingConfig);
   }
   const derivedModelParams: Record<string, unknown> = isEnsembleModelType(modelType)
     ? buildEnsemblePythonParams(experiment, body)
@@ -1786,7 +2083,8 @@ export async function trainModel(
     source: "backend",
     message: "训练结果已生成，正在更新模型产物状态",
   });
-  invalidateProductionArtifact(body.experiment_id, studentId, modelType);
+  removeFileIfExists(getGuidedBacktestSourceMarkerPath(modelSaveLoc));
+  await invalidateArtifactsAfterBacktestChange(body.experiment_id, studentId, modelType);
 
   reportModelProgress(progressReporter, {
     type: "phase",
@@ -1805,6 +2103,9 @@ export async function getReusableProductionModelArtifactResult(
 ) {
   const experiment = await assertExperimentModelAccess(experimentId, studentId);
   assertModelReadyForProduction(experiment, modelType);
+  if (modelType === "lstm") {
+    validateLstmProductionFeasibility(getExperimentTrainingConfig(experiment));
+  }
 
   const productionModelPath = getProductionModelPath(experimentId, studentId, modelType);
   if (!await hasReusableSavedModelArtifact(modelType, productionModelPath)) {
@@ -1833,6 +2134,9 @@ export async function prepareExperimentModelForProduction(
 
   const experiment = await assertExperimentModelAccess(experimentId, studentId);
   assertModelReadyForProduction(experiment, modelType);
+  if (modelType === "lstm") {
+    validateLstmProductionFeasibility(getExperimentTrainingConfig(experiment));
+  }
   const trainingConfig = getExperimentTrainingConfig(experiment);
 
   const productionModelPath = getProductionModelPath(experimentId, studentId, modelType);
@@ -2057,6 +2361,9 @@ export async function predictExperimentModel(
 ) {
   const experiment = await assertExperimentModelAccess(experimentId, studentId);
   assertModelReadyForProduction(experiment, modelType);
+  if (modelType === "lstm") {
+    validateLstmProductionFeasibility(getExperimentTrainingConfig(experiment));
+  }
 
   const productionModelPath = getProductionModelPath(experimentId, studentId, modelType);
   if (!await hasReusableSavedModelArtifact(modelType, productionModelPath)) {

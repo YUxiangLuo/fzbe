@@ -344,7 +344,10 @@ def run(args) -> None:
     """
     Main entry point for ARIMA model training and prediction.
     """
-    log.info(f"ARIMA run started with args: {vars(args)}")
+    summarized_args = dict(vars(args))
+    if isinstance(summarized_args.get("data"), str):
+        summarized_args["data"] = f"<json payload chars={len(summarized_args['data'])}>"
+    log.info(f"ARIMA run started with args: {summarized_args}")
     pretty: bool = bool(getattr(args, "pretty", False))
     save_path = getattr(args, "save_model", None)
     load_path = getattr(args, "load_model", None)

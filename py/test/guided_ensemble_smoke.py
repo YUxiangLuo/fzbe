@@ -96,7 +96,11 @@ def drive_boosting_steps(common_args):
     step("split_residual_sets")
     for round_number in range(1, BOOSTING_MAX_ROUNDS + 1):
         step(f"round_{round_number}_evaluate_candidates")
-        selection = step(f"round_{round_number}_select_winner")
+        selection_step_id = f"round_{round_number}_select_winner"
+        selection = step(selection_step_id)
+        retried_selection = step(selection_step_id)
+        if retried_selection != selection:
+            raise AssertionError(f"boosting retry changed the cached payload for {selection_step_id}")
         if selection.get("output", {}).get("action") == "early_stop":
             break
     step("retrain_chain")
@@ -107,8 +111,12 @@ def drive_boosting_steps(common_args):
 
 def drive_static_steps(model_type, common_args):
     final_result = None
-    for step_id in STATIC_SEQUENCES[model_type]:
+    for step_index, step_id in enumerate(STATIC_SEQUENCES[model_type]):
         payload = run_step(model_type, step_id, common_args)
+        if step_index == 0:
+            retried_payload = run_step(model_type, step_id, common_args)
+            if retried_payload != payload:
+                raise AssertionError(f"{model_type} retry changed the cached payload for {step_id}")
         if "final_result" in payload:
             final_result = payload["final_result"]
     return final_result

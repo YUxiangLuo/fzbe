@@ -10,6 +10,7 @@ const srcRoot = path.resolve(import.meta.dir, "../../../src");
 const configModulePath = path.join(srcRoot, "config", "index.ts");
 const pythonModulePath = path.join(srcRoot, "utils", "python.ts");
 const modelRuntimeModulePath = path.join(srcRoot, "modules", "models", "model-runtime.ts");
+const modelLocksModulePath = path.join(srcRoot, "modules", "models", "model-locks.ts");
 const modelsServiceModulePath = path.join(srcRoot, "modules", "models", "models.service.ts");
 const freshModelsServiceModulePath = `${modelsServiceModulePath}?models-service-test`;
 const datasetCsvPath = "/tmp/dataset.csv";
@@ -50,6 +51,8 @@ const statSync = mock((_: string) => ({
 }));
 const unlinkSync = mock(() => {});
 const copyFileSync = mock((_: string, __: string) => {});
+const readFileSync = mock((_: string, __?: unknown) => "");
+const writeFileSync = mock((_: string, __: unknown, ___?: unknown) => {});
 const mkdirSync = mock((_: string, __?: unknown) => undefined);
 const rmSync = mock((_: string, __?: unknown) => undefined);
 const spawnMock = mock((_: string[], __: Record<string, unknown>) => ({
@@ -71,6 +74,14 @@ const spawnMock = mock((_: string[], __: Record<string, unknown>) => ({
   kill: mock(() => {}),
 }));
 const originalSpawn = Bun.spawn;
+const acquireModelExecutionLock = mock(async () => ({ connection: {} as never, name: "exec:1" }));
+const releaseModelExecutionLock = mock(async () => {});
+const acquireModelArtifactMutationLocks = mock(async () => ([
+  { connection: {} as never, name: "exec:1" },
+]));
+const releaseModelArtifactMutationLocks = mock(async () => {});
+const acquireModelSlot = mock(async () => ({ connection: {} as never, name: "slot:1" }));
+const releaseModelSlot = mock(async () => {});
 
 mock.module(configModulePath, () => ({
   env: {
@@ -97,6 +108,8 @@ mock.module("fs", () => ({
     statSync,
     unlinkSync,
     copyFileSync,
+    readFileSync,
+    writeFileSync,
     mkdirSync,
     rmSync,
   },
@@ -106,6 +119,8 @@ mock.module("fs", () => ({
   statSync,
   unlinkSync,
   copyFileSync,
+  readFileSync,
+  writeFileSync,
   mkdirSync,
   rmSync,
 }));
@@ -150,10 +165,21 @@ mock.module(modelRuntimeModulePath, () => ({
   buildModelSlotLockName: (slot: number) => `fangzhen-model:slot:${slot}`,
 }));
 
+mock.module(modelLocksModulePath, () => ({
+  acquireModelExecutionLock,
+  releaseModelExecutionLock,
+  acquireModelArtifactMutationLocks,
+  releaseModelArtifactMutationLocks,
+  acquireModelSlot,
+  releaseModelSlot,
+}));
+
 const {
   trainModel,
   runPythonModel,
   createOrResumeGuidedTrainingSession,
+  getGuidedTrainingSession,
+  activateGuidedTrainingSession,
   cleanupExpiredGuidedTrainingSessions,
   cleanupStaleModelArtifacts,
   prepareExperimentModelForProduction,
@@ -213,9 +239,20 @@ describe("models service", () => {
     });
     unlinkSync.mockClear();
     copyFileSync.mockClear();
+    readFileSync.mockClear();
+    writeFileSync.mockClear();
     mkdirSync.mockClear();
     rmSync.mockClear();
     spawnMock.mockClear();
+    acquireModelExecutionLock.mockClear();
+    releaseModelExecutionLock.mockClear();
+    acquireModelArtifactMutationLocks.mockReset();
+    acquireModelArtifactMutationLocks.mockResolvedValue([
+      { connection: {} as never, name: "exec:1" },
+    ]);
+    releaseModelArtifactMutationLocks.mockClear();
+    acquireModelSlot.mockClear();
+    releaseModelSlot.mockClear();
     (Bun as { spawn: typeof Bun.spawn }).spawn = spawnMock as typeof Bun.spawn;
   });
 
@@ -266,6 +303,12 @@ describe("models service", () => {
       "Starting model training and evaluation...",
       "Evaluation metrics computed: RMSE=1.0000, MAE=1.0000, MAPE=1.0000, R²=0.9000",
     ]);
+    const [command, options] = spawnMock.mock.calls[0] ?? [];
+    expect(command).toContain("--data-stdin");
+    expect(command).not.toContain("--data");
+    expect(options).toMatchObject({ maxBuffer: 16 * 1024 * 1024 });
+    expect(options.stdin).toBeInstanceOf(Blob);
+    expect(await (options.stdin as Blob).text()).toBe("[]");
   });
 
   test("does not include raw stderr when Python exits with an untagged failure", async () => {
@@ -390,7 +433,38 @@ describe("models service", () => {
     expect(spawnMock).not.toHaveBeenCalled();
   });
 
-  test("restores the session-scoped guided artifact before reusing a completed session", async () => {
+  test("rejects LSTM training that cannot preserve the fixed six-step production strategy", async () => {
+    poolQuery.mockResolvedValueOnce([[
+      buildExperimentContextRow({
+        data_window_train_start_index: 0,
+        data_window_train_end_index: 4,
+        data_window_evaluate_start_index: 5,
+        data_window_evaluate_end_index: 6,
+      }),
+    ]]);
+
+    await expect(
+      createOrResumeGuidedTrainingSession("lstm", 20240002, {
+        experiment_id: 990002,
+        selected_industry: "制造业",
+        selected_company: "样本企业",
+        selected_product: "样本产品",
+        data_window_train_start_index: 0,
+        data_window_train_end_index: 4,
+        data_window_evaluate_start_index: 5,
+        data_window_evaluate_end_index: 6,
+        lstmNormalization: "minmax",
+        lstmTargetFeature: "销售数量",
+        lstmFeatures: JSON.stringify(["价格指数"]),
+      }),
+    ).rejects.toMatchObject({
+      message: expect.stringContaining("LSTM 生产预测固定为 6 期"),
+    });
+
+    expect(spawnMock).not.toHaveBeenCalled();
+  });
+
+  test("keeps completed-session lookup pure and only restores its artifact on explicit activation", async () => {
     const requestBody = {
       experiment_id: 990002,
       selected_industry: "制造业",
@@ -406,49 +480,194 @@ describe("models service", () => {
     const sessionModelPath = `${artifactDir}/ma.pkl`;
     const productionModelPath = "/tmp/fangzhen-py/trained_models/exp990002-student20240002-ma-production.pkl";
 
+    const completedSessionRow = {
+      session_id: "guided-a",
+      experiment_id: 990002,
+      student_id: 20240002,
+      model_type: "ma",
+      request_hash: "request-hash",
+      request_payload: JSON.stringify(requestBody),
+      status: "completed",
+      current_step_id: null,
+      completed_step_ids: JSON.stringify([
+        "prepare_data",
+        "build_windows",
+        "forecast",
+        "estimate_residuals",
+        "evaluate_metrics",
+        "save_artifact",
+      ]),
+      step_outputs: JSON.stringify({ save_artifact: { metrics: { rmse: 1 } } }),
+      step_plan: JSON.stringify([]),
+      result_payload: JSON.stringify({
+        status: "success",
+        results: { metrics: { rmse: 1, mae: 1, r2: 0.9 } },
+      }),
+      artifact_dir: artifactDir,
+      error_message: null,
+    };
+
     poolQuery.mockReset();
     poolQuery
       .mockResolvedValueOnce([[buildExperimentContextRow()]])
-      .mockResolvedValueOnce([[
-        {
-          session_id: "guided-a",
-          experiment_id: 990002,
-          student_id: 20240002,
-          model_type: "ma",
-          request_hash: "request-hash",
-          request_payload: JSON.stringify(requestBody),
-          status: "completed",
-          current_step_id: null,
-          completed_step_ids: JSON.stringify([
-            "prepare_data",
-            "build_windows",
-            "forecast",
-            "estimate_residuals",
-            "evaluate_metrics",
-            "save_artifact",
-          ]),
-          step_outputs: JSON.stringify({ save_artifact: { metrics: { rmse: 1 } } }),
-          result_payload: JSON.stringify({
-            status: "success",
-            results: { metrics: { rmse: 1, mae: 1, r2: 0.9 } },
-          }),
-          artifact_dir: artifactDir,
-          error_message: null,
-        },
-      ]]);
+      .mockResolvedValueOnce([[completedSessionRow]])
+      .mockResolvedValueOnce([[completedSessionRow]])
+      .mockResolvedValueOnce([[buildExperimentContextRow()]])
+      .mockResolvedValueOnce([[completedSessionRow]])
+      .mockResolvedValueOnce([[]]);
     existsSync.mockImplementation((filePath: string) =>
       filePath === sessionModelPath || filePath === productionModelPath
     );
 
-    const session = await createOrResumeGuidedTrainingSession("ma", 20240002, requestBody);
+    const lookedUpSession = await createOrResumeGuidedTrainingSession("ma", 20240002, requestBody);
 
-    expect(session.status).toBe("completed");
+    expect(lookedUpSession.status).toBe("completed");
+    expect(lookedUpSession.backtest_artifact_changed).toBeFalse();
+    expect(copyFileSync).not.toHaveBeenCalled();
+    expect(unlinkSync).not.toHaveBeenCalledWith(productionModelPath);
+    expect(writeFileSync).not.toHaveBeenCalled();
+    expect(acquireModelArtifactMutationLocks).not.toHaveBeenCalled();
+
+    const activatedSession = await activateGuidedTrainingSession("ma", 20240002, "guided-a");
+
+    expect(activatedSession.status).toBe("completed");
+    expect(activatedSession.backtest_artifact_changed).toBeTrue();
+    expect(acquireModelArtifactMutationLocks).toHaveBeenCalledWith(990002, "ma");
+    expect(releaseModelArtifactMutationLocks).toHaveBeenCalledTimes(1);
     expect(copyFileSync).toHaveBeenCalledWith(
       sessionModelPath,
       "/tmp/fangzhen-py/trained_models/exp990002-student20240002-ma.pkl",
     );
-    expect(unlinkSync).not.toHaveBeenCalledWith(productionModelPath);
+    expect(unlinkSync).toHaveBeenCalledWith(productionModelPath);
+    expect(writeFileSync).toHaveBeenCalledWith(
+      "/tmp/fangzhen-py/trained_models/exp990002-student20240002-ma.pkl.guided-session",
+      "guided-a",
+      "utf8",
+    );
+    const stateResetCall = poolQuery.mock.calls.find(([sql]) =>
+      String(sql).includes("UPDATE experiment_status")
+    );
+    expect(stateResetCall).toBeDefined();
+    expect(String(stateResetCall?.[0])).toContain("moving_average_completed");
+    expect(String(stateResetCall?.[0])).toContain("ensemble_weighted_completed");
+    expect(String(stateResetCall?.[0])).toContain("selected_best_model");
+    expect(String(stateResetCall?.[0])).toContain("quiz_about_plan_completed");
+    expect(stateResetCall?.[1]?.slice(-2)).toEqual([990002, 20240002]);
     expect(spawnMock).not.toHaveBeenCalled();
+  });
+
+  test("makes repeated activation of the same completed guided session idempotent", async () => {
+    const requestBody = {
+      experiment_id: 990002,
+      selected_industry: "制造业",
+      selected_company: "样本企业",
+      selected_product: "样本产品",
+      data_window_train_start_index: 0,
+      data_window_train_end_index: 11,
+      data_window_evaluate_start_index: 12,
+      data_window_evaluate_end_index: 17,
+      moving_average_window: 4,
+    };
+    const artifactDir = "/tmp/fangzhen-py/guided_training/exp990002-student20240002-ma-guided-a";
+    const sessionModelPath = `${artifactDir}/ma.pkl`;
+    const backtestModelPath = "/tmp/fangzhen-py/trained_models/exp990002-student20240002-ma.pkl";
+    const sourceMarkerPath = `${backtestModelPath}.guided-session`;
+    const productionModelPath = "/tmp/fangzhen-py/trained_models/exp990002-student20240002-ma-production.pkl";
+
+    const completedSessionRow = {
+      session_id: "guided-a",
+      experiment_id: 990002,
+      student_id: 20240002,
+      model_type: "ma",
+      request_hash: "request-hash",
+      request_payload: JSON.stringify(requestBody),
+      status: "completed",
+      current_step_id: null,
+      completed_step_ids: JSON.stringify(["save_artifact"]),
+      step_outputs: JSON.stringify({}),
+      step_plan: JSON.stringify([]),
+      result_payload: JSON.stringify({ status: "success", results: {} }),
+      artifact_dir: artifactDir,
+      error_message: null,
+    };
+    poolQuery.mockReset();
+    poolQuery
+      .mockResolvedValueOnce([[completedSessionRow]])
+      .mockResolvedValueOnce([[buildExperimentContextRow()]])
+      .mockResolvedValueOnce([[completedSessionRow]]);
+    existsSync.mockImplementation((filePath: string) => [
+      sessionModelPath,
+      backtestModelPath,
+      sourceMarkerPath,
+      productionModelPath,
+    ].includes(filePath));
+    readFileSync.mockImplementation((filePath: string) =>
+      filePath === sourceMarkerPath ? "guided-a" : ""
+    );
+
+    const session = await activateGuidedTrainingSession("ma", 20240002, "guided-a");
+
+    expect(session.status).toBe("completed");
+    expect(session.backtest_artifact_changed).toBeFalse();
+    expect(copyFileSync).not.toHaveBeenCalled();
+    expect(unlinkSync).not.toHaveBeenCalledWith(productionModelPath);
+    expect(writeFileSync).not.toHaveBeenCalled();
+    expect(poolQuery.mock.calls.some(([sql]) =>
+      String(sql).includes("UPDATE experiment_status")
+    )).toBeFalse();
+    expect(releaseModelArtifactMutationLocks).toHaveBeenCalledTimes(1);
+  });
+
+  test("rejects an old ensemble session after a base model artifact changes", async () => {
+    const requestBody = {
+      experiment_id: 990002,
+      selected_industry: "制造业",
+      selected_company: "样本企业",
+      selected_product: "样本产品",
+      data_window_train_start_index: 0,
+      data_window_train_end_index: 11,
+      data_window_evaluate_start_index: 12,
+      data_window_evaluate_end_index: 17,
+      models: "ma,es",
+      moving_average_window: 4,
+      exponential_smoothing_alpha: 0.35,
+    };
+    const artifactDir = "/tmp/fangzhen-py/guided_training/exp990002-student20240002-weighted_avg-guided-old";
+
+    poolQuery.mockReset();
+    poolQuery
+      .mockResolvedValueOnce([[
+        {
+          session_id: "guided-old",
+          experiment_id: 990002,
+          student_id: 20240002,
+          model_type: "weighted_avg",
+          request_hash: "stale-base-model-revision",
+          request_payload: JSON.stringify(requestBody),
+          status: "completed",
+          current_step_id: null,
+          completed_step_ids: JSON.stringify(["save_artifact"]),
+          step_outputs: JSON.stringify({}),
+          step_plan: JSON.stringify([]),
+          result_payload: JSON.stringify({ status: "success", results: {} }),
+          artifact_dir: artifactDir,
+          error_message: null,
+        },
+      ]])
+      .mockResolvedValueOnce([[buildExperimentContextRow()]]);
+    existsSync.mockImplementation((filePath: string) => (
+      filePath.endsWith("-ma.pkl") || filePath.endsWith("-es.pkl")
+    ));
+    readFileSync.mockReturnValue("current-base-model-revision");
+
+    await expect(
+      getGuidedTrainingSession("weighted_avg", 20240002, "guided-old"),
+    ).rejects.toMatchObject({
+      message: "融合模型依赖的基础模型已更新，请重新开始分阶段训练",
+    });
+
+    expect(copyFileSync).not.toHaveBeenCalled();
+    expect(writeFileSync).not.toHaveBeenCalled();
   });
 
   test("recreates a completed guided session when its reusable artifact is missing", async () => {
@@ -1104,6 +1323,77 @@ describe("models service", () => {
       ma: "/tmp/fangzhen-py/trained_models/exp990002-student20240002-ma.pkl",
       lstm: "/tmp/fangzhen-py/trained_models/exp990002-student20240002-lstm.pkl",
     });
+  });
+
+  test("invalidates dependent ensemble artifacts after a base model is retrained", async () => {
+    poolQuery.mockReset();
+    poolQuery
+      .mockResolvedValueOnce([[buildExperimentContextRow()]])
+      .mockResolvedValueOnce([[{ file_path: "/tmp/dataset.csv" }]]);
+    createReadStream.mockImplementation(() =>
+      Readable.from([modelDatasetCsv]) as unknown as ReturnType<typeof createReadStream>
+    );
+
+    const artifactPaths = new Set([
+      "/tmp/fangzhen-py/trained_models/exp990002-student20240002-ma-production.pkl",
+      "/tmp/fangzhen-py/trained_models/exp990002-student20240002-weighted_avg.pkl",
+      "/tmp/fangzhen-py/trained_models/exp990002-student20240002-weighted_avg-production.pkl",
+      "/tmp/fangzhen-py/trained_models/exp990002-student20240002-boosting.pkl",
+      "/tmp/fangzhen-py/trained_models/exp990002-student20240002-boosting-production.pkl",
+      "/tmp/fangzhen-py/trained_models/exp990002-student20240002-stacking.pkl",
+      "/tmp/fangzhen-py/trained_models/exp990002-student20240002-stacking-production.pkl",
+    ]);
+    existsSync.mockImplementation((filePath: string) =>
+      filePath.endsWith("/run_model.py") || artifactPaths.has(filePath)
+    );
+    spawnMock.mockImplementationOnce(() => ({
+      stdout: new ReadableStream({
+        start(controller) {
+          controller.enqueue(new TextEncoder().encode(JSON.stringify({
+            metrics: { rmse: 1, mae: 1, mape: 1, r2: 0.9 },
+            eval_y_true: [100, 110],
+            predictions: [
+              { prediction: 101, std_dev: 1 },
+              { prediction: 109, std_dev: 1 },
+            ],
+          })));
+          controller.close();
+        },
+      }),
+      stderr: new ReadableStream({ start: (controller) => controller.close() }),
+      exited: Promise.resolve(0),
+      exitCode: 0,
+      killed: false,
+      pid: 4321,
+      kill: mock(() => {}),
+    }));
+
+    await trainModel("ma", 20240002, {
+      experiment_id: 990002,
+      selected_industry: "制造业",
+      selected_company: "样本企业",
+      selected_product: "样本产品",
+      data_window_train_start_index: 0,
+      data_window_train_end_index: 11,
+      data_window_evaluate_start_index: 12,
+      data_window_evaluate_end_index: 17,
+      moving_average_window: 4,
+    });
+
+    for (const artifactPath of artifactPaths) {
+      expect(unlinkSync).toHaveBeenCalledWith(artifactPath);
+    }
+
+    const stateResetCall = poolQuery.mock.calls.find(([sql]) =>
+      String(sql).includes("UPDATE experiment_status")
+    );
+    expect(stateResetCall).toBeDefined();
+    expect(String(stateResetCall?.[0])).toContain("moving_average_completed");
+    expect(String(stateResetCall?.[0])).toContain("ensemble_weighted_completed");
+    expect(String(stateResetCall?.[0])).toContain("ensemble_boosting_completed");
+    expect(String(stateResetCall?.[0])).toContain("ensemble_stacking_completed");
+    expect(String(stateResetCall?.[0])).toContain("quiz_about_plan_completed");
+    expect(stateResetCall?.[1]?.slice(-2)).toEqual([990002, 20240002]);
   });
 
   test("passes persisted LSTM feature lists to ensemble training as JSON to preserve comma-containing field names", async () => {

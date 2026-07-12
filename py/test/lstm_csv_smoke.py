@@ -301,37 +301,30 @@ def main() -> None:
         )
         assert small_train_output["forecast_horizon"] == 2
 
-        small_fit_output = invoke_lstm(
-            small_data_json,
-            "--train-start",
-            "0",
-            "--train-end",
-            "7",
-            "--load-model",
-            str(small_backtest_model),
-            "--save-model",
-            str(small_production_model),
-            "--fit-only",
+        small_fit = subprocess.run(
+            [
+                sys.executable,
+                str(RUN_MODEL),
+                "lstm",
+                "--data",
+                small_data_json,
+                "--train-start",
+                "0",
+                "--train-end",
+                "7",
+                "--load-model",
+                str(small_backtest_model),
+                "--save-model",
+                str(small_production_model),
+                "--fit-only",
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
         )
-        assert small_fit_output["mode"] == "lstm_fit_only"
-        assert_method_metadata(small_fit_output, "lstm_autoregressive")
-        small_production_state = load_pickled_state(small_production_model)
-        assert small_production_state["forecast_strategy"] == "autoregressive"
-        assert_method_metadata(small_production_state, "lstm_autoregressive")
-        assert small_production_state["forecast_horizon"] == 0
-        assert small_production_state["production_forecast_horizon"] == 6
-
-        small_predict_output = invoke_lstm(
-            None,
-            "--load-model",
-            str(small_production_model),
-            "--forecast-steps",
-            "6",
-        )
-        assert small_predict_output["mode"] == "lstm_loaded_predict"
-        assert_method_metadata(small_predict_output, "lstm_autoregressive")
-        assert small_predict_output["forecast_steps"] == 6
-        assert len(extract_predictions(small_predict_output)) == 6
+        assert small_fit.returncode != 0
+        assert "Production LSTM cannot preserve direct multi-horizon forecasting" in small_fit.stderr
+        assert not small_production_model.exists()
 
     print(
         json.dumps(

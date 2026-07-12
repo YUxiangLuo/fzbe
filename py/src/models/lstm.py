@@ -770,14 +770,11 @@ def run(args) -> None:
             and desired_forecast_horizon > 0
             and not _can_fit_direct_forecast(train_size, look_back, desired_forecast_horizon)
         ):
-            log.warning(
-                "Falling back to autoregressive production LSTM because train_size=%s is insufficient for look_back=%s and desired_horizon=%s",
-                train_size,
-                look_back,
-                desired_forecast_horizon,
+            raise ValueError(
+                "[VALIDATION] Production LSTM cannot preserve direct multi-horizon forecasting: "
+                f"train_size={train_size}, look_back={look_back}, "
+                f"required_horizon={desired_forecast_horizon}."
             )
-            effective_forecast_strategy = LEGACY_FORECAST_STRATEGY
-            fit_forecast_horizon = 0
 
         _validate_fit_args(
             parsed_data,

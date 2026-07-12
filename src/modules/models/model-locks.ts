@@ -4,6 +4,7 @@ import logger from "../../utils/logger";
 import { CONCURRENCY_LIMITS } from "../../utils/constants";
 import type { ModelType } from "./models.schema";
 import { buildModelExecutionLockName, buildModelSlotLockName } from "./model-runtime";
+import { BASE_MODEL_TYPES, ENSEMBLE_MODEL_TYPES } from "./model-types";
 
 const MAX_CONCURRENT_MODEL_JOBS = CONCURRENCY_LIMITS.MAX_CONCURRENT_MODEL_JOBS;
 
@@ -94,3 +95,40 @@ export const releaseModelExecutionLock = async (handle: AdvisoryLockHandle | nul
   await releaseAdvisoryLock(handle);
 };
 
+const getArtifactMutationLockTypes = (modelType: ModelType): ModelType[] => {
+  const lockTypes = BASE_MODEL_TYPES.has(modelType)
+    ? [modelType, ...ENSEMBLE_MODEL_TYPES]
+    : [modelType];
+
+  return [...new Set(lockTypes)].sort();
+};
+
+export const acquireModelArtifactMutationLocks = async (
+  experimentId: number,
+  modelType: ModelType,
+): Promise<AdvisoryLockHandle[] | null> => {
+  const acquiredLocks: AdvisoryLockHandle[] = [];
+
+  try {
+    for (const lockModelType of getArtifactMutationLockTypes(modelType)) {
+      const lock = await acquireModelExecutionLock(experimentId, lockModelType);
+      if (!lock) {
+        await Promise.all(acquiredLocks.map((handle) => releaseAdvisoryLock(handle)));
+        return null;
+      }
+      acquiredLocks.push(lock);
+    }
+
+    return acquiredLocks;
+  } catch (error) {
+    await Promise.all(acquiredLocks.map((handle) => releaseAdvisoryLock(handle)));
+    throw error;
+  }
+};
+
+export const releaseModelArtifactMutationLocks = async (
+  handles: AdvisoryLockHandle[] | null | undefined,
+) => {
+  if (!handles) return;
+  await Promise.all(handles.map((handle) => releaseAdvisoryLock(handle)));
+};

@@ -63,11 +63,12 @@ def run_base_model_subprocess(
         raise FileNotFoundError(f"run_model.py not found at {run_model_script}")
 
     # Build command arguments
+    data_json = json.dumps(data, ensure_ascii=False)
     args = [
         python_exec,
         run_model_script,
         model_type,
-        "--data", json.dumps(data, ensure_ascii=False),
+        "--data-stdin",
         "--train-start", str(train_start),
         "--train-end", str(train_end),
         "--eval-start", str(eval_start),
@@ -100,6 +101,7 @@ def run_base_model_subprocess(
             cwd=py_dir,
             capture_output=True,
             text=True,
+            input=data_json,
             timeout=timeout,
             env={**os.environ, "PATH": f"{os.path.join(py_dir, 'venv', 'bin')}:{os.environ.get('PATH', '')}"}
         )
@@ -149,11 +151,12 @@ def run_base_model_fit_subprocess(
     if not os.path.exists(run_model_script):
         raise FileNotFoundError(f"run_model.py not found at {run_model_script}")
 
+    data_json = json.dumps(data, ensure_ascii=False)
     args = [
         python_exec,
         run_model_script,
         model_type,
-        "--data", json.dumps(data, ensure_ascii=False),
+        "--data-stdin",
         "--train-start", str(train_start),
         "--train-end", str(train_end),
         "--load-model", source_model_file,
@@ -168,6 +171,7 @@ def run_base_model_fit_subprocess(
             cwd=py_dir,
             capture_output=True,
             text=True,
+            input=data_json,
             timeout=timeout,
             env={**os.environ, "PATH": f"{os.path.join(py_dir, 'venv', 'bin')}:{os.environ.get('PATH', '')}"}
         )

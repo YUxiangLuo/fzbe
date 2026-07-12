@@ -3,6 +3,7 @@ import { z } from "zod";
 export const ALL_MODELS = ["ma", "es", "arima", "lstm", "stacking", "weighted_avg", "boosting"] as const;
 export type ModelType = (typeof ALL_MODELS)[number];
 export const MIN_EVALUATION_POINTS = 2;
+export const MAX_FORECAST_STEPS = 6;
 
 const baseDataSchema = z.object({
   experiment_id: z.coerce.number().int().min(1),
@@ -171,7 +172,7 @@ export function getTrainSchemaForModel(modelType: ModelType) {
 
 export const predictSchema = z.object({
   experiment_id: z.coerce.number().int().min(1),
-  forecast_steps: z.coerce.number().int().min(1),
+  forecast_steps: z.coerce.number().int().min(1).max(MAX_FORECAST_STEPS),
 });
 
 export const prepareProductionSchema = z.object({

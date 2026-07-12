@@ -33,6 +33,7 @@ def main():
     
     # Add common arguments that all models might use
     parser.add_argument("--data", type=str, help="JSON string of input data")
+    parser.add_argument("--data-stdin", action="store_true", help="Read the JSON input data from stdin")
     parser.add_argument("--train-start", type=int, help="Training data start index")
     parser.add_argument("--train-end", type=int, help="Training data end index")
     parser.add_argument("--eval-start", type=int, help="Evaluation data start index")
@@ -70,6 +71,13 @@ def main():
     # Parse args. We need to parse unknown args because each model's run function
     # expects a Namespace object with all its specific args, even if not defined here.
     args, unknown = parser.parse_known_args()
+
+    if args.data_stdin:
+        if args.data is not None:
+            raise ValueError("[VALIDATION] Use either --data or --data-stdin, not both.")
+        args.data = sys.stdin.read()
+        if not args.data:
+            raise ValueError("[DATA] stdin did not contain model input data.")
 
     if args.model_type not in MODEL_MODULES:
         raise ValueError(f"Unknown model type: {args.model_type}")

@@ -124,6 +124,17 @@ describe("models validation helpers", () => {
 
       expect(localizePredictValidationIssue(issue)).toBe("预测步数必须大于等于 1");
     });
+
+    test("localizes forecast step upper bound violations", () => {
+      const issue = buildIssue({
+        code: "too_big",
+        path: ["forecast_steps"],
+        maximum: 6,
+        message: "Too big",
+      });
+
+      expect(localizePredictValidationIssue(issue)).toBe("预测步数必须小于等于 6");
+    });
   });
 
   describe("buildLocalizedPredictValidationDetails", () => {
