@@ -35,6 +35,7 @@ export const allPossiblePythonParams: Record<string, string> = {
   saveModel: "save-model",
   loadModel: "load-model",
   forecastSteps: "forecast-steps",
+  fitForecastSteps: "fit-forecast-steps",
   fitOnly: "fit-only",
   pretty: "pretty",
   baseModelFiles: "base-model-files",

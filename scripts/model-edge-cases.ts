@@ -186,7 +186,7 @@ function assertTrainingPayload(modelType: ModelType, payload: any) {
     throw new Error(`${modelType} training did not return success results: ${JSON.stringify(payload)}`);
   }
   const results = payload.results;
-  for (const metricKey of ["rmse", "mae", "r2"]) {
+  for (const metricKey of ["rmse", "mae", "mape", "r2"]) {
     assertFiniteNumber(results.metrics?.[metricKey], `${modelType}.metrics.${metricKey}`);
   }
   if (!Array.isArray(results.eval_y_true) || !Array.isArray(results.eval_predictions)) {
@@ -194,6 +194,12 @@ function assertTrainingPayload(modelType: ModelType, payload: any) {
   }
   if (results.eval_y_true.length !== 8 || results.eval_predictions.length !== 8) {
     throw new Error(`${modelType} training eval length mismatch`);
+  }
+  for (const [index, prediction] of results.eval_predictions.entries()) {
+    assertFiniteNumber(prediction, `${modelType}.eval_predictions[${index}]`);
+    if (prediction < 0) {
+      throw new Error(`${modelType}.eval_predictions[${index}] must be non-negative`);
+    }
   }
   if (!Array.isArray(results.evaluate_months) || results.evaluate_months.length !== 8) {
     throw new Error(`${modelType} training missing evaluate_months`);
@@ -237,6 +243,9 @@ function assertPredictionPayload(modelType: ModelType, payload: any, expectedLen
     assertFiniteNumber(point.std_dev, `${modelType}.predictions[${index}].std_dev`);
     if (point.std_dev < 0) {
       throw new Error(`${modelType}.predictions[${index}].std_dev must be non-negative`);
+    }
+    if (point.prediction < 0) {
+      throw new Error(`${modelType}.predictions[${index}].prediction must be non-negative`);
     }
   }
   if (typeof results.method_name !== "string" || typeof results.forecast_strategy !== "string") {
@@ -452,6 +461,21 @@ async function runApiLayer() {
     assertPredictionPayload(modelType, prediction, 3);
   }
 
+  const expandedHorizonModels: ModelType[] = ["lstm", ...ENSEMBLE_MODELS];
+  for (const modelType of expandedHorizonModels) {
+    console.error(`[model-edge] api expand production horizon: ${modelType}`);
+    const prediction = assertStatus<any>(
+      await requestApp(app, `/api/v1/models/${modelType}/predict`, {
+        method: "POST",
+        token,
+        body: { experiment_id: experimentId, forecast_steps: 8 },
+      }),
+      200,
+      `${modelType} expanded-horizon predict`,
+    );
+    assertPredictionPayload(modelType, prediction, 8);
+  }
+
   const invalidPredict = await requestApp(app, "/api/v1/models/ma/predict", {
     method: "POST",
     token,
@@ -464,6 +488,7 @@ async function runApiLayer() {
     status: "ok",
     experiment_id: experimentId,
     trained_models: trainedModels,
+    expanded_horizon_models: expandedHorizonModels,
   };
 }
 

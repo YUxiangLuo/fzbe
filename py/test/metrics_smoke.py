@@ -24,9 +24,10 @@ def main() -> None:
     assert_close(mape([100], [90]), 10.0)
     assert_close(mape([-100], [-90]), 10.0)
 
-    zero_actual_mape = mape([0], [1])
-    if not math.isfinite(zero_actual_mape) or zero_actual_mape <= 0:
-        raise AssertionError(f"expected finite positive zero-actual MAPE, got {zero_actual_mape}")
+    assert_close(mape([0], [1]), 0.0)
+    assert_close(mape([0, 100], [50, 90]), 10.0)
+    assert_close(r2([0, 0], [0, 0]), 1.0)
+    assert_close(r2([0, 0], [1, 0]), 0.0)
 
     print(json.dumps({"model": "metrics", "status": "ok"}, ensure_ascii=False, indent=2))
 

@@ -13,7 +13,6 @@ import {
   GUIDED_TRAINING_ROOT,
   buildGuidedTrainingArtifactDir,
   buildGuidedTrainingStatePath,
-  buildExperimentScopedModelPath,
   buildVersionedModelPath,
 } from "./model-runtime";
 import { loadDatasetFromDb } from "./model-datasets";
@@ -32,7 +31,7 @@ import {
   runPythonModel,
   type ModelProgressReporter,
 } from "./model-python-runner";
-import { transformTrainingResult } from "./model-results";
+import { normalizeDemandPredictionPoints, transformTrainingResult } from "./model-results";
 import {
   buildExperimentTrainingRevision,
   buildModelTrainingRequestHash,
@@ -68,6 +67,9 @@ export { transformTrainingResult } from "./model-results";
 export type { GuidedTrainingSessionPayload, GuidedTrainingStepDefinition } from "./model-types";
 
 const TRAINING_TIMEOUT = TIMEOUTS.MODEL_TRAINING;
+const DEFAULT_PRODUCTION_FORECAST_STEPS = 6;
+const MIN_TRAINING_POINTS = 8;
+const MIN_EVALUATION_POINTS = 2;
 const GUIDED_TRAINING_CLEANUP_BATCH_SIZE = 500;
 const GUIDED_DATASET_FILE_NAME = "dataset.json";
 const MODEL_PIPELINE_REVISION = "model-run-v3";
@@ -203,11 +205,40 @@ const isEnsembleModelType = (modelType: ModelType): modelType is Extract<ModelTy
   return ENSEMBLE_MODEL_TYPES.has(modelType);
 };
 
-const getBacktestModelPath = (experimentId: number, studentId: number, modelType: ModelType) =>
-  buildExperimentScopedModelPath(experimentId, studentId, modelType, "backtest");
+const requireActiveModelTrainingRun = async (
+  experimentId: number,
+  studentId: number,
+  modelType: ModelType,
+) => {
+  const activeRun = await getActiveModelTrainingRun(experimentId, studentId, modelType);
+  if (!activeRun) {
+    throw new ModelValidationError(
+      `${modelType.toUpperCase()} 模型缺少可验证的训练版本，请重新训练该模型`,
+    );
+  }
+  return activeRun;
+};
 
-const getProductionModelPath = (experimentId: number, studentId: number, modelType: ModelType) =>
-  buildExperimentScopedModelPath(experimentId, studentId, modelType, "production");
+const buildProductionCandidateModelPath = (
+  experimentId: number,
+  studentId: number,
+  modelType: ModelType,
+  runId: string,
+) => {
+  const stablePath = buildVersionedModelPath(
+    experimentId,
+    studentId,
+    modelType,
+    runId,
+    "production",
+  );
+  const extension = path.extname(stablePath);
+  const basename = path.basename(stablePath, extension);
+  return path.join(
+    path.dirname(stablePath),
+    `${basename}-${crypto.randomUUID()}${extension}`,
+  );
+};
 
 const getLstmSidecarPath = (modelPath: string) => modelPath.replace(/\.pkl$/, "_keras_model.h5");
 
@@ -245,6 +276,17 @@ const removeSiblingArtifactsByPrefix = (modelPath: string) => {
 
     removeFileIfExists(path.join(directoryPath, siblingFile));
   }
+};
+
+const removeModelArtifactGroup = (modelPath: string) => {
+  const trainedModelsRoot = path.join(PY_DIR, "trained_models");
+  if (!isPathInsideDirectory(modelPath, trainedModelsRoot)) {
+    logger.warn({ modelPath }, "拒绝清理训练模型目录之外的产物组");
+    return;
+  }
+
+  removeFileIfExists(modelPath);
+  removeSiblingArtifactsByPrefix(modelPath);
 };
 
 const hasSavedModelArtifact = (modelType: ModelType, modelPath: string) => {
@@ -762,12 +804,13 @@ const collectPythonRuntimeFiles = (directoryPath: string): string[] => {
   return files;
 };
 
-const getModelRuntimeRevision = () => {
+export const getModelRuntimeRevision = () => {
   if (cachedModelRuntimeRevision) return cachedModelRuntimeRevision;
   const runtimeFiles = [
     path.join(PY_DIR, "guided_model.py"),
     path.join(PY_DIR, "guided_ensemble_model.py"),
     path.join(PY_DIR, "run_model.py"),
+    path.join(PY_DIR, "requirements.txt"),
     ...collectPythonRuntimeFiles(path.join(PY_DIR, "src")),
   ].filter((filePath) => fs.existsSync(filePath)).sort();
   const hash = crypto.createHash("sha256").update(MODEL_PIPELINE_REVISION);
@@ -785,8 +828,31 @@ const getModelRuntimeRevision = () => {
   return cachedModelRuntimeRevision;
 };
 
-const hashDatasetSnapshot = (datasetJson: string) =>
+export const hashDatasetSnapshot = (datasetJson: string) =>
   crypto.createHash("sha256").update(datasetJson).digest("hex");
+
+const assertRunRevisionMatches = (
+  run: ModelTrainingRunRow,
+  datasetRevision: string,
+  runtimeRevision: string,
+  label = run.model_type.toUpperCase(),
+) => {
+  if (typeof run.runtime_revision === "string" && run.runtime_revision !== runtimeRevision) {
+    throw new ModelValidationError(`${label} 模型运行环境已变化，请重新训练该模型`);
+  }
+  if (typeof run.dataset_revision === "string" && run.dataset_revision !== datasetRevision) {
+    throw new ModelValidationError(`${label} 模型对应的数据集版本已变化，请重新训练该模型`);
+  }
+};
+
+const validateActiveRunAgainstSnapshot = (
+  run: ModelTrainingRunRow | null,
+  datasetJson: string,
+  runtimeRevision = getModelRuntimeRevision(),
+) => {
+  if (!run) return;
+  assertRunRevisionMatches(run, hashDatasetSnapshot(datasetJson), runtimeRevision);
+};
 
 const writeGuidedDatasetSnapshot = async (artifactDir: string, datasetJson: string) => {
   await fs.promises.mkdir(artifactDir, { recursive: true });
@@ -797,18 +863,28 @@ const writeGuidedDatasetSnapshot = async (artifactDir: string, datasetJson: stri
   return targetPath;
 };
 
-const buildBaseRunFingerprint = async (
+const buildVerifiedBaseRunContext = async (
   experimentId: number,
   studentId: number,
   body: TrainInput,
+  datasetRevision: string,
+  runtimeRevision: string,
 ) => {
   const fingerprint: Record<string, string> = {};
-  if (!body.models) return fingerprint;
+  const artifacts: Partial<Record<BaseModelType, string>> = {};
+  if (!body.models) return { fingerprint, artifacts };
   for (const baseModel of parseRequestedBaseModels(body.models)) {
-    const activeRun = await getActiveModelTrainingRun(experimentId, studentId, baseModel);
-    fingerprint[baseModel] = activeRun?.run_id ?? "legacy";
+    const activeRun = await requireActiveModelTrainingRun(experimentId, studentId, baseModel);
+    if (!hasSavedModelArtifact(baseModel, activeRun.artifact_path)) {
+      throw new ModelNotFoundError(
+        `${baseModel.toUpperCase()} 模型的当前训练产物已丢失，请重新训练该模型`,
+      );
+    }
+    assertRunRevisionMatches(activeRun, datasetRevision, runtimeRevision, baseModel.toUpperCase());
+    fingerprint[baseModel] = activeRun.run_id;
+    artifacts[baseModel] = activeRun.artifact_path;
   }
-  return fingerprint;
+  return { fingerprint, artifacts };
 };
 
 const parseJsonColumn = <T>(value: unknown, fallback: T): T => {
@@ -1027,12 +1103,14 @@ const buildAvailableBaseModelArtifactMap = async (
   const availableModelFiles: Partial<Record<BaseModelType, string>> = {};
 
   for (const modelName of requestedModels) {
-    const activeRun = await getActiveModelTrainingRun(experimentId, studentId, modelName);
-    const modelPath = activeRun?.artifact_path
-      ?? getBacktestModelPath(experimentId, studentId, modelName);
-    if (hasSavedModelArtifact(modelName, modelPath)) {
-      availableModelFiles[modelName] = modelPath;
+    const activeRun = await requireActiveModelTrainingRun(experimentId, studentId, modelName);
+    const modelPath = activeRun.artifact_path;
+    if (!hasSavedModelArtifact(modelName, modelPath)) {
+      throw new ModelNotFoundError(
+        `${modelName.toUpperCase()} 模型的当前训练产物已丢失，请重新训练该模型`,
+      );
     }
+    availableModelFiles[modelName] = modelPath;
   }
 
   return availableModelFiles;
@@ -1113,6 +1191,26 @@ const getExperimentTrainingConfig = (
 
   if (experiment.data_window_evaluate_start_index <= experiment.data_window_train_end_index) {
     throw new ModelValidationError("实验记录中的评估起始索引必须大于训练结束索引，请重新选择数据窗口后重试");
+  }
+
+  const trainingPoints = experiment.data_window_train_end_index
+    - experiment.data_window_train_start_index
+    + 1;
+  if (trainingPoints < MIN_TRAINING_POINTS) {
+    throw new ModelValidationError(
+      `训练数据窗口至少需要 ${MIN_TRAINING_POINTS} 个数据点，请重新选择数据窗口后重试`,
+      { training_points: trainingPoints, minimum_training_points: MIN_TRAINING_POINTS },
+    );
+  }
+
+  const evaluationPoints = experiment.data_window_evaluate_end_index
+    - experiment.data_window_evaluate_start_index
+    + 1;
+  if (evaluationPoints < MIN_EVALUATION_POINTS) {
+    throw new ModelValidationError(
+      `评估数据窗口至少需要 ${MIN_EVALUATION_POINTS} 个数据点，请重新选择数据窗口后重试`,
+      { evaluation_points: evaluationPoints, minimum_evaluation_points: MIN_EVALUATION_POINTS },
+    );
   }
 
   return {
@@ -1530,7 +1628,13 @@ export async function createOrResumeGuidedTrainingSession(
   const datasetRevision = hashDatasetSnapshot(datasetJson);
   const runtimeRevision = getModelRuntimeRevision();
   const baseRunFingerprint = isEnsembleModelType(modelType)
-    ? await buildBaseRunFingerprint(canonicalBody.experiment_id, studentId, canonicalBody)
+    ? (await buildVerifiedBaseRunContext(
+      canonicalBody.experiment_id,
+      studentId,
+      canonicalBody,
+      datasetRevision,
+      runtimeRevision,
+    )).fingerprint
     : {};
   const experimentRevision = buildExperimentTrainingRevision(modelType, experiment, canonicalBody);
   const requestHash = buildModelTrainingRequestHash({
@@ -1912,19 +2016,6 @@ export async function trainModel(
   const derivedModelParams: Record<string, unknown> = isEnsembleModelType(modelType)
     ? buildEnsemblePythonParams(experiment, body)
     : {};
-  if (isEnsembleModelType(modelType) && body.models) {
-    const baseModelArtifactMap = await buildAvailableBaseModelArtifactMap(body.experiment_id, studentId, body.models);
-    if (Object.keys(baseModelArtifactMap).length > 0) {
-      derivedModelParams.baseModelFiles = JSON.stringify(baseModelArtifactMap);
-      reportModelProgress(progressReporter, {
-        type: "phase",
-        phase: "reuse_artifacts",
-        percent: 9,
-        source: "backend",
-        message: "已找到可复用的基础模型产物，融合训练将优先复用这些结果",
-      });
-    }
-  }
 
   reportModelProgress(progressReporter, {
     type: "phase",
@@ -1957,9 +2048,26 @@ export async function trainModel(
   const datasetJson = JSON.stringify(allData);
   const datasetRevision = hashDatasetSnapshot(datasetJson);
   const runtimeRevision = getModelRuntimeRevision();
-  const baseRunFingerprint = isEnsembleModelType(modelType)
-    ? await buildBaseRunFingerprint(canonicalBody.experiment_id, studentId, canonicalBody)
-    : {};
+  const baseRunContext = isEnsembleModelType(modelType)
+    ? await buildVerifiedBaseRunContext(
+      canonicalBody.experiment_id,
+      studentId,
+      canonicalBody,
+      datasetRevision,
+      runtimeRevision,
+    )
+    : { fingerprint: {}, artifacts: {} };
+  const baseRunFingerprint = baseRunContext.fingerprint;
+  if (isEnsembleModelType(modelType) && Object.keys(baseRunContext.artifacts).length > 0) {
+    derivedModelParams.baseModelFiles = JSON.stringify(baseRunContext.artifacts);
+    reportModelProgress(progressReporter, {
+      type: "phase",
+      phase: "reuse_artifacts",
+      percent: 19,
+      source: "backend",
+      message: "已验证基础模型版本，融合训练将复用对应产物",
+    });
+  }
   const experimentRevision = buildExperimentTrainingRevision(modelType, experiment, canonicalBody);
   const requestHash = buildModelTrainingRequestHash({
     modelType,
@@ -2049,16 +2157,22 @@ export async function getReusableProductionModelArtifactResult(
   const experiment = await assertExperimentModelAccess(experimentId, studentId);
   assertModelReadyForProduction(experiment, modelType);
 
-  const activeRun = await getActiveModelTrainingRun(experimentId, studentId, modelType);
-  const productionModelPath = activeRun
-    ? activeRun.production_artifact_path
-    : getProductionModelPath(experimentId, studentId, modelType);
+  const activeRun = await requireActiveModelTrainingRun(experimentId, studentId, modelType);
+  const productionModelPath = activeRun.production_artifact_path;
   if (!productionModelPath) {
     return null;
   }
   if (!await hasReusableSavedModelArtifact(modelType, productionModelPath)) {
     return null;
   }
+
+  const trainingConfig = getExperimentTrainingConfig(experiment);
+  const allData = await loadDatasetFromDb(
+    trainingConfig.selected_industry,
+    trainingConfig.selected_company,
+    trainingConfig.selected_product,
+  );
+  validateActiveRunAgainstSnapshot(activeRun, JSON.stringify(allData));
 
   return {
     status: "success",
@@ -2074,8 +2188,12 @@ export async function prepareExperimentModelForProduction(
   modelType: ModelType,
   studentId: number,
   experimentId: number,
+  forecastSteps = DEFAULT_PRODUCTION_FORECAST_STEPS,
+  forceRefit = false,
 ) {
-  const reusableArtifact = await getReusableProductionModelArtifactResult(modelType, studentId, experimentId);
+  const reusableArtifact = forceRefit
+    ? null
+    : await getReusableProductionModelArtifactResult(modelType, studentId, experimentId);
   if (reusableArtifact) {
     return reusableArtifact;
   }
@@ -2084,12 +2202,15 @@ export async function prepareExperimentModelForProduction(
   assertModelReadyForProduction(experiment, modelType);
   const trainingConfig = getExperimentTrainingConfig(experiment);
 
-  const activeRun = await getActiveModelTrainingRun(experimentId, studentId, modelType);
-  const productionModelPath = activeRun
-    ? buildVersionedModelPath(experimentId, studentId, modelType, activeRun.run_id, "production")
-    : getProductionModelPath(experimentId, studentId, modelType);
-  const backtestModelPath = activeRun?.artifact_path
-    ?? getBacktestModelPath(experimentId, studentId, modelType);
+  const activeRun = await requireActiveModelTrainingRun(experimentId, studentId, modelType);
+  const previousProductionModelPath = activeRun.production_artifact_path;
+  const productionModelPath = buildProductionCandidateModelPath(
+    experimentId,
+    studentId,
+    modelType,
+    activeRun.run_id,
+  );
+  const backtestModelPath = activeRun.artifact_path;
   if (!hasSavedModelArtifact(modelType, backtestModelPath)) {
     throw new ModelNotFoundError(`未找到该实验的已训练 ${modelType.toUpperCase()} 回测模型`);
   }
@@ -2100,33 +2221,52 @@ export async function prepareExperimentModelForProduction(
     trainingConfig.selected_product,
   );
 
+  validateActiveRunAgainstSnapshot(activeRun, JSON.stringify(allData));
+
   if (trainingConfig.data_window_evaluate_end_index >= allData.length) {
     throw new ModelValidationError("数据窗口索引超出范围", { dataset_size: allData.length });
   }
 
   const snapshotDir = fs.mkdtempSync(path.join(os.tmpdir(), "fz-production-snapshot-"));
-  const dataFile = path.join(snapshotDir, GUIDED_DATASET_FILE_NAME);
-  await Bun.write(dataFile, JSON.stringify(allData));
-  const pythonParams: Record<string, unknown> = {
-    dataFile,
-    trainStart: trainingConfig.data_window_train_start_index,
-    trainEnd: trainingConfig.data_window_evaluate_end_index,
-    saveModel: productionModelPath,
-    loadModel: backtestModelPath,
-    fitOnly: true,
-    pretty: true,
-  };
-
+  let productionArtifactPromoted = false;
   try {
+    const dataFile = path.join(snapshotDir, GUIDED_DATASET_FILE_NAME);
+    await Bun.write(dataFile, JSON.stringify(allData));
+    const pythonParams: Record<string, unknown> = {
+      dataFile,
+      trainStart: trainingConfig.data_window_train_start_index,
+      trainEnd: trainingConfig.data_window_evaluate_end_index,
+      saveModel: productionModelPath,
+      loadModel: backtestModelPath,
+      fitOnly: true,
+      fitForecastSteps: forecastSteps,
+      pretty: true,
+    };
+
     await runPythonModel(modelType, pythonParams, TRAINING_TIMEOUT);
-  } finally {
-    fs.rmSync(snapshotDir, { recursive: true, force: true });
-  }
-  if (activeRun) {
+    if (!await hasReusableSavedModelArtifact(modelType, productionModelPath)) {
+      throw new ModelValidationError("生产模型产物生成不完整，请重试");
+    }
+
     const recorded = await setProductionArtifactForRun(activeRun.run_id, productionModelPath);
     if (!recorded) {
       throw new ModelValidationError("模型版本已变化，已放弃本次生产模型，请重试");
     }
+    productionArtifactPromoted = true;
+  } catch (error) {
+    removeModelArtifactGroup(productionModelPath);
+    throw error;
+  } finally {
+    fs.rmSync(snapshotDir, { recursive: true, force: true });
+  }
+
+  if (
+    productionArtifactPromoted
+    && previousProductionModelPath
+    && previousProductionModelPath !== productionModelPath
+    && previousProductionModelPath !== backtestModelPath
+  ) {
+    removeModelArtifactGroup(previousProductionModelPath);
   }
 
   return {
@@ -2322,8 +2462,14 @@ export async function predictExperimentModel(
   const experiment = await assertExperimentModelAccess(experimentId, studentId);
   assertModelReadyForProduction(experiment, modelType);
 
-  const reusableArtifact = await prepareExperimentModelForProduction(modelType, studentId, experimentId);
-  const productionModelPath = reusableArtifact?.results.saved_model;
+  const productionForecastSteps = Math.max(DEFAULT_PRODUCTION_FORECAST_STEPS, forecastSteps);
+  let reusableArtifact = await prepareExperimentModelForProduction(
+    modelType,
+    studentId,
+    experimentId,
+    productionForecastSteps,
+  );
+  let productionModelPath = reusableArtifact?.results.saved_model;
   if (!productionModelPath || !await hasReusableSavedModelArtifact(modelType, productionModelPath)) {
     throw new ModelNotFoundError(`未找到该实验的 ${modelType.toUpperCase()} 生产预测模型`);
   }
@@ -2335,7 +2481,36 @@ export async function predictExperimentModel(
     pretty: true,
   };
 
-  const result = (await runPythonModel(modelType, pythonParams, TIMEOUTS.MODEL_PREDICTION)) as Record<string, unknown>;
+  let result: Record<string, unknown>;
+  try {
+    result = (await runPythonModel(
+      modelType,
+      pythonParams,
+      TIMEOUTS.MODEL_PREDICTION,
+    )) as Record<string, unknown>;
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "";
+    const needsLstmHorizonRefit = message.startsWith("[PYTHON_VALIDATION]")
+      && message.includes("exceeds the saved LSTM horizon");
+    if (!needsLstmHorizonRefit) throw error;
+
+    reusableArtifact = await prepareExperimentModelForProduction(
+      modelType,
+      studentId,
+      experimentId,
+      productionForecastSteps,
+      true,
+    );
+    productionModelPath = reusableArtifact?.results.saved_model;
+    if (!productionModelPath || !await hasReusableSavedModelArtifact(modelType, productionModelPath)) {
+      throw new ModelNotFoundError(`未找到该实验的 ${modelType.toUpperCase()} 生产预测模型`);
+    }
+    result = (await runPythonModel(
+      modelType,
+      { ...pythonParams, loadModel: productionModelPath },
+      TIMEOUTS.MODEL_PREDICTION,
+    )) as Record<string, unknown>;
+  }
   if (predictionRun) {
     const currentRun = await getActiveModelTrainingRun(experimentId, studentId, modelType);
     if (currentRun?.run_id !== predictionRun.run_id) {
@@ -2343,13 +2518,17 @@ export async function predictExperimentModel(
     }
   }
 
+  const metadata = Object.fromEntries(
+    ["method_name", "forecast_strategy", "implementation_notes"]
+      .filter((key) => result[key] !== undefined)
+      .map((key) => [key, result[key]]),
+  );
+
   return {
     status: "success",
     results: {
-      predictions: result.predictions || [],
-      method_name: result.method_name,
-      forecast_strategy: result.forecast_strategy,
-      implementation_notes: result.implementation_notes,
+      predictions: normalizeDemandPredictionPoints(result.predictions),
+      ...metadata,
     },
   };
 }

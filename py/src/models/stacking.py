@@ -309,7 +309,13 @@ def _load_state(model_path: str) -> Dict[str, Any]:
     return ensure_state_metadata(state, METHOD_NAME, FORECAST_STRATEGY, IMPLEMENTATION_NOTES)
 
 
-def _validate_fit_args(parsed_data: ParsedData, ts: int, te: int, state: Dict[str, Any]) -> None:
+def _validate_fit_args(
+    parsed_data: ParsedData,
+    ts: int,
+    te: int,
+    state: Dict[str, Any],
+    required_forecast_steps: int = 0,
+) -> None:
     n = parsed_data.n_obs
     if not (0 <= ts <= te < n):
         raise ValueError(f"[VALIDATION] Invalid train range: [{ts},{te}], n_obs={n}")
@@ -360,22 +366,13 @@ def _validate_fit_args(parsed_data: ParsedData, ts: int, te: int, state: Dict[st
             "forecast_strategy",
             lstm_model.LEGACY_FORECAST_STRATEGY,
         )
-        saved_eval_horizon = int(source_model_state.get("forecast_horizon", 0) or 0)
-        fit_forecast_horizon = saved_eval_horizon
-        effective_forecast_strategy = forecast_strategy
-
+        fit_forecast_horizon = 0
         if forecast_strategy == lstm_model.DIRECT_FORECAST_STRATEGY:
-            desired_production_horizon = lstm_model._resolve_production_forecast_horizon(
-                state=source_model_state,
-                eval_forecast_horizon=saved_eval_horizon,
+            fit_forecast_horizon = (
+                required_forecast_steps
+                if required_forecast_steps > 0
+                else lstm_model._resolve_production_forecast_horizon(state=source_model_state)
             )
-            train_size = te - ts + 1
-            if desired_production_horizon > fit_forecast_horizon:
-                if lstm_model._can_fit_direct_forecast(train_size, look_back, desired_production_horizon):
-                    fit_forecast_horizon = desired_production_horizon
-                else:
-                    effective_forecast_strategy = lstm_model.LEGACY_FORECAST_STRATEGY
-                    fit_forecast_horizon = 0
 
         try:
             lstm_model._validate_fit_args(
@@ -384,7 +381,7 @@ def _validate_fit_args(parsed_data: ParsedData, ts: int, te: int, state: Dict[st
                 te,
                 look_back,
                 fit_forecast_horizon,
-                effective_forecast_strategy,
+                forecast_strategy,
             )
         except ValueError as exc:
             message = str(exc)
@@ -515,21 +512,11 @@ def _validate_training_args(
             from models import lstm as lstm_model
 
             forecast_strategy = _get_lstm_source_forecast_strategy(source_model_state)
-            reuse_required_steps = max(level1_size, ee - te)
-            fit_forecast_horizon = _resolve_lstm_reuse_production_horizon(
-                source_model_state,
-                requested_steps=reuse_required_steps,
+            fit_forecast_horizon = (
+                level1_size
+                if forecast_strategy == lstm_model.DIRECT_FORECAST_STRATEGY
+                else 0
             )
-            effective_forecast_strategy = forecast_strategy
-
-            if forecast_strategy == lstm_model.DIRECT_FORECAST_STRATEGY:
-                if fit_forecast_horizon > 0 and not lstm_model._can_fit_direct_forecast(
-                    level0_size,
-                    params["look_back"],
-                    fit_forecast_horizon,
-                ):
-                    effective_forecast_strategy = lstm_model.LEGACY_FORECAST_STRATEGY
-                    fit_forecast_horizon = 0
 
             try:
                 lstm_model._validate_fit_args(
@@ -538,7 +525,7 @@ def _validate_training_args(
                     ts + level0_size - 1,
                     params["look_back"],
                     fit_forecast_horizon,
-                    effective_forecast_strategy,
+                    forecast_strategy,
                 )
             except ValueError as exc:
                 message = str(exc)
@@ -761,6 +748,7 @@ def train_and_evaluate(
                             train_end=train_range.stop - 1,
                             source_model_file=adjusted_source_model_file,
                             save_model_file=temp_model_file,
+                            fit_forecast_steps=eval_forecast_steps,
                             timeout=base_timeout,
                         )
                     finally:
@@ -881,7 +869,13 @@ def run(args) -> None:
         state = _load_state(load_path)
         parsed_data = load_data_from_json(args.data)
         ts, te = int(args.train_start), int(args.train_end)
-        _validate_fit_args(parsed_data, ts, te, state)
+        _validate_fit_args(
+            parsed_data,
+            ts,
+            te,
+            state,
+            int(getattr(args, "fit_forecast_steps", 0) or 0),
+        )
 
         models_to_use = state["models"]
         previous_base_model_states = state["base_model_states"]
@@ -896,6 +890,7 @@ def run(args) -> None:
         )
 
         next_base_model_states = {}
+        required_fit_forecast_steps = int(getattr(args, "fit_forecast_steps", 0) or 0) or None
         for model_name in models_to_use:
             previous_model_state = previous_base_model_states[model_name]
             previous_model_file = previous_model_state["model_file"]
@@ -911,6 +906,7 @@ def run(args) -> None:
                 train_end=te,
                 source_model_file=previous_model_file,
                 save_model_file=member_save_path,
+                fit_forecast_steps=required_fit_forecast_steps if model_name == "lstm" else None,
                 timeout=model_timeout,
             )
 

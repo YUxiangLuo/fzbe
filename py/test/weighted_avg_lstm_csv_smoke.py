@@ -494,7 +494,8 @@ def main() -> None:
         )
         reused_short_source_member_state = load_pickled_state(reused_short_source_member)
         assert reused_short_source_member_state["look_back"] == 4
-        assert reused_short_source_member_state["forecast_horizon"] == future_steps
+        assert reused_short_source_member_state["forecast_strategy"] == "direct_multi_horizon"
+        assert reused_short_source_member_state["forecast_horizon"] == len(reused_short_source_predictions)
 
     print(
         json.dumps(

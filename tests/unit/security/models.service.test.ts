@@ -54,29 +54,41 @@ const copyFileSync = mock((_: string, __: string) => {});
 const renameSync = mock((_: string, __: string) => {});
 const mkdirSync = mock((_: string, __?: unknown) => undefined);
 const rmSync = mock((_: string, __?: unknown) => undefined);
-const spawnMock = mock((_: string[], __: Record<string, unknown>) => ({
+const createSpawnResult = (stdout = "", stderr = "", exitCode = 0) => ({
   stdout: new ReadableStream({
     start(controller) {
-      controller.enqueue(new TextEncoder().encode('{"predictions":[]}'));
+      if (stdout) controller.enqueue(new TextEncoder().encode(stdout));
       controller.close();
     },
   }),
   stderr: new ReadableStream({
     start(controller) {
+      if (stderr) controller.enqueue(new TextEncoder().encode(stderr));
       controller.close();
     },
   }),
-  exited: Promise.resolve(0),
-  exitCode: 0,
+  exited: Promise.resolve(exitCode),
+  exitCode,
   killed: false,
   pid: 4321,
   kill: mock(() => {}),
-}));
-const getActiveModelTrainingRun = mock(async () => null as null | {
+});
+const spawnMock = mock((_: string[], __: Record<string, unknown>) => (
+  createSpawnResult('{"predictions":[]}')
+));
+const getActiveModelTrainingRun = mock(async (
+  _experimentId: number,
+  _studentId: number,
+  _modelType: string,
+) => null as null | {
   run_id: string;
   artifact_path: string;
   production_artifact_path: string | null;
+  model_type?: string;
+  dataset_revision?: string;
+  runtime_revision?: string;
 });
+const setProductionArtifactForRun = mock(async (_runId: string, _artifactPath: string) => true);
 const originalSpawn = Bun.spawn;
 
 mock.module(configModulePath, () => ({
@@ -178,7 +190,7 @@ mock.module(modelRunStoreModulePath, () => ({
     reusedExistingRun: false,
   })),
   getActiveModelTrainingRun,
-  setProductionArtifactForRun: mock(async () => true),
+  setProductionArtifactForRun,
 }));
 
 const {
@@ -187,6 +199,8 @@ const {
   createOrResumeGuidedTrainingSession,
   cleanupExpiredGuidedTrainingSessions,
   cleanupStaleModelArtifacts,
+  getReusableProductionModelArtifactResult,
+  getModelRuntimeRevision,
   prepareExperimentModelForProduction,
   predictExperimentModel,
   ModelAccessError,
@@ -222,6 +236,41 @@ const buildExperimentContextRow = (overrides: Record<string, unknown> = {}) => (
   ...overrides,
 });
 
+const buildActiveRun = (
+  modelType: string,
+  overrides: Record<string, unknown> = {},
+) => {
+  const runId = `${modelType}-run-current`;
+  return {
+    run_id: runId,
+    artifact_path: path.join(
+      mockedTrainedModelsRoot,
+      `exp990002-student20240002-${modelType}-${runId}-backtest.pkl`,
+    ),
+    production_artifact_path: null,
+    model_type: modelType,
+    ...overrides,
+  };
+};
+
+const useActiveRuns = (...runs: ReturnType<typeof buildActiveRun>[]) => {
+  const runsByModel = new Map(runs.map((run) => [run.model_type, run]));
+  getActiveModelTrainingRun.mockImplementation(async (_experimentId, _studentId, modelType) => (
+    runsByModel.get(modelType) ?? null
+  ));
+};
+
+const mockExperimentAndDatasetQueries = (
+  experiment = buildExperimentContextRow(),
+) => {
+  poolQuery.mockReset();
+  poolQuery.mockImplementation(async (sql: string) => (
+    sql.includes("FROM dataset_segments")
+      ? [[{ file_path: datasetCsvPath }]]
+      : [[experiment]]
+  ));
+};
+
 describe("models service", () => {
   beforeEach(async () => {
     await writeFile(datasetCsvPath, modelDatasetCsv);
@@ -233,6 +282,8 @@ describe("models service", () => {
 
     getActiveModelTrainingRun.mockReset();
     getActiveModelTrainingRun.mockResolvedValue(null);
+    setProductionArtifactForRun.mockReset();
+    setProductionArtifactForRun.mockResolvedValue(true);
 
     existsSync.mockReset();
     existsSync.mockReturnValue(false);
@@ -746,117 +797,223 @@ describe("models service", () => {
     expect(spawnMock).not.toHaveBeenCalled();
   });
 
-  test("fits an ensemble production artifact from the backtest model with fit-only parameters", async () => {
-    poolQuery.mockReset();
+  test("rejects a reusable production artifact after the model runtime changes", async () => {
+    getActiveModelTrainingRun.mockResolvedValue({
+      run_id: "ma-run-stale-runtime",
+      artifact_path: "/tmp/fangzhen-py/trained_models/ma-run-stale-runtime.pkl",
+      production_artifact_path: "/tmp/fangzhen-py/trained_models/ma-run-stale-runtime-production.pkl",
+      model_type: "ma",
+      dataset_revision: "dataset-revision",
+      runtime_revision: "stale-runtime-revision",
+    });
     poolQuery
-      .mockResolvedValueOnce([[
-        buildExperimentContextRow({
-          data_window_train_end_index: 0,
-          data_window_evaluate_start_index: 1,
-          data_window_evaluate_end_index: 1,
-        }),
-      ]])
-      .mockResolvedValueOnce([[
-        buildExperimentContextRow({
-          data_window_train_end_index: 0,
-          data_window_evaluate_start_index: 1,
-          data_window_evaluate_end_index: 1,
-        }),
-      ]])
-      .mockResolvedValueOnce([[{ file_path: "/tmp/dataset.csv" }]]);
-
-    existsSync.mockImplementation((filePath: string) => !filePath.includes("-weighted_avg-production.pkl"));
+      .mockResolvedValueOnce([[buildExperimentContextRow()]])
+      .mockResolvedValueOnce([[{ file_path: datasetCsvPath }]]);
+    existsSync.mockReturnValue(true);
     createReadStream.mockImplementation(() =>
-      Readable.from([
-        "月份,销售数量,价格指数,产能利用率\n2024-01,100,1.2,0.8\n2024-02,110,1.3,0.9\n",
-      ]) as unknown as ReturnType<typeof createReadStream>
+      Readable.from([modelDatasetCsv]) as unknown as ReturnType<typeof createReadStream>
     );
+
+    await expect(
+      getReusableProductionModelArtifactResult("ma", 20240002, 990002),
+    ).rejects.toThrow("MA 模型运行环境已变化，请重新训练该模型");
+    expect(spawnMock).not.toHaveBeenCalled();
+  });
+
+  test("rejects a reusable production artifact after the dataset changes", async () => {
+    getActiveModelTrainingRun.mockResolvedValue({
+      run_id: "ma-run-stale-data",
+      artifact_path: "/tmp/fangzhen-py/trained_models/ma-run-stale-data.pkl",
+      production_artifact_path: "/tmp/fangzhen-py/trained_models/ma-run-stale-data-production.pkl",
+      model_type: "ma",
+      dataset_revision: "stale-dataset-revision",
+      runtime_revision: getModelRuntimeRevision(),
+    });
+    poolQuery
+      .mockResolvedValueOnce([[buildExperimentContextRow()]])
+      .mockResolvedValueOnce([[{ file_path: datasetCsvPath }]]);
+    existsSync.mockReturnValue(true);
+    createReadStream.mockImplementation(() =>
+      Readable.from([modelDatasetCsv]) as unknown as ReturnType<typeof createReadStream>
+    );
+
+    await expect(
+      getReusableProductionModelArtifactResult("ma", 20240002, 990002),
+    ).rejects.toThrow("MA 模型对应的数据集版本已变化，请重新训练该模型");
+    expect(spawnMock).not.toHaveBeenCalled();
+  });
+
+  test("rejects ensemble training when a selected base run belongs to an old runtime", async () => {
+    getActiveModelTrainingRun.mockResolvedValue({
+      run_id: "base-run-stale-runtime",
+      artifact_path: "/tmp/fangzhen-py/trained_models/base-run-stale-runtime.pkl",
+      production_artifact_path: null,
+      model_type: "ma",
+      dataset_revision: "dataset-revision",
+      runtime_revision: "stale-runtime-revision",
+    });
+    poolQuery
+      .mockResolvedValueOnce([[buildExperimentContextRow()]])
+      .mockResolvedValueOnce([[{ file_path: datasetCsvPath }]]);
+    existsSync.mockReturnValue(true);
+    createReadStream.mockImplementation(() =>
+      Readable.from([modelDatasetCsv]) as unknown as ReturnType<typeof createReadStream>
+    );
+
+    await expect(trainModel("weighted_avg", 20240002, {
+      experiment_id: 990002,
+      models: "ma,lstm",
+    })).rejects.toThrow("MA 模型运行环境已变化，请重新训练该模型");
+    expect(spawnMock).not.toHaveBeenCalled();
+  });
+
+  test("rejects undersized training and evaluation windows before loading data", async () => {
+    poolQuery.mockResolvedValueOnce([[
+      buildExperimentContextRow({
+        data_window_train_end_index: 6,
+        data_window_evaluate_start_index: 7,
+        data_window_evaluate_end_index: 8,
+      }),
+    ]]);
+
+    await expect(trainModel("es", 20240002, {
+      experiment_id: 990002,
+      data_window_train_start_index: 0,
+      data_window_train_end_index: 6,
+      data_window_evaluate_start_index: 7,
+      data_window_evaluate_end_index: 8,
+      exponential_smoothing_alpha: 0.35,
+    })).rejects.toMatchObject({
+      message: "训练数据窗口至少需要 8 个数据点，请重新选择数据窗口后重试",
+      details: { training_points: 7, minimum_training_points: 8 },
+    });
+
+    poolQuery.mockResolvedValueOnce([[
+      buildExperimentContextRow({
+        data_window_train_end_index: 7,
+        data_window_evaluate_start_index: 8,
+        data_window_evaluate_end_index: 8,
+      }),
+    ]]);
+    await expect(trainModel("es", 20240002, {
+      experiment_id: 990002,
+      data_window_train_start_index: 0,
+      data_window_train_end_index: 7,
+      data_window_evaluate_start_index: 8,
+      data_window_evaluate_end_index: 8,
+      exponential_smoothing_alpha: 0.35,
+    })).rejects.toMatchObject({
+      message: "评估数据窗口至少需要 2 个数据点，请重新选择数据窗口后重试",
+      details: { evaluation_points: 1, minimum_evaluation_points: 2 },
+    });
+    expect(createReadStream).not.toHaveBeenCalled();
+    expect(spawnMock).not.toHaveBeenCalled();
+  });
+
+  test("fits an ensemble production artifact from the backtest model with fit-only parameters", async () => {
+    const activeRun = buildActiveRun("weighted_avg");
+    useActiveRuns(activeRun);
+    mockExperimentAndDatasetQueries();
+    existsSync.mockReturnValue(true);
+    createReadStream.mockImplementation(() =>
+      Readable.from([modelDatasetCsv]) as unknown as ReturnType<typeof createReadStream>
+    );
+    spawnMock
+      .mockImplementationOnce(() => createSpawnResult('{"mode":"weighted_avg_fit_only"}'))
+      .mockImplementationOnce(() => createSpawnResult('{"valid":true}'));
 
     const result = await prepareExperimentModelForProduction("weighted_avg", 20240002, 990002);
 
+    const [command] = spawnMock.mock.calls[0] ?? [];
+    const saveModelIndex = command.indexOf("--save-model");
+    const candidatePath = command[saveModelIndex + 1];
+    expect(candidatePath).toMatch(
+      /^\/tmp\/fangzhen-py\/trained_models\/exp990002-student20240002-weighted_avg-weighted_avg-run-current-production-[\w-]+\.pkl$/,
+    );
     expect(result).toEqual({
       status: "success",
       results: {
-        saved_model: "/tmp/fangzhen-py/trained_models/exp990002-student20240002-weighted_avg-production.pkl",
+        saved_model: candidatePath,
         artifact_phase: "production",
         reused_existing: false,
       },
     });
-
-    const [command] = spawnMock.mock.calls[0] ?? [];
     expect(command).toContain("weighted_avg");
     expect(command).toContain("--fit-only");
     expect(command).toContain("--load-model");
-    expect(command).toContain("/tmp/fangzhen-py/trained_models/exp990002-student20240002-weighted_avg.pkl");
+    expect(command).toContain(activeRun.artifact_path);
     expect(command).toContain("--save-model");
-    expect(command).toContain("/tmp/fangzhen-py/trained_models/exp990002-student20240002-weighted_avg-production.pkl");
+    expect(command).toContain(candidatePath);
     expect(command).toContain("--train-end");
-    expect(command).toContain("1");
+    expect(command).toContain("17");
+    expect(command).toContain("--fit-forecast-steps");
+    expect(command).toContain("6");
+    expect(setProductionArtifactForRun).toHaveBeenCalledWith(activeRun.run_id, candidatePath);
   });
 
-  test("reuses an existing production artifact without invoking python", async () => {
+  test("rejects a legacy production artifact without a verifiable active run", async () => {
     existsSync.mockImplementation((filePath: string) => filePath.includes("-ma-production.pkl"));
+
+    await expect(
+      prepareExperimentModelForProduction("ma", 20240002, 990002),
+    ).rejects.toThrow("MA 模型缺少可验证的训练版本，请重新训练该模型");
+
+    expect(spawnMock).not.toHaveBeenCalled();
+    expect(createReadStream).not.toHaveBeenCalled();
+  });
+
+  test("reuses a revision-checked production artifact from the active run", async () => {
+    const productionPath = path.join(mockedTrainedModelsRoot, "ma-current-production.pkl");
+    const activeRun = buildActiveRun("ma", { production_artifact_path: productionPath });
+    useActiveRuns(activeRun);
+    mockExperimentAndDatasetQueries();
+    existsSync.mockReturnValue(true);
+    createReadStream.mockImplementation(() =>
+      Readable.from([modelDatasetCsv]) as unknown as ReturnType<typeof createReadStream>
+    );
 
     const result = await prepareExperimentModelForProduction("ma", 20240002, 990002);
 
     expect(result).toEqual({
       status: "success",
       results: {
-        saved_model: "/tmp/fangzhen-py/trained_models/exp990002-student20240002-ma-production.pkl",
+        saved_model: productionPath,
         artifact_phase: "production",
         reused_existing: true,
       },
     });
     expect(spawnMock).not.toHaveBeenCalled();
-    expect(createReadStream).not.toHaveBeenCalled();
+    expect(poolQuery).toHaveBeenCalledWith(
+      expect.stringContaining("FROM dataset_segments"),
+      ["制造业", "样本企业", "样本产品"],
+    );
   });
 
   test("fits a production artifact from the backtest model with fit-only parameters", async () => {
-    poolQuery.mockReset();
-    poolQuery
-      .mockResolvedValueOnce([[
-        buildExperimentContextRow({
-          data_window_train_end_index: 0,
-          data_window_evaluate_start_index: 1,
-          data_window_evaluate_end_index: 1,
-        }),
-      ]])
-      .mockResolvedValueOnce([[
-        buildExperimentContextRow({
-          data_window_train_end_index: 0,
-          data_window_evaluate_start_index: 1,
-          data_window_evaluate_end_index: 1,
-        }),
-      ]])
-      .mockResolvedValueOnce([[{ file_path: "/tmp/dataset.csv" }]]);
-
-    existsSync.mockImplementation((filePath: string) => !filePath.includes("-ma-production.pkl"));
+    const activeRun = buildActiveRun("ma");
+    useActiveRuns(activeRun);
+    mockExperimentAndDatasetQueries();
+    existsSync.mockReturnValue(true);
     createReadStream.mockImplementation(() =>
-      Readable.from([
-        "月份,销售数量,价格指数,产能利用率\n2024-01,100,1.2,0.8\n2024-02,110,1.3,0.9\n",
-      ]) as unknown as ReturnType<typeof createReadStream>
+      Readable.from([modelDatasetCsv]) as unknown as ReturnType<typeof createReadStream>
     );
 
     const result = await prepareExperimentModelForProduction("ma", 20240002, 990002);
 
-    expect(result).toEqual({
-      status: "success",
-      results: {
-        saved_model: "/tmp/fangzhen-py/trained_models/exp990002-student20240002-ma-production.pkl",
-        artifact_phase: "production",
-        reused_existing: false,
-      },
-    });
-
     const [command, options] = spawnMock.mock.calls[0] ?? [];
+    const saveModelIndex = command.indexOf("--save-model");
+    const candidatePath = command[saveModelIndex + 1];
+    expect(result.results.saved_model).toBe(candidatePath);
     expect(command).toContain("ma");
     expect(command).toContain("--fit-only");
     expect(command).toContain("--load-model");
-    expect(command).toContain("/tmp/fangzhen-py/trained_models/exp990002-student20240002-ma.pkl");
+    expect(command).toContain(activeRun.artifact_path);
     expect(command).toContain("--save-model");
-    expect(command).toContain("/tmp/fangzhen-py/trained_models/exp990002-student20240002-ma-production.pkl");
+    expect(command).toContain(candidatePath);
     expect(command).toContain("--train-end");
-    expect(command).toContain("1");
+    expect(command).toContain("17");
+    expect(command).toContain("--fit-forecast-steps");
+    expect(command).toContain("6");
     expect(options).toMatchObject({
       cwd: "/tmp/fangzhen-py",
       stdout: "pipe",
@@ -870,6 +1027,7 @@ describe("models service", () => {
         TF_NUM_INTEROP_THREADS: "1",
       },
     });
+    expect(setProductionArtifactForRun).toHaveBeenCalledWith(activeRun.run_id, candidatePath);
   });
 
   test("rejects prediction when the experiment belongs to another student", async () => {
@@ -898,12 +1056,15 @@ describe("models service", () => {
   });
 
   test("raises ModelNotFoundError when the experiment-scoped model artifact is missing", async () => {
+    const activeRun = buildActiveRun("ma");
+    useActiveRuns(activeRun);
+
     await expect(
       predictExperimentModel("ma", 20240002, 990002, 6),
     ).rejects.toBeInstanceOf(ModelNotFoundError);
 
     expect(existsSync).toHaveBeenCalledWith(
-      expect.stringContaining("exp990002-student20240002-ma.pkl"),
+      activeRun.artifact_path,
     );
   });
 
@@ -923,48 +1084,25 @@ describe("models service", () => {
   });
 
   test("prepares a missing production artifact before prediction", async () => {
-    poolQuery.mockReset();
-    poolQuery
-      .mockResolvedValueOnce([[
-        buildExperimentContextRow({
-          data_window_train_end_index: 0,
-          data_window_evaluate_start_index: 1,
-          data_window_evaluate_end_index: 1,
-        }),
-      ]])
-      .mockResolvedValueOnce([[
-        buildExperimentContextRow({
-          data_window_train_end_index: 0,
-          data_window_evaluate_start_index: 1,
-          data_window_evaluate_end_index: 1,
-        }),
-      ]])
-      .mockResolvedValueOnce([[
-        buildExperimentContextRow({
-          data_window_train_end_index: 0,
-          data_window_evaluate_start_index: 1,
-          data_window_evaluate_end_index: 1,
-        }),
-      ]])
-      .mockResolvedValueOnce([[{ file_path: "/tmp/dataset.csv" }]]);
+    const activeRun = buildActiveRun("ma");
+    useActiveRuns(activeRun);
+    mockExperimentAndDatasetQueries();
 
     let productionArtifactPrepared = false;
     existsSync.mockImplementation((filePath: string) => (
       filePath.endsWith("/run_model.py")
-      || (filePath.includes("-ma.pkl") && !filePath.includes("-production"))
-      || (productionArtifactPrepared && filePath.includes("-ma-production.pkl"))
+      || filePath === activeRun.artifact_path
+      || (productionArtifactPrepared && filePath.includes("-production-"))
     ));
     createReadStream.mockImplementation(() =>
-      Readable.from([
-        "月份,销售数量,价格指数,产能利用率\n2024-01,100,1.2,0.8\n2024-02,110,1.3,0.9\n",
-      ]) as unknown as ReturnType<typeof createReadStream>
+      Readable.from([modelDatasetCsv]) as unknown as ReturnType<typeof createReadStream>
     );
     spawnMock
       .mockImplementationOnce(() => ({
         stdout: new ReadableStream({
           start(controller) {
             productionArtifactPrepared = true;
-            controller.enqueue(new TextEncoder().encode('{"saved_model":"/tmp/fangzhen-py/trained_models/exp990002-student20240002-ma-production.pkl"}'));
+            controller.enqueue(new TextEncoder().encode('{"mode":"ma_fit_only"}'));
             controller.close();
           },
         }),
@@ -1009,16 +1147,27 @@ describe("models service", () => {
     expect(spawnMock).toHaveBeenCalledTimes(2);
 
     const [prepareCommand] = spawnMock.mock.calls[0] ?? [];
+    const saveModelIndex = prepareCommand.indexOf("--save-model");
+    const candidatePath = prepareCommand[saveModelIndex + 1];
     expect(prepareCommand).toContain("--fit-only");
-    expect(prepareCommand.some((arg) => arg.includes("exp990002-student20240002-ma-production.pkl"))).toBe(true);
+    expect(prepareCommand).toContain("--fit-forecast-steps");
+    expect(prepareCommand).toContain("6");
+    expect(candidatePath).toContain("exp990002-student20240002-ma-ma-run-current-production-");
 
     const [predictCommand] = spawnMock.mock.calls[1] ?? [];
     expect(predictCommand).toContain("--forecast-steps");
-    expect(predictCommand.some((arg) => arg.includes("exp990002-student20240002-ma-production.pkl"))).toBe(true);
+    expect(predictCommand).toContain(candidatePath);
+    expect(setProductionArtifactForRun).toHaveBeenCalledWith(activeRun.run_id, candidatePath);
   });
 
   test("runs prediction with the experiment-scoped model artifact and returns python predictions", async () => {
+    const productionPath = path.join(mockedTrainedModelsRoot, "ma-current-production.pkl");
+    useActiveRuns(buildActiveRun("ma", { production_artifact_path: productionPath }));
+    mockExperimentAndDatasetQueries();
     existsSync.mockImplementation(() => true);
+    createReadStream.mockImplementation(() =>
+      Readable.from([modelDatasetCsv]) as unknown as ReturnType<typeof createReadStream>
+    );
     spawnMock.mockImplementationOnce((command: string[]) => ({
       stdout: new ReadableStream({
         start(controller) {
@@ -1054,12 +1203,171 @@ describe("models service", () => {
     expect(command).toContain("6");
     expect(command).toContain("--pretty");
     expect(command).toContain("/tmp/fangzhen-py/run_model.py");
-    expect(command.some((arg) => arg.includes("exp990002-student20240002-ma-production.pkl"))).toBe(true);
+    expect(command).toContain(productionPath);
     expect(options).toMatchObject({
       cwd: "/tmp/fangzhen-py",
       stdout: "pipe",
       stderr: "pipe",
     });
+  });
+
+  test("floors negative production demand predictions at the API boundary", async () => {
+    const productionPath = path.join(mockedTrainedModelsRoot, "ma-current-production.pkl");
+    useActiveRuns(buildActiveRun("ma", { production_artifact_path: productionPath }));
+    mockExperimentAndDatasetQueries();
+    existsSync.mockImplementation(() => true);
+    createReadStream.mockImplementation(() =>
+      Readable.from([modelDatasetCsv]) as unknown as ReturnType<typeof createReadStream>
+    );
+    spawnMock.mockImplementationOnce(() => ({
+      stdout: new ReadableStream({
+        start(controller) {
+          controller.enqueue(new TextEncoder().encode(
+            '{"predictions":[{"prediction":-4.2,"std_dev":1.5},{"prediction":3.1,"std_dev":0.8}]}',
+          ));
+          controller.close();
+        },
+      }),
+      stderr: new ReadableStream({
+        start(controller) {
+          controller.close();
+        },
+      }),
+      exited: Promise.resolve(0),
+      exitCode: 0,
+      killed: false,
+      pid: 4321,
+      kill: mock(() => {}),
+    }));
+
+    const result = await predictExperimentModel("ma", 20240002, 990002, 2);
+
+    expect(result.results.predictions).toEqual([
+      { prediction: 0, std_dev: 1.5 },
+      { prediction: 3.1, std_dev: 0.8 },
+    ]);
+  });
+
+  test("refits and retries when a cached LSTM production horizon is too short", async () => {
+    const previousProductionPath = path.join(mockedTrainedModelsRoot, "lstm-current-production.pkl");
+    const activeRun = buildActiveRun("lstm", {
+      production_artifact_path: previousProductionPath,
+    });
+    useActiveRuns(activeRun);
+    mockExperimentAndDatasetQueries();
+    existsSync.mockReturnValue(true);
+    createReadStream.mockImplementation(() =>
+      Readable.from([modelDatasetCsv]) as unknown as ReturnType<typeof createReadStream>
+    );
+    spawnMock
+      .mockImplementationOnce(() => ({
+        stdout: new ReadableStream({
+          start(controller) {
+            controller.close();
+          },
+        }),
+        stderr: new ReadableStream({
+          start(controller) {
+            controller.enqueue(new TextEncoder().encode(
+              "[VALIDATION] Requested forecast_steps (8) exceeds the saved LSTM horizon (6).",
+            ));
+            controller.close();
+          },
+        }),
+        exited: Promise.resolve(1),
+        exitCode: 1,
+        killed: false,
+        pid: 4321,
+        kill: mock(() => {}),
+      }))
+      .mockImplementationOnce(() => ({
+        stdout: new ReadableStream({
+          start(controller) {
+            controller.enqueue(new TextEncoder().encode('{"mode":"lstm_fit_only"}'));
+            controller.close();
+          },
+        }),
+        stderr: new ReadableStream({
+          start(controller) {
+            controller.close();
+          },
+        }),
+        exited: Promise.resolve(0),
+        exitCode: 0,
+        killed: false,
+        pid: 4321,
+        kill: mock(() => {}),
+      }))
+      .mockImplementationOnce(() => ({
+        stdout: new ReadableStream({
+          start(controller) {
+            controller.enqueue(new TextEncoder().encode(
+              '{"predictions":[{"prediction":12.5,"std_dev":1.2}]}',
+            ));
+            controller.close();
+          },
+        }),
+        stderr: new ReadableStream({
+          start(controller) {
+            controller.close();
+          },
+        }),
+        exited: Promise.resolve(0),
+        exitCode: 0,
+        killed: false,
+        pid: 4321,
+        kill: mock(() => {}),
+      }));
+
+    const result = await predictExperimentModel("lstm", 20240002, 990002, 8);
+
+    expect(result.results.predictions).toEqual([{ prediction: 12.5, std_dev: 1.2 }]);
+    expect(spawnMock).toHaveBeenCalledTimes(3);
+    const [refitCommand] = spawnMock.mock.calls[1] ?? [];
+    const saveModelIndex = refitCommand.indexOf("--save-model");
+    const candidatePath = refitCommand[saveModelIndex + 1];
+    expect(refitCommand).toContain("--fit-only");
+    expect(refitCommand).toContain("--fit-forecast-steps");
+    expect(refitCommand).toContain("8");
+    expect(candidatePath).not.toBe(previousProductionPath);
+    expect(setProductionArtifactForRun).toHaveBeenCalledWith(activeRun.run_id, candidatePath);
+    expect(unlinkSync).toHaveBeenCalledWith(previousProductionPath);
+  });
+
+  test("keeps the current production artifact untouched when horizon refit fails", async () => {
+    const previousProductionPath = path.join(mockedTrainedModelsRoot, "lstm-current-production.pkl");
+    const activeRun = buildActiveRun("lstm", {
+      production_artifact_path: previousProductionPath,
+    });
+    useActiveRuns(activeRun);
+    mockExperimentAndDatasetQueries();
+    existsSync.mockReturnValue(true);
+    createReadStream.mockImplementation(() =>
+      Readable.from([modelDatasetCsv]) as unknown as ReturnType<typeof createReadStream>
+    );
+    spawnMock
+      .mockImplementationOnce(() => createSpawnResult(
+        "",
+        "[VALIDATION] Requested forecast_steps (8) exceeds the saved LSTM horizon (6).",
+        1,
+      ))
+      .mockImplementationOnce(() => createSpawnResult(
+        "",
+        "[VALIDATION] synthetic production refit failure",
+        1,
+      ));
+
+    await expect(
+      predictExperimentModel("lstm", 20240002, 990002, 8),
+    ).rejects.toThrow("synthetic production refit failure");
+
+    const [refitCommand] = spawnMock.mock.calls[1] ?? [];
+    const saveModelIndex = refitCommand.indexOf("--save-model");
+    const candidatePath = refitCommand[saveModelIndex + 1];
+    expect(candidatePath).not.toBe(previousProductionPath);
+    expect(unlinkSync).toHaveBeenCalledWith(candidatePath);
+    expect(unlinkSync).not.toHaveBeenCalledWith(previousProductionPath);
+    expect(setProductionArtifactForRun).not.toHaveBeenCalled();
   });
 
   test("rejects a prediction result when its active model version changes in flight", async () => {
@@ -1068,17 +1376,23 @@ describe("models service", () => {
       run_id: "ma-run-a",
       artifact_path: "/tmp/fangzhen-py/trained_models/ma-run-a.pkl",
       production_artifact_path: productionPath,
+      model_type: "ma",
     };
     const runB = {
       run_id: "ma-run-b",
       artifact_path: "/tmp/fangzhen-py/trained_models/ma-run-b.pkl",
       production_artifact_path: "/tmp/fangzhen-py/trained_models/ma-run-b-production.pkl",
+      model_type: "ma",
     };
     getActiveModelTrainingRun
       .mockResolvedValueOnce(runA)
       .mockResolvedValueOnce(runA)
       .mockResolvedValueOnce(runB);
+    mockExperimentAndDatasetQueries();
     existsSync.mockReturnValue(true);
+    createReadStream.mockImplementation(() =>
+      Readable.from([modelDatasetCsv]) as unknown as ReturnType<typeof createReadStream>
+    );
     spawnMock.mockImplementationOnce(() => ({
       stdout: new ReadableStream({
         start(controller) {
@@ -1106,17 +1420,11 @@ describe("models service", () => {
   });
 
   test("passes available base model artifacts through to ensemble training", async () => {
-    poolQuery.mockReset();
-    poolQuery
-      .mockResolvedValueOnce([[buildExperimentContextRow()]])
-      .mockResolvedValueOnce([[{ file_path: "/tmp/dataset.csv" }]]);
-
-    existsSync.mockImplementation((filePath: string) => (
-      filePath.endsWith("/run_model.py")
-      || filePath.includes("-ma.pkl")
-      || filePath.includes("-lstm.pkl")
-      || filePath.includes("-lstm_keras_model.h5")
-    ));
+    const maRun = buildActiveRun("ma");
+    const lstmRun = buildActiveRun("lstm");
+    useActiveRuns(maRun, lstmRun);
+    mockExperimentAndDatasetQueries();
+    existsSync.mockReturnValue(true);
     createReadStream.mockImplementation(() =>
       Readable.from([
         "月份,销售数量,价格指数,产能利用率\n2024-01,100,1.2,0.8\n2024-02,110,1.3,0.9\n2024-03,120,1.4,1.0\n2024-04,130,1.5,1.1\n2024-05,140,1.6,1.2\n2024-06,150,1.7,1.3\n2024-07,160,1.8,1.4\n2024-08,170,1.9,1.5\n2024-09,180,2.0,1.6\n2024-10,190,2.1,1.7\n2024-11,200,2.2,1.8\n2024-12,210,2.3,1.9\n2025-01,220,2.4,2.0\n2025-02,230,2.5,2.1\n2025-03,240,2.6,2.2\n2025-04,250,2.7,2.3\n2025-05,260,2.8,2.4\n2025-06,270,2.9,2.5\n",
@@ -1165,25 +1473,18 @@ describe("models service", () => {
 
     const encodedBaseModelFiles = command[baseModelFilesArgIndex + 1];
     expect(JSON.parse(encodedBaseModelFiles)).toEqual({
-      ma: "/tmp/fangzhen-py/trained_models/exp990002-student20240002-ma.pkl",
-      lstm: "/tmp/fangzhen-py/trained_models/exp990002-student20240002-lstm.pkl",
+      ma: maRun.artifact_path,
+      lstm: lstmRun.artifact_path,
     });
+    expect(getActiveModelTrainingRun).toHaveBeenCalledTimes(2);
   });
 
   test("passes persisted LSTM feature lists to ensemble training as JSON to preserve comma-containing field names", async () => {
-    poolQuery.mockReset();
-    poolQuery
-      .mockResolvedValueOnce([[buildExperimentContextRow({
-        lstm_features: JSON.stringify(["价格指数", "外部,指标"]),
-      })]])
-      .mockResolvedValueOnce([[{ file_path: "/tmp/dataset.csv" }]]);
-
-    existsSync.mockImplementation((filePath: string) => (
-      filePath.endsWith("/run_model.py")
-      || filePath.includes("-ma.pkl")
-      || filePath.includes("-lstm.pkl")
-      || filePath.includes("-lstm_keras_model.h5")
-    ));
+    useActiveRuns(buildActiveRun("ma"), buildActiveRun("lstm"));
+    mockExperimentAndDatasetQueries(buildExperimentContextRow({
+      lstm_features: JSON.stringify(["价格指数", "外部,指标"]),
+    }));
+    existsSync.mockReturnValue(true);
     spawnMock.mockImplementationOnce(() => ({
       stdout: new ReadableStream({
         start(controller) {
@@ -1225,6 +1526,21 @@ describe("models service", () => {
     expect(JSON.parse(command[lstmFeaturesArgIndex + 1])).toEqual(["价格指数", "外部,指标"]);
   });
 
+  test("rejects legacy base artifacts without active training runs", async () => {
+    mockExperimentAndDatasetQueries();
+    existsSync.mockReturnValue(true);
+    createReadStream.mockImplementation(() =>
+      Readable.from([modelDatasetCsv]) as unknown as ReturnType<typeof createReadStream>
+    );
+
+    await expect(trainModel("weighted_avg", 20240002, {
+      experiment_id: 990002,
+      models: "ma,lstm",
+    })).rejects.toThrow("MA 模型缺少可验证的训练版本，请重新训练该模型");
+
+    expect(spawnMock).not.toHaveBeenCalled();
+  });
+
   test("rejects comma-collision LSTM feature lists that differ from persisted config", async () => {
     poolQuery.mockReset();
     poolQuery.mockResolvedValueOnce([[buildExperimentContextRow({
@@ -1251,7 +1567,13 @@ describe("models service", () => {
   });
 
   test("returns an empty prediction list when python omits predictions", async () => {
+    const productionPath = path.join(mockedTrainedModelsRoot, "lstm-current-production.pkl");
+    useActiveRuns(buildActiveRun("lstm", { production_artifact_path: productionPath }));
+    mockExperimentAndDatasetQueries();
     existsSync.mockImplementation(() => true);
+    createReadStream.mockImplementation(() =>
+      Readable.from([modelDatasetCsv]) as unknown as ReturnType<typeof createReadStream>
+    );
     spawnMock.mockImplementationOnce(() => ({
       stdout: new ReadableStream({
         start(controller) {

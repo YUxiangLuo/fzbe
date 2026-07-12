@@ -290,8 +290,26 @@ def train_and_evaluate(
     }
 
     # --- Evaluate the best model ---
-    log.info(f"Forecasting {len(eval_range)} steps for evaluation")
-    y_pred, conf_int = best_model.predict(n_periods=len(eval_range), return_conf_int=True)
+    forecast_steps = eval_range.stop - train_range.stop
+    forecast_offset = eval_range.start - train_range.stop
+    log.info(
+        f"Forecasting {forecast_steps} steps through evaluation gap "
+        f"(offset={forecast_offset}, evaluated_points={len(eval_range)})"
+    )
+    all_predictions, all_conf_int = best_model.predict(
+        n_periods=forecast_steps,
+        return_conf_int=True,
+    )
+    y_pred = np.asarray(all_predictions)[
+        forecast_offset : forecast_offset + len(eval_range)
+    ]
+    conf_int = np.asarray(all_conf_int)[
+        forecast_offset : forecast_offset + len(eval_range)
+    ]
+    if len(y_pred) != len(eval_range):
+        raise ValueError(
+            "[VALIDATION] ARIMA forecast did not cover the configured evaluation range"
+        )
     y_true = y_eval.tolist()
 
     # Check convergence

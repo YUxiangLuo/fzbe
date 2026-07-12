@@ -731,8 +731,13 @@ def run(args) -> None:
         normalization = state.get("normalization", 'minmax')
         forecast_strategy = state.get("forecast_strategy", LEGACY_FORECAST_STRATEGY)
         train_size = te - ts + 1
+        explicit_fit_forecast_steps = int(getattr(args, "fit_forecast_steps", 0) or 0)
         desired_forecast_horizon = (
-            _resolve_production_forecast_horizon(state=state)
+            (
+                explicit_fit_forecast_steps
+                if explicit_fit_forecast_steps > 0
+                else _resolve_production_forecast_horizon(state=state)
+            )
             if forecast_strategy == DIRECT_FORECAST_STRATEGY
             else 0
         )
@@ -743,14 +748,11 @@ def run(args) -> None:
             and desired_forecast_horizon > 0
             and not _can_fit_direct_forecast(train_size, look_back, desired_forecast_horizon)
         ):
-            log.warning(
-                "Falling back to autoregressive production LSTM because train_size=%s is insufficient for look_back=%s and desired_horizon=%s",
-                train_size,
-                look_back,
-                desired_forecast_horizon,
+            raise ValueError(
+                "[VALIDATION] Training range is too short to preserve the evaluated direct LSTM strategy "
+                f"(train_size={train_size}, look_back={look_back}, required_horizon={desired_forecast_horizon}). "
+                "Please increase the data window instead of switching forecast strategy."
             )
-            effective_forecast_strategy = LEGACY_FORECAST_STRATEGY
-            fit_forecast_horizon = 0
 
         _validate_fit_args(
             parsed_data,

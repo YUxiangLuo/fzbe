@@ -97,8 +97,20 @@ def train_and_evaluate(
     )
     log.debug(f"Model fitted successfully")
 
-    log.info(f"Forecasting {len(eval_range)} steps for evaluation")
-    y_pred = model.forecast(len(eval_range))
+    forecast_steps = eval_range.stop - train_range.stop
+    forecast_offset = eval_range.start - train_range.stop
+    log.info(
+        f"Forecasting {forecast_steps} steps through evaluation gap "
+        f"(offset={forecast_offset}, evaluated_points={len(eval_range)})"
+    )
+    all_predictions = np.asarray(model.forecast(forecast_steps))
+    y_pred = all_predictions[
+        forecast_offset : forecast_offset + len(eval_range)
+    ]
+    if len(y_pred) != len(eval_range):
+        raise ValueError(
+            "[VALIDATION] ES forecast did not cover the configured evaluation range"
+        )
     y_true = y_eval.tolist()
 
     residuals = np.array(y_true) - np.array(y_pred)

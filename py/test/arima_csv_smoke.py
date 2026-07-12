@@ -203,6 +203,40 @@ def main() -> None:
         assert_series_close(actual_eval_predictions, expected_eval_predictions.tolist())
         assert_series_close(actual_eval_std, expected_eval_std)
 
+        gap_output = invoke_arima(
+            data_json,
+            "--train-start",
+            "0",
+            "--train-end",
+            "19",
+            "--eval-start",
+            "22",
+            "--eval-end",
+            "23",
+            "--d",
+            str(d),
+            "--max-p",
+            str(max_p),
+            "--max-q",
+            str(max_q),
+            "--pretty",
+        )
+        gap_reference, _ = select_reference_model(sales[0:20], d, max_p, max_q)
+        gap_predictions, gap_conf_int = gap_reference.predict(
+            n_periods=4,
+            return_conf_int=True,
+        )
+        assert gap_output["metrics"]["evaluate_months"] == timestamps[22:24]
+        assert gap_output["eval_y_true"] == sales[22:24]
+        assert_series_close(
+            [float(item["prediction"]) for item in gap_output["predictions"]],
+            gap_predictions.tolist()[2:4],
+        )
+        assert_series_close(
+            [float(item["std_dev"]) for item in gap_output["predictions"]],
+            to_std_devs(gap_conf_int.tolist())[2:4],
+        )
+
         fit_output = invoke_arima(
             data_json,
             "--train-start",
@@ -293,7 +327,7 @@ def main() -> None:
                 "fixture": str(CSV_FIXTURE),
                 "checked_modes": ["training", "fit_only", "loaded_predict"],
                 "model": "arima",
-                "edge_cases": ["train_short_window", "fit_only_short_window"],
+                "edge_cases": ["evaluation_gap", "train_short_window", "fit_only_short_window"],
                 "status": "ok",
             },
             ensure_ascii=False,

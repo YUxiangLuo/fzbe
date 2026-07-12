@@ -290,7 +290,8 @@ def _run_es(step_id: str, args, state: Dict[str, Any]) -> Dict[str, Any]:
         y = parsed_data.y
         timestamps = parsed_data.timestamps or [str(i) for i in range(parsed_data.n_obs)]
         ts, te, es_idx, ee = _parse_common_ranges(args)
-        alpha = float(getattr(args, "alpha", 0.5))
+        alpha_arg = getattr(args, "alpha", None)
+        alpha = float(alpha_arg) if alpha_arg is not None else 0.5
         es._validate_training_args(y, ts, te, es_idx, ee, alpha)
         state.clear()
         state.update({
@@ -325,8 +326,17 @@ def _run_es(step_id: str, args, state: Dict[str, Any]) -> Dict[str, Any]:
         }
 
     if step_id == "forecast":
-        _, eval_range = _state_ranges(state)
-        y_pred = state["model"].forecast(len(eval_range)).tolist()
+        train_range, eval_range = _state_ranges(state)
+        forecast_steps = eval_range.stop - train_range.stop
+        forecast_offset = eval_range.start - train_range.stop
+        all_predictions = np.asarray(state["model"].forecast(forecast_steps))
+        y_pred = all_predictions[
+            forecast_offset : forecast_offset + len(eval_range)
+        ].tolist()
+        if len(y_pred) != len(eval_range):
+            raise ValueError(
+                "[VALIDATION] ES forecast did not cover the configured evaluation range"
+            )
         state["y_pred"] = y_pred
         return {
             "predicted_points": len(y_pred),
@@ -559,7 +569,22 @@ def _run_arima(step_id: str, args, state: Dict[str, Any]) -> Dict[str, Any]:
         y = np.asarray(state["y"])
         y_eval = y[eval_range]
         best_model = state["best_model"]
-        y_pred, conf_int = best_model.predict(n_periods=len(eval_range), return_conf_int=True)
+        forecast_steps = eval_range.stop - train_range.stop
+        forecast_offset = eval_range.start - train_range.stop
+        all_predictions, all_conf_int = best_model.predict(
+            n_periods=forecast_steps,
+            return_conf_int=True,
+        )
+        y_pred = np.asarray(all_predictions)[
+            forecast_offset : forecast_offset + len(eval_range)
+        ]
+        conf_int = np.asarray(all_conf_int)[
+            forecast_offset : forecast_offset + len(eval_range)
+        ]
+        if len(y_pred) != len(eval_range):
+            raise ValueError(
+                "[VALIDATION] ARIMA forecast did not cover the configured evaluation range"
+            )
         y_true = y_eval.tolist()
         converged = bool(best_model.arima_res_.mle_retvals.get("converged", False))
         state.update({

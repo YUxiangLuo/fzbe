@@ -118,6 +118,7 @@ def fit_and_predict_from_source_model(
             train_end=train_end,
             source_model_file=source_model_file,
             save_model_file=temp_model_file,
+            fit_forecast_steps=forecast_steps if model_name == "lstm" else None,
             timeout=timeout,
         )
 

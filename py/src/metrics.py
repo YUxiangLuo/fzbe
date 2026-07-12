@@ -12,7 +12,7 @@ import numpy as np
 # Type alias for input flexibility
 ArrayLike = Union[List[float], np.ndarray]
 
-# Epsilon for numerical stability in MAPE calculation
+# Epsilon for zero-value and constant-series handling.
 EPS = 1e-12
 
 
@@ -84,9 +84,11 @@ def mape(y_true: ArrayLike, y_pred: ArrayLike) -> float:
         np.asarray(y_true, dtype=np.float64),
         np.asarray(y_pred, dtype=np.float64),
     )
-    diff = np.abs(y_true_arr - y_pred_arr)
-    denom = np.where(np.abs(y_true_arr) > EPS, np.abs(y_true_arr), EPS)
-    return float(100.0 * np.mean(diff / denom))
+    nonzero_actuals = np.abs(y_true_arr) > EPS
+    if not np.any(nonzero_actuals):
+        return 0.0
+    diff = np.abs(y_true_arr[nonzero_actuals] - y_pred_arr[nonzero_actuals])
+    return float(100.0 * np.mean(diff / np.abs(y_true_arr[nonzero_actuals])))
 
 
 def r2(y_true: ArrayLike, y_pred: ArrayLike) -> float:
@@ -109,4 +111,6 @@ def r2(y_true: ArrayLike, y_pred: ArrayLike) -> float:
     )
     ss_res = np.sum((y_true_arr - y_pred_arr) ** 2)
     ss_tot = np.sum((y_true_arr - np.mean(y_true_arr)) ** 2)
-    return float(1.0 - ss_res / ss_tot if ss_tot != 0 else 0.0)
+    if ss_tot <= EPS:
+        return 1.0 if ss_res <= EPS else 0.0
+    return float(1.0 - ss_res / ss_tot)

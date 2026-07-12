@@ -110,6 +110,39 @@ describe("model run authoritative state", () => {
     }
   });
 
+  test("preserves legacy comma-separated LSTM features in authoritative state", () => {
+    const authoritative = buildAuthoritativeResult(
+      "lstm",
+      {
+        ...baseBody,
+        lstmNormalization: "minmax",
+        lstmFeatures: "价格指数, 产能利用率",
+        lstmTargetFeature: "销售数量",
+      },
+      resultFor("lstm"),
+    );
+
+    expect(authoritative.parameters.features).toEqual(["价格指数", "产能利用率"]);
+    expect(authoritative.experimentPatch.lstm_features).toBe(
+      JSON.stringify(["价格指数", "产能利用率"]),
+    );
+  });
+
+  test("keeps JSON LSTM feature names containing commas unambiguous", () => {
+    const authoritative = buildAuthoritativeResult(
+      "lstm",
+      {
+        ...baseBody,
+        lstmNormalization: "minmax",
+        lstmFeatures: JSON.stringify(["价格指数", "外部,指标"]),
+        lstmTargetFeature: "销售数量",
+      },
+      resultFor("lstm"),
+    );
+
+    expect(authoritative.parameters.features).toEqual(["价格指数", "外部,指标"]);
+  });
+
   test("restores the complete current experiment state when reusing an active run", () => {
     const experiment = {
       state_version: 17,

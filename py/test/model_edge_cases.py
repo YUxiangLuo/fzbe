@@ -25,6 +25,8 @@ EXISTING_FULL_SCRIPTS = [
     "stacking_lstm_csv_smoke.py",
     "boosting_csv_smoke.py",
     "boosting_lstm_csv_smoke.py",
+    "ensemble_reuse_lstm_csv_smoke.py",
+    "guided_standalone_parity.py",
     "lstm_feature_diagnostics.py",
     "designed_model_diagnostics.py",
     "medium_model_stress.py",

@@ -139,6 +139,7 @@ def run_base_model_fit_subprocess(
     train_end: int,
     source_model_file: str,
     save_model_file: str,
+    fit_forecast_steps: Optional[int] = None,
     timeout: Optional[int] = 60,
 ) -> Dict[str, Any]:
     """Refit a base model from an existing artifact using fit-only mode."""
@@ -161,6 +162,10 @@ def run_base_model_fit_subprocess(
         "--fit-only",
         "--pretty",
     ]
+    if fit_forecast_steps is not None:
+        if int(fit_forecast_steps) <= 0:
+            raise ValueError("fit_forecast_steps must be > 0 when provided")
+        args.extend(["--fit-forecast-steps", str(int(fit_forecast_steps))])
 
     try:
         result = subprocess.run(

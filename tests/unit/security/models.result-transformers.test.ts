@@ -73,10 +73,9 @@ describe("model training result transformers", () => {
       logs: ["done"],
     });
 
-    expect(transformed).toEqual({
+    expect(transformed).toMatchObject({
       status: "success",
       results: {
-        metrics: { rmse: 1.2, mae: 0.8, r2: 0.91 },
         eval_y_true: [10, 12],
         eval_predictions: [9.5, 12.4],
         notes: ["ok"],
@@ -84,6 +83,10 @@ describe("model training result transformers", () => {
         logs: ["done"],
       },
     });
+    expect((transformed.results.metrics as Record<string, number>).rmse).toBeCloseTo(0.4527692569);
+    expect((transformed.results.metrics as Record<string, number>).mae).toBeCloseTo(0.45);
+    expect((transformed.results.metrics as Record<string, number>).mape).toBeCloseTo(4.1666666667);
+    expect((transformed.results.metrics as Record<string, number>).r2).toBeCloseTo(0.795);
   });
 
   test("adds ARIMA-specific order and diagnostics fields", () => {
@@ -173,5 +176,46 @@ describe("model training result transformers", () => {
       eval_predictions: [42, 43],
       meta_model: { intercept: 0.1, coefficients: [0.4, 0.6] },
     });
+  });
+
+  test("floors negative demand predictions and recomputes metrics from displayed values", () => {
+    const transformed = transformTrainingResult("ma", {
+      metrics: { rmse: 999, mae: 999, mape: 999, r2: 999, custom: "kept" },
+      eval_y_true: [0, 10],
+      predictions: [{ prediction: -5 }, { prediction: -2 }],
+    });
+
+    expect(transformed.results.eval_predictions).toEqual([0, 0]);
+    expect(transformed.results.metrics).toMatchObject({
+      custom: "kept",
+      rmse: Math.sqrt(50),
+      mae: 5,
+      mape: 100,
+      r2: -1,
+    });
+  });
+
+  test("uses finite conventions for all-zero actual values", () => {
+    const perfect = transformTrainingResult("es", {
+      metrics: {},
+      eval_y_true: [0, 0],
+      predictions: [{ prediction: -1 }, { prediction: 0 }],
+    });
+    const imperfect = transformTrainingResult("es", {
+      metrics: {},
+      eval_y_true: [0, 0],
+      predictions: [{ prediction: 1 }, { prediction: 0 }],
+    });
+
+    expect(perfect.results.metrics).toMatchObject({ mape: 0, r2: 1 });
+    expect(imperfect.results.metrics).toMatchObject({ mape: 0, r2: 0 });
+  });
+
+  test("rejects malformed Python prediction points instead of converting them to demand", () => {
+    expect(() => transformTrainingResult("ma", {
+      metrics: {},
+      eval_y_true: [10],
+      predictions: [{ prediction: null }],
+    })).toThrow("[PYTHON_DATA] Prediction point 0 is not finite");
   });
 });

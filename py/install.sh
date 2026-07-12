@@ -39,7 +39,6 @@ fi
 echo "Installing dependencies..."
 uv pip install \
   --python "$VENV_DIR/bin/python3" \
-  --extra-index-url https://download.pytorch.org/whl/cpu \
   -r requirements.txt
 
 # 清理 bytecode 缓存

@@ -42,6 +42,11 @@ def main():
     parser.add_argument("--load-model", type=str, help="Path to load a trained model")
     parser.add_argument("--forecast-steps", type=int, help="Number of steps to forecast")
     parser.add_argument("--fit-only", action="store_true", help="Fit a production model without evaluation")
+    parser.add_argument(
+        "--fit-forecast-steps",
+        type=int,
+        help="Required direct forecast horizon when refitting an artifact",
+    )
     parser.add_argument("--pretty", action="store_true", help="Pretty print JSON output")
 
     # Add model-specific arguments (these will be parsed by the individual model's run function)

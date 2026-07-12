@@ -220,14 +220,30 @@ const parseRequestedBaseModels = (models: string | undefined): BaseModelType[] =
 };
 
 const parseLstmFeatures = (value: unknown): string[] => {
-  const parsed = parseJson<unknown>(value, []);
-  return Array.isArray(parsed)
-    ? parsed.filter((item): item is string => typeof item === "string" && item.trim().length > 0)
-    : [];
+  const normalize = (items: unknown[]) => items
+    .filter((item): item is string => typeof item === "string")
+    .map((item) => item.trim())
+    .filter((item) => item.length > 0);
+
+  if (Array.isArray(value)) return normalize(value);
+  if (typeof value !== "string") return [];
+
+  const trimmed = value.trim();
+  if (!trimmed) return [];
+  const parsed = parseJson<unknown>(trimmed, null);
+  if (Array.isArray(parsed)) return normalize(parsed);
+
+  // The public training API historically accepted comma-separated feature
+  // names. Keep that contract for legacy callers while JSON remains the
+  // unambiguous representation for field names that themselves contain commas.
+  return normalize(trimmed.split(","));
 };
 
 const normalizeRevisionValue = (field: string, value: unknown) => {
-  if (field === "lstm_features" || field.endsWith("_base_models")) {
+  if (field === "lstm_features") {
+    return parseLstmFeatures(value);
+  }
+  if (field.endsWith("_base_models")) {
     return parseJson(value, value ?? null);
   }
   return value ?? null;

@@ -68,18 +68,22 @@ def load_csv_records(csv_path: Path) -> list[dict[str, str]]:
         return list(csv.DictReader(handle))
 
 
-def invoke_lstm(data_json: str | None, *extra_args: str) -> dict:
+def run_lstm(data_json: str | None, *extra_args: str) -> subprocess.CompletedProcess[str]:
     command = [sys.executable, str(RUN_MODEL), "lstm"]
     if data_json is not None:
         command.extend(["--data", data_json])
     command.extend(extra_args)
 
-    completed = subprocess.run(
+    return subprocess.run(
         command,
         capture_output=True,
         text=True,
         check=False,
     )
+
+
+def invoke_lstm(data_json: str | None, *extra_args: str) -> dict:
+    completed = run_lstm(data_json, *extra_args)
     if completed.returncode != 0:
         raise RuntimeError(
             "lstm CLI execution failed\n"
@@ -301,7 +305,7 @@ def main() -> None:
         )
         assert small_train_output["forecast_horizon"] == 2
 
-        small_fit_output = invoke_lstm(
+        rejected_fit = run_lstm(
             small_data_json,
             "--train-start",
             "0",
@@ -313,31 +317,55 @@ def main() -> None:
             str(small_production_model),
             "--fit-only",
         )
+        if rejected_fit.returncode == 0:
+            raise AssertionError("expected short direct LSTM production refit to fail")
+        if "too short to preserve the evaluated direct LSTM strategy" not in rejected_fit.stderr:
+            raise AssertionError(
+                "missing explicit direct-strategy validation error\n"
+                f"stdout:\n{rejected_fit.stdout}\n"
+                f"stderr:\n{rejected_fit.stderr}"
+            )
+
+        small_fit_output = invoke_lstm(
+            small_data_json,
+            "--train-start",
+            "0",
+            "--train-end",
+            "7",
+            "--load-model",
+            str(small_backtest_model),
+            "--save-model",
+            str(small_production_model),
+            "--fit-forecast-steps",
+            "2",
+            "--fit-only",
+        )
         assert small_fit_output["mode"] == "lstm_fit_only"
-        assert_method_metadata(small_fit_output, "lstm_autoregressive")
+        assert_method_metadata(small_fit_output, "lstm_direct")
+        assert small_fit_output["forecast_horizon"] == 2
         small_production_state = load_pickled_state(small_production_model)
-        assert small_production_state["forecast_strategy"] == "autoregressive"
-        assert_method_metadata(small_production_state, "lstm_autoregressive")
-        assert small_production_state["forecast_horizon"] == 0
-        assert small_production_state["production_forecast_horizon"] == 6
+        assert small_production_state["forecast_strategy"] == "direct_multi_horizon"
+        assert_method_metadata(small_production_state, "lstm_direct")
+        assert small_production_state["forecast_horizon"] == 2
+        assert small_production_state["production_forecast_horizon"] == 2
 
         small_predict_output = invoke_lstm(
             None,
             "--load-model",
             str(small_production_model),
             "--forecast-steps",
-            "6",
+            "2",
         )
         assert small_predict_output["mode"] == "lstm_loaded_predict"
-        assert_method_metadata(small_predict_output, "lstm_autoregressive")
-        assert small_predict_output["forecast_steps"] == 6
-        assert len(extract_predictions(small_predict_output)) == 6
+        assert_method_metadata(small_predict_output, "lstm_direct")
+        assert small_predict_output["forecast_steps"] == 2
+        assert len(extract_predictions(small_predict_output)) == 2
 
     print(
         json.dumps(
             {
                 "fixture": str(CSV_FIXTURE),
-                "checked_modes": ["type_inference", "training", "fit_only", "loaded_predict"],
+                "checked_modes": ["type_inference", "training", "fit_only", "loaded_predict", "short_refit_rejection"],
                 "feature_count": len(FEATURE_KEYS),
                 "model": "lstm",
                 "status": "ok",
