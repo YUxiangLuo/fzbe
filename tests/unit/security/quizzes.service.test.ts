@@ -221,6 +221,7 @@ describe("quizzes service", () => {
       }
 
       if (sql.includes("UPDATE experiment_status")) {
+        expect(sql).toContain("state_version = state_version + 1");
         expect(params).toEqual([1, 1, 990007, 20240007]);
         return [[]];
       }

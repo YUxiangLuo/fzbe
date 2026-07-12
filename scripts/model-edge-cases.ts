@@ -42,62 +42,6 @@ const ENSEMBLE_MODELS: Array<Extract<ModelType, "weighted_avg" | "stacking" | "b
   "stacking",
   "boosting",
 ];
-const MODEL_TO_COMPLETION_PATCH: Record<ModelType, (results: Record<string, any>) => Record<string, unknown>> = {
-  ma: (results) => ({
-    moving_average_completed: true,
-    moving_average_window: 6,
-    moving_average_metrics_rmse: results.metrics.rmse,
-    moving_average_metrics_mae: results.metrics.mae,
-    moving_average_metrics_r2: results.metrics.r2,
-  }),
-  es: (results) => ({
-    exponential_smoothing_completed: true,
-    exponential_smoothing_alpha: 0.35,
-    exponential_smoothing_metrics_rmse: results.metrics.rmse,
-    exponential_smoothing_metrics_mae: results.metrics.mae,
-    exponential_smoothing_metrics_r2: results.metrics.r2,
-  }),
-  arima: (results) => ({
-    arima_completed: true,
-    arima_d: 1,
-    arima_p: results.best_order?.p ?? null,
-    arima_q: results.best_order?.q ?? null,
-    arima_metrics_rmse: results.metrics.rmse,
-    arima_metrics_mae: results.metrics.mae,
-    arima_metrics_r2: results.metrics.r2,
-  }),
-  lstm: (results) => ({
-    lstm_completed: true,
-    lstm_normalization: "minmax",
-    lstm_features: ["价格指数", "促销投入", "产能利用率"],
-    lstm_target_field: "销售数量",
-    lstm_metrics_rmse: results.metrics.rmse,
-    lstm_metrics_mae: results.metrics.mae,
-    lstm_metrics_r2: results.metrics.r2,
-  }),
-  weighted_avg: (results) => ({
-    ensemble_weighted_completed: true,
-    ensemble_weighted_base_models: BASE_MODELS,
-    ensemble_weighted_metrics_rmse: results.metrics.rmse,
-    ensemble_weighted_metrics_mae: results.metrics.mae,
-    ensemble_weighted_metrics_r2: results.metrics.r2,
-  }),
-  stacking: (results) => ({
-    ensemble_stacking_completed: true,
-    ensemble_stacking_base_models: BASE_MODELS,
-    ensemble_stacking_metrics_rmse: results.metrics.rmse,
-    ensemble_stacking_metrics_mae: results.metrics.mae,
-    ensemble_stacking_metrics_r2: results.metrics.r2,
-  }),
-  boosting: (results) => ({
-    ensemble_boosting_completed: true,
-    ensemble_boosting_base_models: BASE_MODELS,
-    ensemble_boosting_metrics_rmse: results.metrics.rmse,
-    ensemble_boosting_metrics_mae: results.metrics.mae,
-    ensemble_boosting_metrics_r2: results.metrics.r2,
-  }),
-};
-
 function parseOptions(): CliOptions {
   const options: CliOptions = {
     layer: "all",
@@ -406,32 +350,17 @@ async function createModelExperiment(
   }
   assertStatus(
     await requestApp(app, `/api/v1/experiment-runs/${experimentId}`, {
-      method: "PUT",
+      method: "PATCH",
       token,
-      body: baseExperimentPatch(),
+      body: {
+        ...baseExperimentPatch(),
+        expected_version: Number(created.state_version ?? 0),
+      },
     }),
     200,
     "prepare model stage experiment",
   );
   return experimentId;
-}
-
-async function updateExperimentState(
-  app: AppLike,
-  token: string,
-  experimentId: number,
-  patch: Record<string, unknown>,
-  label: string,
-) {
-  assertStatus(
-    await requestApp(app, `/api/v1/experiment-runs/${experimentId}`, {
-      method: "PUT",
-      token,
-      body: patch,
-    }),
-    200,
-    label,
-  );
 }
 
 async function runApiLayer() {
@@ -474,13 +403,6 @@ async function runApiLayer() {
       `${modelType} training`,
     );
     assertTrainingPayload(modelType, training);
-    await updateExperimentState(
-      app,
-      token,
-      experimentId,
-      MODEL_TO_COMPLETION_PATCH[modelType](training.results),
-      `${modelType} completion patch`,
-    );
     trainedModels.push(modelType);
   }
 
@@ -496,13 +418,6 @@ async function runApiLayer() {
       `${modelType} training`,
     );
     assertTrainingPayload(modelType, training);
-    await updateExperimentState(
-      app,
-      token,
-      experimentId,
-      MODEL_TO_COMPLETION_PATCH[modelType](training.results),
-      `${modelType} completion patch`,
-    );
     trainedModels.push(modelType);
   }
 

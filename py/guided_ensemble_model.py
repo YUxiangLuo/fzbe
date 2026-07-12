@@ -103,6 +103,16 @@ def _parse_common_ranges(args) -> Tuple[int, int, int, int]:
     return int(args.train_start), int(args.train_end), int(args.eval_start), int(args.eval_end)
 
 
+def _read_data_json(args) -> str:
+    data_file = getattr(args, "data_file", None)
+    if data_file:
+        with open(data_file, "r", encoding="utf-8") as handle:
+            return handle.read()
+    if args.data:
+        return args.data
+    raise ValueError("[DATA] 训练数据快照缺失。")
+
+
 def _range_to_state(range_value: range) -> Dict[str, int]:
     return {"start": int(range_value.start), "stop": int(range_value.stop)}
 
@@ -205,7 +215,7 @@ def _build_model_params(
 
 def _initialize_state(model_type: str, args, state: Dict[str, Any]) -> Dict[str, Any]:
     module = ENSEMBLE_MODULES[model_type]
-    parsed_data = load_data_from_json(args.data)
+    parsed_data = load_data_from_json(_read_data_json(args))
     ts, te, es_idx, ee = _parse_common_ranges(args)
     train_range = range(ts, te + 1)
     eval_range = range(es_idx, ee + 1)
@@ -1063,6 +1073,7 @@ def main() -> None:
     parser.add_argument("--state-file", required=True)
     parser.add_argument("--artifact-dir", required=True)
     parser.add_argument("--data", type=str)
+    parser.add_argument("--data-file", type=str)
     parser.add_argument("--train-start", type=int)
     parser.add_argument("--train-end", type=int)
     parser.add_argument("--eval-start", type=int)

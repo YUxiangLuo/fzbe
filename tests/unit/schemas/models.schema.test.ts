@@ -156,6 +156,15 @@ describe("Models Schemas", () => {
 
       expect(result.success).toBe(true);
     });
+
+    test("should reject forecasts longer than the production horizon", () => {
+      const result = predictSchema.safeParse({
+        experiment_id: 12,
+        forecast_steps: 13,
+      });
+
+      expect(result.success).toBe(false);
+    });
   });
 
   describe("prepareProductionSchema", () => {

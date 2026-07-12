@@ -10,6 +10,7 @@ const srcRoot = path.resolve(import.meta.dir, "../../../src");
 const configModulePath = path.join(srcRoot, "config", "index.ts");
 const pythonModulePath = path.join(srcRoot, "utils", "python.ts");
 const modelRuntimeModulePath = path.join(srcRoot, "modules", "models", "model-runtime.ts");
+const modelRunStoreModulePath = path.join(srcRoot, "modules", "models", "model-run-store.ts");
 const modelsServiceModulePath = path.join(srcRoot, "modules", "models", "models.service.ts");
 const freshModelsServiceModulePath = `${modelsServiceModulePath}?models-service-test`;
 const datasetCsvPath = "/tmp/dataset.csv";
@@ -50,6 +51,7 @@ const statSync = mock((_: string) => ({
 }));
 const unlinkSync = mock(() => {});
 const copyFileSync = mock((_: string, __: string) => {});
+const renameSync = mock((_: string, __: string) => {});
 const mkdirSync = mock((_: string, __?: unknown) => undefined);
 const rmSync = mock((_: string, __?: unknown) => undefined);
 const spawnMock = mock((_: string[], __: Record<string, unknown>) => ({
@@ -70,6 +72,11 @@ const spawnMock = mock((_: string[], __: Record<string, unknown>) => ({
   pid: 4321,
   kill: mock(() => {}),
 }));
+const getActiveModelTrainingRun = mock(async () => null as null | {
+  run_id: string;
+  artifact_path: string;
+  production_artifact_path: string | null;
+});
 const originalSpawn = Bun.spawn;
 
 mock.module(configModulePath, () => ({
@@ -97,6 +104,7 @@ mock.module("fs", () => ({
     statSync,
     unlinkSync,
     copyFileSync,
+    renameSync,
     mkdirSync,
     rmSync,
   },
@@ -106,6 +114,7 @@ mock.module("fs", () => ({
   statSync,
   unlinkSync,
   copyFileSync,
+  renameSync,
   mkdirSync,
   rmSync,
 }));
@@ -125,6 +134,16 @@ mock.module(modelRuntimeModulePath, () => ({
   ) => path.join(
     mockedTrainedModelsRoot,
     `exp${experimentId}-student${studentId}-${modelType}${phase === "production" ? "-production" : ""}.pkl`,
+  ),
+  buildVersionedModelPath: (
+    experimentId: number,
+    studentId: number,
+    modelType: string,
+    runId: string,
+    phase: "backtest" | "production" = "backtest",
+  ) => path.join(
+    mockedTrainedModelsRoot,
+    `exp${experimentId}-student${studentId}-${modelType}-${runId}-${phase}.pkl`,
   ),
   buildGuidedTrainingArtifactDir: (
     experimentId: number,
@@ -148,6 +167,18 @@ mock.module(modelRuntimeModulePath, () => ({
   buildModelExecutionLockName: (experimentId: number, modelType: string) =>
     `fangzhen-model:exp:${experimentId}:${modelType}`,
   buildModelSlotLockName: (slot: number) => `fangzhen-model:slot:${slot}`,
+}));
+
+mock.module(modelRunStoreModulePath, () => ({
+  buildExperimentTrainingRevision: mock(() => "experiment-revision"),
+  buildModelTrainingRequestHash: mock(() => "request-hash"),
+  commitModelTrainingRun: mock(async ({ runId, sessionId }: { runId?: string; sessionId?: string }) => ({
+    runId: runId ?? sessionId ?? "run-test",
+    stateVersion: 1,
+    reusedExistingRun: false,
+  })),
+  getActiveModelTrainingRun,
+  setProductionArtifactForRun: mock(async () => true),
 }));
 
 const {
@@ -200,6 +231,9 @@ describe("models service", () => {
       [buildExperimentContextRow()],
     ]);
 
+    getActiveModelTrainingRun.mockReset();
+    getActiveModelTrainingRun.mockResolvedValue(null);
+
     existsSync.mockReset();
     existsSync.mockReturnValue(false);
 
@@ -213,6 +247,7 @@ describe("models service", () => {
     });
     unlinkSync.mockClear();
     copyFileSync.mockClear();
+    renameSync.mockClear();
     mkdirSync.mockClear();
     rmSync.mockClear();
     spawnMock.mockClear();
@@ -384,6 +419,7 @@ describe("models service", () => {
     poolQuery.mockReset();
     poolQuery
       .mockResolvedValueOnce([[buildExperimentContextRow()]])
+      .mockResolvedValueOnce([[{ file_path: datasetCsvPath }]])
       .mockResolvedValueOnce([[
         {
           session_id: "guided-a",
@@ -391,6 +427,8 @@ describe("models service", () => {
           student_id: 20240002,
           model_type: "ma",
           request_hash: "request-hash",
+          dataset_revision: "0".repeat(64),
+          runtime_revision: "0".repeat(64),
           request_payload: JSON.stringify(requestBody),
           status: "completed",
           current_step_id: null,
@@ -418,9 +456,14 @@ describe("models service", () => {
     const session = await createOrResumeGuidedTrainingSession("ma", 20240002, requestBody);
 
     expect(session.status).toBe("completed");
+    const versionedPath = "/tmp/fangzhen-py/trained_models/exp990002-student20240002-ma-guided-a-backtest.pkl";
     expect(copyFileSync).toHaveBeenCalledWith(
       sessionModelPath,
-      "/tmp/fangzhen-py/trained_models/exp990002-student20240002-ma.pkl",
+      expect.stringContaining(`${versionedPath}.tmp-`),
+    );
+    expect(renameSync).toHaveBeenCalledWith(
+      expect.stringContaining(`${versionedPath}.tmp-`),
+      versionedPath,
     );
     expect(unlinkSync).not.toHaveBeenCalledWith(productionModelPath);
     expect(spawnMock).not.toHaveBeenCalled();
@@ -482,6 +525,7 @@ describe("models service", () => {
     poolQuery.mockReset();
     poolQuery
       .mockResolvedValueOnce([[buildExperimentContextRow()]])
+      .mockResolvedValueOnce([[{ file_path: datasetCsvPath }]])
       .mockResolvedValueOnce([[completedSessionRow]])
       .mockResolvedValueOnce([[]])
       .mockResolvedValueOnce([[]])
@@ -1018,6 +1062,49 @@ describe("models service", () => {
     });
   });
 
+  test("rejects a prediction result when its active model version changes in flight", async () => {
+    const productionPath = "/tmp/fangzhen-py/trained_models/ma-run-a-production.pkl";
+    const runA = {
+      run_id: "ma-run-a",
+      artifact_path: "/tmp/fangzhen-py/trained_models/ma-run-a.pkl",
+      production_artifact_path: productionPath,
+    };
+    const runB = {
+      run_id: "ma-run-b",
+      artifact_path: "/tmp/fangzhen-py/trained_models/ma-run-b.pkl",
+      production_artifact_path: "/tmp/fangzhen-py/trained_models/ma-run-b-production.pkl",
+    };
+    getActiveModelTrainingRun
+      .mockResolvedValueOnce(runA)
+      .mockResolvedValueOnce(runA)
+      .mockResolvedValueOnce(runB);
+    existsSync.mockReturnValue(true);
+    spawnMock.mockImplementationOnce(() => ({
+      stdout: new ReadableStream({
+        start(controller) {
+          controller.enqueue(new TextEncoder().encode('{"predictions":[{"prediction":101.2}]}'));
+          controller.close();
+        },
+      }),
+      stderr: new ReadableStream({
+        start(controller) {
+          controller.close();
+        },
+      }),
+      exited: Promise.resolve(0),
+      exitCode: 0,
+      killed: false,
+      pid: 4321,
+      kill: mock(() => {}),
+    }));
+
+    await expect(
+      predictExperimentModel("ma", 20240002, 990002, 6),
+    ).rejects.toMatchObject({
+      message: "预测期间模型版本已变化，请重新预测",
+    });
+  });
+
   test("passes available base model artifacts through to ensemble training", async () => {
     poolQuery.mockReset();
     poolQuery
@@ -1071,6 +1158,8 @@ describe("models service", () => {
     });
 
     const [command] = spawnMock.mock.calls[0] ?? [];
+    expect(command).toContain("--data-file");
+    expect(command).not.toContain("--data");
     const baseModelFilesArgIndex = command.indexOf("--base-model-files");
     expect(baseModelFilesArgIndex).toBeGreaterThan(-1);
 

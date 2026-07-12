@@ -1,6 +1,7 @@
 import path from "path";
 import fs from "fs";
 import crypto from "crypto";
+import os from "node:os";
 import type { Stats } from "node:fs";
 import type { RowDataPacket } from "mysql2/promise";
 import { pool } from "../../config";
@@ -13,6 +14,7 @@ import {
   buildGuidedTrainingArtifactDir,
   buildGuidedTrainingStatePath,
   buildExperimentScopedModelPath,
+  buildVersionedModelPath,
 } from "./model-runtime";
 import { loadDatasetFromDb } from "./model-datasets";
 import { ModelAccessError, ModelNotFoundError, ModelValidationError } from "./model-errors";
@@ -31,6 +33,14 @@ import {
   type ModelProgressReporter,
 } from "./model-python-runner";
 import { transformTrainingResult } from "./model-results";
+import {
+  buildExperimentTrainingRevision,
+  buildModelTrainingRequestHash,
+  commitModelTrainingRun,
+  getActiveModelTrainingRun,
+  setProductionArtifactForRun,
+  type ModelTrainingRunRow,
+} from "./model-run-store";
 import {
   BASE_MODEL_TYPES,
   ENSEMBLE_DERIVED_BODY_KEYS,
@@ -59,6 +69,9 @@ export type { GuidedTrainingSessionPayload, GuidedTrainingStepDefinition } from 
 
 const TRAINING_TIMEOUT = TIMEOUTS.MODEL_TRAINING;
 const GUIDED_TRAINING_CLEANUP_BATCH_SIZE = 500;
+const GUIDED_DATASET_FILE_NAME = "dataset.json";
+const MODEL_PIPELINE_REVISION = "model-run-v3";
+let cachedModelRuntimeRevision: string | null = null;
 
 interface ExperimentOwnershipRow extends RowDataPacket {
   student_id: number;
@@ -107,6 +120,8 @@ interface GuidedTrainingSessionRow extends RowDataPacket {
   student_id: number;
   model_type: GuidedModelType;
   request_hash: string;
+  dataset_revision: string;
+  runtime_revision: string;
   request_payload: unknown;
   status: GuidedTrainingStatus;
   current_step_id: string | null;
@@ -116,6 +131,8 @@ interface GuidedTrainingSessionRow extends RowDataPacket {
   result_payload: unknown;
   artifact_dir: string;
   error_message: string | null;
+  experiment_state_version: number | null;
+  updated_at: string | Date;
 }
 
 interface GuidedTrainingCleanupRow extends RowDataPacket {
@@ -227,20 +244,6 @@ const removeSiblingArtifactsByPrefix = (modelPath: string) => {
     }
 
     removeFileIfExists(path.join(directoryPath, siblingFile));
-  }
-};
-
-const invalidateProductionArtifact = (experimentId: number, studentId: number, modelType: ModelType) => {
-  const productionModelPath = getProductionModelPath(experimentId, studentId, modelType);
-  removeFileIfExists(productionModelPath);
-
-  if (modelType === "lstm") {
-    removeFileIfExists(getLstmSidecarPath(productionModelPath));
-    return;
-  }
-
-  if (isEnsembleModelType(modelType)) {
-    removeSiblingArtifactsByPrefix(productionModelPath);
   }
 };
 
@@ -365,9 +368,7 @@ if not os.path.exists(source_model_path):
     raise FileNotFoundError(f"source model not found: {source_model_path}")
 
 os.makedirs(os.path.dirname(destination_model_path), exist_ok=True)
-shutil.copy2(source_model_path, destination_model_path)
-
-with open(destination_model_path, "rb") as handle:
+with open(source_model_path, "rb") as handle:
     state = pickle.load(handle)
 
 source_keras_path = state.get("keras_model_path")
@@ -378,24 +379,37 @@ if not os.path.exists(source_keras_path):
     raise FileNotFoundError(f"source keras model not found: {source_keras_path}")
 
 destination_keras_path = os.path.splitext(destination_model_path)[0] + "_keras_model.h5"
-shutil.copy2(source_keras_path, destination_keras_path)
 state["keras_model_path"] = destination_keras_path
 
-fd, temp_name = tempfile.mkstemp(
-    prefix=f".{os.path.basename(destination_model_path)}.",
+keras_fd, temp_keras_name = tempfile.mkstemp(
+    prefix=f".{os.path.basename(destination_keras_path)}.",
     suffix=".tmp",
     dir=os.path.dirname(destination_model_path),
 )
+os.close(keras_fd)
+temp_model_name = None
 try:
-    with os.fdopen(fd, "wb") as handle:
+    shutil.copy2(source_keras_path, temp_keras_name)
+    model_fd, temp_model_name = tempfile.mkstemp(
+        prefix=f".{os.path.basename(destination_model_path)}.",
+        suffix=".tmp",
+        dir=os.path.dirname(destination_model_path),
+    )
+    with os.fdopen(model_fd, "wb") as handle:
         pickle.dump(state, handle, protocol=pickle.HIGHEST_PROTOCOL)
         handle.flush()
         os.fsync(handle.fileno())
-    os.replace(temp_name, destination_model_path)
+    os.replace(temp_keras_name, destination_keras_path)
+    os.replace(temp_model_name, destination_model_path)
 finally:
-    if os.path.exists(temp_name):
+    if os.path.exists(temp_keras_name):
         try:
-            os.remove(temp_name)
+            os.remove(temp_keras_name)
+        except OSError:
+            pass
+    if temp_model_name and os.path.exists(temp_model_name):
+        try:
+            os.remove(temp_model_name)
         except OSError:
             pass
 `;
@@ -550,25 +564,13 @@ const copyModelArtifact = async (
     return;
   }
 
-  fs.copyFileSync(sourceModelPath, destinationModelPath);
-};
-
-const restoreGuidedSessionBacktestArtifact = async (
-  row: GuidedTrainingSessionRow,
-  options: { invalidateProductionArtifact?: boolean } = {},
-) => {
-  const sourceModelPath = getGuidedSessionModelPath(row.artifact_dir, row.model_type);
-  const backtestModelPath = getBacktestModelPath(row.experiment_id, row.student_id, row.model_type);
-
-  if (!(await hasReusableSavedModelArtifact(row.model_type, sourceModelPath))) {
-    throw new ModelNotFoundError("分阶段训练产物已过期或已被清理，请重新开始分阶段训练");
+  const temporaryModelPath = `${destinationModelPath}.tmp-${crypto.randomUUID()}`;
+  try {
+    fs.copyFileSync(sourceModelPath, temporaryModelPath);
+    fs.renameSync(temporaryModelPath, destinationModelPath);
+  } finally {
+    removeFileIfExists(temporaryModelPath);
   }
-
-  await copyModelArtifact(row.model_type, sourceModelPath, backtestModelPath);
-  if (options.invalidateProductionArtifact) {
-    invalidateProductionArtifact(row.experiment_id, row.student_id, row.model_type);
-  }
-  return backtestModelPath;
 };
 
 const isPathInsideDirectory = (candidatePath: string, rootDirectory: string) => {
@@ -745,27 +747,69 @@ export async function cleanupExpiredGuidedTrainingSessions(
   };
 }
 
-const stableJsonStringify = (value: unknown): string => {
-  if (Array.isArray(value)) {
-    return `[${value.map((item) => stableJsonStringify(item)).join(",")}]`;
+const collectPythonRuntimeFiles = (directoryPath: string): string[] => {
+  if (!fs.existsSync(directoryPath)) return [];
+  const files: string[] = [];
+  for (const entry of fs.readdirSync(directoryPath, { withFileTypes: true })) {
+    const entryPath = path.join(directoryPath, entry.name);
+    if (entry.isDirectory()) {
+      if (entry.name === "__pycache__") continue;
+      files.push(...collectPythonRuntimeFiles(entryPath));
+    } else if (entry.isFile() && entry.name.endsWith(".py")) {
+      files.push(entryPath);
+    }
   }
-
-  if (value && typeof value === "object") {
-    const record = value as Record<string, unknown>;
-    return `{${Object.keys(record)
-      .sort()
-      .map((key) => `${JSON.stringify(key)}:${stableJsonStringify(record[key])}`)
-      .join(",")}}`;
-  }
-
-  return JSON.stringify(value);
+  return files;
 };
 
-const hashGuidedTrainingRequest = (modelType: GuidedModelType, body: TrainInput) =>
-  crypto
-    .createHash("sha256")
-    .update(stableJsonStringify({ modelType, body }))
-    .digest("hex");
+const getModelRuntimeRevision = () => {
+  if (cachedModelRuntimeRevision) return cachedModelRuntimeRevision;
+  const runtimeFiles = [
+    path.join(PY_DIR, "guided_model.py"),
+    path.join(PY_DIR, "guided_ensemble_model.py"),
+    path.join(PY_DIR, "run_model.py"),
+    ...collectPythonRuntimeFiles(path.join(PY_DIR, "src")),
+  ].filter((filePath) => fs.existsSync(filePath)).sort();
+  const hash = crypto.createHash("sha256").update(MODEL_PIPELINE_REVISION);
+  for (const filePath of runtimeFiles) {
+    try {
+      hash.update(path.relative(PY_DIR, filePath));
+      hash.update(fs.readFileSync(filePath));
+    } catch {
+      // A deployment may atomically replace files while the revision is first
+      // calculated. Missing files are excluded and the cache is rebuilt on the
+      // next process start.
+    }
+  }
+  cachedModelRuntimeRevision = hash.digest("hex");
+  return cachedModelRuntimeRevision;
+};
+
+const hashDatasetSnapshot = (datasetJson: string) =>
+  crypto.createHash("sha256").update(datasetJson).digest("hex");
+
+const writeGuidedDatasetSnapshot = async (artifactDir: string, datasetJson: string) => {
+  await fs.promises.mkdir(artifactDir, { recursive: true });
+  const targetPath = path.join(artifactDir, GUIDED_DATASET_FILE_NAME);
+  const temporaryPath = `${targetPath}.tmp-${crypto.randomUUID()}`;
+  await Bun.write(temporaryPath, datasetJson);
+  fs.renameSync(temporaryPath, targetPath);
+  return targetPath;
+};
+
+const buildBaseRunFingerprint = async (
+  experimentId: number,
+  studentId: number,
+  body: TrainInput,
+) => {
+  const fingerprint: Record<string, string> = {};
+  if (!body.models) return fingerprint;
+  for (const baseModel of parseRequestedBaseModels(body.models)) {
+    const activeRun = await getActiveModelTrainingRun(experimentId, studentId, baseModel);
+    fingerprint[baseModel] = activeRun?.run_id ?? "legacy";
+  }
+  return fingerprint;
+};
 
 const parseJsonColumn = <T>(value: unknown, fallback: T): T => {
   if (value === null || value === undefined) {
@@ -974,16 +1018,18 @@ const buildEnsemblePythonParams = (
   return pythonParams;
 };
 
-const buildAvailableBaseModelArtifactMap = (
+const buildAvailableBaseModelArtifactMap = async (
   experimentId: number,
   studentId: number,
   modelsValue: string,
-): Partial<Record<BaseModelType, string>> => {
+): Promise<Partial<Record<BaseModelType, string>>> => {
   const requestedModels = parseRequestedBaseModels(modelsValue);
   const availableModelFiles: Partial<Record<BaseModelType, string>> = {};
 
   for (const modelName of requestedModels) {
-    const modelPath = getBacktestModelPath(experimentId, studentId, modelName);
+    const activeRun = await getActiveModelTrainingRun(experimentId, studentId, modelName);
+    const modelPath = activeRun?.artifact_path
+      ?? getBacktestModelPath(experimentId, studentId, modelName);
     if (hasSavedModelArtifact(modelName, modelPath)) {
       availableModelFiles[modelName] = modelPath;
     }
@@ -1294,8 +1340,25 @@ const buildGuidedTrainingSessionPayload = (
     step_outputs: stepOutputs,
     result,
     error_message: row.error_message,
+    experiment_state_version: row.experiment_state_version === null
+      ? null
+      : Number(row.experiment_state_version),
   };
 };
+
+const buildCanonicalTrainingBody = (
+  body: TrainInput,
+  trainingConfig: ExperimentTrainingConfig,
+): TrainInput => ({
+  ...body,
+  selected_industry: trainingConfig.selected_industry,
+  selected_company: trainingConfig.selected_company,
+  selected_product: trainingConfig.selected_product,
+  data_window_train_start_index: trainingConfig.data_window_train_start_index,
+  data_window_train_end_index: trainingConfig.data_window_train_end_index,
+  data_window_evaluate_start_index: trainingConfig.data_window_evaluate_start_index,
+  data_window_evaluate_end_index: trainingConfig.data_window_evaluate_end_index,
+});
 
 const fetchGuidedTrainingSessionRow = async (
   sessionId: string,
@@ -1306,6 +1369,8 @@ const fetchGuidedTrainingSessionRow = async (
             student_id,
             model_type,
             request_hash,
+            dataset_revision,
+            runtime_revision,
             request_payload,
             status,
             current_step_id,
@@ -1314,7 +1379,9 @@ const fetchGuidedTrainingSessionRow = async (
             step_plan,
             result_payload,
             artifact_dir,
-            error_message
+            error_message,
+            experiment_state_version,
+            updated_at
        FROM model_guided_training_sessions
       WHERE session_id = ?
       LIMIT 1`,
@@ -1328,36 +1395,25 @@ const buildGuidedTrainingPythonParams = async (
   modelType: GuidedModelType,
   studentId: number,
   body: TrainInput,
+  artifactDir: string,
 ): Promise<Record<string, unknown>> => {
   const experiment = await assertExperimentModelAccess(body.experiment_id, studentId);
   assertTrainingRequestMatchesExperiment(experiment, body);
   const trainingConfig = getExperimentTrainingConfig(experiment);
+  const canonicalBody = buildCanonicalTrainingBody(body, trainingConfig);
   if (modelType === "ma") {
-    validateMovingAverageWindow(trainingConfig, body.moving_average_window);
-  }
-  if (isEnsembleModelType(modelType)) {
-    buildEnsemblePythonParams(experiment, body);
+    validateMovingAverageWindow(trainingConfig, canonicalBody.moving_average_window);
   }
   const derivedModelParams: Record<string, unknown> = isEnsembleModelType(modelType)
     ? buildEnsemblePythonParams(experiment, body)
     : {};
-
-  const allData = await loadDatasetFromDb(
-    trainingConfig.selected_industry,
-    trainingConfig.selected_company,
-    trainingConfig.selected_product,
-  );
-
-  if (
-    trainingConfig.data_window_train_end_index >= allData.length
-    || trainingConfig.data_window_evaluate_end_index >= allData.length
-  ) {
-    throw new ModelValidationError("数据窗口索引超出范围", { dataset_size: allData.length });
+  const datasetFile = path.join(artifactDir, GUIDED_DATASET_FILE_NAME);
+  if (!fs.existsSync(datasetFile)) {
+    throw new ModelNotFoundError("训练数据快照已丢失，请重新创建训练会话");
   }
-
-  const modelSaveLoc = getBacktestModelPath(body.experiment_id, studentId, modelType);
+  const modelSaveLoc = getGuidedSessionModelPath(artifactDir, modelType);
   const pythonParams: Record<string, unknown> = {
-    data: JSON.stringify(allData),
+    dataFile: datasetFile,
     trainStart: trainingConfig.data_window_train_start_index,
     trainEnd: trainingConfig.data_window_train_end_index,
     evalStart: trainingConfig.data_window_evaluate_start_index,
@@ -1375,13 +1431,71 @@ const buildGuidedTrainingPythonParams = async (
 
   Object.assign(pythonParams, derivedModelParams);
   if (isEnsembleModelType(modelType) && body.models) {
-    const baseModelArtifactMap = buildAvailableBaseModelArtifactMap(body.experiment_id, studentId, body.models);
+    const baseModelArtifactMap = await buildAvailableBaseModelArtifactMap(body.experiment_id, studentId, body.models);
     if (Object.keys(baseModelArtifactMap).length > 0) {
       pythonParams.baseModelFiles = JSON.stringify(baseModelArtifactMap);
     }
   }
 
   return pythonParams;
+};
+
+const materializeCompletedGuidedTrainingRun = async (row: GuidedTrainingSessionRow) => {
+  const body = parseJsonColumn<TrainInput>(row.request_payload, {} as TrainInput);
+  const result = parseJsonColumn<GuidedTrainingSessionPayload["result"]>(row.result_payload, null);
+  if (!result) {
+    throw new ModelValidationError("已完成训练会话缺少结果，无法恢复");
+  }
+
+  const sourceModelPath = getGuidedSessionModelPath(row.artifact_dir, row.model_type);
+  if (!await hasReusableSavedModelArtifact(row.model_type, sourceModelPath)) {
+    throw new ModelNotFoundError("分阶段训练产物已过期或已被清理，请重新开始分阶段训练");
+  }
+  const versionedArtifactPath = buildVersionedModelPath(
+    row.experiment_id,
+    row.student_id,
+    row.model_type,
+    row.session_id,
+    "backtest",
+  );
+  if (!await hasReusableSavedModelArtifact(row.model_type, versionedArtifactPath)) {
+    await copyModelArtifact(row.model_type, sourceModelPath, versionedArtifactPath);
+  }
+  result.results.saved_model = versionedArtifactPath;
+
+  const completedStepIds = parseJsonColumn<string[]>(row.completed_step_ids, []);
+  const stepOutputs = parseJsonColumn<Record<string, unknown>>(row.step_outputs, {});
+  const stepPlan = getGuidedTrainingSteps(row);
+  const committed = await commitModelTrainingRun({
+    runId: row.session_id,
+    sessionId: row.session_id,
+    experimentId: row.experiment_id,
+    studentId: row.student_id,
+    modelType: row.model_type,
+    requestHash: row.request_hash,
+    datasetRevision: row.dataset_revision,
+    runtimeRevision: row.runtime_revision,
+    body,
+    result,
+    artifactPath: versionedArtifactPath,
+    guidedSession: {
+      sessionId: row.session_id,
+      currentStepId: null,
+      completedStepIds,
+      stepOutputs,
+      stepPlan,
+      result,
+    },
+  });
+  row.result_payload = JSON.stringify(result);
+  row.experiment_state_version = committed.stateVersion;
+  return row;
+};
+
+const isDuplicateGuidedTrainingRequestError = (error: unknown) => {
+  if (!error || typeof error !== "object") return false;
+  const candidate = error as { code?: string; errno?: number };
+  return candidate.code === "ER_DUP_ENTRY" || candidate.errno === 1062;
 };
 
 export async function createOrResumeGuidedTrainingSession(
@@ -1396,17 +1510,45 @@ export async function createOrResumeGuidedTrainingSession(
   const experiment = await assertExperimentModelAccess(body.experiment_id, studentId);
   assertTrainingRequestMatchesExperiment(experiment, body);
   const trainingConfig = getExperimentTrainingConfig(experiment);
+  const canonicalBody = buildCanonicalTrainingBody(body, trainingConfig);
   if (modelType === "ma") {
-    validateMovingAverageWindow(trainingConfig, body.moving_average_window);
+    validateMovingAverageWindow(trainingConfig, canonicalBody.moving_average_window);
   }
 
-  const requestHash = hashGuidedTrainingRequest(modelType, body);
+  const allData = await loadDatasetFromDb(
+    trainingConfig.selected_industry,
+    trainingConfig.selected_company,
+    trainingConfig.selected_product,
+  );
+  if (
+    trainingConfig.data_window_train_end_index >= allData.length
+    || trainingConfig.data_window_evaluate_end_index >= allData.length
+  ) {
+    throw new ModelValidationError("数据窗口索引超出范围", { dataset_size: allData.length });
+  }
+  const datasetJson = JSON.stringify(allData);
+  const datasetRevision = hashDatasetSnapshot(datasetJson);
+  const runtimeRevision = getModelRuntimeRevision();
+  const baseRunFingerprint = isEnsembleModelType(modelType)
+    ? await buildBaseRunFingerprint(canonicalBody.experiment_id, studentId, canonicalBody)
+    : {};
+  const experimentRevision = buildExperimentTrainingRevision(modelType, experiment, canonicalBody);
+  const requestHash = buildModelTrainingRequestHash({
+    modelType,
+    body: canonicalBody,
+    datasetRevision,
+    runtimeRevision,
+    experimentRevision,
+    baseRunFingerprint,
+  });
   const [existingRows] = await pool.query<GuidedTrainingSessionRow[]>(
     `SELECT session_id,
             experiment_id,
             student_id,
             model_type,
             request_hash,
+            dataset_revision,
+            runtime_revision,
             request_payload,
             status,
             current_step_id,
@@ -1415,31 +1557,39 @@ export async function createOrResumeGuidedTrainingSession(
             step_plan,
             result_payload,
             artifact_dir,
-            error_message
+            error_message,
+            experiment_state_version,
+            updated_at
        FROM model_guided_training_sessions
       WHERE experiment_id = ?
         AND student_id = ?
         AND model_type = ?
         AND request_hash = ?
       LIMIT 1`,
-    [body.experiment_id, studentId, modelType, requestHash],
+    [canonicalBody.experiment_id, studentId, modelType, requestHash],
   );
 
   const existingSession = existingRows[0];
   if (existingSession) {
     if (existingSession.status === "running") {
-      await pool.query(
+      const staleAfterSeconds = Math.ceil(TIMEOUTS.MODEL_TRAINING / 1000) + 30;
+      const [resetResult] = await pool.query(
         `UPDATE model_guided_training_sessions
-            SET status = 'ready'
-          WHERE session_id = ?`,
-        [existingSession.session_id],
+            SET status = 'ready',
+                error_message = NULL
+          WHERE session_id = ?
+            AND status = 'running'
+            AND updated_at < DATE_SUB(NOW(), INTERVAL ? SECOND)`,
+        [existingSession.session_id, staleAfterSeconds],
       );
-      existingSession.status = "ready";
+      if (Number((resetResult as { affectedRows?: number }).affectedRows ?? 0) === 1) {
+        existingSession.status = "ready";
+      }
     }
     if (existingSession.status === "completed") {
       try {
-        await restoreGuidedSessionBacktestArtifact(existingSession);
-        return buildGuidedTrainingSessionPayload(existingSession);
+        const restoredSession = await materializeCompletedGuidedTrainingRun(existingSession);
+        return buildGuidedTrainingSessionPayload(restoredSession);
       } catch (error) {
         if (!(error instanceof ModelNotFoundError)) {
           throw error;
@@ -1459,24 +1609,32 @@ export async function createOrResumeGuidedTrainingSession(
         }
       }
     } else {
+      const datasetFile = path.join(existingSession.artifact_dir, GUIDED_DATASET_FILE_NAME);
+      if (!fs.existsSync(datasetFile)) {
+        await writeGuidedDatasetSnapshot(existingSession.artifact_dir, datasetJson);
+      }
       return buildGuidedTrainingSessionPayload(existingSession);
     }
   }
 
   const sessionId = crypto.randomUUID();
-  const artifactDir = buildGuidedTrainingArtifactDir(body.experiment_id, studentId, modelType, sessionId);
+  const artifactDir = buildGuidedTrainingArtifactDir(canonicalBody.experiment_id, studentId, modelType, sessionId);
   fs.mkdirSync(artifactDir, { recursive: true });
+  await writeGuidedDatasetSnapshot(artifactDir, datasetJson);
 
   const completedStepIds: string[] = [];
-  const stepPlan = buildGuidedTrainingStepPlan(modelType, body);
+  const stepPlan = buildGuidedTrainingStepPlan(modelType, canonicalBody);
   const currentStepId = getGuidedNextStepId(stepPlan, completedStepIds);
-  await pool.query(
-    `INSERT INTO model_guided_training_sessions
+  try {
+    await pool.query(
+      `INSERT INTO model_guided_training_sessions
        (session_id,
         experiment_id,
         student_id,
         model_type,
         request_hash,
+        dataset_revision,
+        runtime_revision,
         request_payload,
         status,
         current_step_id,
@@ -1486,21 +1644,39 @@ export async function createOrResumeGuidedTrainingSession(
         result_payload,
         artifact_dir,
         expires_at)
-     VALUES (?, ?, ?, ?, ?, ?, 'ready', ?, ?, ?, ?, NULL, ?, DATE_ADD(NOW(), INTERVAL 7 DAY))`,
-    [
-      sessionId,
-      body.experiment_id,
-      studentId,
-      modelType,
-      requestHash,
-      JSON.stringify(body),
-      currentStepId,
-      JSON.stringify(completedStepIds),
-      JSON.stringify({}),
-      JSON.stringify(stepPlan),
-      artifactDir,
-    ],
-  );
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'ready', ?, ?, ?, ?, NULL, ?, DATE_ADD(NOW(), INTERVAL 7 DAY))`,
+      [
+        sessionId,
+        canonicalBody.experiment_id,
+        studentId,
+        modelType,
+        requestHash,
+        datasetRevision,
+        runtimeRevision,
+        JSON.stringify(canonicalBody),
+        currentStepId,
+        JSON.stringify(completedStepIds),
+        JSON.stringify({}),
+        JSON.stringify(stepPlan),
+        artifactDir,
+      ],
+    );
+  } catch (error) {
+    if (!isDuplicateGuidedTrainingRequestError(error)) throw error;
+    fs.rmSync(artifactDir, { recursive: true, force: true });
+    const [racedRows] = await pool.query<GuidedTrainingSessionRow[]>(
+      `SELECT *
+         FROM model_guided_training_sessions
+        WHERE experiment_id = ?
+          AND student_id = ?
+          AND model_type = ?
+          AND request_hash = ?
+        LIMIT 1`,
+      [canonicalBody.experiment_id, studentId, modelType, requestHash],
+    );
+    if (racedRows[0]) return buildGuidedTrainingSessionPayload(racedRows[0]);
+    throw error;
+  }
 
   const row = await fetchGuidedTrainingSessionRow(sessionId);
   if (!row) {
@@ -1530,7 +1706,10 @@ export async function getGuidedTrainingSession(
 
   await assertExperimentModelAccess(row.experiment_id, studentId);
   if (row.status === "completed") {
-    await restoreGuidedSessionBacktestArtifact(row);
+    const sourceModelPath = getGuidedSessionModelPath(row.artifact_dir, row.model_type);
+    if (!await hasReusableSavedModelArtifact(row.model_type, sourceModelPath)) {
+      throw new ModelNotFoundError("分阶段训练产物已过期或已被清理");
+    }
   }
   return buildGuidedTrainingSessionPayload(row);
 }
@@ -1555,8 +1734,8 @@ export async function runGuidedTrainingStep(
   }
 
   if (row.status === "completed") {
-    await restoreGuidedSessionBacktestArtifact(row);
-    return buildGuidedTrainingSessionPayload(row);
+    const restoredRow = await materializeCompletedGuidedTrainingRun(row);
+    return buildGuidedTrainingSessionPayload(restoredRow);
   }
 
   const body = parseJsonColumn<TrainInput>(row.request_payload, {} as TrainInput);
@@ -1597,7 +1776,7 @@ export async function runGuidedTrainingStep(
     sessionMarkedRunning = true;
 
     const sessionModelPath = getGuidedSessionModelPath(row.artifact_dir, modelType);
-    const pythonParams = await buildGuidedTrainingPythonParams(modelType, studentId, body);
+    const pythonParams = await buildGuidedTrainingPythonParams(modelType, studentId, body, row.artifact_dir);
     pythonParams.saveModel = sessionModelPath;
     const stateFilePath = buildGuidedTrainingStatePath(row.experiment_id, studentId, modelType, sessionId);
     const pythonStepResult = await runPythonGuidedTrainingStep(
@@ -1619,11 +1798,18 @@ export async function runGuidedTrainingStep(
       : stepPlan;
 
     let transformedResult: ReturnType<typeof transformTrainingResult> | null = null;
+    let versionedArtifactPath: string | null = null;
     if (pythonStepResult.final_result) {
-      const backtestModelPath = await restoreGuidedSessionBacktestArtifact(row, {
-        invalidateProductionArtifact: true,
-      });
-      pythonStepResult.final_result.saved_model = backtestModelPath;
+      const sourceModelPath = getGuidedSessionModelPath(row.artifact_dir, row.model_type);
+      versionedArtifactPath = buildVersionedModelPath(
+        row.experiment_id,
+        row.student_id,
+        row.model_type,
+        row.session_id,
+        "backtest",
+      );
+      await copyModelArtifact(row.model_type, sourceModelPath, versionedArtifactPath);
+      pythonStepResult.final_result.saved_model = versionedArtifactPath;
       transformedResult = transformTrainingResult(modelType, pythonStepResult.final_result);
     }
 
@@ -1632,8 +1818,31 @@ export async function runGuidedTrainingStep(
       ? null
       : getGuidedNextStepId(nextStepPlan, nextCompletedStepIds);
 
-    await pool.query(
-      `UPDATE model_guided_training_sessions
+    if (transformedResult && versionedArtifactPath) {
+      await commitModelTrainingRun({
+        runId: row.session_id,
+        sessionId: row.session_id,
+        experimentId: row.experiment_id,
+        studentId: row.student_id,
+        modelType: row.model_type,
+        requestHash: row.request_hash,
+        datasetRevision: row.dataset_revision,
+        runtimeRevision: row.runtime_revision,
+        body,
+        result: transformedResult,
+        artifactPath: versionedArtifactPath,
+        guidedSession: {
+          sessionId,
+          currentStepId,
+          completedStepIds: nextCompletedStepIds,
+          stepOutputs: nextStepOutputs,
+          stepPlan: nextStepPlan,
+          result: transformedResult,
+        },
+      });
+    } else {
+      await pool.query(
+        `UPDATE model_guided_training_sessions
           SET status = ?,
               current_step_id = ?,
               completed_step_ids = ?,
@@ -1650,8 +1859,10 @@ export async function runGuidedTrainingStep(
         JSON.stringify(nextStepPlan),
         transformedResult ? JSON.stringify(transformedResult) : null,
         sessionId,
-      ],
-    );
+        ],
+      );
+    }
+    sessionMarkedRunning = false;
 
     const updatedRow = await fetchGuidedTrainingSessionRow(sessionId);
     if (!updatedRow) {
@@ -1694,14 +1905,15 @@ export async function trainModel(
   const experiment = await assertExperimentModelAccess(body.experiment_id, studentId);
   assertTrainingRequestMatchesExperiment(experiment, body);
   const trainingConfig = getExperimentTrainingConfig(experiment);
+  const canonicalBody = buildCanonicalTrainingBody(body, trainingConfig);
   if (modelType === "ma") {
-    validateMovingAverageWindow(trainingConfig, body.moving_average_window);
+    validateMovingAverageWindow(trainingConfig, canonicalBody.moving_average_window);
   }
   const derivedModelParams: Record<string, unknown> = isEnsembleModelType(modelType)
     ? buildEnsemblePythonParams(experiment, body)
     : {};
   if (isEnsembleModelType(modelType) && body.models) {
-    const baseModelArtifactMap = buildAvailableBaseModelArtifactMap(body.experiment_id, studentId, body.models);
+    const baseModelArtifactMap = await buildAvailableBaseModelArtifactMap(body.experiment_id, studentId, body.models);
     if (Object.keys(baseModelArtifactMap).length > 0) {
       derivedModelParams.baseModelFiles = JSON.stringify(baseModelArtifactMap);
       reportModelProgress(progressReporter, {
@@ -1742,10 +1954,35 @@ export async function trainModel(
     message: "实验数据已加载，正在准备 Python 训练参数",
   });
 
-  const modelSaveLoc = getBacktestModelPath(body.experiment_id, studentId, modelType);
+  const datasetJson = JSON.stringify(allData);
+  const datasetRevision = hashDatasetSnapshot(datasetJson);
+  const runtimeRevision = getModelRuntimeRevision();
+  const baseRunFingerprint = isEnsembleModelType(modelType)
+    ? await buildBaseRunFingerprint(canonicalBody.experiment_id, studentId, canonicalBody)
+    : {};
+  const experimentRevision = buildExperimentTrainingRevision(modelType, experiment, canonicalBody);
+  const requestHash = buildModelTrainingRequestHash({
+    modelType,
+    body: canonicalBody,
+    datasetRevision,
+    runtimeRevision,
+    experimentRevision,
+    baseRunFingerprint,
+  });
+  const runId = crypto.randomUUID();
+  const modelSaveLoc = buildVersionedModelPath(
+    body.experiment_id,
+    studentId,
+    modelType,
+    runId,
+    "backtest",
+  );
+  const snapshotDir = fs.mkdtempSync(path.join(os.tmpdir(), "fz-training-snapshot-"));
+  const dataFile = path.join(snapshotDir, GUIDED_DATASET_FILE_NAME);
+  await Bun.write(dataFile, datasetJson);
 
   const pythonParams: Record<string, unknown> = {
-    data: JSON.stringify(allData),
+    dataFile,
     trainStart: trainingConfig.data_window_train_start_index,
     trainEnd: trainingConfig.data_window_train_end_index,
     evalStart: trainingConfig.data_window_evaluate_start_index,
@@ -1767,7 +2004,12 @@ export async function trainModel(
   }
 
   const timeout = TRAINING_TIMEOUT;
-  const result = (await runPythonModel(modelType, pythonParams, timeout, progressReporter)) as Record<string, unknown>;
+  let result: Record<string, unknown>;
+  try {
+    result = (await runPythonModel(modelType, pythonParams, timeout, progressReporter)) as Record<string, unknown>;
+  } finally {
+    fs.rmSync(snapshotDir, { recursive: true, force: true });
+  }
   reportModelProgress(progressReporter, {
     type: "phase",
     phase: "invalidate_production_artifact",
@@ -1775,8 +2017,6 @@ export async function trainModel(
     source: "backend",
     message: "训练结果已生成，正在更新模型产物状态",
   });
-  invalidateProductionArtifact(body.experiment_id, studentId, modelType);
-
   reportModelProgress(progressReporter, {
     type: "phase",
     phase: "transform_result",
@@ -1784,7 +2024,21 @@ export async function trainModel(
     source: "backend",
     message: "正在整理评估指标、预测值和模型元数据",
   });
-  return transformTrainingResult(modelType, result);
+  const transformedResult = transformTrainingResult(modelType, result);
+  await commitModelTrainingRun({
+    runId,
+    sessionId: null,
+    experimentId: canonicalBody.experiment_id,
+    studentId,
+    modelType,
+    requestHash,
+    datasetRevision,
+    runtimeRevision,
+    body: canonicalBody,
+    result: transformedResult,
+    artifactPath: modelSaveLoc,
+  });
+  return transformedResult;
 }
 
 export async function getReusableProductionModelArtifactResult(
@@ -1795,7 +2049,13 @@ export async function getReusableProductionModelArtifactResult(
   const experiment = await assertExperimentModelAccess(experimentId, studentId);
   assertModelReadyForProduction(experiment, modelType);
 
-  const productionModelPath = getProductionModelPath(experimentId, studentId, modelType);
+  const activeRun = await getActiveModelTrainingRun(experimentId, studentId, modelType);
+  const productionModelPath = activeRun
+    ? activeRun.production_artifact_path
+    : getProductionModelPath(experimentId, studentId, modelType);
+  if (!productionModelPath) {
+    return null;
+  }
   if (!await hasReusableSavedModelArtifact(modelType, productionModelPath)) {
     return null;
   }
@@ -1824,8 +2084,12 @@ export async function prepareExperimentModelForProduction(
   assertModelReadyForProduction(experiment, modelType);
   const trainingConfig = getExperimentTrainingConfig(experiment);
 
-  const productionModelPath = getProductionModelPath(experimentId, studentId, modelType);
-  const backtestModelPath = getBacktestModelPath(experimentId, studentId, modelType);
+  const activeRun = await getActiveModelTrainingRun(experimentId, studentId, modelType);
+  const productionModelPath = activeRun
+    ? buildVersionedModelPath(experimentId, studentId, modelType, activeRun.run_id, "production")
+    : getProductionModelPath(experimentId, studentId, modelType);
+  const backtestModelPath = activeRun?.artifact_path
+    ?? getBacktestModelPath(experimentId, studentId, modelType);
   if (!hasSavedModelArtifact(modelType, backtestModelPath)) {
     throw new ModelNotFoundError(`未找到该实验的已训练 ${modelType.toUpperCase()} 回测模型`);
   }
@@ -1840,10 +2104,11 @@ export async function prepareExperimentModelForProduction(
     throw new ModelValidationError("数据窗口索引超出范围", { dataset_size: allData.length });
   }
 
-  invalidateProductionArtifact(experimentId, studentId, modelType);
-
+  const snapshotDir = fs.mkdtempSync(path.join(os.tmpdir(), "fz-production-snapshot-"));
+  const dataFile = path.join(snapshotDir, GUIDED_DATASET_FILE_NAME);
+  await Bun.write(dataFile, JSON.stringify(allData));
   const pythonParams: Record<string, unknown> = {
-    data: JSON.stringify(allData),
+    dataFile,
     trainStart: trainingConfig.data_window_train_start_index,
     trainEnd: trainingConfig.data_window_evaluate_end_index,
     saveModel: productionModelPath,
@@ -1852,7 +2117,17 @@ export async function prepareExperimentModelForProduction(
     pretty: true,
   };
 
-  await runPythonModel(modelType, pythonParams, TRAINING_TIMEOUT);
+  try {
+    await runPythonModel(modelType, pythonParams, TRAINING_TIMEOUT);
+  } finally {
+    fs.rmSync(snapshotDir, { recursive: true, force: true });
+  }
+  if (activeRun) {
+    const recorded = await setProductionArtifactForRun(activeRun.run_id, productionModelPath);
+    if (!recorded) {
+      throw new ModelValidationError("模型版本已变化，已放弃本次生产模型，请重试");
+    }
+  }
 
   return {
     status: "success",
@@ -2047,14 +2322,12 @@ export async function predictExperimentModel(
   const experiment = await assertExperimentModelAccess(experimentId, studentId);
   assertModelReadyForProduction(experiment, modelType);
 
-  const productionModelPath = getProductionModelPath(experimentId, studentId, modelType);
-  if (!await hasReusableSavedModelArtifact(modelType, productionModelPath)) {
-    await prepareExperimentModelForProduction(modelType, studentId, experimentId);
-  }
-
-  if (!await hasReusableSavedModelArtifact(modelType, productionModelPath)) {
+  const reusableArtifact = await prepareExperimentModelForProduction(modelType, studentId, experimentId);
+  const productionModelPath = reusableArtifact?.results.saved_model;
+  if (!productionModelPath || !await hasReusableSavedModelArtifact(modelType, productionModelPath)) {
     throw new ModelNotFoundError(`未找到该实验的 ${modelType.toUpperCase()} 生产预测模型`);
   }
+  const predictionRun = await getActiveModelTrainingRun(experimentId, studentId, modelType);
 
   const pythonParams = {
     loadModel: productionModelPath,
@@ -2063,6 +2336,12 @@ export async function predictExperimentModel(
   };
 
   const result = (await runPythonModel(modelType, pythonParams, TIMEOUTS.MODEL_PREDICTION)) as Record<string, unknown>;
+  if (predictionRun) {
+    const currentRun = await getActiveModelTrainingRun(experimentId, studentId, modelType);
+    if (currentRun?.run_id !== predictionRun.run_id) {
+      throw new ModelValidationError("预测期间模型版本已变化，请重新预测");
+    }
+  }
 
   return {
     status: "success",

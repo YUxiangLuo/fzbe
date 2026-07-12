@@ -70,36 +70,50 @@ const optionalBoolean = z.preprocess(booleanPreprocess, z.boolean()).nullable().
 const optionalString = z.preprocess(stringPreprocess, z.string()).nullable().optional();
 const optionalJson = z.preprocess(jsonPreprocess, z.union([z.array(z.any()), z.record(z.string(), z.any()), z.string()])).nullable().optional();
 
-const optionalFields: Record<string, z.ZodTypeAny> = {
+const studentWritableFields: Record<string, z.ZodTypeAny> = {
   highest_completed_step: optionalInt(0, 7),
   selected_industry: optionalString, selected_company: optionalString, selected_product: optionalString,
   selected_base_models: optionalJson, selected_ensemble_models: optionalJson,
   data_window_train_start_index: optionalInt(0), data_window_train_end_index: optionalInt(0),
   data_window_evaluate_start_index: optionalInt(0), data_window_evaluate_end_index: optionalInt(0),
-  moving_average_completed: optionalBoolean, moving_average_window: optionalInt(2),
-  moving_average_metrics_rmse: optionalFloat(0), moving_average_metrics_mae: optionalFloat(0), moving_average_metrics_r2: optionalFloat(),
-  exponential_smoothing_completed: optionalBoolean, exponential_smoothing_alpha: optionalFloat(0),
-  exponential_smoothing_metrics_rmse: optionalFloat(0), exponential_smoothing_metrics_mae: optionalFloat(0), exponential_smoothing_metrics_r2: optionalFloat(),
-  arima_completed: optionalBoolean, arima_p: optionalInt(0), arima_d: optionalInt(0), arima_q: optionalInt(0),
-  arima_metrics_rmse: optionalFloat(0), arima_metrics_mae: optionalFloat(0), arima_metrics_r2: optionalFloat(), arima_adf_stationarity: optionalJson,
-  lstm_completed: optionalBoolean, lstm_normalization: z.preprocess(stringPreprocess, z.enum(NORMALIZATION_VALUES)).nullable().optional(),
+  moving_average_window: optionalInt(2),
+  exponential_smoothing_alpha: optionalFloat(0),
+  arima_d: optionalInt(0, 2), arima_adf_stationarity: optionalJson,
+  lstm_normalization: z.preprocess(stringPreprocess, z.enum(NORMALIZATION_VALUES)).nullable().optional(),
   lstm_features: optionalJson, lstm_target_field: optionalString,
-  lstm_metrics_rmse: optionalFloat(0), lstm_metrics_mae: optionalFloat(0), lstm_metrics_r2: optionalFloat(),
-  ensemble_weighted_completed: optionalBoolean, ensemble_weighted_base_models: optionalJson,
-  ensemble_weighted_metrics_rmse: optionalFloat(0), ensemble_weighted_metrics_mae: optionalFloat(0), ensemble_weighted_metrics_r2: optionalFloat(),
-  ensemble_boosting_completed: optionalBoolean, ensemble_boosting_base_models: optionalJson,
-  ensemble_boosting_metrics_rmse: optionalFloat(0), ensemble_boosting_metrics_mae: optionalFloat(0), ensemble_boosting_metrics_r2: optionalFloat(),
-  ensemble_stacking_completed: optionalBoolean, ensemble_stacking_base_models: optionalJson,
-  ensemble_stacking_metrics_rmse: optionalFloat(0), ensemble_stacking_metrics_mae: optionalFloat(0), ensemble_stacking_metrics_r2: optionalFloat(),
+  ensemble_weighted_base_models: optionalJson,
+  ensemble_boosting_base_models: optionalJson,
+  ensemble_stacking_base_models: optionalJson,
   selected_best_model: z.preprocess(stringPreprocess, z.enum(BEST_MODEL_VALUES)).nullable().optional(),
-  quiz_about_model_completed: optionalBoolean, quiz_about_plan_completed: optionalBoolean,
   production_plan_completed: optionalBoolean, production_forecast_periods: optionalInt(1),
   production_initial_inventory: optionalFloat(0), production_target_service_level: optionalFloat(0), production_safety_stock_z_score: optionalFloat(),
   production_mps_table: optionalJson, production_forecast_results: optionalJson,
   production_capacity_mode: z.preprocess(stringPreprocess, z.enum(CAPACITY_MODE_VALUES)).nullable().optional(),
   production_capacity_scenario: z.preprocess(stringPreprocess, z.enum(CAPACITY_SCENARIO_VALUES)).nullable().optional(),
   production_capacity: optionalInt(0), production_custom_capacity: optionalInt(0),
-  start_time: optionalString, last_activity_at: optionalString, completion_time: optionalString, total_active_duration_seconds: optionalInt(0),
+};
+
+const studentInitialWritableFields: Record<string, z.ZodTypeAny> = {
+  highest_completed_step: studentWritableFields.highest_completed_step!,
+  selected_industry: studentWritableFields.selected_industry!,
+  selected_company: studentWritableFields.selected_company!,
+  selected_product: studentWritableFields.selected_product!,
+  selected_base_models: studentWritableFields.selected_base_models!,
+  selected_ensemble_models: studentWritableFields.selected_ensemble_models!,
+  data_window_train_start_index: studentWritableFields.data_window_train_start_index!,
+  data_window_train_end_index: studentWritableFields.data_window_train_end_index!,
+  data_window_evaluate_start_index: studentWritableFields.data_window_evaluate_start_index!,
+  data_window_evaluate_end_index: studentWritableFields.data_window_evaluate_end_index!,
+  moving_average_window: studentWritableFields.moving_average_window!,
+  exponential_smoothing_alpha: studentWritableFields.exponential_smoothing_alpha!,
+  arima_d: studentWritableFields.arima_d!,
+  arima_adf_stationarity: studentWritableFields.arima_adf_stationarity!,
+  lstm_normalization: studentWritableFields.lstm_normalization!,
+  lstm_features: studentWritableFields.lstm_features!,
+  lstm_target_field: studentWritableFields.lstm_target_field!,
+  ensemble_weighted_base_models: studentWritableFields.ensemble_weighted_base_models!,
+  ensemble_boosting_base_models: studentWritableFields.ensemble_boosting_base_models!,
+  ensemble_stacking_base_models: studentWritableFields.ensemble_stacking_base_models!,
 };
 
 export const experimentIdParamSchema = z.object({
@@ -107,16 +121,15 @@ export const experimentIdParamSchema = z.object({
 });
 
 export const createExperimentSchema = z.object({
-  status: z.enum(STATUS_VALUES).optional(),
   current_step: optionalInt(1, 7),
-  ...optionalFields,
-});
+  ...studentInitialWritableFields,
+}).strict();
 
 export const updateExperimentSchema = z.object({
-  status: z.enum(STATUS_VALUES).optional(),
+  expected_version: z.coerce.number().int().min(0),
   current_step: optionalInt(1, 7),
-  ...optionalFields,
-}).refine((data) => Object.keys(data).length > 0, "至少需要提供一个字段");
+  ...studentWritableFields,
+}).strict().refine((data) => Object.keys(data).some((key) => key !== "expected_version"), "至少需要提供一个更新字段");
 
 export const experimentEventSchema = z.object({
   step_order: z.number().int().min(1).max(7),

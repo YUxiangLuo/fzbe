@@ -1,5 +1,9 @@
 import { PY_DIR, resolvePythonExecutable } from "./python";
 import { TIMEOUTS } from "./constants";
+import path from "node:path";
+import fs from "node:fs";
+import crypto from "node:crypto";
+import os from "node:os";
 
 export interface AdfInputPoint {
   month: string;
@@ -35,45 +39,43 @@ export class AdfValidationError extends Error {
  * @returns Promise<AdfResult> ADF 检验结果
  */
 export async function runAdf(data: AdfInputPoint[]): Promise<AdfResult> {
-  const jsonArg = JSON.stringify(data);
-  const pythonExec = resolvePythonExecutable();
-
-  const proc = Bun.spawn([pythonExec, "-m", "src.adf", jsonArg, "--pretty"], {
-    cwd: PY_DIR,
-    stdout: "pipe",
-    stderr: "pipe",
-  });
-
-  const timeoutMs = TIMEOUTS.ADF;
-  const timer = setTimeout(() => {
-    try { proc.kill("SIGKILL"); } catch {}
-  }, timeoutMs);
-
+  const inputPath = path.join(os.tmpdir(), `fz-adf-${crypto.randomUUID()}.json`);
   try {
-    const [stdout, stderr] = await Promise.all([
-      new Response(proc.stdout).text(),
-      new Response(proc.stderr).text(),
-    ]);
+    await Bun.write(inputPath, JSON.stringify(data));
+    const pythonExec = resolvePythonExecutable();
+    const proc = Bun.spawn([pythonExec, "-m", "src.adf", inputPath, "--pretty"], {
+      cwd: PY_DIR,
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    const timer = setTimeout(() => {
+      try { proc.kill("SIGKILL"); } catch {}
+    }, TIMEOUTS.ADF);
 
-    const exitCode = await proc.exited;
+    try {
+      const [stdout, stderr] = await Promise.all([
+        new Response(proc.stdout).text(),
+        new Response(proc.stderr).text(),
+      ]);
+      const exitCode = await proc.exited;
+      if (exitCode !== 0) {
+        const message = stderr.trim() || `Process exited with code ${exitCode}`;
+        throw new Error(`ADF 执行失败: ${message}`);
+      }
 
-    if (exitCode !== 0) {
-      const message = stderr.trim() || `Process exited with code ${exitCode}`;
-      throw new Error(`ADF 执行失败: ${message}`);
+      const parsed = JSON.parse(stdout) as AdfResult;
+      const validResults = parsed.filter((item) => !item.error);
+      if (validResults.length === 0) {
+        throw new AdfValidationError("数据量不足，无法进行 ADF 检测");
+      }
+      return validResults;
+    } catch (error) {
+      if (error instanceof Error) throw error;
+      throw new Error("Failed to parse ADF result");
+    } finally {
+      clearTimeout(timer);
     }
-
-    const parsed = JSON.parse(stdout) as AdfResult;
-    const validResults = parsed.filter((item) => !item.error);
-
-    if (validResults.length === 0) {
-      throw new AdfValidationError("数据量不足，无法进行 ADF 检测");
-    }
-
-    return validResults;
-  } catch (error) {
-    if (error instanceof Error) throw error;
-    throw new Error(`Failed to parse ADF result`);
   } finally {
-    clearTimeout(timer);
+    try { fs.unlinkSync(inputPath); } catch {}
   }
 }

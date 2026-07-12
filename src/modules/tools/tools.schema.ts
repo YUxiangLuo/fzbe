@@ -10,7 +10,7 @@ export const adfPointSchema = z.object({
 export const adfRequestSchema = z.object({
   series: z.array(adfPointSchema).min(4, {
     message: "series 至少需要包含 4 条数据点才能进行可靠的 ADF 检验",
-  }),
+  }).max(5000, { message: "series 最多允许 5000 条数据点" }),
 });
 
 export type AdfRequest = z.infer<typeof adfRequestSchema>;

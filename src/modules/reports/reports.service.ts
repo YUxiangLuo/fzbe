@@ -370,6 +370,7 @@ export async function submitReport(
           `UPDATE experiment_status
               SET status = 'Completed',
                   completion_time = NOW(),
+                  state_version = state_version + 1,
                   last_activity_at = NOW()
             WHERE experiment_id = ? AND student_id = ?`,
           [experimentId, studentId],

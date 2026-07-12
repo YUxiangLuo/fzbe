@@ -471,6 +471,7 @@ export async function submitAnswers(
                     WHEN status = 'Not Started' THEN 'In Progress'
                     ELSE status
                   END,
+                  state_version = state_version + 1,
                   last_activity_at = NOW(),
                   start_time = COALESCE(start_time, NOW())
             WHERE experiment_id = ? AND student_id = ?`,

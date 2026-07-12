@@ -2,10 +2,14 @@ import type { RowDataPacket, ResultSetHeader } from "mysql2/promise";
 import { pool } from "../../config";
 import type { CreateExperimentInput, UpdateExperimentInput, ExperimentEventInput } from "./experiments.schema";
 import { prepareStudentExperimentUpdate } from "./experiment-update-policy";
+import {
+  deactivateModelRunsForStudentUpdate,
+  getServerInvalidationPatch,
+} from "../models/model-run-store";
 
 const BOOLEAN_FIELDS = new Set(["moving_average_completed", "exponential_smoothing_completed", "arima_completed", "lstm_completed", "ensemble_weighted_completed", "ensemble_boosting_completed", "ensemble_stacking_completed", "quiz_about_model_completed", "quiz_about_plan_completed", "production_plan_completed"]);
 const JSON_FIELDS = new Set(["selected_base_models", "selected_ensemble_models", "arima_adf_stationarity", "lstm_features", "ensemble_weighted_base_models", "ensemble_boosting_base_models", "ensemble_stacking_base_models", "production_mps_table", "production_forecast_results"]);
-const INTEGER_FIELDS = new Set(["experiment_id", "student_id", "highest_completed_step", "current_step", "data_window_train_start_index", "data_window_train_end_index", "data_window_evaluate_start_index", "data_window_evaluate_end_index", "moving_average_window", "arima_p", "arima_d", "arima_q", "production_forecast_periods", "production_capacity", "production_custom_capacity", "total_active_duration_seconds"]);
+const INTEGER_FIELDS = new Set(["experiment_id", "student_id", "state_version", "highest_completed_step", "current_step", "data_window_train_start_index", "data_window_train_end_index", "data_window_evaluate_start_index", "data_window_evaluate_end_index", "moving_average_window", "arima_p", "arima_d", "arima_q", "production_forecast_periods", "production_capacity", "production_custom_capacity", "total_active_duration_seconds"]);
 const FLOAT_FIELDS = new Set(["moving_average_metrics_rmse", "moving_average_metrics_mae", "moving_average_metrics_r2", "exponential_smoothing_alpha", "exponential_smoothing_metrics_rmse", "exponential_smoothing_metrics_mae", "exponential_smoothing_metrics_r2", "arima_metrics_rmse", "arima_metrics_mae", "arima_metrics_r2", "lstm_metrics_rmse", "lstm_metrics_mae", "lstm_metrics_r2", "ensemble_weighted_metrics_rmse", "ensemble_weighted_metrics_mae", "ensemble_weighted_metrics_r2", "ensemble_boosting_metrics_rmse", "ensemble_boosting_metrics_mae", "ensemble_boosting_metrics_r2", "ensemble_stacking_metrics_rmse", "ensemble_stacking_metrics_mae", "ensemble_stacking_metrics_r2", "production_initial_inventory", "production_target_service_level", "production_safety_stock_z_score"]);
 const datetimeFields = new Set(["start_time", "last_activity_at", "completion_time"]);
 const BASE_MODEL_SELECTION_ORDER = ["moving_average", "exponential_smoothing", "arima", "lstm"] as const;
@@ -29,6 +33,15 @@ const ENSEMBLE_MODEL_SELECTION_ALIASES: Record<string, (typeof ENSEMBLE_MODEL_SE
   stacking_ensemble: "stacking_ensemble",
   ensemble_stacking: "stacking_ensemble",
   stacking: "stacking_ensemble",
+};
+const BEST_MODEL_COMPLETION_FIELDS: Record<string, string> = {
+  ma: "moving_average_completed",
+  exp: "exponential_smoothing_completed",
+  arima: "arima_completed",
+  lstm: "lstm_completed",
+  ensemble_weighted: "ensemble_weighted_completed",
+  ensemble_boosting: "ensemble_boosting_completed",
+  ensemble_stacking: "ensemble_stacking_completed",
 };
 const MODEL_SELECTION_JSON_FIELDS = new Set([
   "selected_base_models",
@@ -273,7 +286,22 @@ export async function updateExperiment(experimentId: number, studentId: number, 
       return { error: "forbidden" as const };
     }
 
+    if (row.status === "Completed") {
+      await connection.rollback();
+      return { error: "completed" as const };
+    }
+
+    const expectedVersion = data.expected_version;
+    if (Number(row.state_version ?? 0) !== expectedVersion) {
+      await connection.rollback();
+      return {
+        error: "conflict" as const,
+        data: normalizeExperimentRow(row),
+      };
+    }
+
     const sanitized = sanitizeForDb(data);
+    delete sanitized.expected_version;
     const preparedUpdate = prepareStudentExperimentUpdate(row as typeof row & {
       status: string;
       start_time: string | Date | null;
@@ -285,12 +313,56 @@ export async function updateExperiment(experimentId: number, studentId: number, 
       return preparedUpdate;
     }
 
-    const columns = Object.keys(preparedUpdate.data);
+    const valuesEqual = (left: unknown, right: unknown) => {
+      if (left === right) return true;
+      if (left === null || left === undefined || right === null || right === undefined) return false;
+      if (typeof left === "object" || typeof right === "object") {
+        try {
+          const parse = (value: unknown) => typeof value === "string" ? JSON.parse(value) : value;
+          return JSON.stringify(parse(left)) === JSON.stringify(parse(right));
+        } catch {
+          return false;
+        }
+      }
+      return String(left) === String(right);
+    };
+    const changedFields = new Set(
+      Object.keys(sanitized).filter((field) => !valuesEqual(sanitized[field], row[field])),
+    );
+    const invalidation = getServerInvalidationPatch(changedFields);
+    const requestedBestModel = sanitized.selected_best_model;
+    if (typeof requestedBestModel === "string") {
+      const completionField = BEST_MODEL_COMPLETION_FIELDS[requestedBestModel];
+      if (!completionField) {
+        await connection.rollback();
+        return { error: "invalid_best_model" as const };
+      }
+      const effectiveCompletion = invalidation.patch[completionField] ?? row[completionField];
+      if (effectiveCompletion !== true && Number(effectiveCompletion) !== 1) {
+        await connection.rollback();
+        return { error: "invalid_best_model" as const };
+      }
+    }
+    await deactivateModelRunsForStudentUpdate(
+      connection,
+      experimentId,
+      studentId,
+      invalidation.modelsToDeactivate,
+    );
+
+    const updateData = {
+      ...invalidation.patch,
+      ...preparedUpdate.data,
+    };
+    const columns = Object.keys(updateData);
     const assignments = columns.map((col) => `${col} = ?`).join(", ");
-    const values = columns.map((key) => preparedUpdate.data[key]);
+    const values = columns.map((key) => updateData[key]);
     values.push(experimentId);
 
-    await connection.query(`UPDATE experiment_status SET ${assignments} WHERE experiment_id = ?`, values);
+    await connection.query(
+      `UPDATE experiment_status SET ${assignments}, state_version = state_version + 1 WHERE experiment_id = ?`,
+      values,
+    );
 
     const [[updatedRow]] = await connection.query<RowDataPacket[]>(
       "SELECT * FROM experiment_status WHERE experiment_id = ? LIMIT 1",

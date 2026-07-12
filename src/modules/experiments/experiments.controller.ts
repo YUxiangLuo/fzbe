@@ -56,7 +56,7 @@ experimentsController.delete("/api/v1/students/me/experiment-runs/:experimentId"
   }
 });
 
-experimentsController.put("/api/v1/experiment-runs/:experimentId", jwtAuth, requireStudent, zValidator("param", experimentIdParamSchema), zValidator("json", updateExperimentSchema), async (c) => {
+experimentsController.on(["PUT", "PATCH"], "/api/v1/experiment-runs/:experimentId", jwtAuth, requireStudent, zValidator("param", experimentIdParamSchema), zValidator("json", updateExperimentSchema), async (c) => {
   try {
     const payload = c.get("jwtPayload") as JwtPayload;
     const { experimentId } = c.req.valid("param");
@@ -67,6 +67,12 @@ experimentsController.put("/api/v1/experiment-runs/:experimentId", jwtAuth, requ
       if (result.error === "not_found") return c.json({ error: "未找到实验状态" }, 404);
       if (result.error === "forbidden") return c.json({ error: "权限不足" }, 403);
       if (result.error === "completed") return c.json({ error: "已完成的实验不允许继续修改" }, 400);
+      if (result.error === "conflict") {
+        return c.json({ error: "实验状态已被其他页面更新，请基于最新状态重试", current: result.data }, 409);
+      }
+      if (result.error === "invalid_best_model") {
+        return c.json({ error: "只能选择已完成训练且仍然有效的模型" }, 400);
+      }
       if (result.error === "no_fields") return c.json({ error: "未提供更新字段" }, 400);
       if (result.error === "invalid_current_step") return c.json({ error: "current_step 不能为空" }, 400);
       return c.json({ error: "highest_completed_step 不能为空" }, 400);

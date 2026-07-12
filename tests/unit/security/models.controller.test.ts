@@ -751,19 +751,40 @@ describe("models controller", () => {
     expect(acquireModelExecutionLock).not.toHaveBeenCalled();
   });
 
-  test("maps python validation failures from prediction to 400", async () => {
-    predictExperimentModel.mockRejectedValueOnce(
-      new Error("[PYTHON_VALIDATION] Requested forecast_steps (20) exceeds the saved LSTM horizon (12)."),
-    );
-
-    const response = await requestJson("/api/v1/models/lstm/predict", {
+  test("rejects prediction horizons above 12 before acquiring capacity", async () => {
+    const response = await requestJson("/api/v1/models/ma/predict", {
       experiment_id: 990002,
-      forecast_steps: 20,
+      forecast_steps: 13,
     });
     const data = await response.json();
 
     expect(response.status).toBe(400);
-    expect(data).toEqual({ error: "Requested forecast_steps (20) exceeds the saved LSTM horizon (12)." });
+    expect(data).toEqual({
+      error: "预测步数不能超过 12",
+      details: {
+        formErrors: [],
+        fieldErrors: {
+          forecast_steps: ["预测步数不能超过 12"],
+        },
+      },
+    });
+    expect(predictExperimentModel).not.toHaveBeenCalled();
+    expect(acquireModelExecutionLock).not.toHaveBeenCalled();
+  });
+
+  test("maps python validation failures from prediction to 400", async () => {
+    predictExperimentModel.mockRejectedValueOnce(
+      new Error("[PYTHON_VALIDATION] Requested forecast_steps (12) exceeds the saved LSTM horizon (6)."),
+    );
+
+    const response = await requestJson("/api/v1/models/lstm/predict", {
+      experiment_id: 990002,
+      forecast_steps: 12,
+    });
+    const data = await response.json();
+
+    expect(response.status).toBe(400);
+    expect(data).toEqual({ error: "Requested forecast_steps (12) exceeds the saved LSTM horizon (6)." });
   });
 
   test("maps python data failures from prediction to 400", async () => {

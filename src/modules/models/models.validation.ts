@@ -136,6 +136,10 @@ export const localizePredictValidationIssue = (issue: ZodIssue): string => {
     return formatMinimumMessage(label, issueWithMinimum.minimum, issueWithMinimum.inclusive);
   }
 
+  if (issue.code === "too_big" && field === "forecast_steps") {
+    return "预测步数不能超过 12";
+  }
+
   if (issue.code === "invalid_format") {
     return `${label}格式无效`;
   }
