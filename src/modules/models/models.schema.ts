@@ -158,8 +158,8 @@ export const prepareProductionSchema = z.object({
   experiment_id: z.coerce.number().int().min(1),
 });
 
-export function isModelType(value: string): value is ModelType {
-  return (ALL_MODELS as readonly string[]).includes(value);
+export function isModelType(value: unknown): value is ModelType {
+  return typeof value === "string" && (ALL_MODELS as readonly string[]).includes(value);
 }
 
 export type TrainInput = z.infer<typeof trainSchema>;

@@ -200,6 +200,8 @@ export const USER_CONSTANTS = {
 // 认证相关常量
 // ============================================
 export const AUTH_CONSTANTS = {
+  /** JWT 签名与验证算法。签发和中间件必须保持一致。 */
+  JWT_ALGORITHM: "HS256",
   /** JWT 有效期（秒） */
   JWT_EXPIRATION_SECONDS: 60 * 60 * 2,
 } as const;

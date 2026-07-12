@@ -3,8 +3,12 @@ import { createMiddleware } from "hono/factory";
 import type { Context, Next } from "hono";
 import { env } from "../config";
 import type { JwtPayload, UserRole } from "../types";
+import { AUTH_CONSTANTS } from "../utils/constants";
 
-export const jwtAuth = jwt({ secret: env.JWT_SECRET });
+export const jwtAuth = jwt({
+  secret: env.JWT_SECRET,
+  alg: AUTH_CONSTANTS.JWT_ALGORITHM,
+});
 
 export const requireRoles = (...allowedRoles: UserRole[]) => {
   return createMiddleware(async (c: Context, next: Next) => {

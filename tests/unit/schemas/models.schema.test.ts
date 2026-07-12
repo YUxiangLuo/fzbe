@@ -185,6 +185,8 @@ describe("Models Schemas", () => {
       expect(isModelType("ma")).toBe(true);
       expect(isModelType("weighted_avg")).toBe(true);
       expect(isModelType("ensemble_weighted")).toBe(false);
+      expect(isModelType(undefined)).toBe(false);
+      expect(isModelType(null)).toBe(false);
     });
   });
 });

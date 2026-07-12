@@ -63,6 +63,6 @@ export async function login(input: LoginInput): Promise<LoginResult | LoginError
     exp: Math.floor(Date.now() / 1000) + AUTH_CONSTANTS.JWT_EXPIRATION_SECONDS,
   };
 
-  const token = await sign(payload, env.JWT_SECRET);
+  const token = await sign(payload, env.JWT_SECRET, AUTH_CONSTANTS.JWT_ALGORITHM);
   return { success: true, token, user: { role: user.role } };
 }
