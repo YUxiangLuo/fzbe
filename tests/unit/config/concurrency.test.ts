@@ -10,6 +10,8 @@ const CONFIG_ENV_NAMES = [
   "PDF_CONCURRENCY",
   "PDF_QUEUE_TIMEOUT_MS",
   "PDF_GENERATION_TIMEOUT_MS",
+  "MODEL_TRAINING_TIMEOUT_MS",
+  "MODEL_PREDICTION_TIMEOUT_MS",
   "DB_QUERY_HEADROOM",
   "DB_CONNECTION_LIMIT",
   "PYTHON_MODEL_THREADS",
@@ -60,6 +62,9 @@ interface ConstantsSnapshot {
     AUTH_REGISTER_MAX_PER_ACCOUNT: number;
   };
   TIMEOUTS: {
+    MODEL_EXECUTION_HARD_CAP: number;
+    MODEL_TRAINING: number;
+    MODEL_PREDICTION: number;
     PDF_QUEUE: number;
     PDF_GENERATION: number;
   };
@@ -114,6 +119,9 @@ describe("concurrency safeguards", () => {
     );
     expect(TIMEOUTS.PDF_QUEUE).toBe(60_000);
     expect(TIMEOUTS.PDF_GENERATION).toBe(30_000);
+    expect(TIMEOUTS.MODEL_EXECUTION_HARD_CAP).toBe(600_000);
+    expect(TIMEOUTS.MODEL_TRAINING).toBe(300_000);
+    expect(TIMEOUTS.MODEL_PREDICTION).toBe(60_000);
     expect(PYTHON_RUNTIME_CONFIG.MODEL_PROCESS_THREADS).toBe(1);
     expect(PYTHON_RUNTIME_CONFIG.TF_INTER_OP_THREADS).toBe(1);
     expect(RATE_LIMITS.AUTH_LOGIN_WINDOW_MS).toBe(15 * 60 * 1000);
@@ -153,6 +161,8 @@ describe("concurrency safeguards", () => {
         MAX_CONCURRENT_PDF_JOBS: "9",
         PDF_QUEUE_TIMEOUT_MS: "70000",
         PDF_GENERATION_TIMEOUT_MS: "45000",
+        MODEL_TRAINING_TIMEOUT_MS: "240000",
+        MODEL_PREDICTION_TIMEOUT_MS: "45000",
         DB_QUERY_HEADROOM: "44",
         DB_CONNECTION_LIMIT: "150",
         PYTHON_MODEL_THREADS: "2",
@@ -169,6 +179,9 @@ describe("concurrency safeguards", () => {
     expect(CONCURRENCY_LIMITS.MAX_CONCURRENT_PDF_JOBS).toBe(9);
     expect(TIMEOUTS.PDF_QUEUE).toBe(70_000);
     expect(TIMEOUTS.PDF_GENERATION).toBe(45_000);
+    expect(TIMEOUTS.MODEL_EXECUTION_HARD_CAP).toBe(600_000);
+    expect(TIMEOUTS.MODEL_TRAINING).toBe(240_000);
+    expect(TIMEOUTS.MODEL_PREDICTION).toBe(45_000);
     expect(DB_POOL_CONFIG.LOCK_CONNECTIONS).toBe(74);
     expect(DB_POOL_CONFIG.QUERY_HEADROOM).toBe(44);
     expect(DB_POOL_CONFIG.CONNECTION_LIMIT).toBe(150);
@@ -200,6 +213,14 @@ describe("concurrency safeguards", () => {
     await expect(loadConstantsSnapshot({ PDF_QUEUE_TIMEOUT_MS: "30s" })).rejects.toThrow(
       "PDF_QUEUE_TIMEOUT_MS must be a positive integer",
     );
+
+    await expect(
+      loadConstantsSnapshot({ MODEL_TRAINING_TIMEOUT_MS: "600001" }),
+    ).rejects.toThrow("MODEL_TRAINING_TIMEOUT_MS must be <= 600000");
+
+    await expect(
+      loadConstantsSnapshot({ MODEL_PREDICTION_TIMEOUT_MS: "0" }),
+    ).rejects.toThrow("MODEL_PREDICTION_TIMEOUT_MS must be a positive integer");
 
     await expect(
       loadConstantsSnapshot({ AUTH_LOGIN_RATE_LIMIT_MAX_PER_ACCOUNT: "0" }),

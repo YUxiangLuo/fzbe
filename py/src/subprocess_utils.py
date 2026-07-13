@@ -9,7 +9,33 @@ import os
 import subprocess
 import sys
 import tempfile
+import time
 from typing import Any, Dict, List, Optional
+
+
+MODEL_DEADLINE_ENV_NAME = "FZ_MODEL_DEADLINE_EPOCH_MS"
+
+
+def _resolve_subprocess_timeout(requested_timeout: Optional[float]) -> Optional[float]:
+    """Cap a nested model timeout to the deadline inherited from the backend."""
+    raw_deadline = os.environ.get(MODEL_DEADLINE_ENV_NAME, "").strip()
+    if not raw_deadline:
+        return requested_timeout
+
+    try:
+        deadline_epoch_ms = int(raw_deadline)
+    except ValueError as exc:
+        raise RuntimeError(
+            f"Invalid {MODEL_DEADLINE_ENV_NAME}: {raw_deadline}"
+        ) from exc
+
+    remaining_seconds = deadline_epoch_ms / 1000.0 - time.time()
+    if remaining_seconds <= 0:
+        raise TimeoutError("Model execution deadline has already expired")
+
+    if requested_timeout is None:
+        return remaining_seconds
+    return min(float(requested_timeout), remaining_seconds)
 
 
 def get_python_executable() -> str:
@@ -101,6 +127,9 @@ def run_base_model_subprocess(
     if not os.path.exists(run_model_script):
         raise FileNotFoundError(f"run_model.py not found at {run_model_script}")
 
+    # Validate the inherited deadline before allocating a temporary snapshot so
+    # an already-expired request cannot leak fz-model-data-*.json files.
+    effective_timeout = _resolve_subprocess_timeout(timeout)
     data_file = _write_subprocess_data_file(data)
     args = [
         python_exec,
@@ -139,7 +168,7 @@ def run_base_model_subprocess(
             cwd=py_dir,
             capture_output=True,
             text=True,
-            timeout=timeout,
+            timeout=effective_timeout,
             env={**os.environ, "PATH": f"{os.path.join(py_dir, 'venv', 'bin')}:{os.environ.get('PATH', '')}"}
         )
 
@@ -154,7 +183,9 @@ def run_base_model_subprocess(
         return _parse_json_stdout(result, model_type)
 
     except subprocess.TimeoutExpired:
-        raise TimeoutError(f"Base model {model_type} timed out after {timeout}s")
+        raise TimeoutError(
+            f"Base model {model_type} timed out after {effective_timeout:.3f}s"
+        )
     finally:
         try:
             os.remove(data_file)
@@ -183,6 +214,9 @@ def run_base_model_fit_subprocess(
     if fit_forecast_steps is not None and int(fit_forecast_steps) <= 0:
         raise ValueError("fit_forecast_steps must be > 0 when provided")
 
+    # Keep deadline validation outside the snapshot lifecycle only while no
+    # snapshot exists; every later failure is covered by the finally below.
+    effective_timeout = _resolve_subprocess_timeout(timeout)
     data_file = _write_subprocess_data_file(data)
     args = [
         python_exec,
@@ -205,7 +239,7 @@ def run_base_model_fit_subprocess(
             cwd=py_dir,
             capture_output=True,
             text=True,
-            timeout=timeout,
+            timeout=effective_timeout,
             env={**os.environ, "PATH": f"{os.path.join(py_dir, 'venv', 'bin')}:{os.environ.get('PATH', '')}"}
         )
 
@@ -220,7 +254,9 @@ def run_base_model_fit_subprocess(
         return _parse_json_stdout(result, f"{model_type} fit-only")
 
     except subprocess.TimeoutExpired:
-        raise TimeoutError(f"Base model {model_type} fit-only timed out after {timeout}s")
+        raise TimeoutError(
+            f"Base model {model_type} fit-only timed out after {effective_timeout:.3f}s"
+        )
     finally:
         try:
             os.remove(data_file)
@@ -259,13 +295,15 @@ def run_base_model_predict_subprocess(
         "--pretty",
     ]
 
+    effective_timeout = _resolve_subprocess_timeout(timeout)
+
     try:
         result = subprocess.run(
             args,
             cwd=py_dir,
             capture_output=True,
             text=True,
-            timeout=timeout,
+            timeout=effective_timeout,
             env={**os.environ, "PATH": f"{os.path.join(py_dir, 'venv', 'bin')}:{os.environ.get('PATH', '')}"}
         )
 
@@ -280,7 +318,9 @@ def run_base_model_predict_subprocess(
         return _parse_json_stdout(result, f"{model_type} predict")
 
     except subprocess.TimeoutExpired:
-        raise TimeoutError(f"Base model {model_type} predict timed out")
+        raise TimeoutError(
+            f"Base model {model_type} predict timed out after {effective_timeout:.3f}s"
+        )
 
 
 def extract_predictions_from_result(result: Dict[str, Any]) -> List[float]:

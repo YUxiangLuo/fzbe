@@ -158,7 +158,13 @@ describe("app route smoke tests", () => {
     const payload = await response.json() as {
       data?: {
         concurrency?: { maxConcurrentPdfJobs?: unknown };
-        timeouts?: { pdfQueueMs?: unknown; pdfGenerationMs?: unknown };
+        timeouts?: {
+          modelExecutionHardCapMs?: unknown;
+          modelTrainingMs?: unknown;
+          modelPredictionMs?: unknown;
+          pdfQueueMs?: unknown;
+          pdfGenerationMs?: unknown;
+        };
         pdfQueue?: Record<string, unknown>;
       };
     };
@@ -169,6 +175,11 @@ describe("app route smoke tests", () => {
       maxConcurrentJobs: payload.data?.concurrency?.maxConcurrentPdfJobs,
       queueTimeoutMs: payload.data?.timeouts?.pdfQueueMs,
       generationTimeoutMs: payload.data?.timeouts?.pdfGenerationMs,
+    });
+    expect(payload.data?.timeouts).toMatchObject({
+      modelExecutionHardCapMs: 600_000,
+      modelTrainingMs: 300_000,
+      modelPredictionMs: 60_000,
     });
   });
 

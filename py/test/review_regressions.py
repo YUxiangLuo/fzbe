@@ -28,7 +28,12 @@ from ensemble_utils import (  # noqa: E402
 from error_protocol import format_known_error  # noqa: E402
 from log_safety import summarize_cli_args  # noqa: E402
 from models import boosting, es, ma, stacking, weighted_avg  # noqa: E402
-from subprocess_utils import run_base_model_subprocess  # noqa: E402
+from subprocess_utils import (  # noqa: E402
+    MODEL_DEADLINE_ENV_NAME,
+    _resolve_subprocess_timeout,
+    run_base_model_fit_subprocess,
+    run_base_model_subprocess,
+)
 
 
 def sample_records(size: int = 18) -> list[dict[str, object]]:
@@ -45,6 +50,53 @@ def sample_records(size: int = 18) -> list[dict[str, object]]:
 def assert_error_tag_contract() -> None:
     assert format_known_error(ValueError("[VALIDATION]abc")) == "[VALIDATION] abc"
     assert format_known_error(ValueError("[DATA]   中文内容")) == "[DATA] 中文内容"
+    assert format_known_error(TimeoutError("base model expired")) == "[TIMEOUT] base model expired"
+    assert format_known_error(TimeoutError("[TIMEOUT] nested")) == "[TIMEOUT] nested"
+
+
+def assert_nested_timeout_respects_backend_deadline() -> None:
+    with (
+        patch.dict(os.environ, {MODEL_DEADLINE_ENV_NAME: "1002500"}),
+        patch("subprocess_utils.time.time", return_value=1000.0),
+    ):
+        assert _resolve_subprocess_timeout(120) == 2.5
+        assert _resolve_subprocess_timeout(1) == 1.0
+
+    with (
+        patch.dict(os.environ, {MODEL_DEADLINE_ENV_NAME: "999999"}),
+        patch("subprocess_utils.time.time", return_value=1000.0),
+    ):
+        try:
+            _resolve_subprocess_timeout(120)
+        except TimeoutError as exc:
+            assert "already expired" in str(exc)
+        else:
+            raise AssertionError("expired backend deadline was accepted")
+
+
+def assert_expired_deadline_precedes_snapshot_creation() -> None:
+    def fail_if_snapshot_is_created(_data: object) -> str:
+        raise AssertionError("temporary snapshot was created after the deadline expired")
+
+    runners = (
+        lambda: run_base_model_subprocess("ma", [], 0, 0, 0, 0, {"window": 1}),
+        lambda: run_base_model_fit_subprocess("ma", [], 0, 0, "source.pkl", "target.pkl"),
+    )
+    with (
+        patch.dict(os.environ, {MODEL_DEADLINE_ENV_NAME: "999999"}),
+        patch("subprocess_utils.time.time", return_value=1000.0),
+        patch(
+            "subprocess_utils._write_subprocess_data_file",
+            side_effect=fail_if_snapshot_is_created,
+        ),
+    ):
+        for runner in runners:
+            try:
+                runner()
+            except TimeoutError as exc:
+                assert "already expired" in str(exc)
+            else:
+                raise AssertionError("expired backend deadline was accepted")
 
 
 def assert_log_redaction() -> None:
@@ -255,6 +307,8 @@ def assert_guided_attempt_replay() -> None:
 
 def main() -> None:
     assert_error_tag_contract()
+    assert_nested_timeout_respects_backend_deadline()
+    assert_expired_deadline_precedes_snapshot_creation()
     assert_log_redaction()
     assert_internal_split_boundaries()
     assert_demand_semantics()

@@ -468,6 +468,9 @@ app.get("/api/v1/runtime-info", (c) =>
       pythonTensorflowInterOpThreads: PYTHON_RUNTIME_CONFIG.TF_INTER_OP_THREADS,
     },
     timeouts: {
+      modelExecutionHardCapMs: TIMEOUTS.MODEL_EXECUTION_HARD_CAP,
+      modelTrainingMs: TIMEOUTS.MODEL_TRAINING,
+      modelPredictionMs: TIMEOUTS.MODEL_PREDICTION,
       pdfQueueMs: TIMEOUTS.PDF_QUEUE,
       pdfGenerationMs: TIMEOUTS.PDF_GENERATION,
     },

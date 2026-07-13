@@ -4,9 +4,20 @@ import logger from "../../utils/logger";
 import { PYTHON_RUNTIME_CONFIG, TIMEOUTS } from "../../utils/constants";
 import { PY_DIR, resolvePythonExecutable } from "../../utils/python";
 import { extractPythonTaggedError } from "./model-error-protocol";
+import { ModelTimeoutError } from "./model-errors";
 
 const TRAINING_TIMEOUT = TIMEOUTS.MODEL_TRAINING;
+const MODEL_DEADLINE_ENV_NAME = "FZ_MODEL_DEADLINE_EPOCH_MS";
+const PROCESS_TERMINATION_WAIT_MS = 5_000;
 const GUIDED_ENSEMBLE_MODEL_TYPES = new Set(["weighted_avg", "boosting", "stacking"]);
+
+const resolvePythonProcessTimeoutMs = (timeoutMs?: number): number => {
+  const requestedTimeoutMs = timeoutMs ?? TRAINING_TIMEOUT;
+  if (!Number.isFinite(requestedTimeoutMs) || requestedTimeoutMs <= 0) {
+    throw new RangeError(`Python 模型超时必须是正数，收到: ${requestedTimeoutMs}`);
+  }
+  return Math.min(requestedTimeoutMs, TIMEOUTS.MODEL_EXECUTION_HARD_CAP);
+};
 
 export function buildPythonModelProcessEnv(): Record<string, string> {
   const modelThreads = String(PYTHON_RUNTIME_CONFIG.MODEL_PROCESS_THREADS);
@@ -217,6 +228,8 @@ export async function runPythonModel(
   abortSignal?: AbortSignal,
 ): Promise<unknown> {
   if (abortSignal?.aborted) throw getAbortError(abortSignal);
+  const executionTimeoutMs = resolvePythonProcessTimeoutMs(timeoutMs);
+  const deadlineEpochMs = Date.now() + executionTimeoutMs;
   const pythonExec = resolvePythonExecutable();
 
   const scriptPath = path.join(PY_DIR, "run_model.py");
@@ -252,6 +265,7 @@ export async function runPythonModel(
     env: {
       ...process.env,
       ...buildPythonModelProcessEnv(),
+      [MODEL_DEADLINE_ENV_NAME]: String(deadlineEpochMs),
       PATH: `${path.dirname(pythonExec)}${path.delimiter}${process.env.PATH ?? ""}`,
     },
   });
@@ -280,6 +294,28 @@ export async function runPythonModel(
 
   let timeoutId: ReturnType<typeof setTimeout> | undefined;
   let abortHandler: (() => void) | undefined;
+  let forcedTerminationError: Error | null = null;
+  let terminationPromise: Promise<void> | null = null;
+
+  const terminatePythonProcessTree = (error: Error): Promise<Error> => {
+    forcedTerminationError ??= error;
+    if (!terminationPromise) {
+      terminationPromise = (async () => {
+        killPythonProcessTree();
+        const exited = await Promise.race([
+          proc.exited.then(() => true),
+          Bun.sleep(PROCESS_TERMINATION_WAIT_MS).then(() => false),
+        ]);
+        if (!exited) {
+          logger.error(
+            { pid: proc.pid, modelType, waitMs: PROCESS_TERMINATION_WAIT_MS },
+            "终止 Python 进程组后等待退出超时",
+          );
+        }
+      })();
+    }
+    return terminationPromise.then(() => forcedTerminationError!);
+  };
 
   const executionPromise = new Promise<unknown>(async (resolve, reject) => {
     try {
@@ -303,6 +339,11 @@ export async function runPythonModel(
 
       await proc.exited;
 
+      if (forcedTerminationError) {
+        reject(forcedTerminationError);
+        return;
+      }
+
       reportModelProgress(progressReporter, {
         type: "phase",
         phase: "python_finished",
@@ -317,7 +358,10 @@ export async function runPythonModel(
           typeof arg === "string" && arg.length > 200 ? `${arg.slice(0, 200)}...[truncated]` : arg,
         );
         logger.error({ stderr: stderr.slice(0, 2000), modelType, args: truncatedArgs }, "Python 执行失败");
-        const taggedError = extractPythonTaggedError(stderr);
+        const taggedError = extractPythonTaggedError(
+          stderr,
+          executionTimeoutMs,
+        );
         if (taggedError) {
           reject(taggedError);
         } else {
@@ -336,41 +380,45 @@ export async function runPythonModel(
       }
     } catch (err) {
       reject(err);
-    } finally {
-      if (timeoutId) clearTimeout(timeoutId);
-      if (abortHandler && abortSignal) {
-        abortSignal.removeEventListener("abort", abortHandler);
-      }
     }
   });
 
   const competingPromises: Promise<unknown>[] = [executionPromise];
-  if (timeoutMs) {
-    competingPromises.push(new Promise<unknown>((_, reject) => {
-      timeoutId = setTimeout(() => {
-        killPythonProcessTree();
-        reject(new Error(`Python 执行超时 (${timeoutMs}ms)`));
-      }, timeoutMs);
-    }));
-  }
+  competingPromises.push(new Promise<unknown>((_, reject) => {
+    const remainingMs = Math.max(0, deadlineEpochMs - Date.now());
+    timeoutId = setTimeout(() => {
+      const timeoutError = new ModelTimeoutError(
+        `Python 执行超时 (${executionTimeoutMs}ms)`,
+        executionTimeoutMs,
+        "python_process",
+      );
+      void terminatePythonProcessTree(timeoutError).then(reject);
+    }, remainingMs);
+  }));
   if (abortSignal) {
     competingPromises.push(new Promise<unknown>((_, reject) => {
       abortHandler = () => {
-        killPythonProcessTree();
-        reject(getAbortError(abortSignal));
+        void terminatePythonProcessTree(getAbortError(abortSignal)).then(reject);
       };
       abortSignal.addEventListener("abort", abortHandler, { once: true });
       if (abortSignal.aborted) abortHandler();
     }));
   }
 
-  // 超时后 executionPromise 仍会 reject（进程被杀后 exitCode !== 0），
+  // 竞速结束后 executionPromise 仍可能 reject（进程被杀后 exitCode !== 0），
   // 若不捕获会触发 unhandledRejection。用 .catch 吞掉滞后的 rejection。
   executionPromise.catch((err) => {
-    logger.debug({ err, modelType }, "超时后 executionPromise 滞后 rejection（已忽略）");
+    logger.debug({ err, modelType }, "executionPromise 滞后 rejection（已忽略）");
   });
 
-  return Promise.race(competingPromises);
+  try {
+    return await Promise.race(competingPromises);
+  } finally {
+    if (timeoutId) clearTimeout(timeoutId);
+    if (abortHandler && abortSignal) {
+      abortSignal.removeEventListener("abort", abortHandler);
+    }
+  }
 }
 
 export interface GuidedPythonStepResult {
@@ -398,6 +446,8 @@ export async function runPythonGuidedTrainingStep(
   abortSignal?: AbortSignal,
 ): Promise<GuidedPythonStepResult> {
   if (abortSignal?.aborted) throw getAbortError(abortSignal);
+  const executionTimeoutMs = resolvePythonProcessTimeoutMs(timeoutMs);
+  const deadlineEpochMs = Date.now() + executionTimeoutMs;
   const pythonExec = resolvePythonExecutable();
   const scriptPath = path.join(PY_DIR, GUIDED_ENSEMBLE_MODEL_TYPES.has(modelType) ? "guided_ensemble_model.py" : "guided_model.py");
   if (!fs.existsSync(scriptPath)) {
@@ -438,12 +488,15 @@ export async function runPythonGuidedTrainingStep(
     env: {
       ...process.env,
       ...buildPythonModelProcessEnv(),
+      [MODEL_DEADLINE_ENV_NAME]: String(deadlineEpochMs),
       PATH: `${path.dirname(pythonExec)}${path.delimiter}${process.env.PATH ?? ""}`,
     },
   });
 
   let timeoutId: ReturnType<typeof setTimeout> | undefined;
   let abortHandler: (() => void) | undefined;
+  let forcedTerminationError: Error | null = null;
+  let terminationPromise: Promise<void> | null = null;
 
   const killPythonProcessTree = () => {
     if (proc.exitCode !== null || proc.killed) return;
@@ -464,6 +517,26 @@ export async function runPythonGuidedTrainingStep(
     }
   };
 
+  const terminatePythonProcessTree = (error: Error): Promise<Error> => {
+    forcedTerminationError ??= error;
+    if (!terminationPromise) {
+      terminationPromise = (async () => {
+        killPythonProcessTree();
+        const exited = await Promise.race([
+          proc.exited.then(() => true),
+          Bun.sleep(PROCESS_TERMINATION_WAIT_MS).then(() => false),
+        ]);
+        if (!exited) {
+          logger.error(
+            { pid: proc.pid, modelType, stepId, waitMs: PROCESS_TERMINATION_WAIT_MS },
+            "终止 guided Python 进程组后等待退出超时",
+          );
+        }
+      })();
+    }
+    return terminationPromise.then(() => forcedTerminationError!);
+  };
+
   const executionPromise = new Promise<GuidedPythonStepResult>(async (resolve, reject) => {
     try {
       const [stdout, stderr] = await Promise.all([
@@ -472,12 +545,17 @@ export async function runPythonGuidedTrainingStep(
       ]);
       await proc.exited;
 
+      if (forcedTerminationError) {
+        reject(forcedTerminationError);
+        return;
+      }
+
       if (proc.exitCode !== 0) {
         logger.error(
           { stderr: stderr.slice(0, 2000), modelType, stepId },
           "guided Python 阶段执行失败",
         );
-        const taggedError = extractPythonTaggedError(stderr);
+        const taggedError = extractPythonTaggedError(stderr, executionTimeoutMs);
         reject(taggedError ?? new Error("Python 执行失败"));
         return;
       }
@@ -493,26 +571,25 @@ export async function runPythonGuidedTrainingStep(
       }
     } catch (err) {
       reject(err);
-    } finally {
-      if (timeoutId) clearTimeout(timeoutId);
-      if (abortHandler && abortSignal) {
-        abortSignal.removeEventListener("abort", abortHandler);
-      }
     }
   });
 
   const timeoutPromise = new Promise<GuidedPythonStepResult>((_, reject) => {
+    const remainingMs = Math.max(0, deadlineEpochMs - Date.now());
     timeoutId = setTimeout(() => {
-      killPythonProcessTree();
-      reject(new Error(`Python 执行超时 (${timeoutMs}ms)`));
-    }, timeoutMs);
+      const timeoutError = new ModelTimeoutError(
+        `Python 执行超时 (${executionTimeoutMs}ms)`,
+        executionTimeoutMs,
+        "python_process",
+      );
+      void terminatePythonProcessTree(timeoutError).then(reject);
+    }, remainingMs);
   });
   const competingPromises: Promise<GuidedPythonStepResult>[] = [executionPromise, timeoutPromise];
   if (abortSignal) {
     competingPromises.push(new Promise<GuidedPythonStepResult>((_, reject) => {
       abortHandler = () => {
-        killPythonProcessTree();
-        reject(getAbortError(abortSignal));
+        void terminatePythonProcessTree(getAbortError(abortSignal)).then(reject);
       };
       abortSignal.addEventListener("abort", abortHandler, { once: true });
       if (abortSignal.aborted) abortHandler();
@@ -520,8 +597,15 @@ export async function runPythonGuidedTrainingStep(
   }
 
   executionPromise.catch((err) => {
-    logger.debug({ err, modelType, stepId }, "guided Python 超时后滞后 rejection（已忽略）");
+    logger.debug({ err, modelType, stepId }, "guided Python 滞后 rejection（已忽略）");
   });
 
-  return Promise.race(competingPromises);
+  try {
+    return await Promise.race(competingPromises);
+  } finally {
+    if (timeoutId) clearTimeout(timeoutId);
+    if (abortHandler && abortSignal) {
+      abortSignal.removeEventListener("abort", abortHandler);
+    }
+  }
 }

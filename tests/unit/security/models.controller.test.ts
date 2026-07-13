@@ -93,6 +93,17 @@ class ModelServiceUnavailableError extends Error {
     super(message);
   }
 }
+class ModelTimeoutError extends Error {
+  readonly code = "MODEL_TIMEOUT";
+
+  constructor(
+    message: string,
+    public timeoutMs: number,
+    public source: "python_process" | "python_subprocess",
+  ) {
+    super(message);
+  }
+}
 
 mock.module("../../../src/modules/models/models.service", () => ({
   createOrResumeGuidedTrainingSession,
@@ -112,6 +123,7 @@ mock.module("../../../src/modules/models/models.service", () => ({
   ModelAccessError,
   ModelConflictError,
   ModelServiceUnavailableError,
+  ModelTimeoutError,
 }));
 
 const { default: modelsController } = await import("../../../src/modules/models/models.controller");
@@ -314,6 +326,87 @@ describe("models controller", () => {
     expect(await response.json()).toEqual({
       error: "数据库模型锁已失效",
       code: "MODEL_LOCK_LOST",
+    });
+  });
+
+  test("returns a structured 504 when a guided step times out", async () => {
+    runGuidedTrainingStep.mockRejectedValueOnce(
+      new ModelTimeoutError("Python 执行超时", 300_000, "python_process"),
+    );
+    const response = await request(
+      "/api/v1/models/ma/guided-training/sessions/guided-1/steps/forecast/run",
+      "POST",
+    );
+
+    expect(response.status).toBe(504);
+    expect(await response.json()).toEqual({
+      error: "训练步骤超时，请重试当前步骤",
+      code: "MODEL_TIMEOUT",
+      operation: "guided_training_step",
+      timeout_ms: 300_000,
+      retryable: true,
+    });
+  });
+
+  test("returns a structured 504 when guided artifact recovery times out", async () => {
+    createOrResumeGuidedTrainingSession.mockRejectedValueOnce(
+      new ModelTimeoutError("复制融合模型产物超时", 30_000, "python_process"),
+    );
+    const response = await request(
+      "/api/v1/models/weighted_avg/guided-training/sessions",
+      "POST",
+      {
+        ...trainBody(),
+        models: "ma,es",
+      },
+    );
+
+    expect(response.status).toBe(504);
+    expect(await response.json()).toEqual({
+      error: "恢复训练会话模型产物超时，请重试",
+      code: "MODEL_TIMEOUT",
+      operation: "guided_training_session",
+      timeout_ms: 30_000,
+      retryable: true,
+    });
+  });
+
+  test("returns a structured 504 when production preparation times out", async () => {
+    prepareExperimentModelForProduction.mockRejectedValueOnce(
+      new ModelTimeoutError("Python 执行超时", 600_000, "python_process"),
+    );
+    const response = await request("/api/v1/models/weighted_avg/prepare-production", "POST", {
+      experiment_id: 990002,
+      forecast_steps: 6,
+    });
+
+    expect(response.status).toBe(504);
+    expect(await response.json()).toEqual({
+      error: "生产模型准备超时，请稍后重试",
+      code: "MODEL_TIMEOUT",
+      operation: "production_preparation",
+      timeout_ms: 600_000,
+      retryable: true,
+    });
+  });
+
+  test("returns a structured 504 when prediction times out", async () => {
+    predictExperimentModel.mockRejectedValueOnce(
+      new ModelTimeoutError("Python 执行超时", 60_000, "python_subprocess"),
+    );
+    const response = await request("/api/v1/models/ma/predict", "POST", {
+      experiment_id: 990002,
+      forecast_steps: 6,
+      preparation_token: preparationToken,
+    });
+
+    expect(response.status).toBe(504);
+    expect(await response.json()).toEqual({
+      error: "预测超时（60秒）",
+      code: "MODEL_TIMEOUT",
+      operation: "prediction",
+      timeout_ms: 60_000,
+      retryable: true,
     });
   });
 

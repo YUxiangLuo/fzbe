@@ -1,11 +1,17 @@
+import { ModelTimeoutError } from "./model-errors";
+
 const PYTHON_STDERR_TAGS = [
   { marker: "[VALIDATION]", servicePrefix: "[PYTHON_VALIDATION]" },
   { marker: "[DATA]", servicePrefix: "[PYTHON_DATA]" },
+  { marker: "[TIMEOUT]", servicePrefix: "[PYTHON_TIMEOUT]" },
 ] as const;
 
 const PYTHON_SERVICE_ERROR_PATTERN = /^\[PYTHON_(VALIDATION|DATA)\]\s*([\s\S]*)$/;
 
-export const extractPythonTaggedError = (stderr: string): Error | null => {
+export const extractPythonTaggedError = (
+  stderr: string,
+  timeoutMs: number,
+): Error | null => {
   const lines = stderr
     .split(/\r?\n/)
     .map((line) => line.trim())
@@ -17,6 +23,13 @@ export const extractPythonTaggedError = (stderr: string): Error | null => {
       const markerIndex = line.indexOf(marker);
       if (markerIndex === -1) continue;
       const detail = line.slice(markerIndex + marker.length).trim();
+      if (marker === "[TIMEOUT]") {
+        return new ModelTimeoutError(
+          detail || "Python 子进程执行超时",
+          timeoutMs,
+          "python_subprocess",
+        );
+      }
       return new Error(`${servicePrefix}${detail ? ` ${detail}` : ""}`);
     }
   }

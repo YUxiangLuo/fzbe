@@ -236,6 +236,9 @@ const {
   runPythonModel,
   createOrResumeGuidedTrainingSession,
   runGuidedTrainingStep,
+  resolveGuidedStepTimeoutMs,
+  resolveProductionPreparationTimeoutMs,
+  waitForAuxiliaryPythonProcess,
   computeEnsemblePhase1TrainSize,
   cleanupExpiredGuidedTrainingSessions,
   cleanupStaleModelArtifacts,
@@ -247,6 +250,7 @@ const {
   predictExperimentModel,
   ModelAccessError,
   ModelNotFoundError,
+  ModelTimeoutError,
 } = await import(freshModelsServiceModulePath);
 
 const trainModel = createOrResumeGuidedTrainingSession;
@@ -394,6 +398,66 @@ describe("models service", () => {
     (Bun as { spawn: typeof Bun.spawn }).spawn = spawnMock as typeof Bun.spawn;
   });
 
+  test("clamps dynamic ensemble budgets to the ten-minute hard cap", () => {
+    const ensembleBody = {
+      models: "ma,es,arima,lstm",
+    } as never;
+
+    expect(resolveGuidedStepTimeoutMs("ma", "fit", {} as never)).toBe(300_000);
+    expect(
+      resolveGuidedStepTimeoutMs("weighted_avg", "validation_predictions", ensembleBody),
+    ).toBe(600_000);
+    expect(
+      resolveGuidedStepTimeoutMs("stacking", "level1_predictions", ensembleBody),
+    ).toBe(600_000);
+    expect(
+      resolveGuidedStepTimeoutMs("boosting", "retrain_chain", ensembleBody),
+    ).toBe(600_000);
+
+    const activeRun = buildActiveRun("weighted_avg", {
+      parameters: JSON.stringify({ models: ["ma", "es", "arima", "lstm"] }),
+    });
+    expect(
+      resolveProductionPreparationTimeoutMs("weighted_avg", activeRun as never),
+    ).toBe(600_000);
+  });
+
+  test("classifies auxiliary Python process deadlines as typed model timeouts", async () => {
+    let stdoutController!: ReadableStreamDefaultController<Uint8Array>;
+    let stderrController!: ReadableStreamDefaultController<Uint8Array>;
+    let resolveExit!: (exitCode: number) => void;
+    const exited = new Promise<number>((resolve) => {
+      resolveExit = resolve;
+    });
+    const kill = mock(() => {
+      stdoutController.close();
+      stderrController.close();
+      resolveExit(137);
+    });
+    const proc = {
+      stdout: new ReadableStream<Uint8Array>({
+        start(controller) { stdoutController = controller; },
+      }),
+      stderr: new ReadableStream<Uint8Array>({
+        start(controller) { stderrController = controller; },
+      }),
+      exited,
+      kill,
+    };
+
+    const error = await waitForAuxiliaryPythonProcess(proc, "复制融合模型产物", 1).catch(
+      (caughtError) => caughtError,
+    );
+
+    expect(error).toBeInstanceOf(ModelTimeoutError);
+    expect(error).toMatchObject({
+      code: "MODEL_TIMEOUT",
+      timeoutMs: 1,
+      source: "python_process",
+    });
+    expect(kill).toHaveBeenCalledWith("SIGKILL");
+  });
+
   afterEach(async () => {
     (Bun as { spawn: typeof Bun.spawn }).spawn = originalSpawn;
     await unlink(datasetCsvPath).catch(() => {});
@@ -482,6 +546,86 @@ describe("models service", () => {
 
     await expect(execution).rejects.toBe(lockLostError);
     expect(proc.kill).toHaveBeenCalledWith("SIGKILL");
+  });
+
+  test("terminates the Python process before rejecting with a typed timeout", async () => {
+    existsSync.mockImplementation((filePath: string) => filePath.endsWith("/run_model.py"));
+    let stdoutController!: ReadableStreamDefaultController<Uint8Array>;
+    let stderrController!: ReadableStreamDefaultController<Uint8Array>;
+    let resolveExit!: (exitCode: number) => void;
+    const exited = new Promise<number>((resolve) => {
+      resolveExit = resolve;
+    });
+    const proc = {
+      stdout: new ReadableStream<Uint8Array>({
+        start(controller) { stdoutController = controller; },
+      }),
+      stderr: new ReadableStream<Uint8Array>({
+        start(controller) { stderrController = controller; },
+      }),
+      exited,
+      exitCode: null as number | null,
+      killed: false,
+      pid: 999_999_998,
+      kill: mock(() => {
+        proc.killed = true;
+        proc.exitCode = 137;
+        stdoutController.close();
+        stderrController.close();
+        resolveExit(137);
+      }),
+    };
+    let inheritedDeadline: number | null = null;
+    spawnMock.mockImplementationOnce((_command, options) => {
+      inheritedDeadline = Number((options.env as Record<string, string>).FZ_MODEL_DEADLINE_EPOCH_MS);
+      return proc;
+    });
+
+    const startedAt = Date.now();
+    const error = await runPythonModel("ma", { data: "[]" }, 10).catch(
+      (caughtError) => caughtError,
+    );
+
+    expect(error).toBeInstanceOf(ModelTimeoutError);
+    expect(error).toMatchObject({
+      code: "MODEL_TIMEOUT",
+      timeoutMs: 10,
+      source: "python_process",
+    });
+    expect(proc.kill).toHaveBeenCalledWith("SIGKILL");
+    expect(inheritedDeadline).toBeGreaterThanOrEqual(startedAt + 10);
+    expect(proc.exitCode).toBe(137);
+  });
+
+  test("maps a nested Python timeout tag to the typed timeout error", async () => {
+    existsSync.mockImplementation((filePath: string) => filePath.endsWith("/run_model.py"));
+    spawnMock.mockImplementationOnce(() => createSpawnResult("", "[TIMEOUT] Base model lstm timed out", 1));
+
+    const error = await runPythonModel("weighted_avg", { data: "[]" }, 600_000).catch(
+      (caughtError) => caughtError,
+    );
+
+    expect(error).toBeInstanceOf(ModelTimeoutError);
+    expect(error).toMatchObject({
+      code: "MODEL_TIMEOUT",
+      timeoutMs: 600_000,
+      source: "python_subprocess",
+    });
+  });
+
+  test("clamps a direct Python runner timeout to the immutable hard cap", async () => {
+    existsSync.mockImplementation((filePath: string) => filePath.endsWith("/run_model.py"));
+    let inheritedDeadline = 0;
+    spawnMock.mockImplementationOnce((_command, options) => {
+      inheritedDeadline = Number((options.env as Record<string, string>).FZ_MODEL_DEADLINE_EPOCH_MS);
+      return createSpawnResult('{"predictions":[]}', "", 0);
+    });
+
+    const startedAt = Date.now();
+    await runPythonModel("ma", { data: "[]" }, 900_000);
+
+    expect(inheritedDeadline).toBeGreaterThanOrEqual(startedAt + 600_000);
+    expect(inheritedDeadline).toBeLessThanOrEqual(Date.now() + 600_000);
   });
 
   test("does not include raw stderr when Python exits with an untagged failure", async () => {

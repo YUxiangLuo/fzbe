@@ -25,14 +25,32 @@ import {
   ModelAccessError,
   ModelConflictError,
   ModelServiceUnavailableError,
+  ModelTimeoutError,
 } from "./models.service";
 import { handleUnexpectedError } from "../../utils/error-handler";
 import type { JwtPayload } from "../../types";
-import { TIMEOUTS } from "../../utils/constants";
 import { parsePythonServiceError } from "./model-error-protocol";
 
 const modelsController = new Hono();
 const SLOT_FREE_REUSABLE_PRODUCTION_MODEL_TYPES = new Set<ModelType>(["ma", "es", "arima", "lstm"]);
+
+type ModelTimeoutOperation =
+  | "guided_training_session"
+  | "guided_training_step"
+  | "production_preparation"
+  | "prediction";
+
+const buildModelTimeoutPayload = (
+  error: ModelTimeoutError,
+  operation: ModelTimeoutOperation,
+  message: string,
+) => ({
+  error: message,
+  code: error.code,
+  operation,
+  timeout_ms: error.timeoutMs,
+  retryable: true,
+});
 
 modelsController.post(
   "/api/v1/models/:model_type/guided-training/sessions",
@@ -79,6 +97,16 @@ modelsController.post(
       }
       if (error instanceof ModelNotFoundError) {
         return c.json({ error: error.message }, 404);
+      }
+      if (error instanceof ModelTimeoutError) {
+        return c.json(
+          buildModelTimeoutPayload(
+            error,
+            "guided_training_session",
+            "恢复训练会话模型产物超时，请重试",
+          ),
+          504,
+        );
       }
       return handleUnexpectedError(c, error, "创建分阶段训练会话失败");
     }
@@ -206,10 +234,11 @@ modelsController.post(
       if (error instanceof ModelNotFoundError) {
         return c.json({ error: error.message }, 404);
       }
-
-      const err = error as Error;
-      if (err.message?.includes("timed out") || err.message?.includes("超时")) {
-        return c.json({ error: "训练步骤超时，请重试当前步骤" }, 504);
+      if (error instanceof ModelTimeoutError) {
+        return c.json(
+          buildModelTimeoutPayload(error, "guided_training_step", "训练步骤超时，请重试当前步骤"),
+          504,
+        );
       }
       const pythonError = parsePythonServiceError(error);
       if (pythonError !== null) {
@@ -297,14 +326,17 @@ modelsController.post(
       if (error instanceof ModelServiceUnavailableError) {
         return c.json({ error: error.message, code: error.code }, 503);
       }
-      const err = error as Error;
-      if (err.message?.includes("timed out") || err.message?.includes("超时")) {
-        return c.json({ error: "生产模型准备超时，请稍后重试" }, 504);
+      if (error instanceof ModelTimeoutError) {
+        return c.json(
+          buildModelTimeoutPayload(error, "production_preparation", "生产模型准备超时，请稍后重试"),
+          504,
+        );
       }
       const pythonError = parsePythonServiceError(error);
       if (pythonError !== null) {
         return c.json({ error: pythonError || "Python 模型输入无效" }, 400);
       }
+      const err = error as Error;
       const message = err.message || `${modelType.toUpperCase()} 生产模型准备失败`;
       return handleUnexpectedError(c, error, message);
     } finally {
@@ -388,15 +420,18 @@ modelsController.post(
       if (error instanceof ModelServiceUnavailableError) {
         return c.json({ error: error.message, code: error.code }, 503);
       }
-      const err = error as Error;
-      if (err.message?.includes("timed out") || err.message?.includes("超时")) {
-        const timeoutSeconds = Math.ceil(TIMEOUTS.MODEL_PREDICTION / 1000);
-        return c.json({ error: `预测超时（${timeoutSeconds}秒）` }, 504);
+      if (error instanceof ModelTimeoutError) {
+        const timeoutSeconds = Math.ceil(error.timeoutMs / 1000);
+        return c.json(
+          buildModelTimeoutPayload(error, "prediction", `预测超时（${timeoutSeconds}秒）`),
+          504,
+        );
       }
       const pythonError = parsePythonServiceError(error);
       if (pythonError !== null) {
         return c.json({ error: pythonError || "Python 模型输入无效" }, 400);
       }
+      const err = error as Error;
       const message = err.message || `${modelType.toUpperCase()} 预测失败`;
       return handleUnexpectedError(c, error, message);
     } finally {

@@ -21,6 +21,7 @@ import {
   ModelConflictError,
   ModelNotFoundError,
   ModelServiceUnavailableError,
+  ModelTimeoutError,
   ModelValidationError,
 } from "./model-errors";
 import {
@@ -66,6 +67,7 @@ export {
   ModelConflictError,
   ModelNotFoundError,
   ModelServiceUnavailableError,
+  ModelTimeoutError,
   ModelValidationError,
 } from "./model-errors";
 export {
@@ -81,6 +83,7 @@ export { transformTrainingResult } from "./model-results";
 export type { GuidedTrainingSessionPayload, GuidedTrainingStepDefinition } from "./model-types";
 
 const TRAINING_TIMEOUT = TIMEOUTS.MODEL_TRAINING;
+const MODEL_EXECUTION_HARD_CAP = TIMEOUTS.MODEL_EXECUTION_HARD_CAP;
 const DEFAULT_PRODUCTION_FORECAST_STEPS = 6;
 const MIN_TRAINING_POINTS = 8;
 const MIN_EVALUATION_POINTS = 2;
@@ -279,7 +282,7 @@ const buildProductionCandidateModelPath = (
 const getLstmSidecarPath = (modelPath: string) => modelPath.replace(/\.pkl$/, "_keras_model.h5");
 const AUXILIARY_PYTHON_TIMEOUT_MS = 30_000;
 
-const waitForAuxiliaryPythonProcess = async (
+export const waitForAuxiliaryPythonProcess = async (
   proc: {
     stdout: ReadableStream<Uint8Array>;
     stderr: ReadableStream<Uint8Array>;
@@ -287,6 +290,7 @@ const waitForAuxiliaryPythonProcess = async (
     kill: (signal?: number | NodeJS.Signals) => void;
   },
   label: string,
+  timeoutMs: number = AUXILIARY_PYTHON_TIMEOUT_MS,
 ) => {
   let timeoutId: ReturnType<typeof setTimeout> | undefined;
   const completion = Promise.all([
@@ -297,8 +301,8 @@ const waitForAuxiliaryPythonProcess = async (
   const timeout = new Promise<never>((_, reject) => {
     timeoutId = setTimeout(() => {
       try { proc.kill("SIGKILL"); } catch { /* process may already have exited */ }
-      reject(new Error(`${label}超时`));
-    }, AUXILIARY_PYTHON_TIMEOUT_MS);
+      reject(new ModelTimeoutError(`${label}超时`, timeoutMs, "python_process"));
+    }, timeoutMs);
     timeoutId.unref?.();
   });
   try {
@@ -441,6 +445,9 @@ const hasCompleteEnsembleArtifact = async (modelPath: string) => {
     const payload = JSON.parse(stdout) as { valid?: unknown };
     return payload.valid === true;
   } catch (error) {
+    if (error instanceof ModelTimeoutError) {
+      throw error;
+    }
     logger.warn({ err: error, modelPath }, "解析融合模型产物校验结果失败");
     return false;
   }
@@ -1069,16 +1076,22 @@ export const resolveGuidedStepTimeoutMs = (
     || (modelType === "stacking" && ["level1_predictions", "eval_predictions"].includes(stepId))
     || (modelType === "boosting" && /^round_\d+_evaluate_candidates$/.test(stepId))
   ) {
-    return Math.max(TRAINING_TIMEOUT, sumBudgetSeconds * 1000);
+    return Math.min(
+      MODEL_EXECUTION_HARD_CAP,
+      Math.max(TRAINING_TIMEOUT, sumBudgetSeconds * 1000),
+    );
   }
   if (modelType === "boosting" && stepId === "retrain_chain") {
     const maxCandidateSeconds = Math.max(...models.map((model) => BASE_MODEL_TIMEOUT_SECONDS[model]));
-    return Math.max(TRAINING_TIMEOUT, (models.length * maxCandidateSeconds + 30) * 1000);
+    return Math.min(
+      MODEL_EXECUTION_HARD_CAP,
+      Math.max(TRAINING_TIMEOUT, (models.length * maxCandidateSeconds + 30) * 1000),
+    );
   }
   return TRAINING_TIMEOUT;
 };
 
-const resolveProductionPreparationTimeoutMs = (
+export const resolveProductionPreparationTimeoutMs = (
   modelType: ModelType,
   activeRun: ModelTrainingRunRow,
 ) => {
@@ -1090,13 +1103,19 @@ const resolveProductionPreparationTimeoutMs = (
   const models = rawModels.length > 0 ? rawModels : [...BASE_MODEL_TYPES] as BaseModelType[];
   if (modelType === "boosting") {
     const maxCandidateSeconds = Math.max(...models.map((model) => BASE_MODEL_TIMEOUT_SECONDS[model]));
-    return Math.max(TRAINING_TIMEOUT, (models.length * maxCandidateSeconds + 60) * 1000);
+    return Math.min(
+      MODEL_EXECUTION_HARD_CAP,
+      Math.max(TRAINING_TIMEOUT, (models.length * maxCandidateSeconds + 60) * 1000),
+    );
   }
   const sumBudgetSeconds = models.reduce(
     (sum, model) => sum + BASE_MODEL_TIMEOUT_SECONDS[model],
     60,
   );
-  return Math.max(TRAINING_TIMEOUT, sumBudgetSeconds * 1000);
+  return Math.min(
+    MODEL_EXECUTION_HARD_CAP,
+    Math.max(TRAINING_TIMEOUT, sumBudgetSeconds * 1000),
+  );
 };
 
 const assertRequestMatchesPersistedValue = (
@@ -1793,6 +1812,30 @@ const parseGuidedAttemptReceipt = (
     }
   }
   return receipt;
+};
+
+const cleanupIncompleteGuidedAttemptArtifacts = (
+  attempt: GuidedTrainingStepAttemptRow,
+) => {
+  try {
+    if (parseGuidedAttemptReceipt(attempt)) return;
+  } catch (error) {
+    logger.warn(
+      { err: error, attemptId: attempt.attempt_id },
+      "校验超时 guided attempt 工件失败，将按未完成工件清理",
+    );
+  }
+
+  for (const filePath of [attempt.candidate_state_path, attempt.receipt_path]) {
+    try {
+      fs.rmSync(filePath, { force: true });
+    } catch (error) {
+      logger.warn(
+        { err: error, attemptId: attempt.attempt_id, filePath },
+        "清理超时 guided attempt 工件失败",
+      );
+    }
+  }
 };
 
 const fetchGuidedAttempt = async (
@@ -2629,6 +2672,9 @@ export async function runGuidedTrainingStep(
         stepId,
         error,
       );
+      if (error instanceof ModelTimeoutError) {
+        cleanupIncompleteGuidedAttemptArtifacts(activeAttempt);
+      }
     }
     throw error;
   } finally {

@@ -20,6 +20,19 @@ function parsePositiveIntegerEnv(name: string): number | null {
   return parsed;
 }
 
+/** 模型执行的不可配置硬上限：10 分钟。 */
+export const MODEL_EXECUTION_HARD_CAP_MS = 10 * 60 * 1000;
+
+function parseModelTimeoutEnv(name: string, fallbackMs: number): number {
+  const value = parsePositiveIntegerEnv(name) ?? fallbackMs;
+  if (value > MODEL_EXECUTION_HARD_CAP_MS) {
+    throw new Error(
+      `${name} must be <= ${MODEL_EXECUTION_HARD_CAP_MS}, got: ${value}`,
+    );
+  }
+  return value;
+}
+
 const SYSTEM_PARALLELISM = Math.max(1, availableParallelism());
 const DEFAULT_MODEL_JOB_CAP = 50;
 const DEFAULT_PDF_JOB_CAP = 12;
@@ -67,10 +80,12 @@ export const CONTENT_LIMITS = {
 // 超时时间 (毫秒)
 // ============================================
 export const TIMEOUTS = {
+  /** 所有 Python 模型任务都不可突破的硬上限 */
+  MODEL_EXECUTION_HARD_CAP: MODEL_EXECUTION_HARD_CAP_MS,
   /** Python 模型训练超时 */
-  MODEL_TRAINING: 300000,
+  MODEL_TRAINING: parseModelTimeoutEnv("MODEL_TRAINING_TIMEOUT_MS", 300000),
   /** Python 模型预测超时 */
-  MODEL_PREDICTION: 60000,
+  MODEL_PREDICTION: parseModelTimeoutEnv("MODEL_PREDICTION_TIMEOUT_MS", 60000),
   /** ADF 平稳性检测超时 */
   ADF: 30000,
   /** PDF 生成超时（Puppeteer 执行） */
