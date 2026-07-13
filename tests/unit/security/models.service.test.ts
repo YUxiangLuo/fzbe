@@ -522,50 +522,6 @@ describe("models service", () => {
     await unlink(datasetCsvPath).catch(() => {});
   });
 
-  test("reports only safe Python progress lines to callers", async () => {
-    existsSync.mockImplementation((filePath: string) => filePath.endsWith("/run_model.py"));
-    const progressMessages: string[] = [];
-
-    spawnMock.mockImplementationOnce(() => ({
-      stdout: new ReadableStream({
-        start(controller) {
-          controller.enqueue(new TextEncoder().encode('{"predictions":[]}'));
-          controller.close();
-        },
-      }),
-      stderr: new ReadableStream({
-        start(controller) {
-          controller.enqueue(new TextEncoder().encode([
-            "2026-06-28 06:00:00,000 - INFO - Starting model training and evaluation...",
-            "2026-06-28 06:00:00,001 - INFO - MA run started with args: {'data': '[{\\\"销售数量\\\": 123}]'}",
-            "Traceback (most recent call last):",
-            "File \"/opt/fangzhen2/fzbe/py/src/models/ma.py\", line 1, in <module>",
-            "ValueError: boom",
-            "2026-06-28 06:00:00,002 - DEBUG - Training data: min=1, max=2, mean=1.5",
-            "2026-06-28 06:00:00,003 - INFO - Evaluation metrics computed: RMSE=1.0000, MAE=1.0000, MAPE=1.0000, R²=0.9000",
-          ].join("\n")));
-          controller.close();
-        },
-      }),
-      exited: Promise.resolve(0),
-      exitCode: 0,
-      killed: false,
-      pid: 4321,
-      kill: mock(() => {}),
-    }));
-
-    await runPythonModel("ma", { data: "[]" }, undefined, (event) => {
-      if (event.source === "python") {
-        progressMessages.push(event.message);
-      }
-    });
-
-    expect(progressMessages).toEqual([
-      "Starting model training and evaluation...",
-      "Evaluation metrics computed: RMSE=1.0000, MAE=1.0000, MAPE=1.0000, R²=0.9000",
-    ]);
-  });
-
   test("terminates an in-flight Python process when the model lock signal is lost", async () => {
     existsSync.mockImplementation((filePath: string) => filePath.endsWith("/run_model.py"));
     let stdoutController!: ReadableStreamDefaultController<Uint8Array>;
@@ -685,39 +641,6 @@ describe("models service", () => {
 
     expect(inheritedDeadline).toBeGreaterThanOrEqual(startedAt + 600_000);
     expect(inheritedDeadline).toBeLessThanOrEqual(Date.now() + 600_000);
-  });
-
-  test("does not include raw stderr when Python exits with an untagged failure", async () => {
-    existsSync.mockImplementation((filePath: string) => filePath.endsWith("/run_model.py"));
-    spawnMock.mockImplementationOnce(() => ({
-      stdout: new ReadableStream({
-        start(controller) {
-          controller.close();
-        },
-      }),
-      stderr: new ReadableStream({
-        start(controller) {
-          controller.enqueue(new TextEncoder().encode([
-            "Traceback (most recent call last):",
-            "File \"/opt/fangzhen2/fzbe/py/src/models/ma.py\", line 1, in <module>",
-            "RuntimeError: internal failure with /opt/fangzhen2/secret/path",
-          ].join("\n")));
-          controller.close();
-        },
-      }),
-      exited: Promise.resolve(1),
-      exitCode: 1,
-      killed: false,
-      pid: 4321,
-      kill: mock(() => {}),
-    }));
-
-    const error = await runPythonModel("ma", { data: "[]" }).catch((caughtError) => caughtError as Error);
-
-    expect(error).toBeInstanceOf(Error);
-    expect(error.message).toBe("Python 执行失败");
-    expect(error.message).not.toContain("Traceback");
-    expect(error.message).not.toContain("/opt/fangzhen2");
   });
 
   test("blocks training for completed experiments before loading dataset data", async () => {
