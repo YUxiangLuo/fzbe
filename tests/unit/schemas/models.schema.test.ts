@@ -152,6 +152,7 @@ describe("Models Schemas", () => {
       const result = predictSchema.safeParse({
         experiment_id: 12,
         forecast_steps: 6,
+        preparation_token: "123e4567-e89b-42d3-a456-426614174000",
       });
 
       expect(result.success).toBe(true);
@@ -177,6 +178,7 @@ describe("Models Schemas", () => {
     test("should accept a valid production preparation payload", () => {
       const result = prepareProductionSchema.safeParse({
         experiment_id: 12,
+        forecast_steps: 6,
       });
 
       expect(result.success).toBe(true);

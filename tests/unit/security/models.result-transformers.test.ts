@@ -80,9 +80,9 @@ describe("model training result transformers", () => {
         eval_predictions: [9.5, 12.4],
         notes: ["ok"],
         saved_model: "/tmp/ma.pkl",
-        logs: ["done"],
       },
     });
+    expect(transformed.results).not.toHaveProperty("logs");
     expect((transformed.results.metrics as Record<string, number>).rmse).toBeCloseTo(0.4527692569);
     expect((transformed.results.metrics as Record<string, number>).mae).toBeCloseTo(0.45);
     expect((transformed.results.metrics as Record<string, number>).mape).toBeCloseTo(4.1666666667);

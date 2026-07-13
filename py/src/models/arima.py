@@ -12,6 +12,7 @@ import pmdarima as pm
 
 from data_utils import ParsedData, load_data_from_json
 from logger import log, get_log_contents
+from log_safety import summarize_cli_args
 from metrics import mae, mape, r2, rmse
 from model_info import attach_method_metadata, ensure_state_metadata
 from serialization import dump_model, load_model
@@ -285,7 +286,7 @@ def train_and_evaluate(
             "aic": float(bic_aic),
             "bic": float(bic_bic),
         },
-        "selected_model": "aic_optimized" if best_model == aic_model else "bic_optimized",
+        "selected_model": "aic_optimized" if best_model is aic_model else "bic_optimized",
         "selection_criterion": selection_criterion,
     }
 
@@ -350,7 +351,7 @@ def run(args) -> None:
     """
     Main entry point for ARIMA model training and prediction.
     """
-    log.info(f"ARIMA run started with args: {vars(args)}")
+    log.info(f"ARIMA run started with args: {summarize_cli_args(args)}")
     pretty: bool = bool(getattr(args, "pretty", False))
     save_path = getattr(args, "save_model", None)
     load_path = getattr(args, "load_model", None)

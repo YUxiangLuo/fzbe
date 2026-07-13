@@ -152,10 +152,12 @@ export function getTrainSchemaForModel(modelType: ModelType) {
 export const predictSchema = z.object({
   experiment_id: z.coerce.number().int().min(1),
   forecast_steps: z.coerce.number().int().min(1).max(12),
+  preparation_token: z.string().uuid(),
 });
 
 export const prepareProductionSchema = z.object({
   experiment_id: z.coerce.number().int().min(1),
+  forecast_steps: z.coerce.number().int().min(1).max(12),
 });
 
 export function isModelType(value: unknown): value is ModelType {

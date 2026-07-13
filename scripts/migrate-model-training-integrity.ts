@@ -76,6 +76,19 @@ try {
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
   `);
 
+  await addColumnIfMissing(
+    connection,
+    "model_training_runs",
+    "production_artifact_forecast_steps",
+    "TINYINT UNSIGNED NULL AFTER production_artifact_path",
+  );
+  await addColumnIfMissing(
+    connection,
+    "model_training_runs",
+    "production_revision",
+    "CHAR(36) NULL AFTER production_artifact_forecast_steps",
+  );
+
   console.log("Model training integrity migration complete.");
 } catch (error) {
   console.error("Model training integrity migration failed:", error);

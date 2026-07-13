@@ -18,6 +18,7 @@ from sklearn.preprocessing import MinMaxScaler, OneHotEncoder, StandardScaler
 # Import shared utilities
 from data_utils import ParsedData, infer_feature_types as infer_parsed_feature_types, load_data_from_json
 from logger import log, get_log_contents
+from log_safety import summarize_cli_args
 from metrics import mae, mape, r2, rmse
 from model_info import attach_method_metadata, ensure_state_metadata
 from serialization import dump_model, load_model
@@ -73,14 +74,6 @@ def _parse_feature_key_list(raw_value: Optional[str]) -> Optional[List[str]]:
         return [str(item).strip() for item in parsed if str(item).strip()]
 
     return [item.strip() for item in str(raw_value).split(',') if item.strip()]
-
-
-def _summarize_args_for_log(args) -> Dict[str, Any]:
-    summarized = dict(vars(args))
-    data = summarized.get("data")
-    if isinstance(data, str):
-        summarized["data"] = f"<json payload chars={len(data)}>"
-    return summarized
 
 
 def _load_state(model_path: str) -> Dict[str, Any]:
@@ -704,7 +697,7 @@ def run(args) -> None:
     tf.keras.utils.set_random_seed(42)
     _set_random_seed(42)
 
-    log.info(f"LSTM run started with args: {_summarize_args_for_log(args)}")
+    log.info(f"LSTM run started with args: {summarize_cli_args(args)}")
 
     pretty: bool = bool(getattr(args, "pretty", False))
     save_path = getattr(args, "save_model", None)

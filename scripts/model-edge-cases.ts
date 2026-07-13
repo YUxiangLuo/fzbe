@@ -321,6 +321,46 @@ function trainingBody(experimentId: number, modelType: ModelType) {
   }
 }
 
+async function trainGuidedModel(
+  app: AppLike,
+  token: string,
+  experimentId: number,
+  modelType: ModelType,
+) {
+  let session = assertStatus<any>(
+    await requestApp(app, `/api/v1/models/${modelType}/guided-training/sessions`, {
+      method: "POST",
+      token,
+      body: trainingBody(experimentId, modelType),
+    }),
+    200,
+    `${modelType} guided session creation`,
+  );
+
+  for (let stepCount = 0; stepCount < 64 && session.status !== "completed"; stepCount += 1) {
+    if (session.status === "failed" || session.status === "superseded") {
+      throw new Error(`${modelType} guided session became ${session.status}: ${JSON.stringify(session)}`);
+    }
+    if (typeof session.next_step_id !== "string" || typeof session.session_id !== "string") {
+      throw new Error(`${modelType} guided session has no runnable next step: ${JSON.stringify(session)}`);
+    }
+    session = assertStatus<any>(
+      await requestApp(
+        app,
+        `/api/v1/models/${modelType}/guided-training/sessions/${session.session_id}/steps/${session.next_step_id}/run`,
+        { method: "POST", token, body: {} },
+      ),
+      200,
+      `${modelType} guided step ${session.next_step_id}`,
+    );
+  }
+
+  if (session.status !== "completed" || !session.result) {
+    throw new Error(`${modelType} guided training did not complete: ${JSON.stringify(session)}`);
+  }
+  return session.result;
+}
+
 async function login(app: AppLike) {
   const payload = assertStatus<any>(
     await requestApp(app, "/api/v1/sessions", {
@@ -383,14 +423,14 @@ async function runApiLayer() {
   const experimentId = await createModelExperiment(app, token);
   const trainedModels: ModelType[] = [];
 
-  const badModelType = await requestApp(app, "/api/v1/models/not-real/training", {
+  const badModelType = await requestApp(app, "/api/v1/models/not-real/guided-training/sessions", {
     method: "POST",
     token,
     body: { experiment_id: experimentId },
   });
   assertStatus(badModelType, 400, "invalid model type should be rejected");
 
-  const badSchema = await requestApp(app, "/api/v1/models/ma/training", {
+  const badSchema = await requestApp(app, "/api/v1/models/ma/guided-training/sessions", {
     method: "POST",
     token,
     body: {
@@ -402,30 +442,14 @@ async function runApiLayer() {
 
   for (const modelType of BASE_MODELS) {
     console.error(`[model-edge] api train: ${modelType}`);
-    const training = assertStatus<any>(
-      await requestApp(app, `/api/v1/models/${modelType}/training`, {
-        method: "POST",
-        token,
-        body: trainingBody(experimentId, modelType),
-      }),
-      200,
-      `${modelType} training`,
-    );
+    const training = await trainGuidedModel(app, token, experimentId, modelType);
     assertTrainingPayload(modelType, training);
     trainedModels.push(modelType);
   }
 
   for (const modelType of ENSEMBLE_MODELS) {
     console.error(`[model-edge] api train: ${modelType}`);
-    const training = assertStatus<any>(
-      await requestApp(app, `/api/v1/models/${modelType}/training`, {
-        method: "POST",
-        token,
-        body: trainingBody(experimentId, modelType),
-      }),
-      200,
-      `${modelType} training`,
-    );
+    const training = await trainGuidedModel(app, token, experimentId, modelType);
     assertTrainingPayload(modelType, training);
     trainedModels.push(modelType);
   }
@@ -434,17 +458,17 @@ async function runApiLayer() {
   const notReadyPrepare = await requestApp(app, "/api/v1/models/ma/prepare-production", {
     method: "POST",
     token,
-    body: { experiment_id: notReadyExperimentId },
+    body: { experiment_id: notReadyExperimentId, forecast_steps: 3 },
   });
   assertStatus(notReadyPrepare, 400, "prepare-production should reject incomplete models");
 
   for (const modelType of trainedModels) {
     console.error(`[model-edge] api production predict: ${modelType}`);
-    assertStatus(
+    const preparation = assertStatus<any>(
       await requestApp(app, `/api/v1/models/${modelType}/prepare-production`, {
         method: "POST",
         token,
-        body: { experiment_id: experimentId },
+        body: { experiment_id: experimentId, forecast_steps: 3 },
       }),
       200,
       `${modelType} prepare-production`,
@@ -453,7 +477,11 @@ async function runApiLayer() {
       await requestApp(app, `/api/v1/models/${modelType}/predict`, {
         method: "POST",
         token,
-        body: { experiment_id: experimentId, forecast_steps: 3 },
+        body: {
+          experiment_id: experimentId,
+          forecast_steps: 3,
+          preparation_token: preparation.results?.preparation_token,
+        },
       }),
       200,
       `${modelType} predict`,
@@ -464,11 +492,24 @@ async function runApiLayer() {
   const expandedHorizonModels: ModelType[] = ["lstm", ...ENSEMBLE_MODELS];
   for (const modelType of expandedHorizonModels) {
     console.error(`[model-edge] api expand production horizon: ${modelType}`);
+    const preparation = assertStatus<any>(
+      await requestApp(app, `/api/v1/models/${modelType}/prepare-production`, {
+        method: "POST",
+        token,
+        body: { experiment_id: experimentId, forecast_steps: 8 },
+      }),
+      200,
+      `${modelType} expanded-horizon prepare-production`,
+    );
     const prediction = assertStatus<any>(
       await requestApp(app, `/api/v1/models/${modelType}/predict`, {
         method: "POST",
         token,
-        body: { experiment_id: experimentId, forecast_steps: 8 },
+        body: {
+          experiment_id: experimentId,
+          forecast_steps: 8,
+          preparation_token: preparation.results?.preparation_token,
+        },
       }),
       200,
       `${modelType} expanded-horizon predict`,

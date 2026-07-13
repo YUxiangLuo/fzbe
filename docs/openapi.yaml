@@ -439,6 +439,21 @@ components:
 
     ModelPredictRequest:
       type: object
+      required: [experiment_id, forecast_steps, preparation_token]
+      properties:
+        experiment_id:
+          type: integer
+          minimum: 1
+        forecast_steps:
+          type: integer
+          minimum: 1
+          maximum: 12
+        preparation_token:
+          type: string
+          format: uuid
+
+    ModelPrepareProductionRequest:
+      type: object
       required: [experiment_id, forecast_steps]
       properties:
         experiment_id:
@@ -449,13 +464,16 @@ components:
           minimum: 1
           maximum: 12
 
-    ModelPrepareProductionRequest:
+    ModelOperationResponse:
       type: object
-      required: [experiment_id]
+      required: [status, results]
       properties:
-        experiment_id:
-          type: integer
-          minimum: 1
+        status:
+          type: string
+          enum: [success]
+        results:
+          type: object
+          additionalProperties: true
 
     GuidedTrainingSession:
       type: object
@@ -472,7 +490,7 @@ components:
           enum: [ma, es, arima, lstm, stacking, weighted_avg, boosting]
         status:
           type: string
-          enum: [ready, running, failed, completed]
+          enum: [ready, running, failed, completed, superseded]
         current_step_id:
           type: string
           nullable: true
@@ -494,17 +512,18 @@ components:
         error_message:
           type: string
           nullable: true
+        error_code:
+          type: string
+          nullable: true
+          enum: [GUIDED_SESSION_SUPERSEDED]
         experiment_state_version:
           type: integer
           minimum: 0
           nullable: true
 
     GuidedTrainingSessionResponse:
-      type: object
-      required: [data]
-      properties:
-        data:
-          $ref: '#/components/schemas/GuidedTrainingSession'
+      allOf:
+        - $ref: '#/components/schemas/GuidedTrainingSession'
 
     AcademicTerm:
       type: object
@@ -2204,129 +2223,12 @@ paths:
               schema:
                 $ref: '#/components/schemas/ErrorResponse'
 
-  /api/v1/models/{model_type}/training:
-    post:
-      tags: [Models]
-      summary: 模型训练
-      operationId: trainModel
-      security:
-        - bearerAuth: []
-      parameters:
-        - $ref: '#/components/parameters/modelType'
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema:
-              $ref: '#/components/schemas/ModelTrainRequest'
-      responses:
-        '200':
-          description: 训练成功
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/DataEnvelope'
-        '400':
-          description: 参数/数据错误
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/ErrorResponse'
-        '403':
-          description: 权限不足
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/ErrorResponse'
-        '404':
-          description: 实验不存在
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/ErrorResponse'
-        '409':
-          description: 同一实验下该模型已有训练/预测任务在执行
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/ErrorResponse'
-        '429':
-          description: 模型服务繁忙
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/ErrorResponse'
-        '504':
-          description: 训练超时
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/ErrorResponse'
-
-  /api/v1/models/{model_type}/training/stream:
-    post:
-      tags: [Models]
-      summary: 模型训练（流式进度）
-      operationId: trainModelStream
-      description: 返回 NDJSON 事件流，逐行输出训练进度、后端日志和最终结果。最终事件 type 为 result；训练过程错误会以 type 为 error 的事件返回。
-      security:
-        - bearerAuth: []
-      parameters:
-        - $ref: '#/components/parameters/modelType'
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema:
-              $ref: '#/components/schemas/ModelTrainRequest'
-      responses:
-        '200':
-          description: 训练进度事件流
-          content:
-            application/x-ndjson:
-              schema:
-                type: string
-                example: |
-                  {"type":"progress","phase":"queued","percent":2,"message":"已获取模型训练执行资源，正在启动训练任务"}
-                  {"type":"log","source":"python","percent":52,"message":"Training finished. Metrics: ..."}
-                  {"type":"result","data":{"status":"success","results":{"metrics":{"rmse":1.0,"mae":1.0,"r2":0.9}}}}
-        '400':
-          description: 参数/数据错误
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/ErrorResponse'
-        '403':
-          description: 权限不足
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/ErrorResponse'
-        '404':
-          description: 实验不存在
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/ErrorResponse'
-        '409':
-          description: 同一实验下该模型已有训练/预测任务在执行
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/ErrorResponse'
-        '429':
-          description: 模型服务繁忙
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/ErrorResponse'
-
   /api/v1/models/{model_type}/guided-training/sessions:
     post:
       tags: [Models]
       summary: 创建或恢复分阶段模型训练会话
       operationId: createOrResumeGuidedTrainingSession
-      description: 使用与普通训练相同的请求体创建可逐步执行的 guided training 会话；相同实验、学生、模型和请求参数会复用已有会话。
+      description: 使用模型训练参数创建可逐步执行的 guided training 会话；相同实验、学生、模型和请求参数会复用已有会话。
       security:
         - bearerAuth: []
       parameters:
@@ -2398,6 +2300,42 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/ErrorResponse'
+    delete:
+      tags: [Models]
+      summary: 废弃未完成的分阶段训练会话
+      operationId: discardGuidedTrainingSession
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/modelType'
+        - $ref: '#/components/parameters/sessionId'
+      responses:
+        '204':
+          description: 会话已废弃
+        '403':
+          description: 权限不足
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '404':
+          description: 会话不存在
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '409':
+          description: 会话正在运行、已完成或模型锁繁忙
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '503':
+          description: 数据库模型锁所有权丢失
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
 
   /api/v1/models/{model_type}/guided-training/sessions/{session_id}/steps/{step_id}/run:
     post:
@@ -2447,6 +2385,12 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/ErrorResponse'
+        '503':
+          description: 数据库模型锁所有权丢失
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
         '504':
           description: 阶段执行超时
           content:
@@ -2475,7 +2419,7 @@ paths:
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/DataEnvelope'
+                $ref: '#/components/schemas/ModelOperationResponse'
         '400':
           description: 参数错误或模型尚未满足生产准备条件
           content:
@@ -2502,6 +2446,12 @@ paths:
                 $ref: '#/components/schemas/ErrorResponse'
         '429':
           description: 模型服务繁忙
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '503':
+          description: 数据库模型锁所有权丢失
           content:
             application/json:
               schema:
@@ -2534,7 +2484,7 @@ paths:
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/DataEnvelope'
+                $ref: '#/components/schemas/ModelOperationResponse'
         '400':
           description: 参数错误
           content:
@@ -2561,6 +2511,12 @@ paths:
                 $ref: '#/components/schemas/ErrorResponse'
         '429':
           description: 模型服务繁忙
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '503':
+          description: 数据库模型锁所有权丢失
           content:
             application/json:
               schema:

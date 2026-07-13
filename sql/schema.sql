@@ -225,15 +225,20 @@ CREATE TABLE IF NOT EXISTS `model_guided_training_sessions` (
   `request_hash` CHAR(64) NOT NULL,
   `dataset_revision` CHAR(64) NOT NULL,
   `runtime_revision` CHAR(64) NOT NULL,
+  `protocol_version` SMALLINT UNSIGNED NOT NULL DEFAULT 2,
   `request_payload` JSON NOT NULL,
-  `status` ENUM('ready', 'running', 'failed', 'completed') NOT NULL DEFAULT 'ready',
+  `status` ENUM('ready', 'running', 'failed', 'completed', 'superseded') NOT NULL DEFAULT 'ready',
   `current_step_id` VARCHAR(64) DEFAULT NULL,
   `completed_step_ids` JSON NOT NULL,
   `step_outputs` JSON NOT NULL,
   `step_plan` JSON NOT NULL,
   `result_payload` JSON DEFAULT NULL,
   `artifact_dir` VARCHAR(1024) NOT NULL,
+  `committed_state_path` VARCHAR(1024) DEFAULT NULL,
+  `committed_state_sha256` CHAR(64) DEFAULT NULL,
+  `active_attempt_id` CHAR(36) DEFAULT NULL,
   `error_message` TEXT DEFAULT NULL,
+  `superseded_reason` TEXT DEFAULT NULL,
   `experiment_state_version` BIGINT UNSIGNED DEFAULT NULL,
   `created_at` TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
   `updated_at` TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
@@ -251,6 +256,29 @@ CREATE TABLE IF NOT EXISTS `model_guided_training_sessions` (
   INDEX `idx_guided_training_status` (`status`, `expires_at`)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
+CREATE TABLE IF NOT EXISTS `model_guided_training_step_attempts` (
+  `attempt_id` CHAR(36) PRIMARY KEY,
+  `session_id` CHAR(36) NOT NULL,
+  `step_id` VARCHAR(64) NOT NULL,
+  `status` ENUM('running', 'python_completed', 'committed', 'failed') NOT NULL DEFAULT 'running',
+  `input_state_path` VARCHAR(1024) DEFAULT NULL,
+  `input_state_sha256` CHAR(64) DEFAULT NULL,
+  `candidate_state_path` VARCHAR(1024) NOT NULL,
+  `candidate_state_sha256` CHAR(64) DEFAULT NULL,
+  `receipt_path` VARCHAR(1024) NOT NULL,
+  `output_payload` JSON DEFAULT NULL,
+  `final_result_payload` JSON DEFAULT NULL,
+  `error_message` TEXT DEFAULT NULL,
+  `run_count` INT UNSIGNED NOT NULL DEFAULT 1,
+  `lease_expires_at` TIMESTAMP NULL DEFAULT NULL,
+  `created_at` TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  `updated_at` TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+
+  FOREIGN KEY (`session_id`) REFERENCES `model_guided_training_sessions`(`session_id`) ON DELETE CASCADE,
+  INDEX `idx_guided_attempt_session_step` (`session_id`, `step_id`, `created_at`),
+  INDEX `idx_guided_attempt_lease` (`status`, `lease_expires_at`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
 CREATE TABLE IF NOT EXISTS `model_training_runs` (
   `run_id` CHAR(36) PRIMARY KEY,
   `session_id` CHAR(36) DEFAULT NULL,
@@ -264,6 +292,8 @@ CREATE TABLE IF NOT EXISTS `model_training_runs` (
   `metrics` JSON NOT NULL,
   `artifact_path` VARCHAR(1024) NOT NULL,
   `production_artifact_path` VARCHAR(1024) DEFAULT NULL,
+  `production_artifact_forecast_steps` TINYINT UNSIGNED DEFAULT NULL,
+  `production_revision` CHAR(36) DEFAULT NULL,
   `is_active` BOOLEAN NOT NULL DEFAULT true,
   `created_at` TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
   `activated_at` TIMESTAMP DEFAULT CURRENT_TIMESTAMP,

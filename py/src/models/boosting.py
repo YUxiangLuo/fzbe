@@ -21,11 +21,21 @@ from scipy.sparse import csr_matrix
 
 from data_utils import ParsedData, infer_feature_types, load_data_from_json
 from ensemble_utils import (
+    build_lstm_params_from_source_state,
     build_ensemble_subprocess_data,
+    compute_phase1_train_size,
+    format_predictions,
+    get_lstm_source_forecast_strategy,
     get_member_model_path,
+    load_lstm_source_state,
+    normalize_demand_forecast,
     parse_base_model_files_arg,
+    parse_feature_name_list,
     persist_member_model_artifact,
+    prepare_lstm_source_model_for_requested_steps,
     remove_member_model_artifact,
+    resolve_lstm_reuse_production_horizon,
+    validate_internal_split_base_params,
 )
 from metrics import mae, mape, r2, rmse
 from model_info import attach_method_metadata, ensure_state_metadata
@@ -51,141 +61,14 @@ IMPLEMENTATION_NOTES = [
 
 
 # ---------- utilities ----------
-def _parse_feature_name_list(raw_value: Any) -> List[str]:
-    if raw_value is None:
-        return []
-    if isinstance(raw_value, list):
-        return [str(item).strip() for item in raw_value if str(item).strip()]
-    if isinstance(raw_value, str):
-        try:
-            parsed = json.loads(raw_value)
-        except json.JSONDecodeError:
-            parsed = None
-        if isinstance(parsed, list):
-            return [str(item).strip() for item in parsed if str(item).strip()]
-        return [item.strip() for item in raw_value.split(",") if item.strip()]
-    return []
-
-
-def _load_lstm_source_state(model_file: str, context: str) -> Dict[str, Any]:
-    source_model_state = load_model(model_file)
-    if not isinstance(source_model_state, dict) or source_model_state.get("model_type") != "lstm":
-        raise ValueError(f"[VALIDATION] {context} is invalid.")
-    return source_model_state
-
-
-def _build_lstm_params_from_source_state(
-    parsed_data: ParsedData,
-    source_model_state: Dict[str, Any],
-    fallback_params: Dict[str, Any],
-) -> Dict[str, Any]:
-    target_feature = str(
-        source_model_state.get("target_key")
-        or fallback_params.get("lstm_target_feature")
-        or parsed_data.target_key
-    )
-    feature_keys = [
-        feature_name
-        for feature_name in source_model_state.get("feature_keys", []) or []
-        if feature_name and feature_name != target_feature
-    ]
-    raw_feature_types = source_model_state.get("feature_types")
-    if isinstance(raw_feature_types, dict) and raw_feature_types:
-        feature_types = {
-            str(key): value
-            for key, value in raw_feature_types.items()
-            if key == target_feature or key in feature_keys
-        }
-    else:
-        feature_types = infer_feature_types(
-            parsed_data=parsed_data,
-            target_key=target_feature,
-            feature_keys=feature_keys,
-        )
-    feature_types[target_feature] = "numeric"
-
-    params = {
-        "look_back": int(source_model_state["look_back"]),
-        "epochs": int(source_model_state.get("epochs", fallback_params.get("epochs", 20))),
-        "feature_types": feature_types,
-        "normalization": source_model_state.get(
-            "normalization",
-            fallback_params.get("normalization", "minmax"),
-        ),
-        "lstm_target_feature": target_feature,
-    }
-    if feature_keys:
-        params["lstm_features"] = json.dumps(feature_keys, ensure_ascii=False)
-    return params
-
-
-def _get_lstm_source_forecast_strategy(source_model_state: Dict[str, Any]) -> str:
-    from models import lstm as lstm_model
-
-    if source_model_state.get("forecast_strategy"):
-        return str(source_model_state["forecast_strategy"])
-    if int(source_model_state.get("forecast_horizon", 0) or 0) > 0:
-        return lstm_model.DIRECT_FORECAST_STRATEGY
-    return lstm_model.LEGACY_FORECAST_STRATEGY
-
-
-def _resolve_lstm_reuse_production_horizon(
-    source_model_state: Dict[str, Any],
-    requested_steps: int = 0,
-) -> int:
-    from models import lstm as lstm_model
-
-    forecast_strategy = _get_lstm_source_forecast_strategy(source_model_state)
-    if forecast_strategy != lstm_model.DIRECT_FORECAST_STRATEGY:
-        return 0
-
-    saved_eval_horizon = int(source_model_state.get("forecast_horizon", 0) or 0)
-    current_required_horizon = lstm_model._resolve_production_forecast_horizon(
-        state=source_model_state,
-        eval_forecast_horizon=saved_eval_horizon,
-    )
-    return max(current_required_horizon, int(requested_steps or 0))
-
-
-def _prepare_lstm_source_model_for_requested_steps(
-    source_model_file: str,
-    source_model_state: Dict[str, Any],
-    requested_steps: int,
-) -> Tuple[str, Optional[str]]:
-    current_required_horizon = _resolve_lstm_reuse_production_horizon(source_model_state)
-    requested_required_horizon = _resolve_lstm_reuse_production_horizon(
-        source_model_state,
-        requested_steps=requested_steps,
-    )
-    if requested_required_horizon <= current_required_horizon:
-        return source_model_file, None
-
-    adjusted_state = dict(source_model_state)
-    adjusted_state["production_forecast_horizon"] = requested_required_horizon
-    fd, adjusted_source_model_file = tempfile.mkstemp(
-        prefix=f"boosting_lstm_source_{os.getpid()}_",
-        suffix=".pkl",
-    )
-    os.close(fd)
-    try:
-        dump_model(adjusted_state, adjusted_source_model_file)
-    except Exception:
-        try:
-            os.remove(adjusted_source_model_file)
-        except OSError:
-            pass
-        raise
-    return adjusted_source_model_file, adjusted_source_model_file
-
-
-def _format_predictions(preds: List[float], std_dev: float = 0.0) -> List[Dict[str, float]]:
-    return [{"prediction": float(p), "std_dev": float(std_dev)} for p in preds]
-
-
-def _compute_phase1_train_size(train_size: int) -> int:
-    if train_size <= 15:
-        return max(train_size - 3, int(train_size * 0.85))
-    return max(3, int(train_size * 0.8))
+_parse_feature_name_list = parse_feature_name_list
+_load_lstm_source_state = load_lstm_source_state
+_build_lstm_params_from_source_state = build_lstm_params_from_source_state
+_get_lstm_source_forecast_strategy = get_lstm_source_forecast_strategy
+_resolve_lstm_reuse_production_horizon = resolve_lstm_reuse_production_horizon
+_prepare_lstm_source_model_for_requested_steps = prepare_lstm_source_model_for_requested_steps
+_format_predictions = format_predictions
+_compute_phase1_train_size = compute_phase1_train_size
 
 
 def _load_state(model_path: str) -> Dict[str, Any]:
@@ -521,6 +404,10 @@ def _validate_training_args(
     if es <= te:
         raise ValueError("[VALIDATION] eval_start must be > train_end.")
 
+    validate_internal_split_base_params(
+        models_to_use, model_params, te - ts + 1, "boosting"
+    )
+
     for model_name in models_to_use:
         if model_name not in model_params:
             raise ValueError(f"[VALIDATION] Missing parameters for model: {model_name}")
@@ -640,6 +527,8 @@ def predict(
             timeout=60,
         )
         stage_predictions = np.asarray(extract_predictions_from_result(result), dtype=float)
+        if _stage_idx == 0:
+            stage_predictions = normalize_demand_forecast(stage_predictions)
         if final_predictions is None:
             final_predictions = coefficient * stage_predictions
         else:
@@ -648,7 +537,7 @@ def predict(
     if final_predictions is None:
         raise ValueError("[VALIDATION] Saved Boosting model is empty.")
 
-    return final_predictions.tolist(), std_dev_residuals
+    return normalize_demand_forecast(final_predictions).tolist(), std_dev_residuals
 
 
 # ---------- train and evaluate ----------
@@ -718,6 +607,9 @@ def train_and_evaluate(
                 round_parsed_data,
                 boost_train_range,
             )
+            if round_idx == 0:
+                stage_predictions = normalize_demand_forecast(stage_predictions)
+                fitted_train_predictions = normalize_demand_forecast(fitted_train_predictions)
             next_residual_val = residual_val - coefficient * stage_predictions
             next_rmse = rmse(np.zeros_like(next_residual_val), next_residual_val)
             stage_results.append({
@@ -879,6 +771,9 @@ def train_and_evaluate(
             round_parsed_data,
             train_range,
         )
+        if stage_idx == 0:
+            stage_eval_predictions = normalize_demand_forecast(stage_eval_predictions)
+            fitted_train_predictions = normalize_demand_forecast(fitted_train_predictions)
         final_eval_preds += coefficient * stage_eval_predictions
         residual_full_train = residual_full_train - coefficient * fitted_train_predictions
 
@@ -896,6 +791,7 @@ def train_and_evaluate(
             file=sys.stderr,
         )
 
+    final_eval_preds = normalize_demand_forecast(final_eval_preds)
     final_residuals = y_true_eval - final_eval_preds
     std_dev_residuals = float(np.std(final_residuals, ddof=1)) if len(final_residuals) > 1 else 0.0
     metrics = {

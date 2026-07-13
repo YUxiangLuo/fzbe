@@ -221,7 +221,9 @@ def run(args) -> None:
         y = parsed_data.y
 
         ts, te = int(args.train_start), int(args.train_end)
-        window = int(state.get("window") if state else getattr(args, "window", 0))
+        if state and state.get("window") is None:
+            raise ValueError("[VALIDATION] Saved MA model is missing window.")
+        window = int(state["window"] if state else getattr(args, "window", 0))
         _validate_fit_args(y, ts, te, window)
 
         history_start = max(ts, te - window + 1)

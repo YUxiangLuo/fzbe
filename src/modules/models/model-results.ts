@@ -100,6 +100,9 @@ const resultTransformers: Record<ModelType, (result: Record<string, unknown>) =>
   ma: () => ({}),
   lstm: (result) => ({
     feature_types: result.feature_types,
+    look_back: result.look_back,
+    epochs: result.epochs,
+    forecast_horizon: result.forecast_horizon,
     diagnostics: result.diagnostics
       ? { ...(result.diagnostics as object), y_pred_eval: (result.predictions as { prediction: number }[] | undefined)?.map((p) => p.prediction) || [] }
       : undefined,
@@ -142,7 +145,6 @@ export function transformTrainingResult(
     implementation_notes: result.implementation_notes,
     notes: result.notes || [],
     saved_model: result.saved_model,
-    logs: result.logs,
   };
 
   const modelSpecificTransformedResult = resultTransformers[modelType]?.(normalizedResult) || {};

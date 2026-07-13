@@ -8,6 +8,7 @@ state to a pickle file, and prints a compact JSON payload for the backend.
 """
 
 import argparse
+import hashlib
 import json
 import os
 import pickle
@@ -21,6 +22,7 @@ import numpy as np
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "src")))
 
 from data_utils import infer_feature_types, load_data_from_json
+from error_protocol import format_known_error
 from logger import get_log_contents, log
 from metrics import mae, mape, r2, rmse
 from model_info import attach_method_metadata
@@ -51,15 +53,6 @@ def _load_model_module(model_type: str) -> None:
         from models import lstm as lstm_module
         lstm = lstm_module
         return
-
-
-def _format_known_error(exc: Exception):
-    message = str(exc).strip()
-    if message.startswith("[VALIDATION]"):
-        return f"[VALIDATION] {message[13:].strip()}".strip()
-    if message.startswith("[DATA]"):
-        return f"[DATA] {message[7:].strip()}".strip()
-    return None
 
 
 def _jsonable(value: Any) -> Any:
@@ -93,6 +86,42 @@ def _save_state(path: str, state: Dict[str, Any]) -> None:
         handle.flush()
         os.fsync(handle.fileno())
     os.replace(temp_path, path)
+
+
+def _sha256_file(path: str | None) -> str | None:
+    if not path or not os.path.exists(path):
+        return None
+    digest = hashlib.sha256()
+    with open(path, "rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _write_receipt(path: str, payload: Dict[str, Any]) -> None:
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    temp_path = f"{path}.tmp-{os.getpid()}"
+    with open(temp_path, "w", encoding="utf-8") as handle:
+        json.dump(payload, handle, ensure_ascii=False)
+        handle.flush()
+        os.fsync(handle.fileno())
+    os.replace(temp_path, path)
+
+
+def _load_existing_receipt(path: str, attempt_id: str, step_id: str) -> Dict[str, Any] | None:
+    if not path or not os.path.exists(path):
+        return None
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            payload = json.load(handle)
+    except (OSError, json.JSONDecodeError):
+        return None
+    if payload.get("attempt_id") != attempt_id or payload.get("step_id") != step_id:
+        return None
+    candidate_path = payload.get("candidate_state_path")
+    if not isinstance(candidate_path, str) or _sha256_file(candidate_path) != payload.get("candidate_state_sha256"):
+        return None
+    return payload
 
 
 def _month_labels(timestamps: List[str], range_value: range) -> List[str]:
@@ -1031,7 +1060,10 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Run one guided model training stage.")
     parser.add_argument("model_type", type=str)
     parser.add_argument("step_id", type=str)
-    parser.add_argument("--state-file", required=True)
+    parser.add_argument("--input-state-file")
+    parser.add_argument("--output-state-file", required=True)
+    parser.add_argument("--receipt-file", required=True)
+    parser.add_argument("--attempt-id", required=True)
     parser.add_argument("--artifact-dir", required=True)
     parser.add_argument("--data", type=str)
     parser.add_argument("--data-file", type=str)
@@ -1055,7 +1087,16 @@ def main() -> None:
     args, _ = parser.parse_known_args()
 
     os.makedirs(args.artifact_dir, exist_ok=True)
-    state = _load_state(args.state_file)
+    existing_receipt = _load_existing_receipt(
+        args.receipt_file,
+        args.attempt_id,
+        args.step_id,
+    )
+    if existing_receipt is not None:
+        print(json.dumps(existing_receipt, ensure_ascii=False, indent=2 if args.pretty else None))
+        return
+
+    state = _load_state(args.input_state_file)
     step_result = run_step(args.model_type, args.step_id, args, state)
 
     final_result = None
@@ -1065,14 +1106,21 @@ def main() -> None:
     else:
         output = step_result
 
-    _save_state(args.state_file, state)
+    _save_state(args.output_state_file, state)
     payload = {
+        "protocol_version": 2,
+        "attempt_id": args.attempt_id,
         "step_id": args.step_id,
         "output": _jsonable(output),
+        "input_state_path": args.input_state_file,
+        "input_state_sha256": _sha256_file(args.input_state_file),
+        "candidate_state_path": args.output_state_file,
+        "candidate_state_sha256": _sha256_file(args.output_state_file),
     }
     if final_result is not None:
         payload["final_result"] = _jsonable(final_result)
 
+    _write_receipt(args.receipt_file, payload)
     print(json.dumps(payload, ensure_ascii=False, indent=2 if args.pretty else None))
 
 
@@ -1080,7 +1128,7 @@ if __name__ == "__main__":
     try:
         main()
     except Exception as exc:
-        formatted_error = _format_known_error(exc)
+        formatted_error = format_known_error(exc)
         if formatted_error is None:
             raise
         print(formatted_error, file=sys.stderr, flush=True)

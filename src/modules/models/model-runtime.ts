@@ -49,6 +49,20 @@ export const buildGuidedTrainingStatePath = (
   "state.pkl",
 );
 
+export const buildGuidedTrainingAttemptPaths = (
+  artifactDir: string,
+  stepId: string,
+  attemptId: string,
+) => {
+  const safeStepId = stepId.replace(/[^A-Za-z0-9_-]/g, "_");
+  const checkpointDir = path.join(artifactDir, "checkpoints");
+  const basename = `${safeStepId}-${attemptId}`;
+  return {
+    candidateStatePath: path.join(checkpointDir, `${basename}.pkl`),
+    receiptPath: path.join(checkpointDir, `${basename}.receipt.json`),
+  };
+};
+
 export const buildModelExecutionLockName = (
   experimentId: number,
   modelType: ModelType,

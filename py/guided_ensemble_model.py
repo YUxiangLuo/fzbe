@@ -10,6 +10,7 @@ state to a pickle file, and prints a compact JSON payload for the backend.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import pickle
@@ -22,10 +23,12 @@ import numpy as np
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "src")))
 
 from data_utils import infer_feature_types, load_data_from_json
+from error_protocol import format_known_error
 from ensemble_utils import (
     build_ensemble_subprocess_data,
     fit_and_predict_from_source_model,
     get_member_model_path,
+    normalize_demand_forecast,
     parse_base_model_files_arg,
     persist_member_model_artifact,
     remove_member_model_artifact,
@@ -48,15 +51,6 @@ ENSEMBLE_MODULES = {
     "stacking": stacking,
     "boosting": boosting,
 }
-
-
-def _format_known_error(exc: Exception):
-    message = str(exc).strip()
-    if message.startswith("[VALIDATION]"):
-        return f"[VALIDATION] {message[13:].strip()}".strip()
-    if message.startswith("[DATA]"):
-        return f"[DATA] {message[7:].strip()}".strip()
-    return None
 
 
 def _jsonable(value: Any) -> Any:
@@ -88,6 +82,42 @@ def _save_state(path: str, state: Dict[str, Any]) -> None:
         handle.flush()
         os.fsync(handle.fileno())
     os.replace(temp_path, path)
+
+
+def _sha256_file(path: str | None) -> str | None:
+    if not path or not os.path.exists(path):
+        return None
+    digest = hashlib.sha256()
+    with open(path, "rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _write_receipt(path: str, payload: Dict[str, Any]) -> None:
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    temp_path = f"{path}.tmp-{os.getpid()}"
+    with open(temp_path, "w", encoding="utf-8") as handle:
+        json.dump(payload, handle, ensure_ascii=False)
+        handle.flush()
+        os.fsync(handle.fileno())
+    os.replace(temp_path, path)
+
+
+def _load_existing_receipt(path: str, attempt_id: str, step_id: str) -> Dict[str, Any] | None:
+    if not path or not os.path.exists(path):
+        return None
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            payload = json.load(handle)
+    except (OSError, json.JSONDecodeError):
+        return None
+    if payload.get("attempt_id") != attempt_id or payload.get("step_id") != step_id:
+        return None
+    candidate_path = payload.get("candidate_state_path")
+    if not isinstance(candidate_path, str) or _sha256_file(candidate_path) != payload.get("candidate_state_sha256"):
+        return None
+    return payload
 
 
 def _get_arg(args, name: str, default: Any = None, cast_type=None):
@@ -313,7 +343,7 @@ def _holdout_predictions(
                             requested_steps=len(holdout_range),
                         )
                     )
-                predictions[model_name] = fit_and_predict_from_source_model(
+                predictions[model_name] = normalize_demand_forecast(fit_and_predict_from_source_model(
                     model_name=model_name,
                     source_model_file=adjusted_source_model_file,
                     data=lstm_data_dicts if model_name == "lstm" else numeric_data_dicts,
@@ -321,7 +351,7 @@ def _holdout_predictions(
                     train_end=train_range.stop - 1,
                     forecast_steps=len(holdout_range),
                     timeout=timeout,
-                )
+                )).tolist()
             finally:
                 if temp_source_model_file and os.path.exists(temp_source_model_file):
                     os.remove(temp_source_model_file)
@@ -337,7 +367,9 @@ def _holdout_predictions(
             model_params=params.copy(),
             timeout=timeout,
         )
-        predictions[model_name] = extract_predictions_from_result(result)
+        predictions[model_name] = normalize_demand_forecast(
+            extract_predictions_from_result(result)
+        ).tolist()
 
     return predictions
 
@@ -404,7 +436,7 @@ def _eval_member_predictions(
                     y_pred_eval = extract_predictions_from_result(result)[
                         eval_forecast_offset: eval_forecast_offset + len(eval_range)
                     ]
-                    eval_predictions[model_name] = y_pred_eval
+                    eval_predictions[model_name] = normalize_demand_forecast(y_pred_eval).tolist()
                     base_model_states[model_name] = {
                         "model_type": model_name,
                         "model_file": temp_model_file,
@@ -422,7 +454,7 @@ def _eval_member_predictions(
             y_pred_eval = extract_predictions_from_result(result)[
                 eval_forecast_offset: eval_forecast_offset + len(eval_range)
             ]
-            eval_predictions[model_name] = y_pred_eval
+            eval_predictions[model_name] = normalize_demand_forecast(y_pred_eval).tolist()
             base_model_states[model_name] = {
                 "model_type": model_name,
                 "model_file": source_model_file,
@@ -443,7 +475,9 @@ def _eval_member_predictions(
             model_params=params_with_save,
             timeout=timeout,
         )
-        eval_predictions[model_name] = extract_predictions_from_result(result)
+        eval_predictions[model_name] = normalize_demand_forecast(
+            extract_predictions_from_result(result)
+        ).tolist()
         base_model_states[model_name] = {
             "model_type": model_name,
             "model_file": temp_model_file,
@@ -464,7 +498,7 @@ def _save_flat_ensemble_artifact(module, state: Dict[str, Any], extra_state: Dic
             model_name,
             source_file,
             perm_file,
-            move_source=model_state.get("artifact_origin") == "temporary_training",
+            move_source=False,
         )
         model_state["model_file"] = perm_file
         model_state.pop("artifact_origin", None)
@@ -798,6 +832,9 @@ def _run_boosting(step_id: str, args, state: Dict[str, Any]) -> Dict[str, Any]:
                     round_parsed_data,
                     boost_train_range,
                 )
+                if round_idx == 0:
+                    stage_predictions = normalize_demand_forecast(stage_predictions)
+                    fitted_train_predictions = normalize_demand_forecast(fitted_train_predictions)
                 next_residual_val = residual_val - coefficient * stage_predictions
                 next_rmse = rmse(np.zeros_like(next_residual_val), next_residual_val)
                 remove_member_model_artifact(model_name, temp_model_file)
@@ -850,10 +887,6 @@ def _run_boosting(step_id: str, args, state: Dict[str, Any]) -> Dict[str, Any]:
             stage_summary["action"] = "early_stop"
 
         state["search_summary"]["stages"].append(stage_summary)
-        for result in stage_results:
-            temp_model_file = result.get("temp_model_file")
-            if temp_model_file:
-                remove_member_model_artifact(result["model_name"], temp_model_file)
         state.pop("pending_round_index", None)
         state.pop("pending_current_rmse", None)
         state.pop("pending_stage_results", None)
@@ -965,6 +998,9 @@ def _run_boosting(step_id: str, args, state: Dict[str, Any]) -> Dict[str, Any]:
                 round_parsed_data,
                 train_range,
             )
+            if stage_idx == 0:
+                stage_eval_predictions = normalize_demand_forecast(stage_eval_predictions)
+                fitted_train_predictions = normalize_demand_forecast(fitted_train_predictions)
             final_eval_preds += coefficient * stage_eval_predictions
             residual_full_train = residual_full_train - coefficient * fitted_train_predictions
             stage_rmse = rmse(y_true_eval, final_eval_preds)
@@ -992,7 +1028,7 @@ def _run_boosting(step_id: str, args, state: Dict[str, Any]) -> Dict[str, Any]:
 
     if step_id == "combine_evaluate":
         y_true_eval = np.asarray(state["eval_y_true"], dtype=float)
-        final_eval_preds = np.asarray(state["final_eval_preds"], dtype=float)
+        final_eval_preds = normalize_demand_forecast(state["final_eval_preds"])
         final_residuals = y_true_eval - final_eval_preds
         std_dev = float(np.std(final_residuals, ddof=1)) if len(final_residuals) > 1 else 0.0
         timestamps = parsed_data.timestamps
@@ -1032,7 +1068,7 @@ def _run_boosting(step_id: str, args, state: Dict[str, Any]) -> Dict[str, Any]:
                     model_name,
                     source_file,
                     perm_file,
-                    move_source=model_state.get("artifact_origin") == "temporary_training",
+                    move_source=False,
                 )
                 model_state["model_file"] = perm_file
                 model_state.pop("artifact_origin", None)
@@ -1070,7 +1106,10 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Run one guided ensemble model training stage.")
     parser.add_argument("model_type", type=str)
     parser.add_argument("step_id", type=str)
-    parser.add_argument("--state-file", required=True)
+    parser.add_argument("--input-state-file")
+    parser.add_argument("--output-state-file", required=True)
+    parser.add_argument("--receipt-file", required=True)
+    parser.add_argument("--attempt-id", required=True)
     parser.add_argument("--artifact-dir", required=True)
     parser.add_argument("--data", type=str)
     parser.add_argument("--data-file", type=str)
@@ -1098,7 +1137,16 @@ def main() -> None:
     args, _ = parser.parse_known_args()
 
     os.makedirs(args.artifact_dir, exist_ok=True)
-    state = _load_state(args.state_file)
+    existing_receipt = _load_existing_receipt(
+        args.receipt_file,
+        args.attempt_id,
+        args.step_id,
+    )
+    if existing_receipt is not None:
+        print(json.dumps(existing_receipt, ensure_ascii=False, indent=2 if args.pretty else None))
+        return
+
+    state = _load_state(args.input_state_file)
     step_result = run_step(args.model_type, args.step_id, args, state)
 
     final_result = None
@@ -1108,14 +1156,21 @@ def main() -> None:
     else:
         output = step_result
 
-    _save_state(args.state_file, state)
+    _save_state(args.output_state_file, state)
     payload = {
+        "protocol_version": 2,
+        "attempt_id": args.attempt_id,
         "step_id": args.step_id,
         "output": _jsonable(output),
+        "input_state_path": args.input_state_file,
+        "input_state_sha256": _sha256_file(args.input_state_file),
+        "candidate_state_path": args.output_state_file,
+        "candidate_state_sha256": _sha256_file(args.output_state_file),
     }
     if final_result is not None:
         payload["final_result"] = _jsonable(final_result)
 
+    _write_receipt(args.receipt_file, payload)
     print(json.dumps(payload, ensure_ascii=False, indent=2 if args.pretty else None))
 
 
@@ -1123,9 +1178,8 @@ if __name__ == "__main__":
     try:
         main()
     except Exception as exc:
-        known_error = _format_known_error(exc)
+        known_error = format_known_error(exc)
         if known_error:
-            print(known_error, file=sys.stderr)
-        else:
-            print(f"[PYTHON_ERROR] {exc}", file=sys.stderr)
+            print(known_error, file=sys.stderr, flush=True)
+            sys.exit(1)
         raise

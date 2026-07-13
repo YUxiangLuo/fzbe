@@ -11,6 +11,7 @@ from statsmodels.tsa.api import SimpleExpSmoothing
 
 from data_utils import ParsedData, load_data_from_json
 from logger import log, get_log_contents
+from log_safety import summarize_cli_args
 from metrics import mae, mape, r2, rmse
 from model_info import attach_method_metadata, ensure_state_metadata
 from serialization import dump_model, load_model
@@ -170,7 +171,7 @@ def _validate_fit_args(y: ArrayLike, ts: int, te: int, alpha: float) -> None:
 
 def run(args) -> None:
     """Main entry point for ES model training and prediction."""
-    log.info(f"ES run started with args: {vars(args)}")
+    log.info(f"ES run started with args: {summarize_cli_args(args)}")
     pretty: bool = bool(getattr(args, "pretty", False))
     save_path = getattr(args, "save_model", None)
     load_path = getattr(args, "load_model", None)
@@ -186,7 +187,9 @@ def run(args) -> None:
         y = parsed_data.y
 
         ts, te = int(args.train_start), int(args.train_end)
-        alpha = float(state.get("alpha") if state else getattr(args, "alpha", 0.5))
+        if state and state.get("alpha") is None:
+            raise ValueError("[VALIDATION] Saved ES model is missing alpha.")
+        alpha = float(state["alpha"] if state else getattr(args, "alpha", 0.5))
         _validate_fit_args(y, ts, te, alpha)
 
         y_fit = np.asarray(y)[range(ts, te + 1)]

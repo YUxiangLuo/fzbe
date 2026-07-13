@@ -7,6 +7,7 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), 'src'
 
 # Import all model modules
 from models import arima, es, lstm, ma, stacking, weighted_avg, boosting
+from error_protocol import format_known_error
 
 MODEL_MODULES = {
     "arima": arima,
@@ -18,14 +19,6 @@ MODEL_MODULES = {
     "boosting": boosting,
 }
 
-
-def _format_known_error(exc: Exception):
-    message = str(exc).strip()
-    if message.startswith("[VALIDATION]"):
-        return f"[VALIDATION] {message[13:].strip()}".strip()
-    if message.startswith("[DATA]"):
-        return f"[DATA] {message[7:].strip()}".strip()
-    return None
 
 def main():
     parser = argparse.ArgumentParser(description="Run a specified time series model.")
@@ -93,7 +86,7 @@ if __name__ == "__main__":
     try:
         main()
     except Exception as exc:
-        formatted_error = _format_known_error(exc)
+        formatted_error = format_known_error(exc)
         if formatted_error is None:
             raise
         print(formatted_error, file=sys.stderr, flush=True)

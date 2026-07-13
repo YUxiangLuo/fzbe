@@ -8,6 +8,7 @@ import json
 import os
 import subprocess
 import sys
+import tempfile
 from typing import Any, Dict, List, Optional
 
 
@@ -27,6 +28,44 @@ def get_python_executable() -> str:
 
     # Fallback to system python
     return sys.executable
+
+
+def _write_subprocess_data_file(data: List[Dict[str, Any]]) -> str:
+    fd, file_path = tempfile.mkstemp(prefix="fz-model-data-", suffix=".json")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump(data, handle, ensure_ascii=False)
+            handle.flush()
+            os.fsync(handle.fileno())
+    except Exception:
+        try:
+            os.remove(file_path)
+        except OSError:
+            pass
+        raise
+    return file_path
+
+
+def _parse_json_stdout(result: subprocess.CompletedProcess[str], context: str) -> Dict[str, Any]:
+    output = result.stdout.strip()
+    if not output:
+        raise ValueError(f"No JSON output from {context}")
+    try:
+        return json.loads(output)
+    except json.JSONDecodeError as exc:
+        raise ValueError(
+            f"Failed to parse JSON from {context}. Error: {exc}; "
+            f"stdout: {output[:2000]}"
+        ) from exc
+
+
+def _raise_tagged_subprocess_error(stderr: str) -> None:
+    for line in reversed(stderr.splitlines()):
+        for tag in ("[VALIDATION]", "[DATA]"):
+            marker_index = line.find(tag)
+            if marker_index >= 0:
+                detail = line[marker_index + len(tag):].strip()
+                raise ValueError(f"{tag} {detail}".rstrip())
 
 
 def run_base_model_subprocess(
@@ -62,12 +101,12 @@ def run_base_model_subprocess(
     if not os.path.exists(run_model_script):
         raise FileNotFoundError(f"run_model.py not found at {run_model_script}")
 
-    # Build command arguments
+    data_file = _write_subprocess_data_file(data)
     args = [
         python_exec,
         run_model_script,
         model_type,
-        "--data", json.dumps(data, ensure_ascii=False),
+        "--data-file", data_file,
         "--train-start", str(train_start),
         "--train-end", str(train_end),
         "--eval-start", str(eval_start),
@@ -105,31 +144,22 @@ def run_base_model_subprocess(
         )
 
         if result.returncode != 0:
+            _raise_tagged_subprocess_error(result.stderr)
             raise RuntimeError(
                 f"Base model {model_type} failed with exit code {result.returncode}.\n"
                 f"stderr: {result.stderr}\n"
                 f"stdout: {result.stdout}"
             )
 
-        # Parse JSON output
-        output = result.stdout.strip()
-
-        # Find the JSON part (skip any log messages before it)
-        json_start = output.find('{')
-        if json_start == -1:
-            raise ValueError(f"No JSON output found from {model_type}. stdout: {output}")
-
-        json_output = output[json_start:]
-        return json.loads(json_output)
+        return _parse_json_stdout(result, model_type)
 
     except subprocess.TimeoutExpired:
         raise TimeoutError(f"Base model {model_type} timed out after {timeout}s")
-    except json.JSONDecodeError as e:
-        raise ValueError(
-            f"Failed to parse JSON from {model_type}.\n"
-            f"Error: {e}\n"
-            f"stdout: {result.stdout}"
-        )
+    finally:
+        try:
+            os.remove(data_file)
+        except OSError:
+            pass
 
 
 def run_base_model_fit_subprocess(
@@ -150,11 +180,15 @@ def run_base_model_fit_subprocess(
     if not os.path.exists(run_model_script):
         raise FileNotFoundError(f"run_model.py not found at {run_model_script}")
 
+    if fit_forecast_steps is not None and int(fit_forecast_steps) <= 0:
+        raise ValueError("fit_forecast_steps must be > 0 when provided")
+
+    data_file = _write_subprocess_data_file(data)
     args = [
         python_exec,
         run_model_script,
         model_type,
-        "--data", json.dumps(data, ensure_ascii=False),
+        "--data-file", data_file,
         "--train-start", str(train_start),
         "--train-end", str(train_end),
         "--load-model", source_model_file,
@@ -163,8 +197,6 @@ def run_base_model_fit_subprocess(
         "--pretty",
     ]
     if fit_forecast_steps is not None:
-        if int(fit_forecast_steps) <= 0:
-            raise ValueError("fit_forecast_steps must be > 0 when provided")
         args.extend(["--fit-forecast-steps", str(int(fit_forecast_steps))])
 
     try:
@@ -178,28 +210,22 @@ def run_base_model_fit_subprocess(
         )
 
         if result.returncode != 0:
+            _raise_tagged_subprocess_error(result.stderr)
             raise RuntimeError(
                 f"Base model {model_type} fit-only failed with exit code {result.returncode}.\n"
                 f"stderr: {result.stderr}\n"
                 f"stdout: {result.stdout}"
             )
 
-        output = result.stdout.strip()
-        json_start = output.find('{')
-        if json_start == -1:
-            raise ValueError(f"No JSON output found from {model_type} fit-only. stdout: {output}")
-
-        json_output = output[json_start:]
-        return json.loads(json_output)
+        return _parse_json_stdout(result, f"{model_type} fit-only")
 
     except subprocess.TimeoutExpired:
         raise TimeoutError(f"Base model {model_type} fit-only timed out after {timeout}s")
-    except json.JSONDecodeError as e:
-        raise ValueError(
-            f"Failed to parse JSON from {model_type} fit-only.\n"
-            f"Error: {e}\n"
-            f"stdout: {result.stdout}"
-        )
+    finally:
+        try:
+            os.remove(data_file)
+        except OSError:
+            pass
 
 
 def run_base_model_predict_subprocess(
@@ -244,24 +270,17 @@ def run_base_model_predict_subprocess(
         )
 
         if result.returncode != 0:
+            _raise_tagged_subprocess_error(result.stderr)
             raise RuntimeError(
                 f"Base model {model_type} predict failed.\n"
                 f"stderr: {result.stderr}\n"
                 f"stdout: {result.stdout}"
             )
 
-        output = result.stdout.strip()
-        json_start = output.find('{')
-        if json_start == -1:
-            raise ValueError(f"No JSON output from {model_type} predict")
-
-        json_output = output[json_start:]
-        return json.loads(json_output)
+        return _parse_json_stdout(result, f"{model_type} predict")
 
     except subprocess.TimeoutExpired:
         raise TimeoutError(f"Base model {model_type} predict timed out")
-    except json.JSONDecodeError as e:
-        raise ValueError(f"Failed to parse JSON from {model_type} predict: {e}")
 
 
 def extract_predictions_from_result(result: Dict[str, Any]) -> List[float]:

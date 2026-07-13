@@ -131,17 +131,24 @@ def train_guided(
 ) -> dict[str, Any]:
     artifact_dir = temp_path / f"guided-{model_type}-artifacts"
     artifact_dir.mkdir(parents=True, exist_ok=True)
-    args = [
-        "--state-file", str(temp_path / f"guided-{model_type}-state.pkl"),
-        "--artifact-dir", str(artifact_dir),
-        *training_args(data, case, save_model),
-    ]
+    args = ["--artifact-dir", str(artifact_dir), *training_args(data, case, save_model)]
     final_result = None
-    for step_id in STEP_SEQUENCES[model_type]:
+    input_state = None
+    for index, step_id in enumerate(STEP_SEQUENCES[model_type]):
+        candidate_state = temp_path / f"guided-{model_type}-{index}-{step_id}.pkl"
+        receipt_file = temp_path / f"guided-{model_type}-{index}-{step_id}.receipt.json"
+        protocol_args = [
+            "--output-state-file", str(candidate_state),
+            "--receipt-file", str(receipt_file),
+            "--attempt-id", f"{model_type}-{index}",
+        ]
+        if input_state is not None:
+            protocol_args.extend(["--input-state-file", str(input_state)])
         payload = run_json(
-            [sys.executable, str(GUIDED_MODEL), model_type, step_id, *args],
+            [sys.executable, str(GUIDED_MODEL), model_type, step_id, *protocol_args, *args],
             f"guided {model_type}/{step_id}",
         )
+        input_state = candidate_state
         final_result = payload.get("final_result", final_result)
     if not isinstance(final_result, dict):
         raise AssertionError(f"guided {model_type} produced no final result")

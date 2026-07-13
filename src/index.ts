@@ -627,7 +627,7 @@ app.onError((err, c) => {
 const RUNTIME_DISK_CLEANUP_INTERVAL_MS = 24 * 60 * 60 * 1000;
 let runtimeDiskCleanupTimer: ReturnType<typeof setInterval> | null = null;
 
-const longRunningModelPathPattern = /^\/api\/v1\/models\/[^/]+\/(training(?:\/stream)?|prepare-production|predict|guided-training\/sessions\/[^/]+\/steps\/[^/]+\/run)$/;
+const longRunningModelPathPattern = /^\/api\/v1\/models\/[^/]+\/(prepare-production|predict|guided-training\/sessions\/[^/]+\/steps\/[^/]+\/run)$/;
 
 export async function runGuidedTrainingSessionCleanup(trigger = "manual") {
   try {

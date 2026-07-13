@@ -136,11 +136,16 @@ export interface ModelTrainingRunRow extends RowDataPacket {
   metrics: unknown;
   artifact_path: string;
   production_artifact_path: string | null;
+  production_artifact_forecast_steps: number | null;
+  production_revision: string | null;
   is_active: number | boolean;
 }
 
 export interface CompletedGuidedSessionUpdate {
   sessionId: string;
+  activeAttemptId?: string;
+  committedStatePath?: string;
+  committedStateSha256?: string;
   currentStepId: string | null;
   completedStepIds: string[];
   stepOutputs: Record<string, unknown>;
@@ -446,6 +451,9 @@ export const buildAuthoritativeResult = (
         normalization: body.lstmNormalization,
         target_field: body.lstmTargetFeature,
         features,
+        look_back: result.results.look_back ?? null,
+        epochs: result.results.epochs ?? null,
+        forecast_horizon: result.results.forecast_horizon ?? null,
       });
       Object.assign(experimentPatch, {
         lstm_completed: 1,
@@ -743,6 +751,24 @@ export async function commitModelTrainingRun(
       return { runId: existingRun.run_id, stateVersion, reusedExistingRun: true };
     }
 
+    if (input.guidedSession?.activeAttemptId) {
+      const [sessionRows] = await connection.query<RowDataPacket[]>(
+        `SELECT active_attempt_id, status
+           FROM model_guided_training_sessions
+          WHERE session_id = ?
+          LIMIT 1
+          FOR UPDATE`,
+        [input.guidedSession.sessionId],
+      );
+      const session = sessionRows[0];
+      if (!session || session.active_attempt_id !== input.guidedSession.activeAttemptId) {
+        throw new ModelValidationError("训练步骤 attempt 已被替换，已放弃本次提交");
+      }
+      if (session.status === "superseded") {
+        throw new ModelValidationError("训练会话已失效，已放弃本次提交");
+      }
+    }
+
     await assertTrainingRequestStillCurrent(connection, input, experiment);
 
     if (existingRun) {
@@ -786,6 +812,8 @@ export async function commitModelTrainingRun(
                 parameters = ?,
                 metrics = ?,
                 production_artifact_path = NULL,
+                production_artifact_forecast_steps = NULL,
+                production_revision = NULL,
                 is_active = true,
                 activated_at = NOW()
           WHERE run_id = ?`,
@@ -844,7 +872,10 @@ export async function commitModelTrainingRun(
                 step_plan = ?,
                 result_payload = ?,
                 error_message = NULL,
-                experiment_state_version = ?
+                experiment_state_version = ?,
+                committed_state_path = COALESCE(?, committed_state_path),
+                committed_state_sha256 = COALESCE(?, committed_state_sha256),
+                active_attempt_id = NULL
           WHERE session_id = ?`,
         [
           input.guidedSession.currentStepId,
@@ -853,9 +884,32 @@ export async function commitModelTrainingRun(
           JSON.stringify(input.guidedSession.stepPlan),
           JSON.stringify(input.guidedSession.result),
           stateVersion,
+          input.guidedSession.committedStatePath ?? null,
+          input.guidedSession.committedStateSha256 ?? null,
           input.guidedSession.sessionId,
         ],
       );
+      if (input.guidedSession.activeAttemptId) {
+        await connection.query(
+          `UPDATE model_guided_training_step_attempts
+              SET status = 'committed',
+                  candidate_state_sha256 = COALESCE(?, candidate_state_sha256),
+                  output_payload = ?,
+                  final_result_payload = ?,
+                  error_message = NULL
+            WHERE attempt_id = ?`,
+          [
+            input.guidedSession.committedStateSha256 ?? null,
+            JSON.stringify(
+              input.guidedSession.stepOutputs[
+                input.guidedSession.completedStepIds.at(-1) ?? ""
+              ] ?? {},
+            ),
+            JSON.stringify(input.guidedSession.result),
+            input.guidedSession.activeAttemptId,
+          ],
+        );
+      }
     }
 
     await connection.commit();
@@ -887,13 +941,20 @@ export async function getActiveModelTrainingRun(
   return rows[0] ?? null;
 }
 
-export async function setProductionArtifactForRun(runId: string, artifactPath: string) {
+export async function setProductionArtifactForRun(
+  runId: string,
+  artifactPath: string,
+  forecastSteps: number,
+  productionRevision: string,
+) {
   const [result] = await pool.query(
     `UPDATE model_training_runs
-        SET production_artifact_path = ?
+        SET production_artifact_path = ?,
+            production_artifact_forecast_steps = ?,
+            production_revision = ?
       WHERE run_id = ?
         AND is_active = true`,
-    [artifactPath, runId],
+    [artifactPath, forecastSteps, productionRevision, runId],
   );
   return Number((result as { affectedRows?: number }).affectedRows ?? 0) === 1;
 }

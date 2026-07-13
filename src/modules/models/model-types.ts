@@ -3,7 +3,7 @@ import type { ModelType } from "./models.schema";
 export type BaseModelType = "ma" | "es" | "arima" | "lstm";
 export type EnsembleModelType = Extract<ModelType, "weighted_avg" | "boosting" | "stacking">;
 export type GuidedModelType = BaseModelType | EnsembleModelType;
-export type GuidedTrainingStatus = "ready" | "running" | "failed" | "completed";
+export type GuidedTrainingStatus = "ready" | "running" | "failed" | "completed" | "superseded";
 
 export const BASE_MODEL_TYPES = new Set<ModelType>(["ma", "es", "arima", "lstm"]);
 export const ENSEMBLE_MODEL_TYPES = new Set<ModelType>(["weighted_avg", "boosting", "stacking"]);
@@ -44,6 +44,7 @@ export interface GuidedTrainingSessionPayload {
     experiment_state_patch?: Record<string, unknown>;
   } | null;
   error_message: string | null;
+  error_code: "GUIDED_SESSION_SUPERSEDED" | null;
   experiment_state_version: number | null;
 }
 
