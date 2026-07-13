@@ -5,7 +5,12 @@ import { adfRequestSchema } from "./tools.schema";
 import { performAdfTest } from "./tools.service";
 import { handleUnexpectedError } from "../../utils/error-handler";
 import { AdfValidationError, type AdfInputPoint } from "../../utils/adf";
-import { acquireModelSlot, releaseModelSlot } from "../models/model-locks";
+import {
+  ModelCapacityBusyError,
+  ModelOperationDeadlineError,
+  ModelServiceUnavailableError,
+  ModelTimeoutError,
+} from "../models/model-errors";
 
 const toolsController = new Hono();
 
@@ -17,21 +22,43 @@ toolsController.post(
   async (c) => {
     const { series } = c.req.valid("json") as { series: AdfInputPoint[] };
 
-    let slotLock = null;
     try {
-      slotLock = await acquireModelSlot();
-      if (!slotLock) {
-        return c.json({ error: "模型服务繁忙，请稍后再试" }, 429);
-      }
       const result = await performAdfTest(series);
       return c.json({ result });
     } catch (error) {
       if (error instanceof AdfValidationError) {
         return c.json({ error: error.message }, 400);
       }
+      if (error instanceof ModelCapacityBusyError) {
+        c.header("Retry-After", String(error.retryAfterSeconds));
+        return c.json({
+          error: error.message,
+          code: error.code,
+          retryable: error.retryable,
+        }, 429);
+      }
+      if (error instanceof ModelOperationDeadlineError) {
+        return c.json({
+          error: "ADF 检测超过服务端时限，请重试",
+          code: error.code,
+          operation: error.operation,
+          timeout_ms: error.timeoutMs,
+          retryable: error.retryable,
+        }, 504);
+      }
+      if (error instanceof ModelTimeoutError) {
+        return c.json({
+          error: "ADF 检测执行超时，请重试",
+          code: error.code,
+          operation: "adf",
+          timeout_ms: error.timeoutMs,
+          retryable: true,
+        }, 504);
+      }
+      if (error instanceof ModelServiceUnavailableError) {
+        return c.json({ error: error.message, code: error.code }, 503);
+      }
       return handleUnexpectedError(c, error, "ADF 检测失败");
-    } finally {
-      await releaseModelSlot(slotLock);
     }
   },
 );

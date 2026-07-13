@@ -38,13 +38,6 @@ type Queryable = {
   query<T extends RowDataPacket[] | ResultSetHeader>(sql: string, values?: unknown[]): Promise<[T, unknown]>;
 };
 
-type TransactionConnection = Queryable & {
-  beginTransaction(): Promise<void>;
-  commit(): Promise<void>;
-  rollback(): Promise<void>;
-  release(): void;
-};
-
 function accumulateCleanupSummary(target: DeleteCleanupSummary, source: DeleteCleanupSummary) {
   if (source.deletedClasses) {
     target.deletedClasses = (target.deletedClasses ?? 0) + source.deletedClasses;

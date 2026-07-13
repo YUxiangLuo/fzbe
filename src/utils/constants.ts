@@ -33,6 +33,80 @@ function parseModelTimeoutEnv(name: string, fallbackMs: number): number {
   return value;
 }
 
+/**
+ * 模型 HTTP 超时必须保持：operation + 最坏终止/解锁 + 响应余量 <= nginx < browser。
+ * nginx 和前端当前是静态部署配置，因此后端只允许缩短 operation deadline，
+ * 不允许通过单个环境变量把它提高到传输层预算之外。
+ */
+export const MODEL_HTTP_TIMEOUT_BUDGETS = {
+  OPERATION_DEADLINE_HARD_CAP: 660_000,
+  NGINX_READ: 675_000,
+  BROWSER_REQUEST: 690_000,
+  /** Includes the bounded failure-status write plus response serialization/network time. */
+  RESPONSE_RESERVE: 6_000,
+  MAX_LOCK_RELEASE_QUERIES: 2,
+} as const;
+
+const ADF_EXECUTION_TIMEOUT_MS = 30_000;
+
+/** The production nginx exact ADF route uses this independent short budget. */
+export const ADF_HTTP_TIMEOUT_BUDGETS = {
+  NGINX_READ: 45_000,
+  RESPONSE_RESERVE: MODEL_HTTP_TIMEOUT_BUDGETS.RESPONSE_RESERVE,
+  MAX_LOCK_RELEASE_QUERIES: 1,
+} as const;
+
+/** Best-effort DB failure recording must fit inside the response reserve. */
+const MODEL_FAILURE_RECORD_TIMEOUT_MS = 2_000;
+
+const MODEL_LOCK_CONNECTION_ACQUIRE_TIMEOUT_MS =
+  parsePositiveIntegerEnv("MODEL_LOCK_CONNECTION_ACQUIRE_TIMEOUT_MS") ?? 2_000;
+const MODEL_LOCK_QUERY_TIMEOUT_MS =
+  parsePositiveIntegerEnv("MODEL_LOCK_QUERY_TIMEOUT_MS") ?? 2_000;
+const MODEL_PROCESS_TERMINATION_GRACE_MS =
+  parsePositiveIntegerEnv("MODEL_PROCESS_TERMINATION_GRACE_MS") ?? 5_000;
+const ADF_OPERATION_CLEANUP_BUDGET_MS =
+  MODEL_PROCESS_TERMINATION_GRACE_MS
+  + ADF_HTTP_TIMEOUT_BUDGETS.MAX_LOCK_RELEASE_QUERIES * MODEL_LOCK_QUERY_TIMEOUT_MS
+  + ADF_HTTP_TIMEOUT_BUDGETS.RESPONSE_RESERVE;
+const ADF_SINGLE_OPERATION_MAX_MS =
+  ADF_HTTP_TIMEOUT_BUDGETS.NGINX_READ - ADF_OPERATION_CLEANUP_BUDGET_MS;
+
+if (ADF_SINGLE_OPERATION_MAX_MS < ADF_EXECUTION_TIMEOUT_MS) {
+  throw new Error(
+    "MODEL_PROCESS_TERMINATION_GRACE_MS and MODEL_LOCK_QUERY_TIMEOUT_MS leave less than "
+    + `${ADF_EXECUTION_TIMEOUT_MS}ms for ADF inside the `
+    + `${ADF_HTTP_TIMEOUT_BUDGETS.NGINX_READ}ms nginx ADF-route budget`,
+  );
+}
+
+const MODEL_OPERATION_CLEANUP_BUDGET_MS =
+  MODEL_PROCESS_TERMINATION_GRACE_MS
+  + MODEL_HTTP_TIMEOUT_BUDGETS.MAX_LOCK_RELEASE_QUERIES * MODEL_LOCK_QUERY_TIMEOUT_MS
+  + MODEL_HTTP_TIMEOUT_BUDGETS.RESPONSE_RESERVE;
+const MODEL_SINGLE_OPERATION_MAX_MS = Math.min(
+  MODEL_HTTP_TIMEOUT_BUDGETS.OPERATION_DEADLINE_HARD_CAP,
+  MODEL_HTTP_TIMEOUT_BUDGETS.NGINX_READ - MODEL_OPERATION_CLEANUP_BUDGET_MS,
+);
+
+if (MODEL_SINGLE_OPERATION_MAX_MS <= 0) {
+  throw new Error(
+    "MODEL_PROCESS_TERMINATION_GRACE_MS and MODEL_LOCK_QUERY_TIMEOUT_MS exceed the nginx model-route cleanup budget",
+  );
+}
+
+const MODEL_SINGLE_OPERATION_TIMEOUT_MS =
+  parsePositiveIntegerEnv("MODEL_OPERATION_DEADLINE_MS")
+  ?? MODEL_HTTP_TIMEOUT_BUDGETS.OPERATION_DEADLINE_HARD_CAP;
+
+if (MODEL_SINGLE_OPERATION_TIMEOUT_MS > MODEL_SINGLE_OPERATION_MAX_MS) {
+  throw new Error(
+    `MODEL_OPERATION_DEADLINE_MS must be <= ${MODEL_SINGLE_OPERATION_MAX_MS} `
+    + `for the ${MODEL_HTTP_TIMEOUT_BUDGETS.NGINX_READ}ms nginx model-route budget, `
+    + `got: ${MODEL_SINGLE_OPERATION_TIMEOUT_MS}`,
+  );
+}
+
 const SYSTEM_PARALLELISM = Math.max(1, availableParallelism());
 const DEFAULT_MODEL_JOB_CAP = 50;
 const DEFAULT_PDF_JOB_CAP = 12;
@@ -82,12 +156,30 @@ export const CONTENT_LIMITS = {
 export const TIMEOUTS = {
   /** 所有 Python 模型任务都不可突破的硬上限 */
   MODEL_EXECUTION_HARD_CAP: MODEL_EXECUTION_HARD_CAP_MS,
+  /** 单次后端模型操作的总时限；每个 guided step / prepare / predict 独立计时。 */
+  MODEL_SINGLE_OPERATION: MODEL_SINGLE_OPERATION_TIMEOUT_MS,
+  /** 当前终止、解锁和 nginx 预算下允许的单次操作最大值。 */
+  MODEL_SINGLE_OPERATION_MAX: MODEL_SINGLE_OPERATION_MAX_MS,
+  /** deadline 后为 Python 终止、两次锁释放和响应传输预留的总预算。 */
+  MODEL_OPERATION_CLEANUP_BUDGET: MODEL_OPERATION_CLEANUP_BUDGET_MS,
+  /** lease 释放后记录模型失败状态的 best-effort 总时限。 */
+  MODEL_FAILURE_RECORD: MODEL_FAILURE_RECORD_TIMEOUT_MS,
+  /** 从连接池获取 advisory-lock 专用连接的最长等待时间。 */
+  MODEL_LOCK_CONNECTION_ACQUIRE: MODEL_LOCK_CONNECTION_ACQUIRE_TIMEOUT_MS,
+  /** advisory-lock 获取、校验和释放 SQL 的最长执行时间。 */
+  MODEL_LOCK_QUERY: MODEL_LOCK_QUERY_TIMEOUT_MS,
+  /** Python 收到 SIGTERM 后允许优雅退出的时间。 */
+  MODEL_PROCESS_TERMINATION_GRACE: MODEL_PROCESS_TERMINATION_GRACE_MS,
+  /** ADF 从接收请求到进入清理前的总时限。 */
+  ADF_OPERATION: Math.min(ADF_SINGLE_OPERATION_MAX_MS, MODEL_SINGLE_OPERATION_TIMEOUT_MS),
+  /** ADF deadline 后为 Python 终止、slot 释放和响应传输预留的预算。 */
+  ADF_OPERATION_CLEANUP_BUDGET: ADF_OPERATION_CLEANUP_BUDGET_MS,
   /** Python 模型训练超时 */
   MODEL_TRAINING: parseModelTimeoutEnv("MODEL_TRAINING_TIMEOUT_MS", 300000),
   /** Python 模型预测超时 */
   MODEL_PREDICTION: parseModelTimeoutEnv("MODEL_PREDICTION_TIMEOUT_MS", 60000),
   /** ADF 平稳性检测超时 */
-  ADF: 30000,
+  ADF: ADF_EXECUTION_TIMEOUT_MS,
   /** PDF 生成超时（Puppeteer 执行） */
   PDF_GENERATION: parsePositiveIntegerEnv("PDF_GENERATION_TIMEOUT_MS") ?? 30000,
   /** PDF 生成排队等待超时 */
@@ -109,7 +201,7 @@ const MAX_CONCURRENT_PDF_JOBS =
 export const CONCURRENCY_LIMITS = {
   /** 当前系统可用并行度（通常等于可用 CPU 核/线程数） */
   SYSTEM_PARALLELISM,
-  /** 默认模型任务上限；按 64 核 / 50 人课堂配置，超过 50 默认仍封顶，可用环境变量覆盖 */
+  /** 默认模型任务上限；64 核 / 100 人课堂默认允许 50 个活跃任务，其余请求快速返回 429。 */
   DEFAULT_MODEL_JOB_CAP,
   /** 默认 PDF 任务上限；PDF/Chromium 更重，自动值按 CPU/4 估算并封顶 */
   DEFAULT_PDF_JOB_CAP,

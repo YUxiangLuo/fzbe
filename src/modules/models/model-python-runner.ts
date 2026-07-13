@@ -3,12 +3,13 @@ import fs from "fs";
 import logger from "../../utils/logger";
 import { PYTHON_RUNTIME_CONFIG, TIMEOUTS } from "../../utils/constants";
 import { PY_DIR, resolvePythonExecutable } from "../../utils/python";
+import { terminateProcessTree } from "../../utils/process-tree";
 import { extractPythonTaggedError } from "./model-error-protocol";
 import { ModelTimeoutError } from "./model-errors";
 
 const TRAINING_TIMEOUT = TIMEOUTS.MODEL_TRAINING;
 const MODEL_DEADLINE_ENV_NAME = "FZ_MODEL_DEADLINE_EPOCH_MS";
-const PROCESS_TERMINATION_WAIT_MS = 5_000;
+const PROCESS_TERMINATION_WAIT_MS = TIMEOUTS.MODEL_PROCESS_TERMINATION_GRACE;
 const GUIDED_ENSEMBLE_MODEL_TYPES = new Set(["weighted_avg", "boosting", "stacking"]);
 
 const resolvePythonProcessTimeoutMs = (timeoutMs?: number): number => {
@@ -225,9 +226,9 @@ export async function runPythonModel(
   params: Record<string, unknown>,
   timeoutMs?: number,
   progressReporter?: ModelProgressReporter,
-  abortSignal?: AbortSignal,
+  terminationSignal?: AbortSignal,
 ): Promise<unknown> {
-  if (abortSignal?.aborted) throw getAbortError(abortSignal);
+  if (terminationSignal?.aborted) throw getAbortError(terminationSignal);
   const executionTimeoutMs = resolvePythonProcessTimeoutMs(timeoutMs);
   const deadlineEpochMs = Date.now() + executionTimeoutMs;
   const pythonExec = resolvePythonExecutable();
@@ -270,28 +271,6 @@ export async function runPythonModel(
     },
   });
 
-  const killPythonProcessTree = () => {
-    if (proc.exitCode !== null || proc.killed) return;
-
-    if (process.platform !== "win32" && SETSID_PATH) {
-      try {
-        process.kill(-proc.pid, "SIGKILL");
-        return;
-      } catch (error) {
-        logger.warn(
-          { error, pid: proc.pid, modelType },
-          "终止 Python 进程组失败，回退为终止主进程",
-        );
-      }
-    }
-
-    try {
-      proc.kill("SIGKILL");
-    } catch (error) {
-      logger.warn({ err: error, pid: proc.pid, modelType }, "终止 Python 主进程失败");
-    }
-  };
-
   let timeoutId: ReturnType<typeof setTimeout> | undefined;
   let abortHandler: (() => void) | undefined;
   let forcedTerminationError: Error | null = null;
@@ -300,19 +279,12 @@ export async function runPythonModel(
   const terminatePythonProcessTree = (error: Error): Promise<Error> => {
     forcedTerminationError ??= error;
     if (!terminationPromise) {
-      terminationPromise = (async () => {
-        killPythonProcessTree();
-        const exited = await Promise.race([
-          proc.exited.then(() => true),
-          Bun.sleep(PROCESS_TERMINATION_WAIT_MS).then(() => false),
-        ]);
-        if (!exited) {
-          logger.error(
-            { pid: proc.pid, modelType, waitMs: PROCESS_TERMINATION_WAIT_MS },
-            "终止 Python 进程组后等待退出超时",
-          );
-        }
-      })();
+      terminationPromise = terminateProcessTree(proc, {
+        graceMs: PROCESS_TERMINATION_WAIT_MS,
+        processGroup: Boolean(SETSID_PATH),
+        label: "模型 Python",
+        logContext: { modelType },
+      });
     }
     return terminationPromise.then(() => forcedTerminationError!);
   };
@@ -395,13 +367,13 @@ export async function runPythonModel(
       void terminatePythonProcessTree(timeoutError).then(reject);
     }, remainingMs);
   }));
-  if (abortSignal) {
+  if (terminationSignal) {
     competingPromises.push(new Promise<unknown>((_, reject) => {
       abortHandler = () => {
-        void terminatePythonProcessTree(getAbortError(abortSignal)).then(reject);
+        void terminatePythonProcessTree(getAbortError(terminationSignal)).then(reject);
       };
-      abortSignal.addEventListener("abort", abortHandler, { once: true });
-      if (abortSignal.aborted) abortHandler();
+      terminationSignal.addEventListener("abort", abortHandler, { once: true });
+      if (terminationSignal.aborted) abortHandler();
     }));
   }
 
@@ -415,8 +387,8 @@ export async function runPythonModel(
     return await Promise.race(competingPromises);
   } finally {
     if (timeoutId) clearTimeout(timeoutId);
-    if (abortHandler && abortSignal) {
-      abortSignal.removeEventListener("abort", abortHandler);
+    if (abortHandler && terminationSignal) {
+      terminationSignal.removeEventListener("abort", abortHandler);
     }
   }
 }
@@ -443,9 +415,9 @@ export async function runPythonGuidedTrainingStep(
   receiptFilePath: string,
   artifactDir: string,
   timeoutMs: number = TRAINING_TIMEOUT,
-  abortSignal?: AbortSignal,
+  terminationSignal?: AbortSignal,
 ): Promise<GuidedPythonStepResult> {
-  if (abortSignal?.aborted) throw getAbortError(abortSignal);
+  if (terminationSignal?.aborted) throw getAbortError(terminationSignal);
   const executionTimeoutMs = resolvePythonProcessTimeoutMs(timeoutMs);
   const deadlineEpochMs = Date.now() + executionTimeoutMs;
   const pythonExec = resolvePythonExecutable();
@@ -498,41 +470,15 @@ export async function runPythonGuidedTrainingStep(
   let forcedTerminationError: Error | null = null;
   let terminationPromise: Promise<void> | null = null;
 
-  const killPythonProcessTree = () => {
-    if (proc.exitCode !== null || proc.killed) return;
-
-    if (process.platform !== "win32" && SETSID_PATH) {
-      try {
-        process.kill(-proc.pid, "SIGKILL");
-        return;
-      } catch (error) {
-        logger.warn({ error, pid: proc.pid, modelType, stepId }, "终止 guided Python 进程组失败");
-      }
-    }
-
-    try {
-      proc.kill("SIGKILL");
-    } catch (error) {
-      logger.warn({ err: error, pid: proc.pid, modelType, stepId }, "终止 guided Python 主进程失败");
-    }
-  };
-
   const terminatePythonProcessTree = (error: Error): Promise<Error> => {
     forcedTerminationError ??= error;
     if (!terminationPromise) {
-      terminationPromise = (async () => {
-        killPythonProcessTree();
-        const exited = await Promise.race([
-          proc.exited.then(() => true),
-          Bun.sleep(PROCESS_TERMINATION_WAIT_MS).then(() => false),
-        ]);
-        if (!exited) {
-          logger.error(
-            { pid: proc.pid, modelType, stepId, waitMs: PROCESS_TERMINATION_WAIT_MS },
-            "终止 guided Python 进程组后等待退出超时",
-          );
-        }
-      })();
+      terminationPromise = terminateProcessTree(proc, {
+        graceMs: PROCESS_TERMINATION_WAIT_MS,
+        processGroup: Boolean(SETSID_PATH),
+        label: "guided Python",
+        logContext: { modelType, stepId },
+      });
     }
     return terminationPromise.then(() => forcedTerminationError!);
   };
@@ -586,13 +532,13 @@ export async function runPythonGuidedTrainingStep(
     }, remainingMs);
   });
   const competingPromises: Promise<GuidedPythonStepResult>[] = [executionPromise, timeoutPromise];
-  if (abortSignal) {
+  if (terminationSignal) {
     competingPromises.push(new Promise<GuidedPythonStepResult>((_, reject) => {
       abortHandler = () => {
-        void terminatePythonProcessTree(getAbortError(abortSignal)).then(reject);
+        void terminatePythonProcessTree(getAbortError(terminationSignal)).then(reject);
       };
-      abortSignal.addEventListener("abort", abortHandler, { once: true });
-      if (abortSignal.aborted) abortHandler();
+      terminationSignal.addEventListener("abort", abortHandler, { once: true });
+      if (terminationSignal.aborted) abortHandler();
     }));
   }
 
@@ -604,8 +550,8 @@ export async function runPythonGuidedTrainingStep(
     return await Promise.race(competingPromises);
   } finally {
     if (timeoutId) clearTimeout(timeoutId);
-    if (abortHandler && abortSignal) {
-      abortSignal.removeEventListener("abort", abortHandler);
+    if (abortHandler && terminationSignal) {
+      terminationSignal.removeEventListener("abort", abortHandler);
     }
   }
 }

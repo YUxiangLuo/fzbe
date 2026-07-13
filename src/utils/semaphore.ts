@@ -18,12 +18,28 @@ export class Semaphore {
     }
   }
 
+  get capacity(): number {
+    return this.max;
+  }
+
   get pending(): number {
     return this.queue.length;
   }
 
   get active(): number {
     return this.running;
+  }
+
+  /**
+   * 立即尝试获取额度，不进入等待队列。
+   *
+   * 模型请求使用该方法实现 fail-fast admission：超过容量的 HTTP 请求直接
+   * 返回 429，而不是在 Bun 进程里堆积并继续争抢数据库连接。
+   */
+  tryAcquire(): boolean {
+    if (this.running >= this.max) return false;
+    this.running++;
+    return true;
   }
 
   async acquire(timeoutMs?: number): Promise<void> {

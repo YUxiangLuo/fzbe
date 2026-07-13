@@ -80,41 +80,8 @@ mock.module(loggerModulePath, () => ({
   default: logger,
 }));
 
-class ModelValidationError extends Error {
-  constructor(message: string, public details?: Record<string, unknown>) {
-    super(message);
-    this.name = "ModelValidationError";
-  }
-}
-
-class ModelNotFoundError extends Error {}
-
-class ModelAccessError extends Error {
-  constructor(message: string, public status = 403) {
-    super(message);
-    this.name = "ModelAccessError";
-  }
-}
-
 mock.module(modelsServiceModulePath, () => ({
-  trainModel: mock(async () => ({ status: "success", results: {} })),
-  createOrResumeGuidedTrainingSession: mock(async () => ({ status: "ready" })),
-  getGuidedTrainingSession: mock(async () => ({ status: "ready" })),
-  runGuidedTrainingStep: mock(async () => ({ status: "completed" })),
-  getReusableProductionModelArtifactResult: mock(async () => null),
-  prepareExperimentModelForProduction: mock(async () => ({ status: "success", results: {} })),
-  predictExperimentModel: mock(async () => ({ status: "success", results: {} })),
-  acquireModelSlot: mock(async () => null),
-  releaseModelSlot: mock(async () => {}),
-  acquireModelExecutionLock: mock(async () => null),
-  releaseModelExecutionLock: mock(async () => {}),
-  loadDatasetFromDb: mock(async () => []),
-  runPythonModel: mock(async () => ({})),
-  transformTrainingResult: mock(() => ({ status: "success", results: {} })),
   cleanupExperimentModelArtifacts,
-  ModelValidationError,
-  ModelNotFoundError,
-  ModelAccessError,
 }));
 
 mock.module("puppeteer-core", () => ({

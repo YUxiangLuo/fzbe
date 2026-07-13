@@ -12,9 +12,6 @@ import { sign } from "hono/jwt";
 mock.restore();
 
 const preparationToken = "123e4567-e89b-42d3-a456-426614174000";
-const combinedSignal = new AbortController().signal;
-const executionLock = { connection: {} as never, name: "exec:1" };
-const slotLock = { connection: {} as never, name: "slot:1" };
 
 const createOrResumeGuidedTrainingSession = mock(async () => ({
   session_id: "guided-1",
@@ -53,7 +50,6 @@ const runGuidedTrainingStep = mock(async () => ({
   error_message: null,
 }));
 const discardGuidedTrainingSession = mock(async () => ({ status: "success" }));
-const getReusableProductionModelArtifactResult = mock(async () => null as unknown);
 const prepareExperimentModelForProduction = mock(async () => ({
   status: "success",
   results: {
@@ -66,11 +62,6 @@ const predictExperimentModel = mock(async () => ({
   status: "success",
   results: { predictions: [] },
 }));
-const acquireModelExecutionLock = mock(async () => executionLock);
-const releaseModelExecutionLock = mock(async () => {});
-const acquireModelSlot = mock(async () => slotLock);
-const releaseModelSlot = mock(async () => {});
-const combineModelLockSignals = mock(() => combinedSignal);
 
 class ModelValidationError extends Error {
   constructor(message: string, public details?: Record<string, unknown>) {
@@ -93,6 +84,20 @@ class ModelServiceUnavailableError extends Error {
     super(message);
   }
 }
+class ModelCapacityBusyError extends Error {
+  readonly code = "MODEL_CAPACITY_BUSY";
+  readonly retryable = true;
+  constructor(message = "模型服务繁忙，请稍后再试", public retryAfterSeconds = 2) {
+    super(message);
+  }
+}
+class ModelOperationDeadlineError extends Error {
+  readonly code = "MODEL_OPERATION_DEADLINE_EXCEEDED";
+  readonly retryable = true;
+  constructor(public timeoutMs: number, public operation: string) {
+    super("deadline");
+  }
+}
 class ModelTimeoutError extends Error {
   readonly code = "MODEL_TIMEOUT";
 
@@ -110,20 +115,16 @@ mock.module("../../../src/modules/models/models.service", () => ({
   getGuidedTrainingSession,
   runGuidedTrainingStep,
   discardGuidedTrainingSession,
-  getReusableProductionModelArtifactResult,
   prepareExperimentModelForProduction,
   predictExperimentModel,
-  acquireModelExecutionLock,
-  releaseModelExecutionLock,
-  acquireModelSlot,
-  releaseModelSlot,
-  combineModelLockSignals,
   ModelValidationError,
   ModelNotFoundError,
   ModelAccessError,
   ModelConflictError,
   ModelServiceUnavailableError,
   ModelTimeoutError,
+  ModelCapacityBusyError,
+  ModelOperationDeadlineError,
 }));
 
 const { default: modelsController } = await import("../../../src/modules/models/models.controller");
@@ -169,18 +170,9 @@ describe("models controller", () => {
       getGuidedTrainingSession,
       runGuidedTrainingStep,
       discardGuidedTrainingSession,
-      getReusableProductionModelArtifactResult,
       prepareExperimentModelForProduction,
       predictExperimentModel,
-      acquireModelExecutionLock,
-      releaseModelExecutionLock,
-      acquireModelSlot,
-      releaseModelSlot,
-      combineModelLockSignals,
     ]) fn.mockClear();
-    getReusableProductionModelArtifactResult.mockResolvedValue(null);
-    acquireModelExecutionLock.mockResolvedValue(executionLock);
-    acquireModelSlot.mockResolvedValue(slotLock);
   });
 
   test("removes both legacy training endpoints", async () => {
@@ -204,7 +196,6 @@ describe("models controller", () => {
       20240002,
       expect.objectContaining({ moving_average_window: 4 }),
     );
-    expect(acquireModelExecutionLock).not.toHaveBeenCalled();
   });
 
   test("validates guided model-specific parameters before service execution", async () => {
@@ -215,6 +206,23 @@ describe("models controller", () => {
     );
     expect(response.status).toBe(400);
     expect(createOrResumeGuidedTrainingSession).not.toHaveBeenCalled();
+  });
+
+  test("returns a 409 when completed-session recovery finds the same model busy", async () => {
+    createOrResumeGuidedTrainingSession.mockRejectedValueOnce(
+      new ModelConflictError("同一模型正在训练或预测，请稍后再试", "MODEL_BUSY"),
+    );
+    const response = await request(
+      "/api/v1/models/ma/guided-training/sessions",
+      "POST",
+      trainBody(),
+    );
+
+    expect(response.status).toBe(409);
+    expect(await response.json()).toEqual({
+      error: "同一模型正在训练或预测，请稍后再试",
+      code: "MODEL_BUSY",
+    });
   });
 
   test("returns structured guided conflicts", async () => {
@@ -251,7 +259,7 @@ describe("models controller", () => {
     expect(discardGuidedTrainingSession).toHaveBeenCalledWith("ma", 20240002, "guided-1");
   });
 
-  test("prepares production explicitly and passes the lock-loss signal", async () => {
+  test("delegates production preparation after validating the request", async () => {
     const response = await request("/api/v1/models/ma/prepare-production", "POST", {
       experiment_id: 990002,
       forecast_steps: 6,
@@ -263,14 +271,11 @@ describe("models controller", () => {
       990002,
       6,
       false,
-      combinedSignal,
     );
-    expect(releaseModelSlot).toHaveBeenCalledWith(slotLock);
-    expect(releaseModelExecutionLock).toHaveBeenCalledWith(executionLock);
   });
 
-  test("reuses a prepared base artifact without taking a global slot", async () => {
-    getReusableProductionModelArtifactResult.mockResolvedValueOnce({
+  test("returns a reusable production artifact supplied by the service", async () => {
+    prepareExperimentModelForProduction.mockResolvedValueOnce({
       status: "success",
       results: {
         preparation_token: preparationToken,
@@ -283,8 +288,7 @@ describe("models controller", () => {
       forecast_steps: 6,
     });
     expect(response.status).toBe(200);
-    expect(acquireModelSlot).not.toHaveBeenCalled();
-    expect(prepareExperimentModelForProduction).not.toHaveBeenCalled();
+    expect(prepareExperimentModelForProduction).toHaveBeenCalledTimes(1);
   });
 
   test("predict requires and forwards the preparation token", async () => {
@@ -300,7 +304,6 @@ describe("models controller", () => {
       990002,
       6,
       preparationToken,
-      combinedSignal,
     );
   });
 
@@ -310,7 +313,6 @@ describe("models controller", () => {
       forecast_steps: 6,
     });
     expect(response.status).toBe(400);
-    expect(acquireModelExecutionLock).not.toHaveBeenCalled();
     expect(predictExperimentModel).not.toHaveBeenCalled();
   });
 
@@ -326,6 +328,42 @@ describe("models controller", () => {
     expect(await response.json()).toEqual({
       error: "数据库模型锁已失效",
       code: "MODEL_LOCK_LOST",
+    });
+  });
+
+  test("returns structured 429 with Retry-After when admission is full", async () => {
+    prepareExperimentModelForProduction.mockRejectedValueOnce(new ModelCapacityBusyError());
+    const response = await request("/api/v1/models/ma/prepare-production", "POST", {
+      experiment_id: 990002,
+      forecast_steps: 6,
+    });
+
+    expect(response.status).toBe(429);
+    expect(response.headers.get("Retry-After")).toBe("2");
+    expect(await response.json()).toEqual({
+      error: "模型服务繁忙，请稍后再试",
+      code: "MODEL_CAPACITY_BUSY",
+      retryable: true,
+    });
+  });
+
+  test("returns structured 504 for the per-operation backend deadline", async () => {
+    predictExperimentModel.mockRejectedValueOnce(
+      new ModelOperationDeadlineError(660_000, "prediction"),
+    );
+    const response = await request("/api/v1/models/ma/predict", "POST", {
+      experiment_id: 990002,
+      forecast_steps: 6,
+      preparation_token: preparationToken,
+    });
+
+    expect(response.status).toBe(504);
+    expect(await response.json()).toEqual({
+      error: "预测超过服务端时限，请重试",
+      code: "MODEL_OPERATION_DEADLINE_EXCEEDED",
+      operation: "prediction",
+      timeout_ms: 660_000,
+      retryable: true,
     });
   });
 
@@ -410,14 +448,15 @@ describe("models controller", () => {
     });
   });
 
-  test("returns 409 when the experiment-scoped lock is busy", async () => {
-    acquireModelExecutionLock.mockResolvedValueOnce(null);
+  test("returns 409 when the service reports the experiment-scoped model is busy", async () => {
+    prepareExperimentModelForProduction.mockRejectedValueOnce(
+      new ModelConflictError("同一模型正在训练或预测，请稍后再试", "MODEL_BUSY"),
+    );
     const response = await request("/api/v1/models/ma/prepare-production", "POST", {
       experiment_id: 990002,
       forecast_steps: 6,
     });
     expect(response.status).toBe(409);
-    expect(acquireModelSlot).not.toHaveBeenCalled();
   });
 
   test("rejects unsupported guided model types", async () => {

@@ -1,4 +1,4 @@
-import type { RowDataPacket, ResultSetHeader } from "mysql2";
+import type { RowDataPacket } from "mysql2";
 import { pool } from "../../config";
 import logger from "../../utils/logger";
 import { normalizeQuestionRow } from "../question-bank/question-bank.service";

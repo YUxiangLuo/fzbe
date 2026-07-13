@@ -165,14 +165,17 @@ export async function createDbConnection() {
 }
 
 export const PARALLEL_STUDENT_USERNAMES = Array.from(
-  { length: 50 },
+  { length: 100 },
   (_, index) => String(20246001 + index),
 );
 
 export const PARALLEL_STUDENT_GROUPS = {
   all: PARALLEL_STUDENT_USERNAMES,
   trainingBurst: PARALLEL_STUDENT_USERNAMES,
-  mixedStartOnly: PARALLEL_STUDENT_USERNAMES.slice(0, 10),
+  mixedStartOnly: [
+    ...PARALLEL_STUDENT_USERNAMES.slice(0, 10),
+    ...PARALLEL_STUDENT_USERNAMES.slice(50),
+  ],
   mixedTraining: PARALLEL_STUDENT_USERNAMES.slice(10, 30),
   mixedProduction: PARALLEL_STUDENT_USERNAMES.slice(30, 50),
 } as const;

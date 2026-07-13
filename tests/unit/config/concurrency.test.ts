@@ -12,6 +12,10 @@ const CONFIG_ENV_NAMES = [
   "PDF_GENERATION_TIMEOUT_MS",
   "MODEL_TRAINING_TIMEOUT_MS",
   "MODEL_PREDICTION_TIMEOUT_MS",
+  "MODEL_OPERATION_DEADLINE_MS",
+  "MODEL_LOCK_CONNECTION_ACQUIRE_TIMEOUT_MS",
+  "MODEL_LOCK_QUERY_TIMEOUT_MS",
+  "MODEL_PROCESS_TERMINATION_GRACE_MS",
   "DB_QUERY_HEADROOM",
   "DB_CONNECTION_LIMIT",
   "PYTHON_MODEL_THREADS",
@@ -63,6 +67,16 @@ interface ConstantsSnapshot {
   };
   TIMEOUTS: {
     MODEL_EXECUTION_HARD_CAP: number;
+    MODEL_SINGLE_OPERATION: number;
+    MODEL_SINGLE_OPERATION_MAX: number;
+    MODEL_OPERATION_CLEANUP_BUDGET: number;
+    MODEL_FAILURE_RECORD: number;
+    MODEL_LOCK_CONNECTION_ACQUIRE: number;
+    MODEL_LOCK_QUERY: number;
+    MODEL_PROCESS_TERMINATION_GRACE: number;
+    ADF: number;
+    ADF_OPERATION: number;
+    ADF_OPERATION_CLEANUP_BUDGET: number;
     MODEL_TRAINING: number;
     MODEL_PREDICTION: number;
     PDF_QUEUE: number;
@@ -120,6 +134,16 @@ describe("concurrency safeguards", () => {
     expect(TIMEOUTS.PDF_QUEUE).toBe(60_000);
     expect(TIMEOUTS.PDF_GENERATION).toBe(30_000);
     expect(TIMEOUTS.MODEL_EXECUTION_HARD_CAP).toBe(600_000);
+    expect(TIMEOUTS.MODEL_SINGLE_OPERATION).toBe(660_000);
+    expect(TIMEOUTS.MODEL_SINGLE_OPERATION_MAX).toBe(660_000);
+    expect(TIMEOUTS.MODEL_OPERATION_CLEANUP_BUDGET).toBe(15_000);
+    expect(TIMEOUTS.MODEL_FAILURE_RECORD).toBe(2_000);
+    expect(TIMEOUTS.MODEL_LOCK_CONNECTION_ACQUIRE).toBe(2_000);
+    expect(TIMEOUTS.MODEL_LOCK_QUERY).toBe(2_000);
+    expect(TIMEOUTS.MODEL_PROCESS_TERMINATION_GRACE).toBe(5_000);
+    expect(TIMEOUTS.ADF).toBe(30_000);
+    expect(TIMEOUTS.ADF_OPERATION).toBe(32_000);
+    expect(TIMEOUTS.ADF_OPERATION_CLEANUP_BUDGET).toBe(13_000);
     expect(TIMEOUTS.MODEL_TRAINING).toBe(300_000);
     expect(TIMEOUTS.MODEL_PREDICTION).toBe(60_000);
     expect(PYTHON_RUNTIME_CONFIG.MODEL_PROCESS_THREADS).toBe(1);
@@ -163,6 +187,10 @@ describe("concurrency safeguards", () => {
         PDF_GENERATION_TIMEOUT_MS: "45000",
         MODEL_TRAINING_TIMEOUT_MS: "240000",
         MODEL_PREDICTION_TIMEOUT_MS: "45000",
+        MODEL_OPERATION_DEADLINE_MS: "660000",
+        MODEL_LOCK_CONNECTION_ACQUIRE_TIMEOUT_MS: "1500",
+        MODEL_LOCK_QUERY_TIMEOUT_MS: "1700",
+        MODEL_PROCESS_TERMINATION_GRACE_MS: "3500",
         DB_QUERY_HEADROOM: "44",
         DB_CONNECTION_LIMIT: "150",
         PYTHON_MODEL_THREADS: "2",
@@ -180,6 +208,14 @@ describe("concurrency safeguards", () => {
     expect(TIMEOUTS.PDF_QUEUE).toBe(70_000);
     expect(TIMEOUTS.PDF_GENERATION).toBe(45_000);
     expect(TIMEOUTS.MODEL_EXECUTION_HARD_CAP).toBe(600_000);
+    expect(TIMEOUTS.MODEL_SINGLE_OPERATION).toBe(660_000);
+    expect(TIMEOUTS.MODEL_SINGLE_OPERATION_MAX).toBe(660_000);
+    expect(TIMEOUTS.MODEL_OPERATION_CLEANUP_BUDGET).toBe(12_900);
+    expect(TIMEOUTS.MODEL_LOCK_CONNECTION_ACQUIRE).toBe(1_500);
+    expect(TIMEOUTS.MODEL_LOCK_QUERY).toBe(1_700);
+    expect(TIMEOUTS.MODEL_PROCESS_TERMINATION_GRACE).toBe(3_500);
+    expect(TIMEOUTS.ADF_OPERATION).toBe(33_800);
+    expect(TIMEOUTS.ADF_OPERATION_CLEANUP_BUDGET).toBe(11_200);
     expect(TIMEOUTS.MODEL_TRAINING).toBe(240_000);
     expect(TIMEOUTS.MODEL_PREDICTION).toBe(45_000);
     expect(DB_POOL_CONFIG.LOCK_CONNECTIONS).toBe(74);
@@ -205,6 +241,15 @@ describe("concurrency safeguards", () => {
     expect(CONCURRENCY_LIMITS.MAX_CONCURRENT_PDF_JOBS).toBe(7);
   });
 
+  test("a deliberately shorter global operation deadline also shortens ADF", async () => {
+    const { TIMEOUTS } = await loadConstantsSnapshot({
+      MODEL_OPERATION_DEADLINE_MS: "20000",
+    });
+
+    expect(TIMEOUTS.MODEL_SINGLE_OPERATION).toBe(20_000);
+    expect(TIMEOUTS.ADF_OPERATION).toBe(20_000);
+  });
+
   test("invalid positive-integer environment values fail fast", async () => {
     await expect(loadConstantsSnapshot({ MAX_CONCURRENT_MODEL_JOBS: "0" })).rejects.toThrow(
       "MAX_CONCURRENT_MODEL_JOBS must be a positive integer",
@@ -221,6 +266,19 @@ describe("concurrency safeguards", () => {
     await expect(
       loadConstantsSnapshot({ MODEL_PREDICTION_TIMEOUT_MS: "0" }),
     ).rejects.toThrow("MODEL_PREDICTION_TIMEOUT_MS must be a positive integer");
+
+    await expect(
+      loadConstantsSnapshot({ MODEL_OPERATION_DEADLINE_MS: "670000" }),
+    ).rejects.toThrow("MODEL_OPERATION_DEADLINE_MS must be <= 660000");
+
+    await expect(loadConstantsSnapshot({
+      MODEL_LOCK_QUERY_TIMEOUT_MS: "3000",
+    })).rejects.toThrow("MODEL_OPERATION_DEADLINE_MS must be <= 658000");
+
+    await expect(loadConstantsSnapshot({
+      MODEL_PROCESS_TERMINATION_GRACE_MS: "10000",
+      MODEL_OPERATION_DEADLINE_MS: "655000",
+    })).rejects.toThrow("leave less than 30000ms for ADF");
 
     await expect(
       loadConstantsSnapshot({ AUTH_LOGIN_RATE_LIMIT_MAX_PER_ACCOUNT: "0" }),

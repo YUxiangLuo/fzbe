@@ -8,15 +8,6 @@ export type GuidedTrainingStatus = "ready" | "running" | "failed" | "completed" 
 export const BASE_MODEL_TYPES = new Set<ModelType>(["ma", "es", "arima", "lstm"]);
 export const ENSEMBLE_MODEL_TYPES = new Set<ModelType>(["weighted_avg", "boosting", "stacking"]);
 export const GUIDED_MODEL_TYPES = new Set<ModelType>(["ma", "es", "arima", "lstm", "weighted_avg", "boosting", "stacking"]);
-export const ENSEMBLE_DERIVED_BODY_KEYS = new Set([
-  "models",
-  "moving_average_window",
-  "exponential_smoothing_alpha",
-  "arimaD",
-  "lstmFeatures",
-  "lstmTargetFeature",
-  "lstmNormalization",
-]);
 
 export interface GuidedTrainingStepDefinition {
   id: string;

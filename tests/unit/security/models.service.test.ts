@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, jest, mock, test } from "bun:test";
 import crypto from "node:crypto";
 import * as actualFs from "node:fs";
 import { unlink, writeFile } from "node:fs/promises";
@@ -110,6 +110,7 @@ const acquireModelSlot = mock(async () => ({
 }));
 const releaseModelExecutionLock = mock(async () => undefined);
 const releaseModelSlot = mock(async () => undefined);
+const verifyModelLockOwned = mock(async () => undefined);
 
 mock.module(configModulePath, () => ({
   env: {
@@ -225,9 +226,8 @@ mock.module(modelLocksModulePath, () => ({
   acquireModelSlot,
   releaseModelExecutionLock,
   releaseModelSlot,
-  assertModelLockOwned: (handle: { signal?: AbortSignal } | null | undefined) => {
-    if (handle?.signal?.aborted) throw handle.signal.reason;
-  },
+  verifyModelLockOwned,
+  getModelLockStats: () => ({}),
   combineModelLockSignals: (...handles: Array<{ signal?: AbortSignal } | null | undefined>) =>
     handles.find((handle) => handle?.signal)?.signal,
 }));
@@ -242,7 +242,6 @@ const {
   computeEnsemblePhase1TrainSize,
   cleanupExpiredGuidedTrainingSessions,
   cleanupStaleModelArtifacts,
-  getReusableProductionModelArtifactResult,
   getModelRuntimeRevision,
   hashDatasetSnapshot,
   loadDatasetFromDb,
@@ -371,11 +370,20 @@ describe("models service", () => {
     getActiveModelTrainingRun.mockResolvedValue(null);
     setProductionArtifactForRun.mockReset();
     setProductionArtifactForRun.mockResolvedValue(true);
-    commitModelTrainingRun.mockClear();
+    commitModelTrainingRun.mockReset();
+    commitModelTrainingRun.mockImplementation(async ({ runId, sessionId }: {
+      runId?: string;
+      sessionId?: string;
+    }) => ({
+      runId: runId ?? sessionId ?? "run-test",
+      stateVersion: 1,
+      reusedExistingRun: false,
+    }));
     acquireModelExecutionLock.mockClear();
     acquireModelSlot.mockClear();
     releaseModelExecutionLock.mockClear();
     releaseModelSlot.mockClear();
+    verifyModelLockOwned.mockClear();
 
     existsSync.mockReset();
     existsSync.mockReturnValue(false);
@@ -429,10 +437,12 @@ describe("models service", () => {
     const exited = new Promise<number>((resolve) => {
       resolveExit = resolve;
     });
+    let exitCode: number | null = null;
     const kill = mock(() => {
+      exitCode = 143;
       stdoutController.close();
       stderrController.close();
-      resolveExit(137);
+      resolveExit(exitCode);
     });
     const proc = {
       stdout: new ReadableStream<Uint8Array>({
@@ -442,12 +452,15 @@ describe("models service", () => {
         start(controller) { stderrController = controller; },
       }),
       exited,
+      get exitCode() { return exitCode; },
+      pid: 12345,
       kill,
     };
 
-    const error = await waitForAuxiliaryPythonProcess(proc, "复制融合模型产物", 1).catch(
-      (caughtError) => caughtError,
-    );
+    const error = await waitForAuxiliaryPythonProcess(proc, "复制融合模型产物", {
+      timeoutMs: 1,
+      terminationGraceMs: 1,
+    }).catch((caughtError) => caughtError);
 
     expect(error).toBeInstanceOf(ModelTimeoutError);
     expect(error).toMatchObject({
@@ -455,10 +468,56 @@ describe("models service", () => {
       timeoutMs: 1,
       source: "python_process",
     });
-    expect(kill).toHaveBeenCalledWith("SIGKILL");
+    expect(kill).toHaveBeenCalledWith("SIGTERM");
+  });
+
+  test("waits for an aborted auxiliary Python process to exit before rejecting", async () => {
+    let stdoutController!: ReadableStreamDefaultController<Uint8Array>;
+    let stderrController!: ReadableStreamDefaultController<Uint8Array>;
+    let resolveExit!: (exitCode: number) => void;
+    let exitCode: number | null = null;
+    const exited = new Promise<number>((resolve) => {
+      resolveExit = resolve;
+    });
+    const kill = mock(() => {
+      stdoutController.error(new Error("stdout pipe closed"));
+      stderrController.error(new Error("stderr pipe closed"));
+    });
+    const proc = {
+      stdout: new ReadableStream<Uint8Array>({
+        start(controller) { stdoutController = controller; },
+      }),
+      stderr: new ReadableStream<Uint8Array>({
+        start(controller) { stderrController = controller; },
+      }),
+      exited,
+      get exitCode() { return exitCode; },
+      pid: 12345,
+      kill,
+    };
+    const controller = new AbortController();
+    const lockLost = Object.assign(new Error("数据库模型锁已失效"), {
+      code: "MODEL_LOCK_LOST",
+    });
+
+    const result = waitForAuxiliaryPythonProcess(proc, "校验融合模型产物", {
+      terminationSignal: controller.signal,
+      terminationGraceMs: 100,
+    });
+    controller.abort(lockLost);
+    let settled = false;
+    void result.finally(() => { settled = true; }).catch(() => {});
+    await Bun.sleep(1);
+    expect(settled).toBe(false);
+
+    exitCode = 143;
+    resolveExit(exitCode);
+    await expect(result).rejects.toBe(lockLost);
+    expect(kill).toHaveBeenCalledWith("SIGTERM");
   });
 
   afterEach(async () => {
+    jest.useRealTimers();
     (Bun as { spawn: typeof Bun.spawn }).spawn = originalSpawn;
     await unlink(datasetCsvPath).catch(() => {});
   });
@@ -545,7 +604,7 @@ describe("models service", () => {
     lockSignal.abort(lockLostError);
 
     await expect(execution).rejects.toBe(lockLostError);
-    expect(proc.kill).toHaveBeenCalledWith("SIGKILL");
+    expect(proc.kill).toHaveBeenCalledWith("SIGTERM");
   });
 
   test("terminates the Python process before rejecting with a typed timeout", async () => {
@@ -592,7 +651,7 @@ describe("models service", () => {
       timeoutMs: 10,
       source: "python_process",
     });
-    expect(proc.kill).toHaveBeenCalledWith("SIGKILL");
+    expect(proc.kill).toHaveBeenCalledWith("SIGTERM");
     expect(inheritedDeadline).toBeGreaterThanOrEqual(startedAt + 10);
     expect(proc.exitCode).toBe(137);
   });
@@ -725,6 +784,41 @@ describe("models service", () => {
     expect(createReadStream).not.toHaveBeenCalled();
   });
 
+  test("does not create a guided session after its operation deadline expires during dataset loading", async () => {
+    jest.useFakeTimers();
+    let resolveDatasetQuery!: (value: unknown) => void;
+    const datasetQuery = new Promise((resolve) => {
+      resolveDatasetQuery = resolve;
+    });
+    poolQuery.mockImplementation((sql: string) => {
+      if (sql.includes("FROM dataset_segments")) return datasetQuery as never;
+      return Promise.resolve([[buildExperimentContextRow()]]) as never;
+    });
+    createReadStream.mockImplementation(() =>
+      Readable.from([modelDatasetCsv]) as unknown as ReturnType<typeof createReadStream>
+    );
+
+    const result = trainModel("ma", 20240002, {
+      experiment_id: 990002,
+      moving_average_window: 4,
+    });
+    for (let attempt = 0; attempt < 10 && poolQuery.mock.calls.length < 2; attempt += 1) {
+      await Promise.resolve();
+    }
+    expect(poolQuery.mock.calls.length).toBe(2);
+
+    jest.advanceTimersByTime(700_000);
+    resolveDatasetQuery([[{ file_path: datasetCsvPath }]]);
+
+    await expect(result).rejects.toMatchObject({
+      code: "MODEL_OPERATION_DEADLINE_EXCEEDED",
+      operation: "guided_training_session",
+    });
+    expect(mkdirSync).not.toHaveBeenCalled();
+    expect(poolQuery.mock.calls.some(([sql]) => String(sql).includes("INSERT INTO model_guided_training_sessions")))
+      .toBe(false);
+  });
+
   test("restores the session-scoped guided artifact before reusing a completed session", async () => {
     const requestBody = {
       experiment_id: 990002,
@@ -794,6 +888,55 @@ describe("models service", () => {
     );
     expect(unlinkSync).not.toHaveBeenCalledWith(productionModelPath);
     expect(spawnMock).not.toHaveBeenCalled();
+  });
+
+  test("removes a newly copied guided artifact when its protected commit fails", async () => {
+    const requestBody = {
+      experiment_id: 990002,
+      moving_average_window: 4,
+    };
+    const row = buildGuidedSessionRow({
+      session_id: "guided-commit-failure",
+      status: "completed",
+      current_step_id: null,
+      completed_step_ids: JSON.stringify(["prepare_data"]),
+      step_outputs: JSON.stringify({ prepare_data: { ok: true } }),
+      result_payload: JSON.stringify({
+        status: "success",
+        results: { metrics: { rmse: 1, mae: 1, r2: 0.9 } },
+      }),
+      request_payload: JSON.stringify(requestBody),
+    });
+    const sourceModelPath = path.join(row.artifact_dir, "ma.pkl");
+    const versionedArtifactPath = path.join(
+      mockedTrainedModelsRoot,
+      "exp990002-student20240002-ma-guided-commit-failure-backtest.pkl",
+    );
+    const existingArtifacts = new Set([sourceModelPath]);
+    existsSync.mockImplementation((filePath: string) => existingArtifacts.has(filePath));
+    renameSync.mockImplementation((_: string, destination: string) => {
+      existingArtifacts.add(destination);
+    });
+    unlinkSync.mockImplementation((filePath: string) => {
+      existingArtifacts.delete(filePath);
+    });
+    createReadStream.mockImplementation(() =>
+      Readable.from([modelDatasetCsv]) as unknown as ReturnType<typeof createReadStream>
+    );
+    poolQuery.mockImplementation(async (sql: string) => {
+      if (sql.includes("FROM dataset_segments")) return [[{ file_path: datasetCsvPath }]];
+      if (sql.includes("FROM model_guided_training_sessions")) return [[row]];
+      return [[buildExperimentContextRow()]];
+    });
+    commitModelTrainingRun.mockRejectedValueOnce(new Error("commit failed"));
+
+    await expect(
+      createOrResumeGuidedTrainingSession("ma", 20240002, requestBody),
+    ).rejects.toThrow("commit failed");
+
+    expect(copyFileSync).toHaveBeenCalled();
+    expect(unlinkSync).toHaveBeenCalledWith(versionedArtifactPath);
+    expect(existingArtifacts.has(versionedArtifactPath)).toBe(false);
   });
 
   test("recreates a completed guided session when its reusable artifact is missing", async () => {
@@ -1096,7 +1239,7 @@ describe("models service", () => {
     );
 
     await expect(
-      getReusableProductionModelArtifactResult("ma", 20240002, 990002, 6),
+      prepareExperimentModelForProduction("ma", 20240002, 990002, 6),
     ).rejects.toThrow("MA 模型运行环境已变化，请重新训练该模型");
     expect(spawnMock).not.toHaveBeenCalled();
   });
@@ -1121,7 +1264,7 @@ describe("models service", () => {
     );
 
     await expect(
-      getReusableProductionModelArtifactResult("ma", 20240002, 990002, 6),
+      prepareExperimentModelForProduction("ma", 20240002, 990002, 6),
     ).rejects.toThrow("MA 模型对应的数据集版本已变化，请重新训练该模型");
     expect(spawnMock).not.toHaveBeenCalled();
   });
@@ -1393,8 +1536,40 @@ describe("models service", () => {
       expect(error).toMatchObject({ code: "GUIDED_SESSION_SUPERSEDED" });
       expect(datasetMutated).toBe(true);
       expect(commitModelTrainingRun).not.toHaveBeenCalled();
-      expect(acquireModelSlot).not.toHaveBeenCalled();
+      expect(acquireModelSlot).toHaveBeenCalledTimes(1);
       expect(spawnMock).not.toHaveBeenCalled();
+      const failureSql = connection.query.mock.calls.map(([sql]) => String(sql));
+      const attemptFailureSql = failureSql.find((sql) =>
+        sql.includes("SET status = IF(status = 'python_completed', status, 'failed')"));
+      const sessionFailureSql = failureSql.find((sql) =>
+        sql.includes("SET status = 'failed'") && sql.includes("active_attempt_id"));
+      expect(attemptFailureSql).toContain("status IN ('running', 'python_completed')");
+      expect(sessionFailureSql).toContain("active_attempt_id = ?");
+      expect(sessionFailureSql).toContain("status = 'running'");
+      expect(sessionFailureSql).not.toContain("active_attempt_id IS NULL");
+
+      // Re-run the same protected failure with pool acquisition unavailable for
+      // the best-effort status write. The original model error must still win.
+      await writeFile(datasetCsvPath, modelDatasetCsv);
+      datasetMutated = false;
+      connection.query.mockClear();
+      poolGetConnection.mockReset();
+      const failureRecordPoolError = new Error("failure record pool unavailable");
+      poolGetConnection
+        .mockResolvedValueOnce(connection as never)
+        .mockRejectedValueOnce(failureRecordPoolError);
+
+      const originalError = await runGuidedTrainingStep(
+        "ma",
+        20240002,
+        row.session_id,
+        "prepare_data",
+      ).catch((caughtError) => caughtError as Error & { code?: string });
+
+      expect(originalError).toMatchObject({ code: "GUIDED_SESSION_SUPERSEDED" });
+      expect(originalError).not.toBe(failureRecordPoolError);
+      expect(datasetMutated).toBe(true);
+      expect(poolGetConnection).toHaveBeenCalledTimes(2);
     } finally {
       await unlink(candidatePath).catch(() => {});
       await unlink(receiptPath).catch(() => {});
@@ -1497,7 +1672,7 @@ describe("models service", () => {
       expect(result.step_outputs.prepare_data).toEqual(receiptOutput);
       expect(poolGetConnection).toHaveBeenCalledTimes(2);
       expect(commitConnection.commit).toHaveBeenCalledTimes(1);
-      expect(acquireModelSlot).not.toHaveBeenCalled();
+      expect(acquireModelSlot).toHaveBeenCalledTimes(1);
       expect(spawnMock).not.toHaveBeenCalled();
     } finally {
       await unlink(candidatePath).catch(() => {});

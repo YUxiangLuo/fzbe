@@ -148,7 +148,7 @@ describe("app route smoke tests", () => {
     expect(payload).not.toHaveProperty("data");
   });
 
-  test("runtime info exposes PDF queue observability", async () => {
+  test("runtime info exposes model and PDF concurrency observability", async () => {
     const app = await getApp();
     const response = await app.fetch(
       new Request("http://localhost/api/v1/runtime-info"),
@@ -157,17 +157,32 @@ describe("app route smoke tests", () => {
     expect(response.status).toBe(200);
     const payload = await response.json() as {
       data?: {
+        e2eServer?: unknown;
         concurrency?: { maxConcurrentPdfJobs?: unknown };
         timeouts?: {
           modelExecutionHardCapMs?: unknown;
+          modelSingleOperationMs?: unknown;
+          modelSingleOperationMaxMs?: unknown;
+          modelOperationCleanupBudgetMs?: unknown;
+          modelFailureRecordMs?: unknown;
+          modelNginxReadMs?: unknown;
+          modelBrowserRequestMs?: unknown;
           modelTrainingMs?: unknown;
           modelPredictionMs?: unknown;
+          adfExecutionMs?: unknown;
+          adfOperationMs?: unknown;
+          adfOperationCleanupBudgetMs?: unknown;
+          adfNginxReadMs?: unknown;
           pdfQueueMs?: unknown;
           pdfGenerationMs?: unknown;
         };
+        modelOperations?: Record<string, unknown>;
+        modelLocks?: Record<string, unknown>;
         pdfQueue?: Record<string, unknown>;
       };
     };
+
+    expect(typeof payload.data?.e2eServer).toBe("boolean");
 
     expect(payload.data?.pdfQueue).toEqual({
       activeJobs: 0,
@@ -178,9 +193,70 @@ describe("app route smoke tests", () => {
     });
     expect(payload.data?.timeouts).toMatchObject({
       modelExecutionHardCapMs: 600_000,
+      modelSingleOperationMs: 660_000,
+      modelSingleOperationMaxMs: 660_000,
+      modelOperationCleanupBudgetMs: 15_000,
+      modelFailureRecordMs: 2_000,
+      modelNginxReadMs: 675_000,
+      modelBrowserRequestMs: 690_000,
       modelTrainingMs: 300_000,
       modelPredictionMs: 60_000,
+      adfExecutionMs: 30_000,
+      adfOperationMs: 32_000,
+      adfOperationCleanupBudgetMs: 13_000,
+      adfNginxReadMs: 45_000,
     });
+    expect(payload.data?.modelOperations).toMatchObject({
+      admission: {
+        active: 0,
+        pending: 0,
+      },
+    });
+    expect(payload.data?.modelLocks).toMatchObject({ active: 0 });
+  });
+
+  test("disables Bun idle timeout only for the exact long-running model and ADF routes", async () => {
+    ensureTestEnv();
+    const { serverConfig } = await import("../../../src/index");
+    const timeout = mock((_request: Request, _seconds: number) => undefined);
+    const server = { timeout } as unknown as Bun.Server<undefined>;
+    const longRunningPaths = [
+      "/api/v1/models/ma/guided-training/sessions",
+      "/api/v1/models/arima/guided-training/sessions/session-1/steps/fit/run",
+      "/api/v1/models/lstm/prepare-production",
+      "/api/v1/models/weighted_avg/predict?trace=1",
+      "/api/v1/tools/adf",
+    ];
+    const ordinaryPaths = [
+      "/api/v1/models/ma/guided-training/sessions/session-1",
+      "/api/v1/models/ma/guided-training/sessions/session-1/steps/fit",
+      "/api/v1/models/ma/prepare-production/extra",
+      "/api/v1/models/ma/predict/",
+      "/api/v1/tools/adf/",
+      "/api/v1/runtime-info",
+    ];
+
+    for (const path of [...longRunningPaths, ...ordinaryPaths]) {
+      await serverConfig.fetch(
+        new Request(`http://localhost${path}`, { method: "POST" }),
+        server,
+      );
+    }
+
+    expect(timeout).toHaveBeenCalledTimes(longRunningPaths.length);
+    expect(timeout.mock.calls.map(([request, seconds]) => ({
+      pathname: new URL(request.url).pathname,
+      seconds,
+    }))).toEqual([
+      { pathname: "/api/v1/models/ma/guided-training/sessions", seconds: 0 },
+      {
+        pathname: "/api/v1/models/arima/guided-training/sessions/session-1/steps/fit/run",
+        seconds: 0,
+      },
+      { pathname: "/api/v1/models/lstm/prepare-production", seconds: 0 },
+      { pathname: "/api/v1/models/weighted_avg/predict", seconds: 0 },
+      { pathname: "/api/v1/tools/adf", seconds: 0 },
+    ]);
   });
 
   test("forbids assistants without assigned classes from reading the question bank", async () => {

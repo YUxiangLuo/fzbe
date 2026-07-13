@@ -5,9 +5,16 @@ import path from "path";
 import { stat } from "node:fs/promises";
 import type { RowDataPacket } from "mysql2/promise";
 import { env, pool, connectionLimit } from "./config";
-import { jwtAuth } from "./middleware";
+import { jwtAuth, requireStudent } from "./middleware";
 import logger from "./utils/logger";
-import { CONCURRENCY_LIMITS, DB_POOL_CONFIG, PYTHON_RUNTIME_CONFIG, TIMEOUTS } from "./utils/constants";
+import {
+  ADF_HTTP_TIMEOUT_BUDGETS,
+  CONCURRENCY_LIMITS,
+  DB_POOL_CONFIG,
+  MODEL_HTTP_TIMEOUT_BUDGETS,
+  PYTHON_RUNTIME_CONFIG,
+  TIMEOUTS,
+} from "./utils/constants";
 import { runStartupEnvironmentChecks } from "./utils/startup-checks";
 import type { JwtPayload, UserRole } from "./types";
 // Import new modular controllers
@@ -20,6 +27,13 @@ import { reportsController } from "./modules/reports";
 import { getPdfQueueStats, holdPdfQueueSlotForTest } from "./modules/reports/reports.service";
 import { modelsController } from "./modules/models";
 import { cleanupExpiredGuidedTrainingSessions, cleanupStaleModelArtifacts } from "./modules/models/models.service";
+import {
+  getModelOperationStats,
+  withModelOperationContext,
+  withModelOperationLease,
+} from "./modules/models/model-operation-lease";
+import { getModelLockStats } from "./modules/models/model-locks";
+import { ModelCapacityBusyError } from "./modules/models/model-errors";
 import { classesController } from "./modules/classes";
 import { classMembersController } from "./modules/class-members";
 import { datasetsController } from "./modules/datasets";
@@ -455,6 +469,7 @@ app.use("*", async (c, next) => {
 app.get("/api/v1/runtime-info", (c) =>
   c.json({
     app: "fangzhen-be",
+    e2eServer: process.env.E2E_SERVER === "1",
     database: env.DB_DATABASE,
     port: env.PORT,
     concurrency: {
@@ -469,15 +484,71 @@ app.get("/api/v1/runtime-info", (c) =>
     },
     timeouts: {
       modelExecutionHardCapMs: TIMEOUTS.MODEL_EXECUTION_HARD_CAP,
+      modelSingleOperationMs: TIMEOUTS.MODEL_SINGLE_OPERATION,
+      modelSingleOperationMaxMs: TIMEOUTS.MODEL_SINGLE_OPERATION_MAX,
+      modelOperationCleanupBudgetMs: TIMEOUTS.MODEL_OPERATION_CLEANUP_BUDGET,
+      modelFailureRecordMs: TIMEOUTS.MODEL_FAILURE_RECORD,
+      modelNginxReadMs: MODEL_HTTP_TIMEOUT_BUDGETS.NGINX_READ,
+      modelBrowserRequestMs: MODEL_HTTP_TIMEOUT_BUDGETS.BROWSER_REQUEST,
+      modelLockConnectionAcquireMs: TIMEOUTS.MODEL_LOCK_CONNECTION_ACQUIRE,
+      modelLockQueryMs: TIMEOUTS.MODEL_LOCK_QUERY,
+      modelProcessTerminationGraceMs: TIMEOUTS.MODEL_PROCESS_TERMINATION_GRACE,
+      adfExecutionMs: TIMEOUTS.ADF,
+      adfOperationMs: TIMEOUTS.ADF_OPERATION,
+      adfOperationCleanupBudgetMs: TIMEOUTS.ADF_OPERATION_CLEANUP_BUDGET,
+      adfNginxReadMs: ADF_HTTP_TIMEOUT_BUDGETS.NGINX_READ,
       modelTrainingMs: TIMEOUTS.MODEL_TRAINING,
       modelPredictionMs: TIMEOUTS.MODEL_PREDICTION,
       pdfQueueMs: TIMEOUTS.PDF_QUEUE,
       pdfGenerationMs: TIMEOUTS.PDF_GENERATION,
     },
+    modelOperations: getModelOperationStats(),
+    modelLocks: getModelLockStats(),
     pdfQueue: getPdfQueueStats(),
   }));
 
 if (process.env.E2E_SERVER === "1") {
+  app.post(
+    "/api/v1/e2e/model-lease/hold",
+    jwtAuth,
+    requireStudent,
+    async (c) => {
+      const body = await c.req.json().catch(() => ({})) as { hold_ms?: unknown };
+      const holdMs = Number(body.hold_ms ?? 3_000);
+      if (!Number.isInteger(holdMs) || holdMs <= 0 || holdMs > 30_000) {
+        return c.json({ error: "hold_ms must be an integer between 1 and 30000" }, 400);
+      }
+      const payload = c.get("jwtPayload") as JwtPayload;
+
+      try {
+        await withModelOperationContext("prediction", async (context) =>
+          await withModelOperationLease(
+            context,
+            {
+              mode: "slot_and_execution",
+              experimentId: payload.sub,
+              modelType: "ma",
+            },
+            async (lease) => {
+              await Bun.sleep(holdMs);
+              await lease.verifyOwned();
+            },
+          ));
+        return c.json({ data: { held_ms: holdMs } });
+      } catch (error) {
+        if (error instanceof ModelCapacityBusyError) {
+          c.header("Retry-After", String(error.retryAfterSeconds));
+          return c.json({
+            error: error.message,
+            code: error.code,
+            retryable: error.retryable,
+          }, 429);
+        }
+        throw error;
+      }
+    },
+  );
+
   app.post("/api/v1/e2e/pdf-slot/hold", async (c) => {
     const body = await c.req.json().catch(() => ({})) as { hold_ms?: unknown };
     const holdMs = Number(body.hold_ms ?? 5_000);
@@ -630,7 +701,7 @@ app.onError((err, c) => {
 const RUNTIME_DISK_CLEANUP_INTERVAL_MS = 24 * 60 * 60 * 1000;
 let runtimeDiskCleanupTimer: ReturnType<typeof setInterval> | null = null;
 
-const longRunningModelPathPattern = /^\/api\/v1\/models\/[^/]+\/(prepare-production|predict|guided-training\/sessions\/[^/]+\/steps\/[^/]+\/run)$/;
+const longRunningRequestPathPattern = /^(?:\/api\/v1\/tools\/adf|\/api\/v1\/models\/[^/]+\/(?:prepare-production|predict|guided-training\/sessions(?:\/[^/]+\/steps\/[^/]+\/run)?))$/;
 
 export async function runGuidedTrainingSessionCleanup(trigger = "manual") {
   try {
@@ -735,9 +806,11 @@ export const serverConfig = {
   idleTimeout: resolveBunIdleTimeoutSeconds(),
   fetch(request: Request, server: Bun.Server<undefined>) {
     const { pathname } = new URL(request.url);
-    if (longRunningModelPathPattern.test(pathname)) {
+    if (longRunningRequestPathPattern.test(pathname)) {
       server.timeout(request, 0);
     }
+    // Model services intentionally do not consume request.signal. Accepted work
+    // continues after a browser disconnect and is bounded by its own deadline.
     return app.fetch(request);
   },
   error(error: Error) {

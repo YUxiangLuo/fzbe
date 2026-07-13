@@ -1,6 +1,6 @@
 import { Hono } from "hono";
 import { jwtAuth, requireStudent } from "../../middleware";
-import { predictSchema, prepareProductionSchema, isModelType, getTrainSchemaForModel, type ModelType } from "./models.schema";
+import { predictSchema, prepareProductionSchema, isModelType, getTrainSchemaForModel } from "./models.schema";
 import {
   buildLocalizedPredictValidationDetails,
   buildLocalizedTrainValidationDetails,
@@ -12,27 +12,22 @@ import {
   discardGuidedTrainingSession,
   getGuidedTrainingSession,
   runGuidedTrainingStep,
-  getReusableProductionModelArtifactResult,
   prepareExperimentModelForProduction,
   predictExperimentModel,
-  acquireModelSlot,
-  releaseModelSlot,
-  acquireModelExecutionLock,
-  combineModelLockSignals,
-  releaseModelExecutionLock,
   ModelValidationError,
   ModelNotFoundError,
   ModelAccessError,
   ModelConflictError,
   ModelServiceUnavailableError,
   ModelTimeoutError,
+  ModelCapacityBusyError,
+  ModelOperationDeadlineError,
 } from "./models.service";
 import { handleUnexpectedError } from "../../utils/error-handler";
 import type { JwtPayload } from "../../types";
 import { parsePythonServiceError } from "./model-error-protocol";
 
 const modelsController = new Hono();
-const SLOT_FREE_REUSABLE_PRODUCTION_MODEL_TYPES = new Set<ModelType>(["ma", "es", "arima", "lstm"]);
 
 type ModelTimeoutOperation =
   | "guided_training_session"
@@ -50,6 +45,17 @@ const buildModelTimeoutPayload = (
   operation,
   timeout_ms: error.timeoutMs,
   retryable: true,
+});
+
+const buildOperationDeadlinePayload = (
+  error: ModelOperationDeadlineError,
+  message: string,
+) => ({
+  error: message,
+  code: error.code,
+  operation: error.operation,
+  timeout_ms: error.timeoutMs,
+  retryable: error.retryable,
 });
 
 modelsController.post(
@@ -89,6 +95,13 @@ modelsController.post(
       const session = await createOrResumeGuidedTrainingSession(modelType, payload.sub, validation.data);
       return c.json(session);
     } catch (error: unknown) {
+      if (error instanceof ModelCapacityBusyError) {
+        c.header("Retry-After", String(error.retryAfterSeconds));
+        return c.json({ error: error.message, code: error.code, retryable: error.retryable }, 429);
+      }
+      if (error instanceof ModelOperationDeadlineError) {
+        return c.json(buildOperationDeadlinePayload(error, "恢复训练会话超过服务端时限，请重试"), 504);
+      }
       if (error instanceof ModelAccessError) {
         return c.json({ error: error.message }, error.status);
       }
@@ -97,6 +110,12 @@ modelsController.post(
       }
       if (error instanceof ModelNotFoundError) {
         return c.json({ error: error.message }, 404);
+      }
+      if (error instanceof ModelConflictError) {
+        return c.json({ error: error.message, code: error.code, ...error.details }, 409);
+      }
+      if (error instanceof ModelServiceUnavailableError) {
+        return c.json({ error: error.message, code: error.code }, 503);
       }
       if (error instanceof ModelTimeoutError) {
         return c.json(
@@ -168,6 +187,13 @@ modelsController.delete(
       await discardGuidedTrainingSession(modelTypeParam, payload.sub, sessionId);
       return c.body(null, 204);
     } catch (error) {
+      if (error instanceof ModelCapacityBusyError) {
+        c.header("Retry-After", String(error.retryAfterSeconds));
+        return c.json({ error: error.message, code: error.code, retryable: error.retryable }, 429);
+      }
+      if (error instanceof ModelOperationDeadlineError) {
+        return c.json(buildOperationDeadlinePayload(error, "删除训练会话超过服务端时限，请重试"), 504);
+      }
       if (error instanceof ModelAccessError) {
         return c.json({ error: error.message }, error.status);
       }
@@ -213,16 +239,17 @@ modelsController.post(
       );
       return c.json(session);
     } catch (error: unknown) {
+      if (error instanceof ModelCapacityBusyError) {
+        c.header("Retry-After", String(error.retryAfterSeconds));
+        return c.json({ error: error.message, code: error.code, retryable: error.retryable }, 429);
+      }
+      if (error instanceof ModelOperationDeadlineError) {
+        return c.json(buildOperationDeadlinePayload(error, "训练步骤超过服务端时限，请重试当前步骤"), 504);
+      }
       if (error instanceof ModelAccessError) {
         return c.json({ error: error.message }, error.status);
       }
       if (error instanceof ModelValidationError) {
-        if (error.message.includes("模型服务繁忙")) {
-          return c.json({ error: error.message }, 429);
-        }
-        if (error.message.includes("同一模型正在训练或预测")) {
-          return c.json({ error: error.message }, 409);
-        }
         return c.json({ error: error.message, ...error.details }, 400);
       }
       if (error instanceof ModelConflictError) {
@@ -275,42 +302,23 @@ modelsController.post(
 
     const body = validation.data;
 
-    let executionLock = null;
-    let slotLock = null;
-
     try {
-      executionLock = await acquireModelExecutionLock(body.experiment_id, modelType);
-      if (!executionLock) {
-        return c.json({ error: "同一模型正在训练或预测，请稍后再试" }, 409);
-      }
-
-      if (SLOT_FREE_REUSABLE_PRODUCTION_MODEL_TYPES.has(modelType)) {
-        const reusableArtifact = await getReusableProductionModelArtifactResult(
-          modelType,
-          payload.sub,
-          body.experiment_id,
-          body.forecast_steps,
-        );
-        if (reusableArtifact) {
-          return c.json(reusableArtifact);
-        }
-      }
-
-      slotLock = await acquireModelSlot();
-      if (!slotLock) {
-        return c.json({ error: "模型服务繁忙，请稍后再试" }, 429);
-      }
-
       const result = await prepareExperimentModelForProduction(
         modelType,
         payload.sub,
         body.experiment_id,
         body.forecast_steps,
         false,
-        combineModelLockSignals(executionLock, slotLock),
       );
       return c.json(result);
     } catch (error: unknown) {
+      if (error instanceof ModelCapacityBusyError) {
+        c.header("Retry-After", String(error.retryAfterSeconds));
+        return c.json({ error: error.message, code: error.code, retryable: error.retryable }, 429);
+      }
+      if (error instanceof ModelOperationDeadlineError) {
+        return c.json(buildOperationDeadlinePayload(error, "生产模型准备超过服务端时限，请稍后重试"), 504);
+      }
       if (error instanceof ModelAccessError) {
         return c.json({ error: error.message }, error.status);
       }
@@ -339,9 +347,6 @@ modelsController.post(
       const err = error as Error;
       const message = err.message || `${modelType.toUpperCase()} 生产模型准备失败`;
       return handleUnexpectedError(c, error, message);
-    } finally {
-      await releaseModelSlot(slotLock);
-      await releaseModelExecutionLock(executionLock);
     }
   },
 );
@@ -381,30 +386,23 @@ modelsController.post(
 
     const body = validation.data;
 
-    let executionLock = null;
-    let slotLock = null;
-
     try {
-      executionLock = await acquireModelExecutionLock(body.experiment_id, modelType);
-      if (!executionLock) {
-        return c.json({ error: "同一模型正在训练或预测，请稍后再试" }, 409);
-      }
-
-      slotLock = await acquireModelSlot();
-      if (!slotLock) {
-        return c.json({ error: "模型服务繁忙，请稍后再试" }, 429);
-      }
-
       const result = await predictExperimentModel(
         modelType,
         payload.sub,
         body.experiment_id,
         body.forecast_steps,
         body.preparation_token,
-        combineModelLockSignals(executionLock, slotLock),
       );
       return c.json(result);
     } catch (error: unknown) {
+      if (error instanceof ModelCapacityBusyError) {
+        c.header("Retry-After", String(error.retryAfterSeconds));
+        return c.json({ error: error.message, code: error.code, retryable: error.retryable }, 429);
+      }
+      if (error instanceof ModelOperationDeadlineError) {
+        return c.json(buildOperationDeadlinePayload(error, "预测超过服务端时限，请重试"), 504);
+      }
       if (error instanceof ModelAccessError) {
         return c.json({ error: error.message }, error.status);
       }
@@ -434,9 +432,6 @@ modelsController.post(
       const err = error as Error;
       const message = err.message || `${modelType.toUpperCase()} 预测失败`;
       return handleUnexpectedError(c, error, message);
-    } finally {
-      await releaseModelSlot(slotLock);
-      await releaseModelExecutionLock(executionLock);
     }
   },
 );

@@ -2,6 +2,19 @@ import { describe, expect, test } from "bun:test";
 import { Semaphore, SemaphoreTimeoutError } from "../../../src/utils/semaphore";
 
 describe("Semaphore", () => {
+  test("tryAcquire is immediate and never enters the wait queue", () => {
+    const sem = new Semaphore(2);
+
+    expect(sem.tryAcquire()).toBe(true);
+    expect(sem.tryAcquire()).toBe(true);
+    expect(sem.tryAcquire()).toBe(false);
+    expect(sem.active).toBe(2);
+    expect(sem.pending).toBe(0);
+
+    sem.release();
+    sem.release();
+  });
+
   test("acquire and release within limit", async () => {
     const sem = new Semaphore(2);
 
