@@ -3,7 +3,7 @@
 from typing import Optional
 
 
-KNOWN_ERROR_TAGS = ("[VALIDATION]", "[DATA]", "[TIMEOUT]")
+KNOWN_ERROR_TAGS = ("[VALIDATION]", "[DATA]", "[MODEL]", "[TIMEOUT]")
 
 
 def format_known_error(exc: Exception) -> Optional[str]:

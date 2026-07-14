@@ -103,15 +103,20 @@ def load_model(path: str) -> Any:
             f"Please ensure the model has been trained and saved first."
         )
 
-    # Load the object
+    # Load the object. Any failure here means the artifact cannot be
+    # reconstructed: corrupt/truncated bytes (UnpicklingError/EOFError/ValueError),
+    # a pickle that references removed or renamed code (ModuleNotFoundError/
+    # ImportError/AttributeError), or an unreadable file (OSError). All of these
+    # are load failures, so surface them through the [MODEL] protocol uniformly
+    # and let the service invalidate the artifact and require a retrain.
     try:
         with open(path, "rb") as fh:
             return pickle.load(fh)
-    except (pickle.UnpicklingError, EOFError, ValueError) as e:
+    except (KeyboardInterrupt, SystemExit):
+        raise
+    except Exception as e:
         raise SerializationError(
             f"[MODEL] Failed to load model from '{path}'.\n"
-            f"The file may be corrupted or in an incompatible format.\n"
-            f"Error: {e}"
+            f"The file may be corrupted, unreadable, or in an incompatible format.\n"
+            f"Error: {type(e).__name__}: {e}"
         ) from e
-    except OSError as e:
-        raise OSError(f"Failed to read from '{path}': {e}") from e

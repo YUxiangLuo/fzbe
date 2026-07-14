@@ -1,8 +1,9 @@
-import { ModelTimeoutError } from "./model-errors";
+import { ModelArtifactError, ModelTimeoutError } from "./model-errors";
 
 const PYTHON_STDERR_TAGS = [
   { marker: "[VALIDATION]", servicePrefix: "[PYTHON_VALIDATION]" },
   { marker: "[DATA]", servicePrefix: "[PYTHON_DATA]" },
+  { marker: "[MODEL]", servicePrefix: "[PYTHON_MODEL]" },
   { marker: "[TIMEOUT]", servicePrefix: "[PYTHON_TIMEOUT]" },
 ] as const;
 
@@ -29,6 +30,9 @@ export const extractPythonTaggedError = (
           timeoutMs,
           "python_subprocess",
         );
+      }
+      if (marker === "[MODEL]") {
+        return new ModelArtifactError(detail || "模型产物损坏或格式不兼容");
       }
       return new Error(`${servicePrefix}${detail ? ` ${detail}` : ""}`);
     }

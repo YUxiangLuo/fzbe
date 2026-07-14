@@ -5,6 +5,16 @@ export class ModelValidationError extends Error {
 }
 
 export class ModelNotFoundError extends Error {}
+
+export class ModelArtifactError extends Error {
+  readonly code = "MODEL_ARTIFACT_INVALID";
+
+  constructor(message = "模型产物损坏或格式不兼容") {
+    super(message);
+    this.name = "ModelArtifactError";
+  }
+}
+
 export class ModelConflictError extends Error {
   constructor(
     message: string,

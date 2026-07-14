@@ -67,8 +67,47 @@ def sample_records(size: int = 18) -> list[dict[str, object]]:
 def assert_error_tag_contract() -> None:
     assert format_known_error(ValueError("[VALIDATION]abc")) == "[VALIDATION] abc"
     assert format_known_error(ValueError("[DATA]   中文内容")) == "[DATA] 中文内容"
+    assert format_known_error(ValueError("[MODEL] corrupt artifact")) == "[MODEL] corrupt artifact"
     assert format_known_error(TimeoutError("base model expired")) == "[TIMEOUT] base model expired"
     assert format_known_error(TimeoutError("[TIMEOUT] nested")) == "[TIMEOUT] nested"
+
+
+def assert_incompatible_pickle_tagged_model() -> None:
+    """A valid pickle that references removed code must load-fail through [MODEL]."""
+    import pickle
+    import tempfile
+
+    from serialization import load_model
+
+    namespace: dict = {}
+    exec(
+        "import sys, types\n"
+        "mod = types.ModuleType('review_ghost_module')\n"
+        "class Ghost:\n    pass\n"
+        "Ghost.__module__ = 'review_ghost_module'\n"
+        "mod.Ghost = Ghost\n"
+        "sys.modules['review_ghost_module'] = mod\n",
+        namespace,
+    )
+    ghost_instance = namespace["Ghost"]()
+
+    with tempfile.NamedTemporaryFile(suffix=".pkl", delete=False) as handle:
+        pickle.dump(ghost_instance, handle)
+        artifact_path = handle.name
+
+    sys.modules.pop("review_ghost_module", None)
+
+    try:
+        load_model(artifact_path)
+    except Exception as exc:  # noqa: BLE001 - contract is the tagged message
+        message = str(exc)
+        assert message.startswith("[MODEL]"), message
+        assert format_known_error(exc) is not None
+        assert format_known_error(exc).startswith("[MODEL]")
+    else:
+        raise AssertionError("incompatible pickle was loaded without error")
+    finally:
+        os.remove(artifact_path)
 
 
 def assert_nested_timeout_respects_backend_deadline() -> None:
@@ -1148,6 +1187,7 @@ def assert_ensemble_source_config_conflicts_end_to_end() -> None:
 
 def main() -> None:
     assert_error_tag_contract()
+    assert_incompatible_pickle_tagged_model()
     assert_nested_timeout_respects_backend_deadline()
     assert_expired_deadline_precedes_snapshot_creation()
     assert_log_redaction()

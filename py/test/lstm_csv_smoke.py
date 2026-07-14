@@ -266,6 +266,30 @@ def main() -> None:
         assert_series_close(future_predictions_one, future_predictions_two)
         assert_series_close(future_std_devs_one, future_std_devs_two)
 
+        corrupt_sidecar = temp_path / "lstm-corrupt-sidecar.h5"
+        corrupt_sidecar.write_bytes(b"not-a-valid-keras-model")
+        corrupt_state_path = temp_path / "lstm-corrupt-state.pkl"
+        corrupt_state = load_pickled_state(production_model)
+        corrupt_state["keras_model_path"] = str(corrupt_sidecar)
+        with corrupt_state_path.open("wb") as handle:
+            pickle.dump(corrupt_state, handle, protocol=pickle.HIGHEST_PROTOCOL)
+
+        corrupt_predict = run_lstm(
+            None,
+            "--load-model",
+            str(corrupt_state_path),
+            "--forecast-steps",
+            "1",
+        )
+        if corrupt_predict.returncode == 0:
+            raise AssertionError("expected corrupt LSTM sidecar to fail")
+        if "[MODEL] Failed to load Keras model" not in corrupt_predict.stderr:
+            raise AssertionError(
+                "missing stable model-artifact error tag\n"
+                f"stdout:\n{corrupt_predict.stdout}\n"
+                f"stderr:\n{corrupt_predict.stderr}"
+            )
+
         small_records = [
             {"y": 1, "x": 10},
             {"y": 2, "x": 11},
@@ -365,7 +389,14 @@ def main() -> None:
         json.dumps(
             {
                 "fixture": str(CSV_FIXTURE),
-                "checked_modes": ["type_inference", "training", "fit_only", "loaded_predict", "short_refit_rejection"],
+                "checked_modes": [
+                    "type_inference",
+                    "training",
+                    "fit_only",
+                    "loaded_predict",
+                    "corrupt_sidecar_rejection",
+                    "short_refit_rejection",
+                ],
                 "feature_count": len(FEATURE_KEYS),
                 "model": "lstm",
                 "status": "ok",

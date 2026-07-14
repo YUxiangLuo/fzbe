@@ -83,21 +83,33 @@ def _parse_feature_key_list(raw_value: Optional[str]) -> Optional[List[str]]:
     return [item.strip() for item in str(raw_value).split(',') if item.strip()]
 
 
+def _load_keras_artifact(keras_model_path: Optional[str]) -> Any:
+    """Load the Keras sidecar while preserving the model-error protocol."""
+    from tensorflow.keras.models import load_model as keras_load_model
+
+    if not keras_model_path or not os.path.exists(keras_model_path):
+        raise ValueError(f"[MODEL] Keras model file not found at {keras_model_path}")
+
+    try:
+        return keras_load_model(keras_model_path, compile=False)
+    except (EOFError, KeyError, OSError, TypeError, ValueError) as exc:
+        raise ValueError(
+            f"[MODEL] Failed to load Keras model from '{keras_model_path}': {exc}"
+        ) from exc
+
+
 def _load_state(model_path: str) -> Dict[str, Any]:
     """
     Load and validate a saved LSTM model state.
     """
-    from tensorflow.keras.models import load_model as keras_load_model
     state = load_model(model_path)
     if not isinstance(state, dict) or state.get("model_type") != MODEL_TYPE:
         raise ValueError("[VALIDATION] Invalid LSTM model file.")
-    
+
     # Load the Keras model from the dedicated file
     keras_model_path = state.get("keras_model_path")
-    if not keras_model_path or not os.path.exists(keras_model_path):
-        raise FileNotFoundError(f"Keras model file not found at {keras_model_path}")
-    state["keras_model"] = keras_load_model(keras_model_path, compile=False)
-    
+    state["keras_model"] = _load_keras_artifact(keras_model_path)
+
     # Ensure normalization is loaded for predict function
     if "normalization" not in state:
         state["normalization"] = 'minmax' # Default to minmax if not found (for older models)
@@ -429,11 +441,8 @@ def predict(
 
     # If state is passed directly, the keras model might not be loaded yet
     if "keras_model" not in state:
-        from tensorflow.keras.models import load_model as keras_load_model
         keras_model_path = state.get("keras_model_path")
-        if not keras_model_path or not os.path.exists(keras_model_path):
-            raise FileNotFoundError(f"Keras model file not found at {keras_model_path}")
-        state["keras_model"] = keras_load_model(keras_model_path, compile=False)
+        state["keras_model"] = _load_keras_artifact(keras_model_path)
         log.debug(f"Loaded Keras model from {keras_model_path}")
 
     prediction_domain = resolve_prediction_domain(
