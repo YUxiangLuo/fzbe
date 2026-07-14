@@ -106,12 +106,9 @@ def train_base_model_artifacts(
 
 def iter_stage_models(state: dict):
     model_chain = state["model_chain"]
-    explicit_coefficients = state.get("stage_coefficients")
-    if isinstance(explicit_coefficients, list) and len(explicit_coefficients) == len(model_chain):
-        stage_coefficients = [float(value) for value in explicit_coefficients]
-    else:
-        learning_rate = float(state.get("learning_rate", 0.3))
-        stage_coefficients = [1.0 if idx == 0 else learning_rate for idx in range(len(model_chain))]
+    stage_coefficients = [float(value) for value in state["stage_coefficients"]]
+    if len(stage_coefficients) != len(model_chain):
+        raise AssertionError("stage coefficients do not match model chain")
 
     usage_counts: dict[str, int] = {}
     for stage_idx, model_name in enumerate(model_chain):

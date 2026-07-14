@@ -40,6 +40,11 @@ def main():
         type=int,
         help="Required direct forecast horizon when refitting an artifact",
     )
+    parser.add_argument(
+        "--allow-negative-predictions",
+        action="store_true",
+        help=argparse.SUPPRESS,
+    )
     parser.add_argument("--pretty", action="store_true", help="Pretty print JSON output")
 
     # Add model-specific arguments (these will be parsed by the individual model's run function)
@@ -66,9 +71,9 @@ def main():
     parser.add_argument("--learning-rate", type=float, help="Boosting learning rate (shrinkage parameter)")
     parser.add_argument("--max-rounds", type=int, help="Boosting maximum number of rounds")
 
-    # Parse args. We need to parse unknown args because each model's run function
-    # expects a Namespace object with all its specific args, even if not defined here.
-    args, unknown = parser.parse_known_args()
+    # Every supported model argument is declared above. Reject misspelled or stale
+    # flags so a requested teaching parameter can never be silently ignored.
+    args = parser.parse_args()
 
     if args.data_file:
         with open(args.data_file, "r", encoding="utf-8") as handle:
@@ -77,8 +82,6 @@ def main():
     if args.model_type not in MODEL_MODULES:
         raise ValueError(f"Unknown model type: {args.model_type}")
 
-    # Pass all parsed args (including unknown ones) to the specific model's run function
-    # The individual model's run function will then parse its specific args from this Namespace
     model_module = MODEL_MODULES[args.model_type]
     model_module.run(args)
 

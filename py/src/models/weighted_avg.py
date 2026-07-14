@@ -24,9 +24,10 @@ from data_utils import (
     load_data_from_json,
 )
 from ensemble_utils import (
-    build_lstm_params_from_source_state,
     build_ensemble_subprocess_data,
+    can_refit_source_artifact_for_internal_holdout,
     compute_phase1_train_size,
+    estimate_residual_std,
     fit_and_predict_from_source_model,
     format_predictions,
     get_lstm_source_forecast_strategy,
@@ -34,10 +35,12 @@ from ensemble_utils import (
     load_lstm_source_state,
     normalize_demand_forecast,
     parse_base_model_files_arg,
+    parse_base_model_names,
     parse_feature_name_list,
     persist_member_model_artifact,
     prepare_lstm_source_model_for_requested_steps,
-    resolve_lstm_reuse_production_horizon,
+    resolve_base_model_artifact_configs,
+    validate_base_model_names,
     validate_internal_split_base_params,
 )
 from metrics import mae, mape, r2, rmse
@@ -55,19 +58,18 @@ METHOD_NAME = "验证残差MSE倒数加权平均融合"
 FORECAST_STRATEGY = "validation_residual_mse_weighted_average"
 IMPLEMENTATION_NOTES = [
     "教科书组合预测常用逆方差或误差方差-协方差思想分配权重；当预测误差近似无偏时，MSE 与方差口径一致。",
-    "本系统先用时间顺序留出的验证段估计各基础模型残差均方误差（MSE），再按其倒数归一化为权重。",
-    "这样既继承误差越小权重越高的逆方差思想，也会惩罚销量预测中常见的系统性高估或低估。",
-    "所有基础模型最终会在完整训练区间重训，再用固定权重组合评估或未来预测。",
-    "预测值附带的 std_dev 是评估段残差的常数标准差，不随预测步长增长，与 ARIMA 随步长展宽的置信区间口径不同。",
+    "本系统按时间顺序留出末段：训练点 n<=15 时前段长度为 max(n-3, floor(0.85n))（本项目最少 n=8，因而留 2-3 点），n>15 时前段为 floor(0.8n)；再按 1/(MSE+1e-9) 归一化为非负且和为 1 的权重。",
+    "该规则会同时惩罚系统性偏差和残差波动，但没有估计模型误差之间的协方差；小验证段上的权重可能不稳定，这是兼容教学小数据的明确妥协。",
+    "内部验证沿用 MA 窗口、ES 的 alpha，以及 LSTM 的 look_back、epochs、特征和归一化配置；LSTM 的动态隐藏单元、批大小和直接输出宽度按当前子训练段与验证跨度依照同一规则重算。ARIMA 只沿用用户固定的 d，并在内部前段重新执行 AIC/BIC stepwise 搜索，避免把完整训练段选出的 p、q 泄漏给留出段。",
+    "基础模型随后使用完整训练区间的既有匹配产物或重新拟合产物生成评估预测；所有表示实体销量的成员预测会先截断到不小于 0，再按固定权重组合，组合结果也做同样的非负兜底。",
+    "std_dev 优先取独立评估段残差的样本标准差；不足 2 点时退回内部权重验证段残差。该常数不随预测步长增长。",
 ]
 
 
 # ---------- utilities ----------
 _parse_feature_name_list = parse_feature_name_list
 _load_lstm_source_state = load_lstm_source_state
-_build_lstm_params_from_source_state = build_lstm_params_from_source_state
 _get_lstm_source_forecast_strategy = get_lstm_source_forecast_strategy
-_resolve_lstm_reuse_production_horizon = resolve_lstm_reuse_production_horizon
 _prepare_lstm_source_model_for_requested_steps = prepare_lstm_source_model_for_requested_steps
 _format_predictions = format_predictions
 _compute_phase1_train_size = compute_phase1_train_size
@@ -78,6 +80,7 @@ def _load_state(model_path: str) -> Dict[str, Any]:
     state = load_model(model_path)
     if not isinstance(state, dict) or state.get("model_type") != MODEL_TYPE:
         raise ValueError("[VALIDATION] Invalid Weighted Average model file.")
+    validate_base_model_names(state.get("models"), "Saved Weighted Average model")
     return ensure_state_metadata(state, METHOD_NAME, FORECAST_STRATEGY, IMPLEMENTATION_NOTES)
 
 
@@ -122,9 +125,10 @@ def _validate_fit_args(
     if not (0 <= ts <= te < n):
         raise ValueError(f"[VALIDATION] Invalid train range: [{ts},{te}], n_obs={n}")
 
-    models_to_use = state.get("models")
-    if not isinstance(models_to_use, list) or len(models_to_use) < 2:
-        raise ValueError("[VALIDATION] Saved Weighted Average model is missing valid base models.")
+    models_to_use = validate_base_model_names(
+        state.get("models"),
+        "Saved Weighted Average model",
+    )
 
     base_model_states = state.get("base_model_states")
     if not isinstance(base_model_states, dict):
@@ -203,18 +207,7 @@ def _validate_training_args(
     """Validate training and evaluation parameters for Weighted Average."""
     n = parsed_data.n_obs
 
-    # Supported base models
-    SUPPORTED_BASE_MODELS = ["ma", "es", "arima", "lstm"]
-
-    if not models_to_use:
-        raise ValueError("[VALIDATION] models_to_use cannot be empty.")
-
-    if len(models_to_use) < 2:
-        raise ValueError("[VALIDATION] Weighted Average requires at least 2 base models.")
-
-    for model_name in models_to_use:
-        if model_name not in SUPPORTED_BASE_MODELS:
-            raise ValueError(f"[VALIDATION] Unknown model: {model_name}")
+    validate_base_model_names(models_to_use, "Weighted Average")
 
     if not (0 <= ts <= te < n):
         raise ValueError(f"[VALIDATION] Invalid train range: [{ts},{te}], n_obs={n}")
@@ -232,27 +225,38 @@ def _validate_training_args(
             raise ValueError(f"[VALIDATION] Missing parameters for model: {model_name}")
         params = model_params[model_name]
         if model_name == "arima":
-            if "d" not in params: raise ValueError("[VALIDATION] ARIMA requires 'd' parameter.")
-            if params["d"] < 0: raise ValueError("[VALIDATION] ARIMA d must be >= 0.")
+            if "d" not in params:
+                raise ValueError("[VALIDATION] ARIMA requires 'd' parameter.")
+            if params["d"] < 0:
+                raise ValueError("[VALIDATION] ARIMA d must be >= 0.")
         elif model_name == "es":
-            if "alpha" not in params: raise ValueError("[VALIDATION] ES requires 'alpha' parameter.")
-            if not (0 < params["alpha"] <= 1): raise ValueError("[VALIDATION] ES alpha must be in (0, 1].")
+            if "alpha" not in params:
+                raise ValueError("[VALIDATION] ES requires 'alpha' parameter.")
+            if not (0 < params["alpha"] <= 1):
+                raise ValueError("[VALIDATION] ES alpha must be in (0, 1].")
         elif model_name == "ma":
-            if "window" not in params: raise ValueError("[VALIDATION] MA requires 'window' parameter.")
-            if params["window"] < 1: raise ValueError("[VALIDATION] MA window must be >= 1.")
+            if "window" not in params:
+                raise ValueError("[VALIDATION] MA requires 'window' parameter.")
+            if params["window"] < 2:
+                raise ValueError("[VALIDATION] MA window must be >= 2.")
         elif model_name == "lstm":
             source_model_file = (base_model_files or {}).get(model_name)
             source_model_state = None
-            if source_model_file and os.path.exists(source_model_file):
+            if source_model_file:
                 source_model_state = _load_lstm_source_state(
                     source_model_file,
                     "Saved Weighted Average LSTM base model",
                 )
-            if "look_back" not in params: raise ValueError("[VALIDATION] LSTM requires 'look_back' parameter.")
-            if "epochs" not in params: raise ValueError("[VALIDATION] LSTM requires 'epochs' parameter.")
-            if params["look_back"] < 1: raise ValueError("[VALIDATION] LSTM look_back must be >= 1.")
-            if params["epochs"] < 1: raise ValueError("[VALIDATION] LSTM epochs must be >= 1.")
-            if te - ts + 1 <= params["look_back"]: raise ValueError("[VALIDATION] Training range must be larger than LSTM look_back.")
+            if "look_back" not in params:
+                raise ValueError("[VALIDATION] LSTM requires 'look_back' parameter.")
+            if "epochs" not in params:
+                raise ValueError("[VALIDATION] LSTM requires 'epochs' parameter.")
+            if params["look_back"] < 1:
+                raise ValueError("[VALIDATION] LSTM look_back must be >= 1.")
+            if params["epochs"] < 1:
+                raise ValueError("[VALIDATION] LSTM epochs must be >= 1.")
+            if te - ts + 1 <= params["look_back"]:
+                raise ValueError("[VALIDATION] Training range must be larger than LSTM look_back.")
             train_size = te - ts + 1
             weight_train_size = _compute_phase1_train_size(train_size)
             weight_val_size = train_size - weight_train_size
@@ -348,6 +352,7 @@ def predict(
     X_future = np.array(base_predictions).T
     model_weights = np.array([weights[name] for name in models_to_use])
     final_predictions = np.sum(X_future * model_weights, axis=1)
+    final_predictions = normalize_demand_forecast(final_predictions)
 
     return final_predictions.tolist(), std_dev_residuals
 
@@ -390,7 +395,7 @@ def train_and_evaluate(
     weight_train_range = range(train_range.start, train_range.start + weight_split)
     weight_val_range = range(train_range.start + weight_split, train_range.stop)
 
-    print(f"[Weighted Average] 数据划分:", file=sys.stderr)
+    print("[Weighted Average] 数据划分:", file=sys.stderr)
     print(f"  权重训练集: {weight_train_range} ({len(weight_train_range)} points)", file=sys.stderr)
     print(f"  权重验证集 (计算权重): {weight_val_range} ({len(weight_val_range)} points)", file=sys.stderr)
     print(f"  评估集: {eval_range} ({len(eval_range)} points)", file=sys.stderr)
@@ -403,7 +408,7 @@ def train_and_evaluate(
     )
 
     # === Step 2: Phase 1 - Train on weight_train, predict on weight_val ===
-    print(f"\n[Weighted Average Phase 1] 训练基础模型并生成权重验证集预测", file=sys.stderr)
+    print("\n[Weighted Average Phase 1] 训练基础模型并生成权重验证集预测", file=sys.stderr)
     weight_val_predictions = {}
 
     # Calculate dynamic timeout for LSTM models
@@ -417,7 +422,10 @@ def train_and_evaluate(
         source_model_file = (base_model_files or {}).get(model_name)
 
         print(f"  训练 {model_name} 在 weight_train，预测 weight_val...", file=sys.stderr)
-        if source_model_file and os.path.exists(source_model_file):
+        if (
+            source_model_file
+            and can_refit_source_artifact_for_internal_holdout(model_name)
+        ):
             adjusted_source_model_file = source_model_file
             temp_source_model_file = None
             try:
@@ -460,21 +468,21 @@ def train_and_evaluate(
         print(f"    ✓ 生成 {len(y_pred_val)} 个weight_val预测", file=sys.stderr)
 
     # === Step 3: Calculate weights using validation residual MSE ===
-    print(f"\n[Weighted Average Phase 2] 计算权重（验证集残差MSE倒数加权）", file=sys.stderr)
+    print("\n[Weighted Average Phase 2] 计算权重（验证集残差MSE倒数加权）", file=sys.stderr)
     y_true_val = parsed_data.y[weight_val_range]  # ✅ weight_val的真实值
-    print(f"  误差计算 (基于weight_val残差MSE):", file=sys.stderr)
+    print("  误差计算 (基于weight_val残差MSE):", file=sys.stderr)
     weights = _compute_inverse_residual_mse_weights(y_true_val, weight_val_predictions)
     for name in models_to_use:
         residuals = y_true_val - np.asarray(weight_val_predictions[name], dtype=float)
         residual_mse = float(np.mean(np.square(residuals)))
         inverse_error = 1.0 / (residual_mse + 1e-9)
         print(f"    {name}: residual_mse={residual_mse:.6f}, inverse_error={inverse_error:.6f}", file=sys.stderr)
-    print(f"  权重归一化:", file=sys.stderr)
+    print("  权重归一化:", file=sys.stderr)
     for name in models_to_use:
         print(f"    {name}: normalized_weight={weights[name]:.6f}", file=sys.stderr)
 
     # === Step 4: Phase 2 - Retrain on full train_range, predict on eval_range ===
-    print(f"\n[Weighted Average Phase 3] 在完整训练集上重新训练基础模型", file=sys.stderr)
+    print("\n[Weighted Average Phase 3] 在完整训练集上重新训练基础模型", file=sys.stderr)
     eval_predictions = {}
     base_model_states = {}
     eval_forecast_steps = eval_range.stop - train_range.stop
@@ -484,7 +492,7 @@ def train_and_evaluate(
         params = model_params[model_name]
         source_model_file = (base_model_files or {}).get(model_name)
 
-        if source_model_file and os.path.exists(source_model_file):
+        if source_model_file:
             if model_name == "lstm":
                 source_model_state = _load_lstm_source_state(
                     source_model_file,
@@ -593,14 +601,23 @@ def train_and_evaluate(
         print(f"    ✓ 生成 {len(y_pred_eval)} 个eval预测", file=sys.stderr)
 
     # === Step 5: Final weighted prediction and evaluation on eval_range ===
-    print(f"\n[Weighted Average Phase 4] 加权组合和最终评估", file=sys.stderr)
+    print("\n[Weighted Average Phase 4] 加权组合和最终评估", file=sys.stderr)
     X_eval = np.array([eval_predictions[name] for name in models_to_use]).T  # ✅ eval_range的预测
     model_weights = np.array([weights[name] for name in models_to_use])
     y_pred_final = np.sum(X_eval * model_weights, axis=1)  # ✅ 加权组合（保持原有算法）
+    y_pred_final = normalize_demand_forecast(y_pred_final)
 
     y_true = parsed_data.y[eval_range]  # ✅ 真实标签
     residuals_final = y_true - y_pred_final
-    std_dev_residuals = float(np.std(residuals_final, ddof=1)) if len(residuals_final) > 1 else 0.0
+    x_weight_val = np.array([weight_val_predictions[name] for name in models_to_use]).T
+    weight_val_blend = np.sum(x_weight_val * model_weights, axis=1)
+    weight_val_blend = normalize_demand_forecast(weight_val_blend)
+    weight_val_residuals = y_true_val - weight_val_blend
+    std_dev_residuals = estimate_residual_std(
+        residuals_final,
+        weight_val_residuals,
+        parsed_data.y[train_range],
+    )
 
     # ✅ 在独立的eval_range上计算指标
     timestamps = parsed_data.timestamps
@@ -724,7 +741,7 @@ def run(args) -> None:
     parsed_data = load_data_from_json(args.data)
     ts, te = int(args.train_start), int(args.train_end)
     es, ee = int(args.eval_start), int(args.eval_end)
-    models_to_use = [model.strip() for model in args.models.split(',')]
+    models_to_use = parse_base_model_names(args.models, "Weighted Average")
 
     # Build model_params from the arguments passed by models.ts
     # models.ts sends: --d, --alpha, --window, --look-back, --epochs, --feature-types, etc.
@@ -755,7 +772,8 @@ def run(args) -> None:
     else:
         auto_max_pq = max(1, min(5, weight_train_size // 6))
 
-    auto_epochs = 20 if train_size <= 15 else 30  # Conservative for ensemble base models
+    # Keep the no-artifact fallback aligned with standalone LSTM training.
+    auto_epochs = 20
 
     model_params = {}
     base_model_files = parse_base_model_files_arg(get_arg("base_model_files", None))
@@ -803,19 +821,15 @@ def run(args) -> None:
         if lstm_features_str:
             lstm_params["lstm_features"] = lstm_features_str
 
-        source_lstm_file = base_model_files.get("lstm")
-        if source_lstm_file and os.path.exists(source_lstm_file):
-            source_lstm_state = _load_lstm_source_state(
-                source_lstm_file,
-                "Saved Weighted Average LSTM base model",
-            )
-            lstm_params = _build_lstm_params_from_source_state(
-                parsed_data,
-                source_lstm_state,
-                lstm_params,
-            )
-
         model_params["lstm"] = lstm_params
+
+    model_params, base_model_files = resolve_base_model_artifact_configs(
+        parsed_data,
+        models_to_use,
+        model_params,
+        base_model_files,
+        "Weighted Average",
+    )
 
     _validate_training_args(parsed_data, ts, te, es, ee, models_to_use, model_params, base_model_files)
 

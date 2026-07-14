@@ -43,6 +43,7 @@ import {
   buildModelTrainingRequestHash,
   commitModelTrainingRun,
   getActiveModelTrainingRun,
+  loadCurrentExperimentStatePatch,
   setProductionArtifactForRun,
   type ModelTrainingRunRow,
 } from "./model-run-store";
@@ -171,6 +172,11 @@ interface GuidedTrainingStepAttemptRow extends RowDataPacket {
 interface GuidedTrainingCleanupRow extends RowDataPacket {
   session_id: string;
   artifact_dir: string;
+}
+
+interface ModelTrainingDependencyRow extends RowDataPacket {
+  base_model_type: BaseModelType;
+  base_run_id: string | null;
 }
 
 interface StaleModelExperimentEligibilityRow extends RowDataPacket {
@@ -1117,6 +1123,9 @@ const parseRequestedBaseModels = (value: string): BaseModelType[] => {
     .filter((item) => item.length > 0);
 
   const dedupedModels = [...new Set(rawModels)];
+  if (dedupedModels.length !== rawModels.length) {
+    throw new ModelValidationError("融合模型的基础模型不能重复");
+  }
   const validModels = dedupedModels.filter(
     (model): model is BaseModelType => ["ma", "es", "arima", "lstm"].includes(model),
   );
@@ -1312,9 +1321,9 @@ const buildEnsemblePythonParams = (
         if (
           !hasDefinedValue(experiment.lstm_normalization)
           || !hasDefinedValue(experiment.lstm_target_field)
-          || persistedFeatures.length === 0
+          || !hasDefinedValue(experiment.lstm_features)
         ) {
-          throw new ModelValidationError("融合模型依赖的 LSTM 基础模型缺少特征或归一化配置");
+          throw new ModelValidationError("融合模型依赖的 LSTM 基础模型缺少特征配置、目标字段或归一化配置");
         }
 
         assertRequestMatchesPersistedValue("LSTM 归一化方式", body.lstmNormalization, experiment.lstm_normalization);
@@ -1483,12 +1492,11 @@ const assertBaseModelReadyForProduction = (
       }
       return;
     case "lstm": {
-      const lstmFeatures = normalizePersistedStringArray(experiment.lstm_features);
       if (
         !normalizeBooleanFlag(experiment.lstm_completed)
         || !hasDefinedValue(experiment.lstm_normalization)
         || !hasDefinedValue(experiment.lstm_target_field)
-        || lstmFeatures.length === 0
+        || !hasDefinedValue(experiment.lstm_features)
       ) {
         throw new ModelValidationError("LSTM 基础模型尚未完成训练，无法准备生产预测模型");
       }
@@ -1546,13 +1554,15 @@ const buildBoostingRoundStepDefinitions = (maxRounds: number): GuidedTrainingSte
       {
         id: `round_${round}_evaluate_candidates`,
         label: `第 ${round} 轮评估候选模型`,
-        description: "用当前残差训练每个候选基础模型，并比较它们降低验证残差 RMSE 的能力。",
+        description: round === 1
+          ? "用原始销量训练全部候选，将候选阶段输出截断为非负后比较验证RMSE；胜出者作为第一阶段，系数为1。"
+          : `用当前有正有负的残差训练全部候选，保留其有符号输出，再比较乘以默认学习率0.3后降低验证残差RMSE的能力；候选类型可重复入选（第${round}轮）。`,
         actionLabel: "评估候选",
       },
       {
         id: `round_${round}_select_winner`,
         label: `第 ${round} 轮选择胜出模型`,
-        description: "选择本轮最能降低验证残差的基础模型加入模型链；若没有改善，则提前停止迭代。",
+        description: "选择本轮使同一时间留出验证段 RMSE 最小且确有改善的模型加入链；若所有候选都没有改善，则提前停止。",
         actionLabel: "选择模型",
       },
     );
@@ -1684,6 +1694,28 @@ const buildGuidedTrainingSessionPayload = (
   };
 };
 
+const buildRefreshedCompletedGuidedTrainingSessionPayload = async (
+  row: GuidedTrainingSessionRow,
+  studentId: number,
+): Promise<GuidedTrainingSessionPayload> => {
+  const payload = buildGuidedTrainingSessionPayload(row);
+  if (row.status !== "completed" || !payload.result) {
+    throw new ModelValidationError("已完成训练会话缺少有效结果，无法恢复");
+  }
+
+  const experimentStatePatch = await loadCurrentExperimentStatePatch(
+    row.experiment_id,
+    studentId,
+  );
+  const stateVersion = Number(experimentStatePatch.state_version);
+  payload.result = {
+    ...payload.result,
+    experiment_state_patch: experimentStatePatch,
+  };
+  payload.experiment_state_version = stateVersion;
+  return payload;
+};
+
 const buildCanonicalTrainingBody = (
   body: TrainInput,
   trainingConfig: ExperimentTrainingConfig,
@@ -1702,6 +1734,7 @@ interface GuidedTrainingIdentity {
   requestHash: string;
   datasetRevision: string;
   runtimeRevision: string;
+  baseRunFingerprint: Record<string, string>;
 }
 
 const computeCurrentGuidedTrainingIdentity = async (
@@ -1737,6 +1770,7 @@ const computeCurrentGuidedTrainingIdentity = async (
   return {
     datasetRevision,
     runtimeRevision,
+    baseRunFingerprint,
     requestHash: buildModelTrainingRequestHash({
       modelType: row.model_type,
       body: canonicalBody,
@@ -1747,6 +1781,26 @@ const computeCurrentGuidedTrainingIdentity = async (
     }),
   };
 };
+
+const stableJsonStringify = (value: unknown): string => {
+  if (Array.isArray(value)) {
+    return `[${value.map((item) => stableJsonStringify(item)).join(",")}]`;
+  }
+  if (value && typeof value === "object") {
+    const record = value as Record<string, unknown>;
+    return `{${Object.keys(record)
+      .sort()
+      .map((key) => `${JSON.stringify(key)}:${stableJsonStringify(record[key])}`)
+      .join(",")}}`;
+  }
+  return JSON.stringify(value);
+};
+
+const guidedRequestPayloadMatches = (
+  row: Pick<GuidedTrainingSessionRow, "request_payload">,
+  canonicalBody: TrainInput,
+) => stableJsonStringify(parseJsonColumn<TrainInput>(row.request_payload, {} as TrainInput))
+  === stableJsonStringify(canonicalBody);
 
 const markGuidedTrainingSessionSuperseded = async (
   row: Pick<GuidedTrainingSessionRow, "session_id">,
@@ -1760,7 +1814,7 @@ const markGuidedTrainingSessionSuperseded = async (
             superseded_reason = ?,
             error_message = NULL
       WHERE session_id = ?
-        AND status <> 'completed'`,
+        AND status <> 'superseded'`,
     [reason, row.session_id],
   );
 };
@@ -1801,6 +1855,82 @@ const assertGuidedTrainingIdentityCurrent = async (
     throw new ModelConflictError(reason, "GUIDED_SESSION_SUPERSEDED");
   }
   return current;
+};
+
+const assertCompletedGuidedTrainingRunCurrent = async (
+  row: Pick<
+    GuidedTrainingSessionRow,
+    "session_id" | "experiment_id" | "student_id" | "model_type" | "request_payload" | "request_hash" | "dataset_revision" | "runtime_revision"
+  >,
+  studentId: number,
+) => {
+  try {
+    const current = await computeCurrentGuidedTrainingIdentity(row, studentId);
+    if (
+      current.datasetRevision !== row.dataset_revision
+      || current.runtimeRevision !== row.runtime_revision
+    ) {
+      throw new ModelValidationError("训练数据或运行环境已变化");
+    }
+
+    const activeRun = await getActiveModelTrainingRun(
+      row.experiment_id,
+      studentId,
+      row.model_type,
+    );
+    if (
+      !activeRun
+      || activeRun.session_id !== row.session_id
+      || activeRun.request_hash !== row.request_hash
+      || activeRun.dataset_revision !== row.dataset_revision
+      || activeRun.runtime_revision !== row.runtime_revision
+    ) {
+      throw new ModelValidationError("已完成会话不再对应当前生效的训练版本");
+    }
+
+    if (!await hasReusableSavedModelArtifact(row.model_type, activeRun.artifact_path)) {
+      throw new ModelNotFoundError("已完成训练版本的模型产物已丢失");
+    }
+
+    if (isEnsembleModelType(row.model_type)) {
+      const body = parseJsonColumn<TrainInput>(row.request_payload, {} as TrainInput);
+      const requestedModels = parseRequestedBaseModels(body.models ?? "");
+      const [dependencyRows] = await pool.query<ModelTrainingDependencyRow[]>(
+        `SELECT base_model_type, base_run_id
+           FROM model_training_run_dependencies
+          WHERE run_id = ?`,
+        [activeRun.run_id],
+      );
+      const dependencyMap = new Map(
+        dependencyRows.map((dependency) => [dependency.base_model_type, dependency.base_run_id]),
+      );
+      if (
+        dependencyRows.length !== requestedModels.length
+        || requestedModels.some((modelName) => (
+          !dependencyMap.has(modelName)
+          || dependencyMap.get(modelName) !== current.baseRunFingerprint[modelName]
+        ))
+      ) {
+        throw new ModelValidationError("融合模型依赖的基础训练版本已变化");
+      }
+    }
+
+    return activeRun;
+  } catch (error) {
+    if (
+      !(error instanceof ModelAccessError)
+      && !(error instanceof ModelValidationError)
+      && !(error instanceof ModelNotFoundError)
+      && !(error instanceof ModelConflictError)
+    ) {
+      throw error;
+    }
+    const reason = error instanceof Error
+      ? `已完成训练会话依赖已变化：${error.message}`
+      : "已完成训练会话依赖已变化";
+    await markGuidedTrainingSessionSuperseded(row, reason);
+    throw new ModelConflictError(reason, "GUIDED_SESSION_SUPERSEDED");
+  }
 };
 
 const fetchGuidedTrainingSessionRow = async (
@@ -2232,89 +2362,6 @@ const buildGuidedTrainingPythonParams = async (
   return pythonParams;
 };
 
-const materializeCompletedGuidedTrainingRun = async (
-  row: GuidedTrainingSessionRow,
-  lease: ModelOperationLease,
-) => {
-  lease.throwIfTerminated();
-  const body = parseJsonColumn<TrainInput>(row.request_payload, {} as TrainInput);
-  const result = parseJsonColumn<GuidedTrainingSessionPayload["result"]>(row.result_payload, null);
-  if (!result) {
-    throw new ModelValidationError("已完成训练会话缺少结果，无法恢复");
-  }
-
-  const sourceModelPath = getGuidedSessionModelPath(row.artifact_dir, row.model_type);
-  if (!await hasReusableSavedModelArtifact(
-    row.model_type,
-    sourceModelPath,
-    lease.terminationSignal,
-  )) {
-    throw new ModelNotFoundError("分阶段训练产物已过期或已被清理，请重新开始分阶段训练");
-  }
-  const versionedArtifactPath = buildVersionedModelPath(
-    row.experiment_id,
-    row.student_id,
-    row.model_type,
-    row.session_id,
-    "backtest",
-  );
-  const versionedArtifactWasReusable = await hasReusableSavedModelArtifact(
-    row.model_type,
-    versionedArtifactPath,
-    lease.terminationSignal,
-  );
-  let cleanupUncommittedArtifact = false;
-  try {
-    if (!versionedArtifactWasReusable) {
-      await lease.verifyOwned();
-      cleanupUncommittedArtifact = true;
-      await copyModelArtifact(
-        row.model_type,
-        sourceModelPath,
-        versionedArtifactPath,
-        lease.terminationSignal,
-      );
-      await lease.verifyOwned();
-    }
-    result.results.saved_model = versionedArtifactPath;
-
-    const completedStepIds = parseJsonColumn<string[]>(row.completed_step_ids, []);
-    const stepOutputs = parseJsonColumn<Record<string, unknown>>(row.step_outputs, {});
-    const stepPlan = getGuidedTrainingSteps(row);
-    await lease.verifyOwned();
-    const committed = await commitModelTrainingRun({
-      runId: row.session_id,
-      sessionId: row.session_id,
-      experimentId: row.experiment_id,
-      studentId: row.student_id,
-      modelType: row.model_type,
-      requestHash: row.request_hash,
-      datasetRevision: row.dataset_revision,
-      runtimeRevision: row.runtime_revision,
-      body,
-      result,
-      artifactPath: versionedArtifactPath,
-      guidedSession: {
-        sessionId: row.session_id,
-        currentStepId: null,
-        completedStepIds,
-        stepOutputs,
-        stepPlan,
-        result,
-      },
-    });
-    cleanupUncommittedArtifact = false;
-    row.result_payload = JSON.stringify(result);
-    row.experiment_state_version = committed.stateVersion;
-    return row;
-  } catch (error) {
-    if (cleanupUncommittedArtifact) {
-      removeModelArtifactGroup(versionedArtifactPath);
-    }
-    throw error;
-  }
-};
-
 const isDuplicateGuidedTrainingRequestError = (error: unknown) => {
   if (!error || typeof error !== "object") return false;
   const candidate = error as { code?: string; errno?: number };
@@ -2418,18 +2465,10 @@ const createOrResumeGuidedTrainingSessionInternal = async (
       }
     } else if (existingSession.status === "completed") {
       try {
-        const restoredSession = await withModelOperationLease(
-          operationContext,
-          {
-            mode: "execution_only",
-            experimentId: existingSession.experiment_id,
-            modelType,
-          },
-          async (lease) => await materializeCompletedGuidedTrainingRun(existingSession, lease),
-        );
-        return buildGuidedTrainingSessionPayload(restoredSession);
+        await assertCompletedGuidedTrainingRunCurrent(existingSession, studentId);
+        return await buildRefreshedCompletedGuidedTrainingSessionPayload(existingSession, studentId);
       } catch (error) {
-        if (!(error instanceof ModelNotFoundError)) {
+        if (!(error instanceof ModelConflictError) || error.code !== "GUIDED_SESSION_SUPERSEDED") {
           throw error;
         }
 
@@ -2439,7 +2478,7 @@ const createOrResumeGuidedTrainingSessionInternal = async (
             artifactDir: existingSession.artifact_dir,
             modelType,
           },
-          "已完成 guided training 会话缺少可复用工件，将删除会话并重新创建",
+          "已完成 guided training 会话不再对应当前训练版本，将删除会话并重新创建",
         );
         operationContext.throwIfTerminated();
         const deletedSession = await deleteGuidedTrainingSession(existingSession);
@@ -2457,6 +2496,42 @@ const createOrResumeGuidedTrainingSessionInternal = async (
       }
       operationContext.throwIfTerminated();
       return buildGuidedTrainingSessionPayload(existingSession);
+    }
+  }
+
+  if (!existingSession) {
+    const activeRun = await getActiveModelTrainingRun(
+      canonicalBody.experiment_id,
+      studentId,
+      modelType,
+    );
+    operationContext.throwIfTerminated();
+    if (activeRun?.session_id) {
+      const completedSession = await fetchGuidedTrainingSessionRow(activeRun.session_id);
+      operationContext.throwIfTerminated();
+      if (
+        completedSession
+        && completedSession.status === "completed"
+        && completedSession.protocol_version === 2
+        && completedSession.model_type === modelType
+        && completedSession.student_id === studentId
+        && guidedRequestPayloadMatches(completedSession, canonicalBody)
+      ) {
+        try {
+          await assertCompletedGuidedTrainingRunCurrent(completedSession, studentId);
+          return await buildRefreshedCompletedGuidedTrainingSessionPayload(completedSession, studentId);
+        } catch (error) {
+          if (!(error instanceof ModelConflictError) || error.code !== "GUIDED_SESSION_SUPERSEDED") {
+            throw error;
+          }
+          operationContext.throwIfTerminated();
+          const deletedSession = await deleteGuidedTrainingSession(completedSession);
+          operationContext.throwIfTerminated();
+          if (!deletedSession) {
+            throw new ModelValidationError("失效的分阶段训练会话清理失败，请稍后重试");
+          }
+        }
+      }
     }
   }
 
@@ -2532,7 +2607,13 @@ const createOrResumeGuidedTrainingSessionInternal = async (
       [canonicalBody.experiment_id, studentId, modelType, requestHash],
     );
     operationContext.throwIfTerminated();
-    if (racedRows[0]) return buildGuidedTrainingSessionPayload(racedRows[0]);
+    if (racedRows[0]) {
+      if (racedRows[0].status === "completed") {
+        await assertCompletedGuidedTrainingRunCurrent(racedRows[0], studentId);
+        return await buildRefreshedCompletedGuidedTrainingSessionPayload(racedRows[0], studentId);
+      }
+      return buildGuidedTrainingSessionPayload(racedRows[0]);
+    }
     throw error;
   }
 
@@ -2585,9 +2666,14 @@ export async function getGuidedTrainingSession(
   }
 
   await assertExperimentModelAccess(row.experiment_id, studentId);
-  if (row.status !== "completed" && row.status !== "superseded") {
+  if (row.status !== "superseded") {
     try {
-      await assertGuidedTrainingIdentityCurrent(row, studentId);
+      if (row.status === "completed") {
+        await assertCompletedGuidedTrainingRunCurrent(row, studentId);
+        return await buildRefreshedCompletedGuidedTrainingSessionPayload(row, studentId);
+      } else {
+        await assertGuidedTrainingIdentityCurrent(row, studentId);
+      }
     } catch (error) {
       if (!(error instanceof ModelConflictError) || error.code !== "GUIDED_SESSION_SUPERSEDED") {
         throw error;
@@ -2595,12 +2681,6 @@ export async function getGuidedTrainingSession(
       const supersededRow = await fetchGuidedTrainingSessionRow(sessionId);
       if (!supersededRow) throw new ModelNotFoundError("未找到分阶段训练会话");
       return buildGuidedTrainingSessionPayload(supersededRow);
-    }
-  }
-  if (row.status === "completed") {
-    const sourceModelPath = getGuidedSessionModelPath(row.artifact_dir, row.model_type);
-    if (!await hasReusableSavedModelArtifact(row.model_type, sourceModelPath)) {
-      throw new ModelNotFoundError("分阶段训练产物已过期或已被清理");
     }
   }
   return buildGuidedTrainingSessionPayload(row);
@@ -2681,13 +2761,8 @@ export async function runGuidedTrainingStep(
       }
 
       if (row.status === "completed") {
-        return await withModelOperationLease(
-          operationContext,
-          { mode: "execution_only", experimentId: row.experiment_id, modelType },
-          async (lease) => buildGuidedTrainingSessionPayload(
-            await materializeCompletedGuidedTrainingRun(row, lease),
-          ),
-        );
+        await assertCompletedGuidedTrainingRunCurrent(row, studentId);
+        return await buildRefreshedCompletedGuidedTrainingSessionPayload(row, studentId);
       }
       if (row.status === "superseded" || row.protocol_version !== 2) {
         if (row.status !== "superseded") {
@@ -2700,6 +2775,17 @@ export async function runGuidedTrainingStep(
       }
 
       const body = parseJsonColumn<TrainInput>(row.request_payload, {} as TrainInput);
+      const evaluationStart = Number(body.data_window_evaluate_start_index);
+      const evaluationEnd = Number(body.data_window_evaluate_end_index);
+      const expectedEvaluationLength = evaluationEnd - evaluationStart + 1;
+      if (
+        !Number.isSafeInteger(evaluationStart)
+        || !Number.isSafeInteger(evaluationEnd)
+        || !Number.isSafeInteger(expectedEvaluationLength)
+        || expectedEvaluationLength <= 0
+      ) {
+        throw new ModelValidationError("训练会话缺少有效的评估区间");
+      }
       const completedStepIds = parseJsonColumn<string[]>(row.completed_step_ids, []);
       if (completedStepIds.includes(stepId)) return buildGuidedTrainingSessionPayload(row);
 
@@ -2782,7 +2868,11 @@ export async function runGuidedTrainingStep(
                 await lease.verifyOwned();
               }
               receiptFinalResult.saved_model = versionedArtifactPath;
-              transformedResult = transformTrainingResult(modelType, receiptFinalResult);
+              transformedResult = transformTrainingResult(
+                modelType,
+                receiptFinalResult,
+                expectedEvaluationLength,
+              );
             }
 
             const status: GuidedTrainingStatus = transformedResult ? "completed" : "ready";
@@ -3304,7 +3394,7 @@ const predictExperimentModelWithLease = async (
   return {
     status: "success",
     results: {
-      predictions: normalizeDemandPredictionPoints(result.predictions),
+      predictions: normalizeDemandPredictionPoints(result.predictions, forecastSteps),
       ...metadata,
     },
   };

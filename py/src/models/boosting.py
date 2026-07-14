@@ -21,20 +21,22 @@ from scipy.sparse import csr_matrix
 
 from data_utils import ParsedData, infer_feature_types, load_data_from_json
 from ensemble_utils import (
-    build_lstm_params_from_source_state,
     build_ensemble_subprocess_data,
     compute_phase1_train_size,
+    estimate_residual_std,
     format_predictions,
     get_lstm_source_forecast_strategy,
     get_member_model_path,
     load_lstm_source_state,
     normalize_demand_forecast,
     parse_base_model_files_arg,
+    parse_base_model_names,
     parse_feature_name_list,
     persist_member_model_artifact,
     prepare_lstm_source_model_for_requested_steps,
     remove_member_model_artifact,
-    resolve_lstm_reuse_production_horizon,
+    resolve_base_model_artifact_configs,
+    validate_base_model_names,
     validate_internal_split_base_params,
 )
 from metrics import mae, mape, r2, rmse
@@ -55,17 +57,18 @@ IMPLEMENTATION_NOTES = [
     "Boosting 的教科书核心是将多个弱学习器串行加到一个强学习器中，后续学习器重点修正前序误差。",
     "梯度提升在平方误差损失下等价于逐步拟合残差；本系统借鉴这一思想，但候选学习器是 MA、ES、ARIMA、LSTM 等时间序列模型。",
     "AdaBoost 通过样本权重实现错误关注；本系统的时间序列基础模型不支持样本权重，因此采用残差学习的加法模型。",
-    "每一轮在候选模型中贪心选择最能降低验证残差 RMSE 的模型，并用学习率控制新增阶段贡献。",
-    "预测值附带的 std_dev 是评估段残差的常数标准差，不随预测步长增长，与 ARIMA 随步长展宽的置信区间口径不同。",
+    "系统按时间顺序留出末段：训练点 n<=15 时前段长度为 max(n-3, floor(0.85n))（本项目最少 n=8，因而留 2-3 点），n>15 时前段为 floor(0.8n)；每轮贪心地从全部候选中选择，同一类型可重复入选。",
+    "候选沿用已完成成员的核心配置：MA 窗口、ES 的 alpha、ARIMA 的 d 及 LSTM 的 look_back、epochs、特征和归一化。候选筛选只在内部前段拟合，所以 ARIMA 从第一轮起就针对当前训练目标和数据段重新搜索 p、q；第一轮目标是原销量，后续轮次才是有符号残差。",
+    "更新训练段残差时，若某阶段在序列开头还没有可定义的样本内拟合值（如 MA 尚未凑满完整窗口、LSTM 尚未凑满 look_back），该前缀按零修正处理，即保持原残差；系统不会改用较短窗口伪造拟合值。",
+    "第一阶段系数固定为 1，后续阶段系数等于学习率（默认 0.3）；无候选继续改善时提前停止，选出的模型链再在完整训练区间逐级重训。",
+    "只有原始销量阶段和最终销量预测会截断到不小于 0，供中间阶段学习的有符号残差不会截断。std_dev 在评估不足 2 点时退回内部残差验证段估计。",
 ]
 
 
 # ---------- utilities ----------
 _parse_feature_name_list = parse_feature_name_list
 _load_lstm_source_state = load_lstm_source_state
-_build_lstm_params_from_source_state = build_lstm_params_from_source_state
 _get_lstm_source_forecast_strategy = get_lstm_source_forecast_strategy
-_resolve_lstm_reuse_production_horizon = resolve_lstm_reuse_production_horizon
 _prepare_lstm_source_model_for_requested_steps = prepare_lstm_source_model_for_requested_steps
 _format_predictions = format_predictions
 _compute_phase1_train_size = compute_phase1_train_size
@@ -73,22 +76,31 @@ _compute_phase1_train_size = compute_phase1_train_size
 
 def _load_state(model_path: str) -> Dict[str, Any]:
     state = load_model(model_path)
-    if not isinstance(state, dict) or state.get("model_type") != MODEL_TYPE:
+    if (
+        not isinstance(state, dict)
+        or state.get("model_type") != MODEL_TYPE
+        or state.get("boosting_variant") != "residual"
+    ):
         raise ValueError("[VALIDATION] Invalid Boosting model file.")
     return ensure_state_metadata(state, METHOD_NAME, FORECAST_STRATEGY, IMPLEMENTATION_NOTES)
 
 
-def _is_residual_boosting_state(state: Dict[str, Any]) -> bool:
-    return state.get("boosting_variant") == "residual"
-
-
 def _get_stage_coefficients(model_chain: List[str], state: Dict[str, Any]) -> List[float]:
     explicit_coefficients = state.get("stage_coefficients")
-    if isinstance(explicit_coefficients, list) and len(explicit_coefficients) == len(model_chain):
-        return [float(coef) for coef in explicit_coefficients]
+    if not isinstance(explicit_coefficients, list) or len(explicit_coefficients) != len(model_chain):
+        raise ValueError("[VALIDATION] Saved Boosting model has invalid stage coefficients.")
+    coefficients = np.asarray(explicit_coefficients, dtype=float).reshape(-1)
+    if not np.isfinite(coefficients).all():
+        raise ValueError("[VALIDATION] Saved Boosting model has non-finite stage coefficients.")
+    return coefficients.tolist()
 
-    learning_rate = float(state.get("learning_rate", 0.3))
-    return [1.0 if idx == 0 else learning_rate for idx in range(len(model_chain))]
+
+def _apply_stage_output_semantics(stage_idx: int, values: Any) -> np.ndarray:
+    """Keep demand non-negative at stage 1 and later residual corrections signed."""
+    predictions = np.asarray(values, dtype=float)
+    if stage_idx == 0:
+        return normalize_demand_forecast(predictions)
+    return predictions
 
 
 def _iter_stage_models(state: Dict[str, Any]):
@@ -137,7 +149,11 @@ def _build_residual_parsed_data(
 
 def _normalize_fitted_values(values: Any, expected_length: int) -> np.ndarray:
     arr = np.asarray(values, dtype=float).reshape(-1)
-    arr = np.nan_to_num(arr, nan=0.0, posinf=0.0, neginf=0.0)
+    if np.isinf(arr).any():
+        raise ValueError("[DATA] Boosting stage produced infinite in-sample fitted values.")
+    # Leading NaNs are a normal warm-up representation for some differenced
+    # models. They mean "no correction available" and therefore map to zero.
+    arr = np.nan_to_num(arr, nan=0.0)
     if arr.size < expected_length:
         arr = np.concatenate([np.zeros(expected_length - arr.size), arr])
     elif arr.size > expected_length:
@@ -147,10 +163,12 @@ def _normalize_fitted_values(values: Any, expected_length: int) -> np.ndarray:
 
 def _compute_ma_in_sample_fitted(train_target: np.ndarray, window: int) -> np.ndarray:
     fitted = np.zeros(len(train_target), dtype=float)
-    for idx in range(1, len(train_target)):
-        history_start = max(0, idx - window)
-        history = train_target[history_start:idx]
-        fitted[idx] = float(np.mean(history)) if history.size > 0 else 0.0
+    # Match the standalone MA definition: a fitted value exists only after a
+    # complete ``window`` of preceding observations is available.  Leaving the
+    # warm-up prefix at zero means those observations do not update Boosting's
+    # residual target through a shorter, otherwise different MA rule.
+    for idx in range(window, len(train_target)):
+        fitted[idx] = float(np.mean(train_target[idx - window:idx]))
     return fitted
 
 
@@ -251,6 +269,7 @@ def _predict_eval_segment(
         model_type=model_name,
         model_file=model_file,
         forecast_steps=forecast_steps,
+        allow_negative_predictions=True,
         timeout=timeout,
     )
     preds = np.asarray(extract_predictions_from_result(result), dtype=float)
@@ -293,6 +312,9 @@ def _train_stage_model(
     temp_model_file = _make_temp_model_path(f"boosting_stage_{model_name}_")
     params_with_save = params.copy()
     params_with_save["save_model"] = temp_model_file
+    # Base-model subprocesses normally clamp physical demand.  A Boosting stage
+    # needs the raw signed output; stage 0 and the final sum are clamped here.
+    params_with_save["allow_negative_predictions"] = True
 
     result = run_base_model_subprocess(
         model_type=model_name,
@@ -390,12 +412,7 @@ def _validate_training_args(
 ) -> None:
     n = parsed_data.n_obs
 
-    if not models_to_use:
-        raise ValueError("[VALIDATION] models_to_use cannot be empty.")
-
-    for name in models_to_use:
-        if name not in SUPPORTED_BASE_MODELS:
-            raise ValueError(f"[VALIDATION] Unknown model: {name}")
+    validate_base_model_names(models_to_use, "Boosting")
 
     if not (0 <= ts <= te < n):
         raise ValueError(f"[VALIDATION] Invalid train range: [{ts},{te}], n_obs={n}")
@@ -426,12 +443,12 @@ def _validate_training_args(
         elif model_name == "ma":
             if "window" not in params:
                 raise ValueError("[VALIDATION] MA requires 'window' parameter.")
-            if params["window"] < 1:
-                raise ValueError("[VALIDATION] MA window must be >= 1.")
+            if params["window"] < 2:
+                raise ValueError("[VALIDATION] MA window must be >= 2.")
         elif model_name == "lstm":
             source_model_file = (base_model_files or {}).get(model_name)
             source_model_state = None
-            if source_model_file and os.path.exists(source_model_file):
+            if source_model_file:
                 source_model_state = _load_lstm_source_state(
                     source_model_file,
                     "Saved Boosting LSTM base model",
@@ -524,11 +541,13 @@ def predict(
             model_type=model_name,
             model_file=model_file,
             forecast_steps=steps,
+            allow_negative_predictions=True,
             timeout=60,
         )
-        stage_predictions = np.asarray(extract_predictions_from_result(result), dtype=float)
-        if _stage_idx == 0:
-            stage_predictions = normalize_demand_forecast(stage_predictions)
+        stage_predictions = _apply_stage_output_semantics(
+            _stage_idx,
+            extract_predictions_from_result(result),
+        )
         if final_predictions is None:
             final_predictions = coefficient * stage_predictions
         else:
@@ -559,7 +578,7 @@ def train_and_evaluate(
     boost_train_range = range(train_range.start, train_range.start + boost_split)
     boost_val_range = range(train_range.start + boost_split, train_range.stop)
 
-    print(f"[Boosting] 数据划分:", file=sys.stderr)
+    print("[Boosting] 数据划分:", file=sys.stderr)
     print(f"  Boost Train Range: {boost_train_range} ({len(boost_train_range)} points)", file=sys.stderr)
     print(f"  Boost Val Range: {boost_val_range} ({len(boost_val_range)} points)", file=sys.stderr)
     print(f"  Eval Range: {eval_range} ({len(eval_range)} points)", file=sys.stderr)
@@ -607,9 +626,11 @@ def train_and_evaluate(
                 round_parsed_data,
                 boost_train_range,
             )
-            if round_idx == 0:
-                stage_predictions = normalize_demand_forecast(stage_predictions)
-                fitted_train_predictions = normalize_demand_forecast(fitted_train_predictions)
+            stage_predictions = _apply_stage_output_semantics(round_idx, stage_predictions)
+            fitted_train_predictions = _apply_stage_output_semantics(
+                round_idx,
+                fitted_train_predictions,
+            )
             next_residual_val = residual_val - coefficient * stage_predictions
             next_rmse = rmse(np.zeros_like(next_residual_val), next_residual_val)
             stage_results.append({
@@ -682,7 +703,7 @@ def train_and_evaluate(
         round_parsed_data = _build_residual_parsed_data(parsed_data, train_range, residual_full_train)
         artifact_origin = "temporary_training"
 
-        if stage_idx == 0 and base_model_files and model_name in base_model_files and os.path.exists(base_model_files[model_name]):
+        if stage_idx == 0 and base_model_files and model_name in base_model_files:
             source_model_file = base_model_files[model_name]
             if model_name == "lstm":
                 source_model_state = _load_lstm_source_state(
@@ -717,6 +738,7 @@ def train_and_evaluate(
                             source_model_file=adjusted_source_model_file,
                             save_model_file=stage_model_file,
                             fit_forecast_steps=eval_range.stop - train_range.stop,
+                            allow_negative_predictions=True,
                             timeout=timeout,
                         )
                     finally:
@@ -771,9 +793,11 @@ def train_and_evaluate(
             round_parsed_data,
             train_range,
         )
-        if stage_idx == 0:
-            stage_eval_predictions = normalize_demand_forecast(stage_eval_predictions)
-            fitted_train_predictions = normalize_demand_forecast(fitted_train_predictions)
+        stage_eval_predictions = _apply_stage_output_semantics(stage_idx, stage_eval_predictions)
+        fitted_train_predictions = _apply_stage_output_semantics(
+            stage_idx,
+            fitted_train_predictions,
+        )
         final_eval_preds += coefficient * stage_eval_predictions
         residual_full_train = residual_full_train - coefficient * fitted_train_predictions
 
@@ -793,7 +817,11 @@ def train_and_evaluate(
 
     final_eval_preds = normalize_demand_forecast(final_eval_preds)
     final_residuals = y_true_eval - final_eval_preds
-    std_dev_residuals = float(np.std(final_residuals, ddof=1)) if len(final_residuals) > 1 else 0.0
+    std_dev_residuals = estimate_residual_std(
+        final_residuals,
+        residual_val,
+        parsed_data.y[train_range],
+    )
     metrics = {
         "rmse": rmse(y_true_eval, final_eval_preds),
         "mae": mae(y_true_eval, final_eval_preds),
@@ -846,80 +874,53 @@ def run(args) -> None:
 
         next_base_model_states: Dict[str, Any] = {}
         required_fit_forecast_steps = int(getattr(args, "fit_forecast_steps", 0) or 0) or None
-        if _is_residual_boosting_state(state):
-            residual_train = np.asarray(parsed_data.y[train_range], dtype=float).copy()
+        residual_train = np.asarray(parsed_data.y[train_range], dtype=float).copy()
 
-            for stage_idx, model_name, coefficient, previous_model_state in _iter_stage_models(state):
-                params = previous_model_state.get("params", {})
-                timeout = _get_model_timeout(model_name, params)
-                round_parsed_data = _build_residual_parsed_data(parsed_data, train_range, residual_train)
-                round_numeric_records, round_lstm_records = _build_round_records(
-                    round_parsed_data,
-                    model_name,
-                    params,
-                )
-                member_save_path = get_member_model_path(save_path, model_name, stage_idx)
-                run_base_model_fit_subprocess(
-                    model_type=model_name,
-                    data=round_lstm_records if model_name == "lstm" else round_numeric_records,
-                    train_start=ts,
-                    train_end=te,
-                    source_model_file=previous_model_state["model_file"],
-                    save_model_file=member_save_path,
-                    fit_forecast_steps=required_fit_forecast_steps if model_name == "lstm" else None,
-                    timeout=timeout,
-                )
-                fitted_train_predictions = _compute_in_sample_fitted_predictions(
-                    model_name,
-                    member_save_path,
-                    round_parsed_data,
-                    train_range,
-                )
-                residual_train = residual_train - coefficient * fitted_train_predictions
-                next_base_model_states.setdefault(model_name, {"models": []})["models"].append({
-                    "model_type": model_name,
-                    "model_file": member_save_path,
-                    "params": params,
-                    "round": stage_idx,
-                    "coefficient": coefficient,
-                })
-        else:
-            stage_model_params: Dict[str, Dict[str, Any]] = {}
-            for _stage_idx, model_name, _coefficient, previous_model_state in _iter_stage_models(state):
-                stage_model_params.setdefault(model_name, previous_model_state.get("params", {}))
-
-            base_models_in_order = list(stage_model_params.keys())
-            numeric_data_dicts, lstm_data_dicts = build_ensemble_subprocess_data(
-                parsed_data,
-                base_models_in_order,
-                stage_model_params,
+        for stage_idx, model_name, coefficient, previous_model_state in _iter_stage_models(state):
+            params = previous_model_state.get("params", {})
+            timeout = _get_model_timeout(model_name, params)
+            round_parsed_data = _build_residual_parsed_data(parsed_data, train_range, residual_train)
+            round_numeric_records, round_lstm_records = _build_round_records(
+                round_parsed_data,
+                model_name,
+                params,
             )
-
-            for stage_idx, model_name, coefficient, previous_model_state in _iter_stage_models(state):
-                params = previous_model_state.get("params", {})
-                timeout = _get_model_timeout(model_name, params)
-                member_save_path = get_member_model_path(save_path, model_name, stage_idx)
-                run_base_model_fit_subprocess(
-                    model_type=model_name,
-                    data=lstm_data_dicts if model_name == "lstm" else numeric_data_dicts,
-                    train_start=ts,
-                    train_end=te,
-                    source_model_file=previous_model_state["model_file"],
-                    save_model_file=member_save_path,
-                    fit_forecast_steps=required_fit_forecast_steps if model_name == "lstm" else None,
-                    timeout=timeout,
-                )
-                next_base_model_states.setdefault(model_name, {"models": []})["models"].append({
-                    "model_type": model_name,
-                    "model_file": member_save_path,
-                    "params": params,
-                    "round": stage_idx,
-                    "coefficient": coefficient,
-                })
+            member_save_path = get_member_model_path(save_path, model_name, stage_idx)
+            run_base_model_fit_subprocess(
+                model_type=model_name,
+                data=round_lstm_records if model_name == "lstm" else round_numeric_records,
+                train_start=ts,
+                train_end=te,
+                source_model_file=previous_model_state["model_file"],
+                save_model_file=member_save_path,
+                fit_forecast_steps=required_fit_forecast_steps if model_name == "lstm" else None,
+                allow_negative_predictions=True,
+                timeout=timeout,
+            )
+            fitted_train_predictions = _compute_in_sample_fitted_predictions(
+                model_name,
+                member_save_path,
+                round_parsed_data,
+                train_range,
+            )
+            # Use exactly the same stage-output semantics as evaluation and
+            # prediction before constructing the next residual target.
+            fitted_train_predictions = _apply_stage_output_semantics(
+                stage_idx,
+                fitted_train_predictions,
+            )
+            residual_train = residual_train - coefficient * fitted_train_predictions
+            next_base_model_states.setdefault(model_name, {"models": []})["models"].append({
+                "model_type": model_name,
+                "model_file": member_save_path,
+                "params": params,
+                "round": stage_idx,
+                "coefficient": coefficient,
+            })
 
         next_state = {
             "model_type": MODEL_TYPE,
-            "boosting_variant": state.get("boosting_variant", "legacy"),
+            "boosting_variant": "residual",
             "model_chain": state["model_chain"],
             "stage_coefficients": _get_stage_coefficients(state["model_chain"], state),
             "base_model_states": next_base_model_states,
@@ -958,7 +959,7 @@ def run(args) -> None:
     es, ee = int(args.eval_start), int(args.eval_end)
     train_range = range(ts, te + 1)
     eval_range = range(es, ee + 1)
-    models_to_use = [model.strip() for model in args.models.split(',') if model.strip()]
+    models_to_use = parse_base_model_names(args.models, "Boosting")
 
     def get_arg(name, default, cast_type=None):
         val = getattr(args, name.replace("-", "_"), None)
@@ -985,7 +986,8 @@ def run(args) -> None:
         auto_max_pq = 2
     else:
         auto_max_pq = max(1, min(5, boost_train_size // 6))
-    auto_epochs = 20 if train_size <= 15 else 30
+    # Keep the no-artifact fallback aligned with standalone LSTM training.
+    auto_epochs = 20
 
     model_params: Dict[str, Dict[str, Any]] = {}
     base_model_files = parse_base_model_files_arg(get_arg("base_model_files", None))
@@ -1033,18 +1035,15 @@ def run(args) -> None:
         if lstm_features_str:
             lstm_params["lstm_features"] = lstm_features_str
 
-        source_lstm_file = base_model_files.get("lstm")
-        if source_lstm_file and os.path.exists(source_lstm_file):
-            source_lstm_state = _load_lstm_source_state(
-                source_lstm_file,
-                "Saved Boosting LSTM base model",
-            )
-            lstm_params = _build_lstm_params_from_source_state(
-                parsed_data,
-                source_lstm_state,
-                lstm_params,
-            )
         model_params["lstm"] = lstm_params
+
+    model_params, base_model_files = resolve_base_model_artifact_configs(
+        parsed_data,
+        models_to_use,
+        model_params,
+        base_model_files,
+        "Boosting",
+    )
 
     _validate_training_args(parsed_data, ts, te, es, ee, models_to_use, model_params, base_model_files)
 

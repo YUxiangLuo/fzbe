@@ -218,4 +218,39 @@ describe("model training result transformers", () => {
       predictions: [{ prediction: null }],
     })).toThrow("[PYTHON_DATA] Prediction point 0 is not finite");
   });
+
+  test("rejects missing or empty Python prediction arrays", () => {
+    expect(() => transformTrainingResult("ma", {
+      metrics: {},
+      eval_y_true: [10],
+    })).toThrow("[PYTHON_DATA] predictions must be an array");
+
+    expect(() => transformTrainingResult("ma", {
+      metrics: {},
+      eval_y_true: [],
+      predictions: [],
+    })).toThrow("[PYTHON_DATA] predictions must contain at least one point");
+  });
+
+  test("rejects evaluation values that do not match the displayed predictions", () => {
+    expect(() => transformTrainingResult("ma", {
+      metrics: { rmse: 999 },
+      eval_y_true: [10],
+      predictions: [{ prediction: 9 }, { prediction: 11 }],
+    })).toThrow("[PYTHON_DATA] Expected 2 evaluation values, received 1");
+
+    expect(() => transformTrainingResult("ma", {
+      metrics: {},
+      eval_y_true: [Number.NaN],
+      predictions: [{ prediction: 9 }],
+    })).toThrow("[PYTHON_DATA] Evaluation value 0 is not finite");
+  });
+
+  test("rejects a Python result shorter than the configured evaluation range", () => {
+    expect(() => transformTrainingResult("ma", {
+      metrics: {},
+      eval_y_true: [10],
+      predictions: [{ prediction: 9 }],
+    }, 2)).toThrow("[PYTHON_DATA] Expected 2 prediction points, received 1");
+  });
 });

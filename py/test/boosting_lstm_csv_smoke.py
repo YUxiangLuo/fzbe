@@ -95,12 +95,9 @@ def load_pickled_state(model_path: Path) -> dict:
 
 def iter_stage_models(state: dict):
     model_chain = state["model_chain"]
-    explicit_coefficients = state.get("stage_coefficients")
-    if isinstance(explicit_coefficients, list) and len(explicit_coefficients) == len(model_chain):
-        stage_coefficients = [float(value) for value in explicit_coefficients]
-    else:
-        learning_rate = float(state.get("learning_rate", 0.3))
-        stage_coefficients = [1.0 if idx == 0 else learning_rate for idx in range(len(model_chain))]
+    stage_coefficients = [float(value) for value in state["stage_coefficients"]]
+    if len(stage_coefficients) != len(model_chain):
+        raise AssertionError("stage coefficients do not match model chain")
 
     usage_counts: dict[str, int] = {}
     for stage_idx, model_name in enumerate(model_chain):
@@ -199,7 +196,7 @@ def main() -> None:
             "--look-back",
             "4",
             "--epochs",
-            "2",
+            "20",
             "--normalization",
             "minmax",
             "--lstm-target-feature",
@@ -222,11 +219,13 @@ def main() -> None:
             "--eval-end",
             str(eval_end),
             "--models",
-            "lstm",
+            "ma,lstm",
+            "--window",
+            "22",
             "--look-back",
             "4",
             "--epochs",
-            "2",
+            "20",
             "--normalization",
             "minmax",
             "--lstm-target-feature",
@@ -245,8 +244,8 @@ def main() -> None:
         actual_eval_std_devs = extract_std_devs(train_output)
         expected_eval_predictions = combine_stage_predictions(train_state, forecast_steps=3)
         assert train_output["mode"] == "boosting_residual_learning"
-        assert train_output["models"] == ["lstm"]
-        assert train_output["model_chain"] == ["lstm"]
+        assert train_output["models"] == ["ma", "lstm"]
+        assert train_output["model_chain"] == ["lstm"], train_output["model_chain"]
         assert train_output["stage_coefficients"] == [1.0]
         assert train_output["metrics"]["evaluate_months"] == timestamps[28:31]
         assert train_output["eval_y_true"] == sales[28:31]
@@ -328,7 +327,9 @@ def main() -> None:
             "--eval-end",
             str(eval_end),
             "--models",
-            "lstm",
+            "ma,lstm",
+            "--window",
+            "3",
             "--look-back",
             "4",
             "--epochs",
@@ -354,7 +355,9 @@ def main() -> None:
             "--eval-end",
             "15",
             "--models",
-            "lstm",
+            "ma,lstm",
+            "--window",
+            "3",
             "--look-back",
             "9",
             "--epochs",
@@ -418,7 +421,9 @@ def main() -> None:
             "--eval-end",
             "35",
             "--models",
-            "lstm",
+            "ma,lstm",
+            "--window",
+            "24",
             "--look-back",
             "9",
             "--epochs",

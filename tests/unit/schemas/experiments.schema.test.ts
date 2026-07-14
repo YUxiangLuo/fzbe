@@ -161,6 +161,30 @@ describe("Experiments Schemas", () => {
       });
       expect(result.success).toBe(true);
     });
+
+    test("should accept complete ADF rows and reject incomplete or duplicate rows", () => {
+      const validRow = {
+        diff_order: 1,
+        statistic: -3.84,
+        p_value: 0.018,
+        used_lags: 2,
+        n_obs: 11,
+        stationary: true,
+        critical_values: { "1%": -3.75, "5%": -2.99, "10%": -2.64 },
+      };
+      expect(updateExperimentSchema.safeParse({
+        expected_version: 0,
+        arima_adf_stationarity: [validRow],
+      }).success).toBe(true);
+      expect(updateExperimentSchema.safeParse({
+        expected_version: 0,
+        arima_adf_stationarity: [{ diff_order: 1 }],
+      }).success).toBe(false);
+      expect(updateExperimentSchema.safeParse({
+        expected_version: 0,
+        arima_adf_stationarity: [validRow, validRow],
+      }).success).toBe(false);
+    });
   });
 
   describe("experimentEventSchema", () => {

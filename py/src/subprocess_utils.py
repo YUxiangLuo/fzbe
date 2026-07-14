@@ -202,6 +202,7 @@ def run_base_model_fit_subprocess(
     save_model_file: str,
     fit_forecast_steps: Optional[int] = None,
     timeout: Optional[int] = 60,
+    allow_negative_predictions: bool = False,
 ) -> Dict[str, Any]:
     """Refit a base model from an existing artifact using fit-only mode."""
     py_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -232,6 +233,8 @@ def run_base_model_fit_subprocess(
     ]
     if fit_forecast_steps is not None:
         args.extend(["--fit-forecast-steps", str(int(fit_forecast_steps))])
+    if allow_negative_predictions:
+        args.append("--allow-negative-predictions")
 
     try:
         result = subprocess.run(
@@ -269,6 +272,7 @@ def run_base_model_predict_subprocess(
     model_file: str,
     forecast_steps: int,
     timeout: Optional[int] = 30,
+    allow_negative_predictions: bool = False,
 ) -> Dict[str, Any]:
     """
     Run a base model prediction in a subprocess.
@@ -294,6 +298,8 @@ def run_base_model_predict_subprocess(
         "--forecast-steps", str(forecast_steps),
         "--pretty",
     ]
+    if allow_negative_predictions:
+        args.append("--allow-negative-predictions")
 
     effective_timeout = _resolve_subprocess_timeout(timeout)
 

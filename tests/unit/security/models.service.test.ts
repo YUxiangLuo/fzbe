@@ -88,6 +88,8 @@ const getActiveModelTrainingRun = mock(async (
   _modelType: string,
 ) => null as null | {
   run_id: string;
+  session_id?: string | null;
+  request_hash?: string;
   artifact_path: string;
   production_artifact_path: string | null;
   production_artifact_forecast_steps?: number | null;
@@ -213,11 +215,16 @@ const commitModelTrainingRun = mock(async ({ runId, sessionId }: { runId?: strin
   reusedExistingRun: false,
 }));
 
+const buildExperimentTrainingRevision = mock(() => "experiment-revision");
+const buildModelTrainingRequestHash = mock(() => "request-hash");
+const loadCurrentExperimentStatePatch = mock(async () => ({ state_version: 1 }));
+
 mock.module(modelRunStoreModulePath, () => ({
-  buildExperimentTrainingRevision: mock(() => "experiment-revision"),
-  buildModelTrainingRequestHash: mock(() => "request-hash"),
+  buildExperimentTrainingRevision,
+  buildModelTrainingRequestHash,
   commitModelTrainingRun,
   getActiveModelTrainingRun,
+  loadCurrentExperimentStatePatch,
   setProductionArtifactForRun,
 }));
 
@@ -235,6 +242,7 @@ mock.module(modelLocksModulePath, () => ({
 const {
   runPythonModel,
   createOrResumeGuidedTrainingSession,
+  getGuidedTrainingSession,
   runGuidedTrainingStep,
   resolveGuidedStepTimeoutMs,
   resolveProductionPreparationTimeoutMs,
@@ -294,6 +302,13 @@ const buildGuidedSessionRow = (overrides: Record<string, unknown> = {}) => ({
   protocol_version: 2,
   request_payload: JSON.stringify({
     experiment_id: 990002,
+    selected_industry: "制造业",
+    selected_company: "样本企业",
+    selected_product: "样本产品",
+    data_window_train_start_index: 0,
+    data_window_train_end_index: 11,
+    data_window_evaluate_start_index: 12,
+    data_window_evaluate_end_index: 17,
     moving_average_window: 4,
   }),
   status: "ready",
@@ -368,6 +383,12 @@ describe("models service", () => {
 
     getActiveModelTrainingRun.mockReset();
     getActiveModelTrainingRun.mockResolvedValue(null);
+    buildExperimentTrainingRevision.mockReset();
+    buildExperimentTrainingRevision.mockReturnValue("experiment-revision");
+    buildModelTrainingRequestHash.mockReset();
+    buildModelTrainingRequestHash.mockReturnValue("request-hash");
+    loadCurrentExperimentStatePatch.mockReset();
+    loadCurrentExperimentStatePatch.mockResolvedValue({ state_version: 1 });
     setProductionArtifactForRun.mockReset();
     setProductionArtifactForRun.mockResolvedValue(true);
     commitModelTrainingRun.mockReset();
@@ -742,7 +763,7 @@ describe("models service", () => {
       .toBe(false);
   });
 
-  test("restores the session-scoped guided artifact before reusing a completed session", async () => {
+  test("keeps a completed guided session current after its own authoritative config commit", async () => {
     const requestBody = {
       experiment_id: 990002,
       selected_industry: "制造业",
@@ -754,115 +775,64 @@ describe("models service", () => {
       data_window_evaluate_end_index: 17,
       moving_average_window: 4,
     };
-    const artifactDir = "/tmp/fangzhen-py/guided_training/exp990002-student20240002-ma-guided-a";
-    const sessionModelPath = `${artifactDir}/ma.pkl`;
-    const productionModelPath = "/tmp/fangzhen-py/trained_models/exp990002-student20240002-ma-production.pkl";
 
     poolQuery.mockReset();
-    poolQuery
-      .mockResolvedValueOnce([[buildExperimentContextRow()]])
-      .mockResolvedValueOnce([[{ file_path: datasetCsvPath }]])
-      .mockResolvedValueOnce([[
-        {
-          session_id: "guided-a",
-          experiment_id: 990002,
-          student_id: 20240002,
-          model_type: "ma",
-          request_hash: "request-hash",
-          dataset_revision: "0".repeat(64),
-          runtime_revision: "0".repeat(64),
-          protocol_version: 2,
-          request_payload: JSON.stringify(requestBody),
-          status: "completed",
-          current_step_id: null,
-          completed_step_ids: JSON.stringify([
-            "prepare_data",
-            "build_windows",
-            "forecast",
-            "estimate_residuals",
-            "evaluate_metrics",
-            "save_artifact",
-          ]),
-          step_outputs: JSON.stringify({ save_artifact: { metrics: { rmse: 1 } } }),
-          step_plan: JSON.stringify([]),
-          result_payload: JSON.stringify({
-            status: "success",
-            results: { metrics: { rmse: 1, mae: 1, r2: 0.9 } },
-          }),
-          artifact_dir: artifactDir,
-          error_message: null,
-        },
-      ]]);
-    existsSync.mockImplementation((filePath: string) =>
-      filePath === sessionModelPath || filePath === productionModelPath
-    );
-
-    const session = await createOrResumeGuidedTrainingSession("ma", 20240002, requestBody);
-
-    expect(session.status).toBe("completed");
-    const versionedPath = "/tmp/fangzhen-py/trained_models/exp990002-student20240002-ma-guided-a-backtest.pkl";
-    expect(copyFileSync).toHaveBeenCalledWith(
-      sessionModelPath,
-      expect.stringContaining(`${versionedPath}.tmp-`),
-    );
-    expect(renameSync).toHaveBeenCalledWith(
-      expect.stringContaining(`${versionedPath}.tmp-`),
-      versionedPath,
-    );
-    expect(unlinkSync).not.toHaveBeenCalledWith(productionModelPath);
-    expect(spawnMock).not.toHaveBeenCalled();
-  });
-
-  test("removes a newly copied guided artifact when its protected commit fails", async () => {
-    const requestBody = {
-      experiment_id: 990002,
-      moving_average_window: 4,
-    };
-    const row = buildGuidedSessionRow({
-      session_id: "guided-commit-failure",
-      status: "completed",
-      current_step_id: null,
-      completed_step_ids: JSON.stringify(["prepare_data"]),
-      step_outputs: JSON.stringify({ prepare_data: { ok: true } }),
-      result_payload: JSON.stringify({
-        status: "success",
-        results: { metrics: { rmse: 1, mae: 1, r2: 0.9 } },
-      }),
-      request_payload: JSON.stringify(requestBody),
-    });
-    const sourceModelPath = path.join(row.artifact_dir, "ma.pkl");
-    const versionedArtifactPath = path.join(
-      mockedTrainedModelsRoot,
-      "exp990002-student20240002-ma-guided-commit-failure-backtest.pkl",
-    );
-    const existingArtifacts = new Set([sourceModelPath]);
-    existsSync.mockImplementation((filePath: string) => existingArtifacts.has(filePath));
-    renameSync.mockImplementation((_: string, destination: string) => {
-      existingArtifacts.add(destination);
-    });
-    unlinkSync.mockImplementation((filePath: string) => {
-      existingArtifacts.delete(filePath);
-    });
     createReadStream.mockImplementation(() =>
       Readable.from([modelDatasetCsv]) as unknown as ReturnType<typeof createReadStream>
     );
+    poolQuery.mockResolvedValueOnce([[{ file_path: datasetCsvPath }]]);
+    const currentDataset = await loadDatasetFromDb("制造业", "样本企业", "样本产品");
+    const completedSession = buildGuidedSessionRow({
+      session_id: "guided-own-commit",
+      request_hash: "request-hash-before-own-commit",
+      dataset_revision: hashDatasetSnapshot(JSON.stringify(currentDataset)),
+      runtime_revision: getModelRuntimeRevision(true),
+      request_payload: JSON.stringify(requestBody),
+      status: "completed",
+      current_step_id: null,
+      completed_step_ids: JSON.stringify([
+        "prepare_data",
+        "build_windows",
+        "forecast",
+        "estimate_residuals",
+        "evaluate_metrics",
+        "save_artifact",
+      ]),
+      step_outputs: JSON.stringify({ save_artifact: { metrics: { rmse: 1 } } }),
+      step_plan: JSON.stringify([]),
+      result_payload: JSON.stringify({
+        status: "success",
+        results: { metrics: { rmse: 1, mae: 1, r2: 0.9 } },
+      }),
+    });
+    const activeRun = buildActiveRun("ma", {
+      session_id: completedSession.session_id,
+      request_hash: completedSession.request_hash,
+      dataset_revision: completedSession.dataset_revision,
+      runtime_revision: completedSession.runtime_revision,
+    });
+    useActiveRuns(activeRun);
+    buildModelTrainingRequestHash.mockReturnValue("request-hash-after-own-commit");
     poolQuery.mockImplementation(async (sql: string) => {
+      if (sql.includes("FROM model_guided_training_sessions")) return [[completedSession]];
       if (sql.includes("FROM dataset_segments")) return [[{ file_path: datasetCsvPath }]];
-      if (sql.includes("FROM model_guided_training_sessions")) return [[row]];
       return [[buildExperimentContextRow()]];
     });
-    commitModelTrainingRun.mockRejectedValueOnce(new Error("commit failed"));
+    existsSync.mockImplementation((filePath: string) => filePath === activeRun.artifact_path);
 
-    await expect(
-      createOrResumeGuidedTrainingSession("ma", 20240002, requestBody),
-    ).rejects.toThrow("commit failed");
+    const session = await getGuidedTrainingSession(
+      "ma",
+      20240002,
+      completedSession.session_id,
+    );
 
-    expect(copyFileSync).toHaveBeenCalled();
-    expect(unlinkSync).toHaveBeenCalledWith(versionedArtifactPath);
-    expect(existingArtifacts.has(versionedArtifactPath)).toBe(false);
+    expect(session.status).toBe("completed");
+    expect(poolQuery.mock.calls.some(([sql]) => String(sql).includes("SET status = 'superseded'"))).toBe(false);
+    expect(copyFileSync).not.toHaveBeenCalled();
+    expect(commitModelTrainingRun).not.toHaveBeenCalled();
   });
 
-  test("recreates a completed guided session when its reusable artifact is missing", async () => {
+  test("refreshes the experiment patch before reusing a completed guided session", async () => {
     const requestBody = {
       experiment_id: 990002,
       selected_industry: "制造业",
@@ -874,79 +844,238 @@ describe("models service", () => {
       data_window_evaluate_end_index: 17,
       moving_average_window: 4,
     };
-    const expiredArtifactDir = "/tmp/fangzhen-py/guided_training/exp990002-student20240002-ma-guided-expired";
-    const freshArtifactDir = "/tmp/fangzhen-py/guided_training/exp990002-student20240002-ma-guided-fresh";
-    const stepPlan = JSON.stringify([
-      {
-        id: "prepare_data",
-        label: "确认训练材料",
-        description: "检查训练输入。",
-        actionLabel: "校验数据",
-      },
-    ]);
 
-    const completedSessionRow = {
-      session_id: "guided-expired",
+    poolQuery.mockReset();
+    createReadStream.mockImplementation(() =>
+      Readable.from([modelDatasetCsv]) as unknown as ReturnType<typeof createReadStream>
+    );
+    poolQuery.mockResolvedValueOnce([[{ file_path: datasetCsvPath }]]);
+    const currentDataset = await loadDatasetFromDb("制造业", "样本企业", "样本产品");
+    const historicalPatch = {
+      state_version: 3,
+      ensemble_weighted_completed: false,
+      selected_best_model: null,
+      production_plan_completed: false,
+    };
+    const currentPatch = {
+      state_version: 11,
+      ensemble_weighted_completed: true,
+      selected_best_model: "ensemble_weighted",
+      production_plan_completed: true,
+    };
+    const completedSession = buildGuidedSessionRow({
+      session_id: "guided-current-patch",
+      dataset_revision: hashDatasetSnapshot(JSON.stringify(currentDataset)),
+      runtime_revision: getModelRuntimeRevision(true),
+      status: "completed",
+      current_step_id: null,
+      result_payload: JSON.stringify({
+        status: "success",
+        results: { metrics: { rmse: 1, mae: 1, r2: 0.9 } },
+        experiment_state_patch: historicalPatch,
+      }),
+      experiment_state_version: 3,
+    });
+    const activeRun = buildActiveRun("ma", {
+      session_id: completedSession.session_id,
+      request_hash: completedSession.request_hash,
+      dataset_revision: completedSession.dataset_revision,
+      runtime_revision: completedSession.runtime_revision,
+    });
+    useActiveRuns(activeRun);
+    poolQuery.mockImplementation(async (sql: string) => {
+      if (sql.includes("FROM dataset_segments")) return [[{ file_path: datasetCsvPath }]];
+      if (sql.includes("FROM model_guided_training_sessions")) return [[completedSession]];
+      return [[buildExperimentContextRow()]];
+    });
+    existsSync.mockImplementation((filePath: string) => filePath === activeRun.artifact_path);
+    loadCurrentExperimentStatePatch.mockResolvedValue(currentPatch);
+
+    const session = await createOrResumeGuidedTrainingSession("ma", 20240002, requestBody);
+
+    expect(session.result?.experiment_state_patch).toEqual(currentPatch);
+    expect(session.experiment_state_version).toBe(11);
+    expect(loadCurrentExperimentStatePatch).toHaveBeenCalledWith(990002, 20240002);
+    expect(commitModelTrainingRun).not.toHaveBeenCalled();
+  });
+
+  test("resumes the active completed session when its post-commit request hash no longer matches", async () => {
+    const requestBody = {
       experiment_id: 990002,
-      student_id: 20240002,
-      model_type: "ma",
-      request_hash: "request-hash",
-      dataset_revision: "0".repeat(64),
-      runtime_revision: "0".repeat(64),
-      protocol_version: 2,
-      request_payload: JSON.stringify(requestBody),
+      selected_industry: "制造业",
+      selected_company: "样本企业",
+      selected_product: "样本产品",
+      data_window_train_start_index: 0,
+      data_window_train_end_index: 11,
+      data_window_evaluate_start_index: 12,
+      data_window_evaluate_end_index: 17,
+      moving_average_window: 4,
+    };
+    createReadStream.mockImplementation(() =>
+      Readable.from([modelDatasetCsv]) as unknown as ReturnType<typeof createReadStream>
+    );
+    poolQuery.mockReset();
+    poolQuery.mockResolvedValueOnce([[{ file_path: datasetCsvPath }]]);
+    const currentDataset = await loadDatasetFromDb("制造业", "样本企业", "样本产品");
+    const row = buildGuidedSessionRow({
+      session_id: "guided-post-commit-resume",
+      request_hash: "request-hash-before-own-commit",
       status: "completed",
       current_step_id: null,
       completed_step_ids: JSON.stringify(["prepare_data"]),
       step_outputs: JSON.stringify({ prepare_data: { ok: true } }),
-      step_plan: stepPlan,
       result_payload: JSON.stringify({
         status: "success",
         results: { metrics: { rmse: 1, mae: 1, r2: 0.9 } },
       }),
-      artifact_dir: expiredArtifactDir,
-      error_message: null,
-    };
-    const freshSessionRow = {
-      ...completedSessionRow,
-      session_id: "guided-fresh",
-      status: "ready",
-      current_step_id: "prepare_data",
-      completed_step_ids: JSON.stringify([]),
-      step_outputs: JSON.stringify({}),
-      result_payload: null,
-      artifact_dir: freshArtifactDir,
-    };
-
-    poolQuery.mockReset();
-    poolQuery
-      .mockResolvedValueOnce([[buildExperimentContextRow()]])
-      .mockResolvedValueOnce([[{ file_path: datasetCsvPath }]])
-      .mockResolvedValueOnce([[completedSessionRow]])
-      .mockResolvedValueOnce([[]])
-      .mockResolvedValueOnce([[]])
-      .mockResolvedValueOnce([[freshSessionRow]]);
-    existsSync.mockReturnValue(false);
+      request_payload: JSON.stringify(requestBody),
+      dataset_revision: hashDatasetSnapshot(JSON.stringify(currentDataset)),
+      runtime_revision: getModelRuntimeRevision(true),
+    });
+    const activeRun = buildActiveRun("ma", {
+      session_id: row.session_id,
+      request_hash: row.request_hash,
+      dataset_revision: row.dataset_revision,
+      runtime_revision: row.runtime_revision,
+    });
+    useActiveRuns(activeRun);
+    buildModelTrainingRequestHash.mockReturnValue("request-hash-after-own-commit");
+    poolQuery.mockImplementation(async (sql: string) => {
+      if (sql.includes("FROM dataset_segments")) return [[{ file_path: datasetCsvPath }]];
+      if (sql.includes("FROM model_guided_training_sessions") && sql.includes("request_hash = ?")) return [[]];
+      if (sql.includes("FROM model_guided_training_sessions")) return [[row]];
+      return [[buildExperimentContextRow()]];
+    });
+    existsSync.mockImplementation((filePath: string) => filePath === activeRun.artifact_path);
 
     const session = await createOrResumeGuidedTrainingSession("ma", 20240002, requestBody);
 
-    expect(session.session_id).toBe("guided-fresh");
-    expect(session.status).toBe("ready");
+    expect(session.session_id).toBe(row.session_id);
+    expect(session.status).toBe("completed");
+    expect(poolQuery.mock.calls.some(([sql]) => String(sql).includes("INSERT INTO model_guided_training_sessions"))).toBe(false);
+    expect(commitModelTrainingRun).not.toHaveBeenCalled();
+  });
+
+  test("supersedes a completed guided session that has no matching active run", async () => {
+    createReadStream.mockImplementation(() =>
+      Readable.from([modelDatasetCsv]) as unknown as ReturnType<typeof createReadStream>
+    );
+    poolQuery.mockReset();
+    poolQuery.mockResolvedValueOnce([[{ file_path: datasetCsvPath }]]);
+    const currentDataset = await loadDatasetFromDb("制造业", "样本企业", "样本产品");
+    let status: "completed" | "superseded" = "completed";
+    const completedSessionRow = buildGuidedSessionRow({
+      session_id: "guided-missing-run",
+      dataset_revision: hashDatasetSnapshot(JSON.stringify(currentDataset)),
+      runtime_revision: getModelRuntimeRevision(true),
+      status: "completed",
+      current_step_id: null,
+      completed_step_ids: JSON.stringify(["prepare_data"]),
+      step_outputs: JSON.stringify({ prepare_data: { ok: true } }),
+      result_payload: JSON.stringify({
+        status: "success",
+        results: { metrics: { rmse: 1, mae: 1, r2: 0.9 } },
+      }),
+    });
+
+    poolQuery.mockImplementation(async (sql: string) => {
+      if (sql.includes("FROM dataset_segments")) return [[{ file_path: datasetCsvPath }]];
+      if (sql.includes("SET status = 'superseded'")) {
+        status = "superseded";
+        return [{ affectedRows: 1 }];
+      }
+      if (sql.includes("FROM model_guided_training_sessions")) {
+        return [[{ ...completedSessionRow, status }]];
+      }
+      return [[buildExperimentContextRow()]];
+    });
+
+    const session = await getGuidedTrainingSession(
+      "ma",
+      20240002,
+      completedSessionRow.session_id,
+    );
+
+    expect(session.status).toBe("superseded");
+    expect(session.error_code).toBe("GUIDED_SESSION_SUPERSEDED");
     expect(copyFileSync).not.toHaveBeenCalled();
-    expect(rmSync).toHaveBeenCalledWith(
-      expiredArtifactDir,
-      { recursive: true, force: true },
+    expect(commitModelTrainingRun).not.toHaveBeenCalled();
+  });
+
+  test("supersedes a completed ensemble session when a base run dependency changes", async () => {
+    createReadStream.mockImplementation(() =>
+      Readable.from([modelDatasetCsv]) as unknown as ReturnType<typeof createReadStream>
     );
-    expect(mkdirSync).toHaveBeenCalledWith(
-      expect.stringContaining("/tmp/fangzhen-py/guided_training/exp990002-student20240002-ma-"),
-      { recursive: true },
+    poolQuery.mockReset();
+    poolQuery.mockResolvedValueOnce([[{ file_path: datasetCsvPath }]]);
+    const currentDataset = await loadDatasetFromDb("制造业", "样本企业", "样本产品");
+    const datasetRevision = hashDatasetSnapshot(JSON.stringify(currentDataset));
+    const runtimeRevision = getModelRuntimeRevision(true);
+    let status: "completed" | "superseded" = "completed";
+    const completedSessionRow = buildGuidedSessionRow({
+      session_id: "guided-stale-ensemble-dependency",
+      model_type: "weighted_avg",
+      request_hash: "weighted-request-hash",
+      dataset_revision: datasetRevision,
+      runtime_revision: runtimeRevision,
+      request_payload: JSON.stringify({
+        experiment_id: 990002,
+        selected_industry: "制造业",
+        selected_company: "样本企业",
+        selected_product: "样本产品",
+        data_window_train_start_index: 0,
+        data_window_train_end_index: 11,
+        data_window_evaluate_start_index: 12,
+        data_window_evaluate_end_index: 17,
+        models: "ma,es",
+      }),
+      status,
+      current_step_id: null,
+      completed_step_ids: JSON.stringify(["prepare_data", "save_artifact"]),
+      result_payload: JSON.stringify({
+        status: "success",
+        results: { metrics: { rmse: 1, mae: 1, r2: 0.9 } },
+      }),
+    });
+    const ensembleRun = buildActiveRun("weighted_avg", {
+      session_id: completedSessionRow.session_id,
+      request_hash: completedSessionRow.request_hash,
+      dataset_revision: datasetRevision,
+      runtime_revision: runtimeRevision,
+    });
+    const currentMaRun = buildActiveRun("ma", { dataset_revision: datasetRevision, runtime_revision: runtimeRevision });
+    const currentEsRun = buildActiveRun("es", { dataset_revision: datasetRevision, runtime_revision: runtimeRevision });
+    useActiveRuns(ensembleRun, currentMaRun, currentEsRun);
+    existsSync.mockReturnValue(true);
+    spawnMock.mockImplementationOnce(() => createSpawnResult('{"valid":true}'));
+
+    poolQuery.mockImplementation(async (sql: string) => {
+      if (sql.includes("FROM dataset_segments")) return [[{ file_path: datasetCsvPath }]];
+      if (sql.includes("FROM model_training_run_dependencies")) {
+        return [[
+          { base_model_type: "ma", base_run_id: "ma-run-replaced" },
+          { base_model_type: "es", base_run_id: currentEsRun.run_id },
+        ]];
+      }
+      if (sql.includes("SET status = 'superseded'")) {
+        status = "superseded";
+        return [{ affectedRows: 1 }];
+      }
+      if (sql.includes("FROM model_guided_training_sessions")) {
+        return [[{ ...completedSessionRow, status }]];
+      }
+      return [[buildExperimentContextRow()]];
+    });
+
+    const session = await getGuidedTrainingSession(
+      "weighted_avg",
+      20240002,
+      completedSessionRow.session_id,
     );
-    expect(poolQuery.mock.calls.some(([sql]) =>
-      String(sql).includes("DELETE FROM model_guided_training_sessions"),
-    )).toBe(true);
-    expect(poolQuery.mock.calls.some(([sql]) =>
-      String(sql).includes("INSERT INTO model_guided_training_sessions"),
-    )).toBe(true);
+
+    expect(session.status).toBe("superseded");
+    expect(session.error_code).toBe("GUIDED_SESSION_SUPERSEDED");
+    expect(poolQuery.mock.calls.some(([sql]) => String(sql).includes("model_training_run_dependencies"))).toBe(true);
   });
 
   test("cleans up expired guided sessions and only removes guided artifact directories", async () => {
@@ -1300,7 +1429,6 @@ describe("models service", () => {
       if (sql.includes("SET status = 'superseded'")) return [{ affectedRows: 1 }];
       return [[buildExperimentContextRow()]];
     });
-
     const error = await runGuidedTrainingStep(
       "ma",
       20240002,
@@ -1375,6 +1503,42 @@ describe("models service", () => {
       if (previousRuntimeRevision === undefined) delete process.env.MODEL_RUNTIME_REVISION;
       else process.env.MODEL_RUNTIME_REVISION = previousRuntimeRevision;
     }
+  });
+
+  test("supersedes a completed guided session before materializing a stale runtime artifact", async () => {
+    createReadStream.mockImplementation(() =>
+      Readable.from([modelDatasetCsv]) as unknown as ReturnType<typeof createReadStream>
+    );
+    poolQuery.mockResolvedValueOnce([[{ file_path: datasetCsvPath }]]);
+    const currentDataset = await loadDatasetFromDb("制造业", "样本企业", "样本产品");
+    const row = buildGuidedSessionRow({
+      status: "completed",
+      current_step_id: null,
+      completed_step_ids: JSON.stringify(["save_artifact"]),
+      result_payload: JSON.stringify({ status: "success", results: {} }),
+      dataset_revision: hashDatasetSnapshot(JSON.stringify(currentDataset)),
+      runtime_revision: "stale-runtime-revision",
+    });
+    poolQuery.mockImplementation(async (sql: string) => {
+      if (sql.includes("FROM model_guided_training_sessions")) return [[row]];
+      if (sql.includes("FROM dataset_segments")) return [[{ file_path: datasetCsvPath }]];
+      if (sql.includes("SET status = 'superseded'")) return [{ affectedRows: 1 }];
+      return [[buildExperimentContextRow()]];
+    });
+    existsSync.mockReturnValue(true);
+
+    const error = await runGuidedTrainingStep(
+      "ma",
+      20240002,
+      row.session_id,
+      "save_artifact",
+    ).catch((caughtError) => caughtError as Error & { code?: string });
+
+    expect(error).toMatchObject({ code: "GUIDED_SESSION_SUPERSEDED" });
+    expect(poolQuery.mock.calls.some(([sql]) =>
+      String(sql).includes("AND status <> 'superseded'"),
+    )).toBe(true);
+    expect(copyFileSync).not.toHaveBeenCalled();
   });
 
   test("rechecks the dataset revision after Python receipt recovery and before DB commit", async () => {
@@ -1863,7 +2027,9 @@ describe("models service", () => {
     spawnMock.mockImplementationOnce((command: string[]) => ({
       stdout: new ReadableStream({
         start(controller) {
-          controller.enqueue(new TextEncoder().encode('{"predictions":[{"prediction":101.2},{"prediction":98.4}]}'));
+          controller.enqueue(new TextEncoder().encode(
+            '{"predictions":[{"prediction":101.2},{"prediction":98.4},{"prediction":99.1},{"prediction":100.3},{"prediction":102.0},{"prediction":103.2}]}',
+          ));
           controller.close();
         },
       }),
@@ -1884,7 +2050,14 @@ describe("models service", () => {
     expect(result).toEqual({
       status: "success",
       results: {
-        predictions: [{ prediction: 101.2 }, { prediction: 98.4 }],
+        predictions: [
+          { prediction: 101.2 },
+          { prediction: 98.4 },
+          { prediction: 99.1 },
+          { prediction: 100.3 },
+          { prediction: 102 },
+          { prediction: 103.2 },
+        ],
       },
     });
 
@@ -2290,7 +2463,7 @@ describe("models service", () => {
     expect(spawnMock).not.toHaveBeenCalled();
   });
 
-  test("returns an empty prediction list when python omits predictions", async () => {
+  test("rejects production output when python omits predictions", async () => {
     const productionPath = path.join(mockedTrainedModelsRoot, "lstm-current-production.pkl");
     useActiveRuns(buildActiveRun("lstm", { production_artifact_path: productionPath }));
     mockExperimentAndDatasetQueries();
@@ -2317,14 +2490,9 @@ describe("models service", () => {
       kill: mock(() => {}),
     }));
 
-    const result = await predictExperimentModel("lstm", 20240002, 990002, 3, preparationToken);
-
-    expect(result).toEqual({
-      status: "success",
-      results: {
-        predictions: [],
-      },
-    });
+    await expect(
+      predictExperimentModel("lstm", 20240002, 990002, 3, preparationToken),
+    ).rejects.toThrow("[PYTHON_DATA] predictions must be an array");
   });
 
   test("rejects ensemble training when a requested base model is not completed", async () => {
@@ -2355,7 +2523,7 @@ describe("models service", () => {
 
   test("rejects ensemble training when persisted LSTM config is incomplete", async () => {
     poolQuery.mockResolvedValueOnce([
-      [buildExperimentContextRow({ lstm_features: JSON.stringify([]) })],
+      [buildExperimentContextRow({ lstm_features: null })],
     ]);
 
     await expect(
@@ -2375,7 +2543,7 @@ describe("models service", () => {
         lstmFeatures: "价格指数,产能利用率",
       }),
     ).rejects.toMatchObject({
-      message: "融合模型依赖的 LSTM 基础模型缺少特征或归一化配置",
+      message: "融合模型依赖的 LSTM 基础模型缺少特征配置、目标字段或归一化配置",
     });
 
     expect(createReadStream).not.toHaveBeenCalled();

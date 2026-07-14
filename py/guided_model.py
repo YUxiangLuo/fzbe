@@ -23,7 +23,8 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "src"
 
 from data_utils import infer_feature_types, load_data_from_json
 from error_protocol import format_known_error
-from logger import get_log_contents, log
+from forecast_utils import DEMAND_PREDICTION_DOMAIN, normalize_demand_forecast
+from logger import get_log_contents
 from metrics import mae, mape, r2, rmse
 from model_info import attach_method_metadata
 from serialization import dump_model
@@ -216,7 +217,7 @@ def _run_ma(step_id: str, args, state: Dict[str, Any]) -> Dict[str, Any]:
             raise ValueError("[VALIDATION] 无法为全部评估区间生成移动平均预测。")
 
         y_true = y[list(eval_range)]
-        y_pred = np.asarray(preds)
+        y_pred = normalize_demand_forecast(preds)
         state.update({
             "y_true": y_true.tolist(),
             "y_pred": y_pred.tolist(),
@@ -302,6 +303,7 @@ def _run_ma(step_id: str, args, state: Dict[str, Any]) -> Dict[str, Any]:
                 "train_end_index": train_range.stop - 1,
                 "history": np.asarray(state["y"])[history_start:train_range.stop].tolist(),
                 "std_dev_residuals": float(state["std_dev_residuals"]),
+                "prediction_domain": DEMAND_PREDICTION_DOMAIN,
             }
             attach_method_metadata(model_state, ma.METHOD_NAME, ma.FORECAST_STRATEGY, ma.IMPLEMENTATION_NOTES)
             dump_model(model_state, state["save_model"])
@@ -343,10 +345,7 @@ def _run_es(step_id: str, args, state: Dict[str, Any]) -> Dict[str, Any]:
     if step_id == "fit_model":
         train_range, _ = _state_ranges(state)
         y_train = np.asarray(state["y"])[train_range]
-        model = es.SimpleExpSmoothing(y_train, initialization_method="estimated").fit(
-            smoothing_level=float(state["alpha"]),
-            optimized=False,
-        )
+        model = es._fit_textbook_ses(y_train, float(state["alpha"]))
         state["model"] = model
         return {
             "alpha": float(state["alpha"]),
@@ -361,11 +360,12 @@ def _run_es(step_id: str, args, state: Dict[str, Any]) -> Dict[str, Any]:
         all_predictions = np.asarray(state["model"].forecast(forecast_steps))
         y_pred = all_predictions[
             forecast_offset : forecast_offset + len(eval_range)
-        ].tolist()
+        ]
         if len(y_pred) != len(eval_range):
             raise ValueError(
                 "[VALIDATION] ES forecast did not cover the configured evaluation range"
             )
+        y_pred = normalize_demand_forecast(y_pred).tolist()
         state["y_pred"] = y_pred
         return {
             "predicted_points": len(y_pred),
@@ -445,6 +445,7 @@ def _run_es(step_id: str, args, state: Dict[str, Any]) -> Dict[str, Any]:
                 "train_end_index": train_range.stop - 1,
                 "model": state["model"],
                 "std_dev_residuals": float(state["std_dev_residuals"]),
+                "prediction_domain": DEMAND_PREDICTION_DOMAIN,
             }
             attach_method_metadata(model_state, es.METHOD_NAME, es.FORECAST_STRATEGY, es.IMPLEMENTATION_NOTES)
             dump_model(model_state, state["save_model"])
@@ -479,6 +480,11 @@ def _run_arima(step_id: str, args, state: Dict[str, Any]) -> Dict[str, Any]:
         d = int(args.d)
         train_size = te - ts + 1
         max_p, max_q = _resolve_arima_limits(train_size, getattr(args, "max_p", None), getattr(args, "max_q", None))
+
+        if d < 0:
+            raise ValueError(f"[VALIDATION] d must be >= 0, got {d}")
+        if max_p < 0 or max_q < 0:
+            raise ValueError("[VALIDATION] max_p and max_q must be >= 0")
 
         if not (0 <= ts <= te < len(y)):
             raise ValueError(f"[VALIDATION] Invalid train range: [{ts},{te}], must be within [0, {len(y)-1}]")
@@ -585,7 +591,7 @@ def _run_arima(step_id: str, args, state: Dict[str, Any]) -> Dict[str, Any]:
                 "aic": float(bic_aic),
                 "bic": float(bic_bic),
             },
-            "selected_model": "aic_optimized" if best_model == aic_model else "bic_optimized",
+            "selected_model": "aic_optimized" if best_model is aic_model else "bic_optimized",
             "selection_criterion": selection_criterion,
         }
         state["best_model"] = best_model
@@ -614,6 +620,7 @@ def _run_arima(step_id: str, args, state: Dict[str, Any]) -> Dict[str, Any]:
             raise ValueError(
                 "[VALIDATION] ARIMA forecast did not cover the configured evaluation range"
             )
+        y_pred = normalize_demand_forecast(y_pred)
         y_true = y_eval.tolist()
         converged = bool(best_model.arima_res_.mle_retvals.get("converged", False))
         state.update({
@@ -698,6 +705,7 @@ def _run_arima(step_id: str, args, state: Dict[str, Any]) -> Dict[str, Any]:
                 "model": best_model,
                 "order": state["best_order"],
                 "d": int(state["d"]),
+                "prediction_domain": DEMAND_PREDICTION_DOMAIN,
             }
             attach_method_metadata(model_state, arima.METHOD_NAME, arima.FORECAST_STRATEGY, arima.IMPLEMENTATION_NOTES)
             dump_model(model_state, state["save_model"])
@@ -915,6 +923,7 @@ def _run_lstm(step_id: str, args, state: Dict[str, Any]) -> Dict[str, Any]:
             "forecast_strategy": lstm.DIRECT_FORECAST_STRATEGY,
             "history_df": state["history_df"],
             "normalization": state["normalization"],
+            "prediction_domain": DEMAND_PREDICTION_DOMAIN,
         }
         full_forecast, _ = lstm._forecast_from_state(state_for_eval, forecast_horizon)
         y_pred = full_forecast[forecast_offset: forecast_offset + len(eval_range)]
@@ -1031,6 +1040,7 @@ def _run_lstm(step_id: str, args, state: Dict[str, Any]) -> Dict[str, Any]:
                     eval_forecast_horizon=forecast_horizon
                 ),
                 "std_dev_residuals": float(state["std_dev_residuals"]),
+                "prediction_domain": DEMAND_PREDICTION_DOMAIN,
             }
             attach_method_metadata(model_state, lstm.METHOD_NAME, lstm.DIRECT_FORECAST_STRATEGY, lstm.DIRECT_IMPLEMENTATION_NOTES)
             dump_model(model_state, save_path)
@@ -1084,7 +1094,7 @@ def main() -> None:
     parser.add_argument("--lstm-features", type=str)
     parser.add_argument("--lstm-target-feature", type=str)
     parser.add_argument("--normalization", type=str, choices=["minmax", "zscore"])
-    args, _ = parser.parse_known_args()
+    args = parser.parse_args()
 
     os.makedirs(args.artifact_dir, exist_ok=True)
     existing_receipt = _load_existing_receipt(

@@ -26,13 +26,40 @@ const normalizeLstmFeaturesInput = (value: unknown) => {
       .filter((item): item is string => typeof item === "string")
       .map((item) => item.trim())
       .filter((item) => item.length > 0);
-    return features.length > 0 ? JSON.stringify(features) : "";
+    return JSON.stringify(features);
   }
 
   return value;
 };
 
 const lstmFeaturesSchema = z.preprocess(normalizeLstmFeaturesInput, z.string().min(1).max(20_000));
+
+const BASE_MODEL_NAMES = new Set(["ma", "es", "arima", "lstm"]);
+const ensembleModelsSchema = z.string().min(1).max(64).superRefine((value, context) => {
+  const models = value
+    .split(",")
+    .map((item) => item.trim())
+    .filter((item) => item.length > 0);
+  if (models.length < 2) {
+    context.addIssue({
+      code: z.ZodIssueCode.custom,
+      message: "融合模型至少需要两个基础模型",
+    });
+    return;
+  }
+  if (new Set(models).size !== models.length) {
+    context.addIssue({
+      code: z.ZodIssueCode.custom,
+      message: "融合模型的基础模型不能重复",
+    });
+  }
+  if (models.some((model) => !BASE_MODEL_NAMES.has(model))) {
+    context.addIssue({
+      code: z.ZodIssueCode.custom,
+      message: "融合模型包含不支持的基础模型",
+    });
+  }
+});
 
 const modelParamsSchema = z.object({
   moving_average_window: z.coerce.number().int().min(2).optional(),
@@ -124,7 +151,7 @@ const lstmTrainSchema = withRangeValidation(
 
 const ensembleTrainSchema = withRangeValidation(
   trainSchemaBase.extend({
-    models: z.string().min(1).max(64),
+    models: ensembleModelsSchema,
   }),
 );
 

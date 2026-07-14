@@ -13,6 +13,8 @@ const runAdf = mock(async () => [{
   diff_order: 0,
   statistic: -3,
   p_value: 0.01,
+  used_lags: 1,
+  n_obs: 10,
   stationary: true,
   critical_values: { "1%": -3, "5%": -2, "10%": -1 },
 }]);

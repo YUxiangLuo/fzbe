@@ -42,7 +42,11 @@ def invoke_es(data_json: str, *extra_args: str) -> dict:
 
 
 def build_es_forecast(series: list[float], alpha: float, steps: int) -> list[float]:
-    model = SimpleExpSmoothing(series, initialization_method="estimated").fit(
+    model = SimpleExpSmoothing(
+        series,
+        initialization_method="known",
+        initial_level=float(series[0]),
+    ).fit(
         smoothing_level=alpha,
         optimized=False,
     )
@@ -65,6 +69,17 @@ def main() -> None:
     sales = [float(row["销售数量"]) for row in records]
     timestamps = [f"{int(row['年份']):04d}-{int(row['月份']):02d}" for row in records]
     alpha = 0.4
+
+    # The executable definition must keep the classroom convention S_1 = Y_1.
+    # statsmodels' "estimated" initialization can use a different heuristic once
+    # the series is long enough, even with smoothing_level fixed.
+    textbook_model = es_model._fit_textbook_ses(sales[0:20], alpha)
+    assert math.isclose(
+        float(textbook_model.params["initial_level"]),
+        sales[0],
+        rel_tol=1e-12,
+        abs_tol=1e-12,
+    )
 
     with tempfile.TemporaryDirectory(prefix="fangzhen-es-csv-") as temp_dir:
         temp_path = Path(temp_dir)

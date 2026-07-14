@@ -69,6 +69,29 @@ const optionalFloat = (min?: number) => z.preprocess(numberPreprocess, buildFloa
 const optionalBoolean = z.preprocess(booleanPreprocess, z.boolean()).nullable().optional();
 const optionalString = z.preprocess(stringPreprocess, z.string()).nullable().optional();
 const optionalJson = z.preprocess(jsonPreprocess, z.union([z.array(z.any()), z.record(z.string(), z.any()), z.string()])).nullable().optional();
+const adfResultRowSchema = z.object({
+  diff_order: z.number().int().min(0).max(2),
+  statistic: z.number().finite(),
+  p_value: z.number().finite().min(0).max(1),
+  used_lags: z.number().int().min(0),
+  n_obs: z.number().int().min(1),
+  stationary: z.boolean(),
+  critical_values: z.object({
+    "1%": z.number().finite(),
+    "5%": z.number().finite(),
+    "10%": z.number().finite(),
+  }).strict(),
+}).strict();
+const adfResultRowsSchema = z.array(adfResultRowSchema).max(3).superRefine((rows, context) => {
+  const diffOrders = rows.map((row) => row.diff_order);
+  if (new Set(diffOrders).size !== diffOrders.length) {
+    context.addIssue({
+      code: z.ZodIssueCode.custom,
+      message: "ADF 检验结果不能包含重复的差分阶数",
+    });
+  }
+});
+const optionalAdfResults = z.preprocess(jsonPreprocess, adfResultRowsSchema).nullable().optional();
 
 const studentWritableFields: Record<string, z.ZodTypeAny> = {
   highest_completed_step: optionalInt(0, 7),
@@ -78,7 +101,7 @@ const studentWritableFields: Record<string, z.ZodTypeAny> = {
   data_window_evaluate_start_index: optionalInt(0), data_window_evaluate_end_index: optionalInt(0),
   moving_average_window: optionalInt(2),
   exponential_smoothing_alpha: optionalFloat(0),
-  arima_d: optionalInt(0, 2), arima_adf_stationarity: optionalJson,
+  arima_d: optionalInt(0, 2), arima_adf_stationarity: optionalAdfResults,
   lstm_normalization: z.preprocess(stringPreprocess, z.enum(NORMALIZATION_VALUES)).nullable().optional(),
   lstm_features: optionalJson, lstm_target_field: optionalString,
   ensemble_weighted_base_models: optionalJson,

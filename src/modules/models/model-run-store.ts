@@ -220,8 +220,17 @@ const parseRequestedBaseModels = (models: string | undefined): BaseModelType[] =
   const parsed = (models ?? "")
     .split(",")
     .map((model) => model.trim())
-    .filter((model): model is BaseModelType => BASE_MODELS.includes(model as BaseModelType));
-  return [...new Set(parsed)];
+    .filter((model) => model.length > 0);
+  if (parsed.length < 2) {
+    throw new ModelValidationError("融合模型至少需要两个基础模型");
+  }
+  if (new Set(parsed).size !== parsed.length) {
+    throw new ModelValidationError("融合模型的基础模型不能重复");
+  }
+  if (parsed.some((model) => !BASE_MODELS.includes(model as BaseModelType))) {
+    throw new ModelValidationError("融合模型包含不支持的基础模型");
+  }
+  return parsed as BaseModelType[];
 };
 
 const parseLstmFeatures = (value: unknown): string[] => {
@@ -522,6 +531,30 @@ export const buildCurrentExperimentStatePatch = (
     ...toClientExperimentPatch(currentExperimentState),
     state_version: stateVersion,
   };
+};
+
+export const loadCurrentExperimentStatePatch = async (
+  experimentId: number,
+  studentId: number,
+) => {
+  const [rows] = await pool.query<RowDataPacket[]>(
+    `SELECT *
+       FROM experiment_status
+      WHERE experiment_id = ?
+        AND student_id = ?
+      LIMIT 1`,
+    [experimentId, studentId],
+  );
+  const experiment = rows[0];
+  if (!experiment) {
+    throw new ModelValidationError("实验不存在或不属于当前用户");
+  }
+
+  const stateVersion = Number(experiment.state_version ?? 0);
+  if (!Number.isSafeInteger(stateVersion) || stateVersion < 0) {
+    throw new ModelValidationError("实验状态版本无效");
+  }
+  return buildCurrentExperimentStatePatch(experiment, stateVersion);
 };
 
 const updateExperimentWithPatch = async (

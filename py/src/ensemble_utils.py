@@ -7,7 +7,7 @@ import json
 import os
 import shutil
 import tempfile
-from typing import Any, Dict, List, Literal, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 
@@ -17,6 +17,8 @@ from data_utils import (
     build_subprocess_records,
     infer_feature_types,
 )
+# Re-exported here because all ensemble modules share this boundary helper.
+from forecast_utils import normalize_demand_forecast as normalize_demand_forecast
 from serialization import dump_model, load_model
 from subprocess_utils import (
     extract_predictions_from_result,
@@ -24,7 +26,41 @@ from subprocess_utils import (
     run_base_model_predict_subprocess,
 )
 
-BaseModelType = Literal["ma", "es", "arima", "lstm"]
+SUPPORTED_BASE_MODEL_TYPES = frozenset({"ma", "es", "arima", "lstm"})
+
+
+def validate_base_model_names(
+    models_to_use: Any,
+    context: str = "Ensemble",
+) -> List[str]:
+    if not isinstance(models_to_use, list):
+        raise ValueError(f"[VALIDATION] {context} base models must be a list.")
+    if any(not isinstance(model, str) or not model.strip() for model in models_to_use):
+        raise ValueError(f"[VALIDATION] {context} contains an invalid base model name.")
+
+    normalized = [model.strip() for model in models_to_use]
+    if len(normalized) < 2:
+        raise ValueError(f"[VALIDATION] {context} requires at least 2 base models.")
+    if len(set(normalized)) != len(normalized):
+        raise ValueError(f"[VALIDATION] {context} base models must not contain duplicates.")
+
+    unknown_models = [
+        model for model in normalized if model not in SUPPORTED_BASE_MODEL_TYPES
+    ]
+    if unknown_models:
+        raise ValueError(
+            f"[VALIDATION] {context} contains unsupported base model: {unknown_models[0]}"
+        )
+    return normalized
+
+
+def parse_base_model_names(raw_value: Any, context: str = "Ensemble") -> List[str]:
+    if not isinstance(raw_value, str):
+        raise ValueError(f"[VALIDATION] {context} requires --models.")
+    return validate_base_model_names(
+        [model.strip() for model in raw_value.split(",") if model.strip()],
+        context,
+    )
 
 
 def parse_feature_name_list(raw_value: Any) -> List[str]:
@@ -165,6 +201,19 @@ def compute_phase1_train_size(train_size: int) -> int:
     return max(3, int(train_size * 0.8))
 
 
+def can_refit_source_artifact_for_internal_holdout(model_name: str) -> bool:
+    """Whether fit-only can safely refit directly from the source artifact.
+
+    MA and ES artifacts contain fixed user parameters, while LSTM fit-only mode
+    carries over the user-facing feature/training configuration and rebuilds its
+    dynamic structure on the shorter prefix.  An ARIMA artifact additionally
+    contains p and q selected using the complete training range; reusing those
+    orders would let the internal holdout influence its own prediction.  ARIMA
+    therefore reruns the same fixed-d AIC/BIC search on the prefix.
+    """
+    return model_name in {"ma", "es", "lstm"}
+
+
 def validate_internal_split_base_params(
     models_to_use: List[str],
     model_params: Dict[str, Dict[str, Any]],
@@ -189,9 +238,34 @@ def validate_internal_split_base_params(
     return phase1_size
 
 
-def normalize_demand_forecast(values: Any) -> np.ndarray:
-    """Normalize forecasts representing physical demand, never signed residuals."""
-    return np.maximum(np.asarray(values, dtype=float), 0.0)
+def estimate_residual_std(
+    primary_residuals: Any,
+    fallback_residuals: Any = None,
+    reference_series: Any = None,
+) -> float:
+    """Estimate a finite sample residual standard deviation for small holdouts.
+
+    The independent evaluation residuals are preferred.  A one-point evaluation
+    cannot identify a sample standard deviation, so ensemble models can fall back
+    to their chronological internal validation residuals.  The reference-series
+    branch is a final small-data fallback consistent with the base models.
+    """
+    for label, values in (
+        ("evaluation", primary_residuals),
+        ("internal validation", fallback_residuals),
+        ("reference", reference_series),
+    ):
+        if values is None:
+            continue
+        array = np.asarray(values, dtype=float).reshape(-1)
+        if array.size and not np.isfinite(array).all():
+            raise ValueError(f"[DATA] {label} values contain NaN or infinity.")
+        if array.size > 1:
+            return float(np.std(array, ddof=1))
+
+    reference = np.asarray(reference_series if reference_series is not None else [], dtype=float).reshape(-1)
+    baseline = abs(float(np.mean(reference))) if reference.size else 0.0
+    return float(max(baseline * 0.05, 1.0))
 
 
 def parse_base_model_files_arg(raw_value: Any) -> Dict[str, str]:
@@ -206,11 +280,136 @@ def parse_base_model_files_arg(raw_value: Any) -> Dict[str, str]:
     if not isinstance(payload, dict):
         raise ValueError("[VALIDATION] --base-model-files must be a JSON object.")
 
-    return {
-        str(model_name): model_file
-        for model_name, model_file in payload.items()
-        if isinstance(model_name, str) and isinstance(model_file, str) and model_file
+    parsed_files: Dict[str, str] = {}
+    for model_name, model_file in payload.items():
+        if not isinstance(model_name, str) or not model_name.strip():
+            raise ValueError(
+                "[VALIDATION] --base-model-files keys must be non-empty model names."
+            )
+        if not isinstance(model_file, str) or not model_file.strip():
+            raise ValueError(
+                f"[VALIDATION] --base-model-files entry for {model_name} must be a non-empty path."
+            )
+        parsed_files[model_name] = model_file
+    return parsed_files
+
+
+def _artifact_integer(value: Any, label: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, (int, np.integer)):
+        raise ValueError(f"[VALIDATION] {label} must be an integer in the saved artifact.")
+    return int(value)
+
+
+def _artifact_float(value: Any, label: str) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float, np.integer, np.floating)):
+        raise ValueError(f"[VALIDATION] {label} must be numeric in the saved artifact.")
+    result = float(value)
+    if not np.isfinite(result):
+        raise ValueError(f"[VALIDATION] {label} must be finite in the saved artifact.")
+    return result
+
+
+def resolve_base_model_artifact_configs(
+    parsed_data: ParsedData,
+    models_to_use: List[str],
+    model_params: Dict[str, Dict[str, Any]],
+    base_model_files: Dict[str, str],
+    context: str,
+) -> Tuple[Dict[str, Dict[str, Any]], Dict[str, str]]:
+    """Validate explicit source artifacts and make their fixed configuration authoritative.
+
+    A selected model without a mapped artifact is trained from ``model_params``.
+    Once an artifact is explicitly mapped, silently falling back to a fresh model
+    would make the ensemble differ from the base-model run shown to the learner,
+    so invalid paths and states are rejected here.
+
+    ARIMA is deliberately special: only the user-fixed differencing order ``d``
+    comes from the artifact.  ``p`` and ``q`` remain search bounds and are selected
+    again on the internal prefix, avoiding holdout leakage from the full-data fit.
+    """
+    selected_models = set(models_to_use)
+    canonical_params = {
+        model_name: dict(params)
+        for model_name, params in model_params.items()
     }
+    validated_files: Dict[str, str] = {}
+
+    for model_name, model_file in base_model_files.items():
+        if model_name not in SUPPORTED_BASE_MODEL_TYPES:
+            raise ValueError(
+                f"[VALIDATION] {context} source artifact uses unsupported model: {model_name}."
+            )
+        if model_name not in selected_models:
+            raise ValueError(
+                f"[VALIDATION] {context} source artifact was supplied for unselected model: "
+                f"{model_name}."
+            )
+        if not isinstance(model_file, str) or not model_file.strip() or not os.path.isfile(model_file):
+            raise ValueError(
+                f"[VALIDATION] {context} source artifact for {model_name} does not exist or is not a file."
+            )
+
+        try:
+            source_state = load_model(model_file)
+        except Exception as exc:
+            raise ValueError(
+                f"[VALIDATION] {context} source artifact for {model_name} cannot be read."
+            ) from exc
+
+        if not isinstance(source_state, dict) or source_state.get("model_type") != model_name:
+            raise ValueError(
+                f"[VALIDATION] {context} source artifact for {model_name} has a mismatched model type."
+            )
+
+        fallback_params = canonical_params.get(model_name)
+        if fallback_params is None:
+            raise ValueError(
+                f"[VALIDATION] {context} is missing fallback parameters for {model_name}."
+            )
+
+        if model_name == "ma":
+            if "window" not in source_state:
+                raise ValueError(
+                    f"[VALIDATION] {context} MA source artifact is missing window."
+                )
+            fallback_params["window"] = _artifact_integer(
+                source_state["window"], f"{context} MA window"
+            )
+        elif model_name == "es":
+            if "alpha" not in source_state:
+                raise ValueError(
+                    f"[VALIDATION] {context} ES source artifact is missing alpha."
+                )
+            fallback_params["alpha"] = _artifact_float(
+                source_state["alpha"], f"{context} ES alpha"
+            )
+        elif model_name == "arima":
+            artifact_d = source_state.get("d")
+            if artifact_d is None:
+                order = source_state.get("order")
+                artifact_d = order.get("d") if isinstance(order, dict) else None
+            if artifact_d is None:
+                raise ValueError(
+                    f"[VALIDATION] {context} ARIMA source artifact is missing d."
+                )
+            fallback_params["d"] = _artifact_integer(
+                artifact_d, f"{context} ARIMA d"
+            )
+        else:
+            try:
+                canonical_params[model_name] = build_lstm_params_from_source_state(
+                    parsed_data,
+                    source_state,
+                    fallback_params,
+                )
+            except (KeyError, TypeError, ValueError) as exc:
+                raise ValueError(
+                    f"[VALIDATION] {context} LSTM source artifact has invalid training configuration."
+                ) from exc
+
+        validated_files[model_name] = model_file
+
+    return canonical_params, validated_files
 
 
 def build_ensemble_subprocess_data(

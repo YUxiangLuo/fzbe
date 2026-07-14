@@ -114,6 +114,20 @@ describe("Models Schemas", () => {
       }
     });
 
+    test("should accept target-only LSTM training with no additional features", () => {
+      const result = getTrainSchemaForModel("lstm").safeParse({
+        experiment_id: 12,
+        lstmFeatures: [],
+        lstmTargetFeature: "销售数量",
+        lstmNormalization: "zscore",
+      });
+
+      expect(result.success).toBe(true);
+      if (result.success) {
+        expect(result.data.lstmFeatures).toBe("[]");
+      }
+    });
+
     test("should require model-specific params for weighted ensemble training", () => {
       const result = getTrainSchemaForModel("weighted_avg").safeParse({
         experiment_id: 12,
@@ -136,6 +150,21 @@ describe("Models Schemas", () => {
       });
 
       expect(result.success).toBe(false);
+    });
+
+    test("should reject duplicate or unsupported ensemble members", () => {
+      expect(getTrainSchemaForModel("weighted_avg").safeParse({
+        experiment_id: 12,
+        models: "ma,ma",
+      }).success).toBe(false);
+      expect(getTrainSchemaForModel("stacking").safeParse({
+        experiment_id: 12,
+        models: "ma,unknown",
+      }).success).toBe(false);
+      expect(getTrainSchemaForModel("boosting").safeParse({
+        experiment_id: 12,
+        models: "ma,es",
+      }).success).toBe(true);
     });
   });
 
