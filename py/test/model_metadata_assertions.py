@@ -12,7 +12,7 @@ EXPECTED_METHOD_METADATA = {
     "arima": {
         "method_name": "ARIMA 自动定阶",
         "forecast_strategy": "arima_multi_step_forecast",
-        "note_fragments": ("ARIMA", "自动搜索"),
+        "note_fragments": ("ARIMA", "stepwise"),
     },
     "lstm_direct": {
         "method_name": "LSTM 多变量销量预测",

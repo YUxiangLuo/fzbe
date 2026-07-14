@@ -3,7 +3,7 @@ import argparse
 import json
 import sys
 from pathlib import Path
-from typing import List, Any
+from typing import List
 
 import pandas as pd
 
@@ -27,11 +27,6 @@ def read_series(input_path: Path, value_key: str) -> List[float]:
 
 
 def main(argv: list[str] | None = None) -> int:
-    import argparse, json, sys
-    from pathlib import Path
-    import pandas as pd
-    from .core import adf_fixed_d
-
     p = argparse.ArgumentParser(description="ADF test with fixed differencing orders (d=0,1,2)")
     p.add_argument("input", type=str, help="JSON array or file path (.json/.csv)")
     p.add_argument("--value-key", default="sales")
@@ -54,20 +49,13 @@ def main(argv: list[str] | None = None) -> int:
         if not path.exists():
             print(f"File not found: {path}", file=sys.stderr)
             return 1
-        if path.suffix.lower() == ".csv":
-            df = pd.read_csv(path)
-            series = df[args.value_key].astype(float).tolist()
-        else:
-            data = json.loads(path.read_text(encoding="utf-8"))
-            series = [float(item[args.value_key]) for item in data]
+        series = read_series(path, args.value_key)
 
     diff_orders = [int(x) for x in args.diff_orders.split(",") if x.strip()]
     results = adf_fixed_d(series, diff_orders, args.regression, args.alpha, args.ndigits)
 
     print(json.dumps(results, ensure_ascii=False, indent=2 if args.pretty else None))
     return 0
-
-
 
 if __name__ == "__main__":
     sys.exit(main())

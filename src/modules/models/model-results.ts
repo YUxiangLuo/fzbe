@@ -11,8 +11,24 @@ interface PredictionPoint extends Record<string, unknown> {
 
 const METRIC_EPSILON = 1e-12;
 
-export const normalizeDemandPredictionPoints = (value: unknown): PredictionPoint[] => {
-  if (!Array.isArray(value)) return [];
+export const normalizeDemandPredictionPoints = (
+  value: unknown,
+  expectedLength?: number,
+): PredictionPoint[] => {
+  // Python applies the demand-domain constraint before residuals and metrics.
+  // Keep this boundary clamp as defense in depth for malformed/custom runner
+  // output; it must not be the primary implementation.
+  if (!Array.isArray(value)) {
+    throw new Error("[PYTHON_DATA] predictions must be an array");
+  }
+  if (value.length === 0) {
+    throw new Error("[PYTHON_DATA] predictions must contain at least one point");
+  }
+  if (expectedLength !== undefined && value.length !== expectedLength) {
+    throw new Error(
+      `[PYTHON_DATA] Expected ${expectedLength} prediction points, received ${value.length}`,
+    );
+  }
   return value.map((item, index) => {
     if (!item || typeof item !== "object" || Array.isArray(item)) {
       throw new Error(`[PYTHON_DATA] Prediction point ${index} must be an object`);
@@ -29,20 +45,32 @@ export const normalizeDemandPredictionPoints = (value: unknown): PredictionPoint
   });
 };
 
+const normalizeEvaluationActuals = (
+  value: unknown,
+  expectedLength: number,
+): number[] => {
+  if (!Array.isArray(value)) {
+    throw new Error("[PYTHON_DATA] eval_y_true must be an array");
+  }
+  if (value.length !== expectedLength) {
+    throw new Error(
+      `[PYTHON_DATA] Expected ${expectedLength} evaluation values, received ${value.length}`,
+    );
+  }
+  return value.map((item, index) => {
+    if (typeof item !== "number" || !Number.isFinite(item)) {
+      throw new Error(`[PYTHON_DATA] Evaluation value ${index} is not finite`);
+    }
+    return item;
+  });
+};
+
 const recomputeCanonicalMetrics = (
   metrics: TrainingMetricsPayload | undefined,
-  actualValue: unknown,
+  actual: number[],
   predictions: PredictionPoint[],
-): TrainingMetricsPayload | undefined => {
-  if (!Array.isArray(actualValue) || actualValue.length === 0 || actualValue.length !== predictions.length) {
-    return metrics;
-  }
-
-  const actual = actualValue.map(Number);
+): TrainingMetricsPayload => {
   const predicted = predictions.map((point) => Number(point.prediction));
-  if (!actual.every(Number.isFinite) || !predicted.every(Number.isFinite)) {
-    return metrics;
-  }
 
   const squaredErrors = actual.map((value, index) => (value - predicted[index]!) ** 2);
   const absoluteErrors = actual.map((value, index) => Math.abs(value - predicted[index]!));
@@ -121,22 +149,25 @@ const resultTransformers: Record<ModelType, (result: Record<string, unknown>) =>
 export function transformTrainingResult(
   modelType: ModelType,
   result: Record<string, unknown>,
+  expectedEvaluationLength?: number,
 ): { status: string; results: Record<string, unknown>; inferred_feature_types?: unknown } {
   const originalMetrics =
     result.metrics && typeof result.metrics === "object"
       ? (result.metrics as TrainingMetricsPayload)
       : undefined;
-  const predictions = normalizeDemandPredictionPoints(result.predictions);
-  const metrics = recomputeCanonicalMetrics(originalMetrics, result.eval_y_true, predictions);
+  const predictions = normalizeDemandPredictionPoints(result.predictions, expectedEvaluationLength);
+  const actual = normalizeEvaluationActuals(result.eval_y_true, predictions.length);
+  const metrics = recomputeCanonicalMetrics(originalMetrics, actual, predictions);
   const normalizedResult = {
     ...result,
+    eval_y_true: actual,
     metrics,
     predictions,
   };
 
   const baseResults = {
     metrics,
-    eval_y_true: result.eval_y_true,
+    eval_y_true: actual,
     eval_predictions: predictions.map((point) => point.prediction),
     evaluate_indices: normalizeNumericArray(metrics?.evaluate_indices),
     evaluate_months: normalizeStringArray(metrics?.evaluate_months),

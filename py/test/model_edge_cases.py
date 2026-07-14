@@ -14,6 +14,7 @@ PY_ROOT = PY_TEST_DIR.parent
 RUN_MODEL = PY_ROOT / "run_model.py"
 
 EXISTING_FULL_SCRIPTS = [
+    "review_regressions.py",
     "metrics_smoke.py",
     "ma_csv_smoke.py",
     "es_csv_smoke.py",
@@ -27,6 +28,7 @@ EXISTING_FULL_SCRIPTS = [
     "boosting_lstm_csv_smoke.py",
     "ensemble_reuse_lstm_csv_smoke.py",
     "guided_standalone_parity.py",
+    "guided_ensemble_parity.py",
     "lstm_feature_diagnostics.py",
     "designed_model_diagnostics.py",
     "medium_model_stress.py",

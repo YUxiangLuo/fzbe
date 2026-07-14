@@ -26,12 +26,17 @@ from data_utils import infer_feature_types, load_data_from_json
 from error_protocol import format_known_error
 from ensemble_utils import (
     build_ensemble_subprocess_data,
+    can_refit_source_artifact_for_internal_holdout,
+    estimate_residual_std,
     fit_and_predict_from_source_model,
     get_member_model_path,
     normalize_demand_forecast,
     parse_base_model_files_arg,
+    parse_base_model_names,
+    parse_feature_name_list,
     persist_member_model_artifact,
     remove_member_model_artifact,
+    resolve_base_model_artifact_configs,
 )
 from logger import get_log_contents
 from metrics import mae, mape, r2, rmse
@@ -153,10 +158,7 @@ def _state_range(state: Dict[str, Any], key: str) -> range:
 
 
 def _parse_models(args) -> List[str]:
-    models = [model.strip() for model in str(args.models or "").split(",") if model.strip()]
-    if len(models) < 2:
-        raise ValueError("[VALIDATION] 融合模型至少需要两个基础模型。")
-    return models
+    return parse_base_model_names(args.models, "Guided ensemble")
 
 
 def _auto_max_pq(phase_train_size: int) -> int:
@@ -168,18 +170,15 @@ def _auto_max_pq(phase_train_size: int) -> int:
 
 
 def _build_model_params(
-    module,
     parsed_data,
-    train_size: int,
     phase_train_size: int,
     models_to_use: List[str],
-    base_model_files: Dict[str, str],
     args,
-    lstm_context: str,
 ) -> Dict[str, Dict[str, Any]]:
     auto_window = max(3, min(12, phase_train_size // 4))
     auto_look_back = max(3, min(12, phase_train_size // 4))
-    auto_epochs = 20 if train_size <= 15 else 30
+    # Keep the no-artifact fallback aligned with standalone LSTM training.
+    auto_epochs = 20
     model_params: Dict[str, Dict[str, Any]] = {}
 
     if "arima" in models_to_use:
@@ -200,7 +199,7 @@ def _build_model_params(
         lstm_features_str = _get_arg(args, "lstm_features", None)
         target_feature = _get_arg(args, "lstm_target_feature", parsed_data.target_key)
         lstm_feature_names = (
-            module._parse_feature_name_list(lstm_features_str)
+            parse_feature_name_list(lstm_features_str)
             if lstm_features_str
             else parsed_data.feature_keys
         )
@@ -229,15 +228,6 @@ def _build_model_params(
         if lstm_features_str:
             lstm_params["lstm_features"] = lstm_features_str
 
-        source_lstm_file = base_model_files.get("lstm")
-        if source_lstm_file and os.path.exists(source_lstm_file):
-            source_lstm_state = module._load_lstm_source_state(source_lstm_file, lstm_context)
-            lstm_params = module._build_lstm_params_from_source_state(
-                parsed_data,
-                source_lstm_state,
-                lstm_params,
-            )
-
         model_params["lstm"] = lstm_params
 
     return model_params
@@ -254,14 +244,17 @@ def _initialize_state(model_type: str, args, state: Dict[str, Any]) -> Dict[str,
     phase_train_size = module._compute_phase1_train_size(train_size)
     base_model_files = parse_base_model_files_arg(_get_arg(args, "base_model_files", None))
     model_params = _build_model_params(
-        module,
         parsed_data,
-        train_size,
         phase_train_size,
         models_to_use,
-        base_model_files,
         args,
-        f"Saved {model_type} LSTM base model",
+    )
+    model_params, base_model_files = resolve_base_model_artifact_configs(
+        parsed_data,
+        models_to_use,
+        model_params,
+        base_model_files,
+        f"Guided {model_type}",
     )
 
     module._validate_training_args(
@@ -330,7 +323,10 @@ def _holdout_predictions(
     for model_name in models_to_use:
         params = model_params[model_name]
         source_model_file = base_model_files.get(model_name)
-        if source_model_file and os.path.exists(source_model_file):
+        if (
+            source_model_file
+            and can_refit_source_artifact_for_internal_holdout(model_name)
+        ):
             adjusted_source_model_file = source_model_file
             temp_source_model_file = None
             try:
@@ -398,7 +394,7 @@ def _eval_member_predictions(
         source_model_file = base_model_files.get(model_name)
         temp_model_file = os.path.join(artifact_dir, f"{prefix}_{model_name}_{os.getpid()}.pkl")
 
-        if source_model_file and os.path.exists(source_model_file):
+        if source_model_file:
             if model_name == "lstm":
                 source_model_state = module._load_lstm_source_state(source_model_file, source_context)
                 source_forecast_strategy = module._get_lstm_source_forecast_strategy(source_model_state)
@@ -597,9 +593,20 @@ def _run_weighted(step_id: str, args, state: Dict[str, Any]) -> Dict[str, Any]:
         x_eval = np.array([eval_predictions[name] for name in models_to_use]).T
         model_weights = np.array([weights[name] for name in models_to_use])
         y_pred_final = np.sum(x_eval * model_weights, axis=1)
+        y_pred_final = normalize_demand_forecast(y_pred_final)
         y_true = parsed_data.y[eval_range]
         residuals = y_true - y_pred_final
-        std_dev = float(np.std(residuals, ddof=1)) if len(residuals) > 1 else 0.0
+        weight_val_range = _state_range(state, "weight_val_range")
+        weight_val_predictions = state["weight_val_predictions"]
+        x_weight_val = np.array([weight_val_predictions[name] for name in models_to_use]).T
+        weight_val_blend = np.sum(x_weight_val * model_weights, axis=1)
+        weight_val_blend = normalize_demand_forecast(weight_val_blend)
+        weight_val_residuals = parsed_data.y[weight_val_range] - weight_val_blend
+        std_dev = estimate_residual_std(
+            residuals,
+            weight_val_residuals,
+            parsed_data.y[train_range],
+        )
         timestamps = parsed_data.timestamps
         metrics = {
             "rmse": rmse(y_true, y_pred_final),
@@ -713,9 +720,20 @@ def _run_stacking(step_id: str, args, state: Dict[str, Any]) -> Dict[str, Any]:
     if step_id == "meta_evaluate":
         x_meta_eval = np.column_stack(state["eval_predictions"])
         y_pred_final = stacking._predict_with_meta_model(state["meta_model"], x_meta_eval)
+        y_pred_final = normalize_demand_forecast(y_pred_final)
         y_true = parsed_data.y[eval_range]
         residuals = y_true - y_pred_final
-        std_dev = float(np.std(residuals, ddof=1)) if len(residuals) > 1 else 0.0
+        level1_range = _state_range(state, "level1_range")
+        x_meta_train = np.column_stack(state["level1_predictions"])
+        level1_blend = normalize_demand_forecast(
+            stacking._predict_with_meta_model(state["meta_model"], x_meta_train)
+        )
+        level1_residuals = parsed_data.y[level1_range] - level1_blend
+        std_dev = estimate_residual_std(
+            residuals,
+            level1_residuals,
+            parsed_data.y[train_range],
+        )
         timestamps = parsed_data.timestamps
         metrics = {
             "rmse": rmse(y_true, y_pred_final),
@@ -832,9 +850,14 @@ def _run_boosting(step_id: str, args, state: Dict[str, Any]) -> Dict[str, Any]:
                     round_parsed_data,
                     boost_train_range,
                 )
-                if round_idx == 0:
-                    stage_predictions = normalize_demand_forecast(stage_predictions)
-                    fitted_train_predictions = normalize_demand_forecast(fitted_train_predictions)
+                stage_predictions = boosting._apply_stage_output_semantics(
+                    round_idx,
+                    stage_predictions,
+                )
+                fitted_train_predictions = boosting._apply_stage_output_semantics(
+                    round_idx,
+                    fitted_train_predictions,
+                )
                 next_residual_val = residual_val - coefficient * stage_predictions
                 next_rmse = rmse(np.zeros_like(next_residual_val), next_residual_val)
                 remove_member_model_artifact(model_name, temp_model_file)
@@ -918,7 +941,7 @@ def _run_boosting(step_id: str, args, state: Dict[str, Any]) -> Dict[str, Any]:
             round_parsed_data = boosting._build_residual_parsed_data(parsed_data, train_range, residual_full_train)
             artifact_origin = "temporary_training"
 
-            if stage_idx == 0 and model_name in base_model_files and os.path.exists(base_model_files[model_name]):
+            if stage_idx == 0 and model_name in base_model_files:
                 source_model_file = base_model_files[model_name]
                 if model_name == "lstm":
                     source_model_state = boosting._load_lstm_source_state(source_model_file, "Saved Boosting LSTM base model")
@@ -944,6 +967,7 @@ def _run_boosting(step_id: str, args, state: Dict[str, Any]) -> Dict[str, Any]:
                                 train_end=train_range.stop - 1,
                                 source_model_file=adjusted_source_model_file,
                                 save_model_file=stage_model_file,
+                                allow_negative_predictions=True,
                                 timeout=timeout,
                             )
                         finally:
@@ -998,9 +1022,14 @@ def _run_boosting(step_id: str, args, state: Dict[str, Any]) -> Dict[str, Any]:
                 round_parsed_data,
                 train_range,
             )
-            if stage_idx == 0:
-                stage_eval_predictions = normalize_demand_forecast(stage_eval_predictions)
-                fitted_train_predictions = normalize_demand_forecast(fitted_train_predictions)
+            stage_eval_predictions = boosting._apply_stage_output_semantics(
+                stage_idx,
+                stage_eval_predictions,
+            )
+            fitted_train_predictions = boosting._apply_stage_output_semantics(
+                stage_idx,
+                fitted_train_predictions,
+            )
             final_eval_preds += coefficient * stage_eval_predictions
             residual_full_train = residual_full_train - coefficient * fitted_train_predictions
             stage_rmse = rmse(y_true_eval, final_eval_preds)
@@ -1030,7 +1059,11 @@ def _run_boosting(step_id: str, args, state: Dict[str, Any]) -> Dict[str, Any]:
         y_true_eval = np.asarray(state["eval_y_true"], dtype=float)
         final_eval_preds = normalize_demand_forecast(state["final_eval_preds"])
         final_residuals = y_true_eval - final_eval_preds
-        std_dev = float(np.std(final_residuals, ddof=1)) if len(final_residuals) > 1 else 0.0
+        std_dev = estimate_residual_std(
+            final_residuals,
+            state["residual_val"],
+            parsed_data.y[train_range],
+        )
         timestamps = parsed_data.timestamps
         metrics = {
             "rmse": rmse(y_true_eval, final_eval_preds),
@@ -1134,7 +1167,7 @@ def main() -> None:
     parser.add_argument("--base-model-files", type=str)
     parser.add_argument("--learning-rate", type=float)
     parser.add_argument("--max-rounds", type=int)
-    args, _ = parser.parse_known_args()
+    args = parser.parse_args()
 
     os.makedirs(args.artifact_dir, exist_ok=True)
     existing_receipt = _load_existing_receipt(

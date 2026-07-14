@@ -17,6 +17,11 @@ from sklearn.preprocessing import MinMaxScaler, OneHotEncoder, StandardScaler
 
 # Import shared utilities
 from data_utils import ParsedData, infer_feature_types as infer_parsed_feature_types, load_data_from_json
+from forecast_utils import (
+    DEMAND_PREDICTION_DOMAIN,
+    apply_prediction_domain,
+    resolve_prediction_domain,
+)
 from logger import log, get_log_contents
 from log_safety import summarize_cli_args
 from metrics import mae, mape, r2, rmse
@@ -30,17 +35,19 @@ DEFAULT_PRODUCTION_FORECAST_HORIZON = 6
 METHOD_NAME = "LSTM 多变量销量预测"
 DIRECT_IMPLEMENTATION_NOTES = [
     "教科书 LSTM 定义的是带遗忘门、输入门和输出门的循环神经网络单元。",
-    "本系统采用两层 LSTM 加 Dense 输出层，隐藏单元数随数据维度和样本量动态选择。",
-    "为了服务未来多期销量预测，默认直接多步输出完整预测 horizon，减少递归预测的误差累积。",
+    "本系统仅用训练区间拟合数值缩放器和类别 One-Hot 编码器，再采用两层 LSTM 加 Dense 输出层；隐藏单元数随编码后维度和训练样本量动态选择。",
+    "为了服务未来多期销量预测，新训练模型采用直接多步策略，一次输出完整预测 horizon，减少递归预测的误差累积；输入只包含预测起点之前最后 look_back 期的历史目标与历史特征，不读取未来特征值。",
     "训练中的 EarlyStopping 监控训练损失而非验证损失（教学数据过小，不再切分验证集），其作用是训练损失进入平台期即停止，并非教科书意义的验证集早停。",
-    "预测值附带的 std_dev 是评估段残差的常数标准差，不随预测步长增长，与 ARIMA 随步长展宽的置信区间口径不同。",
+    "Dense 输出层本身不带非负约束；本系统将逆缩放后的最终销量点预测按 max(0, y_hat) 截断，并以截断值计算残差、指标和 std_dev。该业务后处理不是 LSTM 单元定义的一部分。",
+    "预测值附带的 std_dev 通常是评估段残差的样本标准差；评估不足 2 点时退回训练目标序列波动。该值不随预测步长增长，与 ARIMA 随步长展宽的置信区间口径不同。",
 ]
 AUTOREGRESSIVE_IMPLEMENTATION_NOTES = [
     "教科书 LSTM 定义的是带遗忘门、输入门和输出门的循环神经网络单元。",
     "本系统采用两层 LSTM 加 Dense 输出层，隐藏单元数随数据维度和样本量动态选择。",
-    "当训练数据不足以拟合直接多步输出时，系统回退为一步 LSTM 并递归预测未来多期。",
+    "该一步递归路径仅用于兼容旧模型产物：后续步骤把预测目标滚入窗口，其他特征保持为最后观测值；当前新训练流程不会自动回退到此策略。",
     "训练中的 EarlyStopping 监控训练损失而非验证损失（教学数据过小，不再切分验证集），其作用是训练损失进入平台期即停止，并非教科书意义的验证集早停。",
-    "预测值附带的 std_dev 是评估段残差的常数标准差，不随预测步长增长，与 ARIMA 随步长展宽的置信区间口径不同。",
+    "Dense 输出层本身不带非负约束；兼容旧产物时也只把最终逆缩放销量点预测按 max(0, y_hat) 截断。Boosting 的内部残差学习会显式关闭该截断，以保留有符号残差。",
+    "预测值附带的 std_dev 通常是评估段残差的样本标准差；评估不足 2 点时退回训练目标序列波动。该值不随预测步长增长，与 ARIMA 随步长展宽的置信区间口径不同。",
 ]
 
 # Type alias for input flexibility
@@ -120,16 +127,6 @@ def _create_autoregressive_dataset(
         dataX.append(a)
         dataY.append(dataset[i + look_back, 0]) # Target is the first column
     return np.array(dataX), np.array(dataY)
-
-
-def _create_dataset(
-    dataset: np.ndarray,
-    look_back: int = 1,
-) -> Tuple[np.ndarray, np.ndarray]:
-    """
-    Backward-compatible alias for legacy callers that expect one-step targets.
-    """
-    return _create_autoregressive_dataset(dataset, look_back)
 
 
 def _create_direct_dataset(
@@ -401,19 +398,26 @@ def _forecast_autoregressive_from_state(state: Dict[str, Any], steps: int) -> Tu
     return unscaled_predictions.flatten().tolist(), std_dev_residuals
 
 
-def _forecast_from_state(state: Dict[str, Any], steps: int) -> Tuple[List[float], float]:
+def _forecast_from_state(
+    state: Dict[str, Any],
+    steps: int,
+    prediction_domain: Optional[str] = None,
+) -> Tuple[List[float], float]:
     strategy = state.get("forecast_strategy", LEGACY_FORECAST_STRATEGY)
     if strategy == DIRECT_FORECAST_STRATEGY:
-        return _forecast_direct_from_state(state, steps)
-    return _forecast_autoregressive_from_state(state, steps)
+        predictions, std_dev = _forecast_direct_from_state(state, steps)
+    else:
+        predictions, std_dev = _forecast_autoregressive_from_state(state, steps)
+    output_domain = prediction_domain or resolve_prediction_domain(state)
+    return apply_prediction_domain(predictions, output_domain).tolist(), std_dev
 
 
 # ---------- predict ----------
 def predict(
     model_path: str,
     steps: int,
-    data: Optional[str] = None,
     state: Optional[Dict[str, Any]] = None,
+    allow_negative_predictions: bool = False,
 ) -> Tuple[List[float], float]:
     """
     Forecast using a saved LSTM model.
@@ -432,7 +436,11 @@ def predict(
         state["keras_model"] = keras_load_model(keras_model_path, compile=False)
         log.debug(f"Loaded Keras model from {keras_model_path}")
 
-    return _forecast_from_state(state, steps)
+    prediction_domain = resolve_prediction_domain(
+        state,
+        allow_negative_predictions=allow_negative_predictions,
+    )
+    return _forecast_from_state(state, steps, prediction_domain)
 
 
 def _fit_direct_model(
@@ -614,6 +622,7 @@ def train_and_evaluate(
     epochs: int,
     normalization: str = 'minmax',
     timestamps: Optional[List[str]] = None,
+    prediction_domain: str = DEMAND_PREDICTION_DOMAIN,
 ) -> Tuple[Dict[str, Any], Any, Any, List[float], List[float], float, pd.DataFrame]:
     """
     Trains and evaluates the LSTM model with typed features.
@@ -655,8 +664,13 @@ def train_and_evaluate(
         "forecast_strategy": DIRECT_FORECAST_STRATEGY,
         "history_df": history_df_for_saving,
         "normalization": normalization,
+        "prediction_domain": prediction_domain,
     }
-    full_forecast, _ = _forecast_from_state(state_for_eval, forecast_horizon)
+    full_forecast, _ = _forecast_from_state(
+        state_for_eval,
+        forecast_horizon,
+        prediction_domain,
+    )
     y_pred = full_forecast[forecast_offset: forecast_offset + len(eval_range)]
     if len(y_pred) != len(eval_range):
         raise ValueError("[VALIDATION] 无法为完整评估区间生成 LSTM 预测。")
@@ -712,6 +726,10 @@ def run(args) -> None:
             raise ValueError("[VALIDATION] --load-model is required for fit-only mode.")
 
         state = _load_state(load_path)
+        prediction_domain = resolve_prediction_domain(
+            state,
+            allow_negative_predictions=bool(getattr(args, "allow_negative_predictions", False)),
+        )
         parsed_data = load_data_from_json(
             args.data,
             target_key=state.get("target_key"),
@@ -821,6 +839,7 @@ def run(args) -> None:
             "forecast_strategy": effective_forecast_strategy,
             "production_forecast_horizon": desired_forecast_horizon,
             "std_dev_residuals": std_dev_residuals,
+            "prediction_domain": prediction_domain,
         }
         output_strategy, output_notes = _metadata_for_strategy(effective_forecast_strategy)
         attach_method_metadata(next_state, METHOD_NAME, output_strategy, output_notes)
@@ -853,7 +872,12 @@ def run(args) -> None:
             raise ValueError("[VALIDATION] --forecast_steps must be > 0.")
 
         log.info(f"Starting prediction with {steps} forecast steps")
-        preds, std_dev = predict(load_path, steps, state=state)
+        preds, std_dev = predict(
+            load_path,
+            steps,
+            state=state,
+            allow_negative_predictions=bool(getattr(args, "allow_negative_predictions", False)),
+        )
         predictions_with_std = _format_predictions(preds, std_dev)
 
         out: Dict[str, Any] = {
@@ -940,10 +964,21 @@ def run(args) -> None:
         log.debug(f"Training params: look_back={look_back}, epochs={epochs}, normalization='{normalization}'")
 
         _validate_training_args(parsed_data, ts, te, es, ee, look_back)
+        prediction_domain = resolve_prediction_domain(
+            allow_negative_predictions=bool(getattr(args, "allow_negative_predictions", False)),
+        )
 
         log.info("Starting model training and evaluation...")
         metrics, model, preprocessor, y_true, y_pred, std_dev_residuals, history_df = train_and_evaluate(
-            parsed_data, feature_types, range(ts, te + 1), range(es, ee + 1), look_back, epochs, normalization, months
+            parsed_data,
+            feature_types,
+            range(ts, te + 1),
+            range(es, ee + 1),
+            look_back,
+            epochs,
+            normalization,
+            months,
+            prediction_domain,
         )
         log.info(f"Training finished. Metrics: {metrics}")
 
@@ -999,6 +1034,7 @@ def run(args) -> None:
                     eval_forecast_horizon=int(metrics.get("forecast_horizon", 0) or 0)
                 ),
                 "std_dev_residuals": std_dev_residuals,
+                "prediction_domain": prediction_domain,
             }
             attach_method_metadata(state, METHOD_NAME, DIRECT_FORECAST_STRATEGY, DIRECT_IMPLEMENTATION_NOTES)
             dump_model(state, save_path)

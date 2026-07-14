@@ -9,7 +9,12 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 import numpy as np
 from statsmodels.tsa.api import SimpleExpSmoothing
 
-from data_utils import ParsedData, load_data_from_json
+from data_utils import load_data_from_json
+from forecast_utils import (
+    DEMAND_PREDICTION_DOMAIN,
+    apply_prediction_domain,
+    resolve_prediction_domain,
+)
 from logger import log, get_log_contents
 from log_safety import summarize_cli_args
 from metrics import mae, mape, r2, rmse
@@ -21,8 +26,10 @@ METHOD_NAME = "一次指数平滑"
 FORECAST_STRATEGY = "flat_simple_exponential_smoothing"
 IMPLEMENTATION_NOTES = [
     "本系统实现教科书中的一次指数平滑，平滑系数 alpha 满足 0 < alpha <= 1。",
+    "为使递推定义明确且适合小样本，初始水平固定为训练区间的第一个观测值；alpha 由用户指定，不在训练中自动优化。",
     "一次指数平滑的多步未来销量预测为水平外推；趋势和季节性需要 Holt 或 Holt-Winters 扩展，本系统未在该模型中启用。",
-    "预测值附带的 std_dev 是评估段残差的常数标准差，不随预测步长增长，与 ARIMA 随步长展宽的置信区间口径不同。",
+    "在非负销量输入下，一次指数平滑的凸递推通常自然非负；本系统仍将最终销量点预测按 max(0, y_hat) 截断，并用截断后的值计算残差与指标。该后处理不属于教科书 SES 递推式。",
+    "预测值附带的 std_dev 通常是评估段残差的样本标准差；评估不足 2 点时退回训练序列波动。该值不随预测步长增长，与 ARIMA 随步长展宽的置信区间口径不同。",
 ]
 
 # Type alias for input flexibility
@@ -46,6 +53,7 @@ def predict(
     model_path: str,
     steps: int,
     state: Optional[Dict[str, Any]] = None,
+    allow_negative_predictions: bool = False,
 ) -> Tuple[List[float], float]:
     """Forecast future values using a saved ES model."""
     log.debug(f"ES predict called with steps={steps}, model_path={model_path}")
@@ -55,7 +63,11 @@ def predict(
     alpha = float(state.get("alpha", 0.5))
 
     log.info(f"Generating {steps}-step forecast with alpha={alpha}")
-    predictions = model.forecast(steps)
+    prediction_domain = resolve_prediction_domain(
+        state,
+        allow_negative_predictions=allow_negative_predictions,
+    )
+    predictions = apply_prediction_domain(model.forecast(steps), prediction_domain)
     log.info(f"Generated {len(predictions)} predictions")
 
     return predictions.tolist(), std_dev_residuals
@@ -74,12 +86,35 @@ def _estimate_std_dev(residuals: ArrayLike, reference_series: ArrayLike) -> floa
     return float(max(baseline * 0.05, 1.0))
 
 
+def _fit_textbook_ses(y_train: ArrayLike, alpha: float) -> Any:
+    """Fit SES with the common textbook first-observation initialization.
+
+    ``initialization_method="estimated"`` can choose a heuristic initial level
+    for longer series even when alpha optimization is disabled.  Keeping the
+    first-value convention explicit makes the classroom formula and executable
+    model identical across statsmodels versions.
+    """
+    train_array = np.asarray(y_train, dtype=float)
+    if train_array.size == 0:
+        raise ValueError("[VALIDATION] ES training range is empty.")
+
+    return SimpleExpSmoothing(
+        train_array,
+        initialization_method="known",
+        initial_level=float(train_array[0]),
+    ).fit(
+        smoothing_level=alpha,
+        optimized=False,
+    )
+
+
 def train_and_evaluate(
     y: ArrayLike,
     timestamps: List[str],
     train_range: range,
     eval_range: range,
     alpha: float,
+    prediction_domain: str = DEMAND_PREDICTION_DOMAIN,
 ) -> Tuple[Dict[str, Any], Any, List[float], List[float], float]:
     """Train and evaluate the Exponential Smoothing model."""
     log.info(f"Starting ES train_and_evaluate: alpha={alpha}, train_range={train_range}, eval_range={eval_range}")
@@ -93,9 +128,7 @@ def train_and_evaluate(
     log.debug(f"Training data: min={np.min(y_train):.4f}, max={np.max(y_train):.4f}, mean={np.mean(y_train):.4f}")
 
     log.info(f"Fitting SimpleExpSmoothing with alpha={alpha}")
-    model = SimpleExpSmoothing(y_train, initialization_method="estimated").fit(
-        smoothing_level=alpha, optimized=False
-    )
+    model = _fit_textbook_ses(y_train, alpha)
     log.debug(f"Model fitted successfully")
 
     forecast_steps = eval_range.stop - train_range.stop
@@ -112,6 +145,7 @@ def train_and_evaluate(
         raise ValueError(
             "[VALIDATION] ES forecast did not cover the configured evaluation range"
         )
+    y_pred = apply_prediction_domain(y_pred, prediction_domain)
     y_true = y_eval.tolist()
 
     residuals = np.array(y_true) - np.array(y_pred)
@@ -183,6 +217,10 @@ def run(args) -> None:
             raise ValueError("[VALIDATION] --save-model is required for fit-only mode.")
 
         state = _load_state(load_path) if load_path else {}
+        prediction_domain = resolve_prediction_domain(
+            state,
+            allow_negative_predictions=bool(getattr(args, "allow_negative_predictions", False)),
+        )
         parsed_data = load_data_from_json(args.data)
         y = parsed_data.y
 
@@ -193,9 +231,7 @@ def run(args) -> None:
         _validate_fit_args(y, ts, te, alpha)
 
         y_fit = np.asarray(y)[range(ts, te + 1)]
-        model = SimpleExpSmoothing(y_fit, initialization_method="estimated").fit(
-            smoothing_level=alpha, optimized=False
-        )
+        model = _fit_textbook_ses(y_fit, alpha)
         std_dev_residuals = float(state.get("std_dev_residuals", _estimate_std_dev([], y_fit)))
 
         next_state = {
@@ -204,6 +240,7 @@ def run(args) -> None:
             "train_end_index": te,
             "model": model,
             "std_dev_residuals": std_dev_residuals,
+            "prediction_domain": prediction_domain,
         }
         attach_method_metadata(next_state, METHOD_NAME, FORECAST_STRATEGY, IMPLEMENTATION_NOTES)
         dump_model(next_state, save_path)
@@ -228,7 +265,12 @@ def run(args) -> None:
                 raise ValueError("[VALIDATION] --forecast_steps must be > 0.")
 
             log.info(f"Starting prediction with {steps} forecast steps")
-            preds, std_dev = predict(load_path, steps, state=state)
+            preds, std_dev = predict(
+                load_path,
+                steps,
+                state=state,
+                allow_negative_predictions=bool(getattr(args, "allow_negative_predictions", False)),
+            )
             predictions_with_std = _format_predictions(preds, std_dev)
 
             out: Dict[str, Any] = {
@@ -267,10 +309,18 @@ def run(args) -> None:
         log.debug(f"Training params: alpha={alpha}")
 
         _validate_training_args(y, ts, te, es, ee, alpha)
+        prediction_domain = resolve_prediction_domain(
+            allow_negative_predictions=bool(getattr(args, "allow_negative_predictions", False)),
+        )
 
         log.info("Starting model training and evaluation...")
         metrics, model, y_true, y_pred, std_dev_residuals = train_and_evaluate(
-            y, timestamps, range(ts, te + 1), range(es, ee + 1), alpha
+            y,
+            timestamps,
+            range(ts, te + 1),
+            range(es, ee + 1),
+            alpha,
+            prediction_domain,
         )
         log.info(f"Training finished. Metrics: {metrics}")
 
@@ -293,6 +343,7 @@ def run(args) -> None:
             state = {
                 "model_type": MODEL_TYPE, "alpha": alpha, "train_end_index": te,
                 "model": model, "std_dev_residuals": std_dev_residuals,
+                "prediction_domain": prediction_domain,
             }
             attach_method_metadata(state, METHOD_NAME, FORECAST_STRATEGY, IMPLEMENTATION_NOTES)
             dump_model(state, save_path)

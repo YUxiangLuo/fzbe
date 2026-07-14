@@ -242,6 +242,14 @@ describe("model run authoritative state", () => {
 });
 
 describe("model training request integrity", () => {
+  test("rejects duplicate ensemble members at the persistence boundary", () => {
+    expect(() => buildExperimentTrainingRevision(
+      "weighted_avg",
+      {},
+      { ...baseBody, models: "ma,ma" },
+    )).toThrow("融合模型的基础模型不能重复");
+  });
+
   const experiment = {
     ...baseBody,
     moving_average_window: 6,

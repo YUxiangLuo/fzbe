@@ -10,6 +10,7 @@ const storeModulePath = path.join(srcRoot, "modules", "models", "model-run-store
 const freshStoreModulePath = `${storeModulePath}?transaction-test`;
 
 const query = mock(async () => [[]]);
+const poolQuery = mock(async () => [[]]);
 const beginTransaction = mock(async () => {});
 const commit = mock(async () => {});
 const rollback = mock(async () => {});
@@ -19,7 +20,7 @@ const connection = { query, beginTransaction, commit, rollback, release };
 mock.module(configModulePath, () => ({
   pool: {
     getConnection: mock(async () => connection),
-    query: mock(async () => [[]]),
+    query: poolQuery,
   },
 }));
 
@@ -27,6 +28,7 @@ const {
   buildExperimentTrainingRevision,
   buildModelTrainingRequestHash,
   commitModelTrainingRun,
+  loadCurrentExperimentStatePatch,
 } = await import(freshStoreModulePath);
 
 const baseExperiment = {
@@ -67,10 +69,41 @@ const successResult = () => ({
 describe("model run transactional activation", () => {
   beforeEach(() => {
     query.mockReset();
+    poolQuery.mockReset();
     beginTransaction.mockClear();
     commit.mockClear();
     rollback.mockClear();
     release.mockClear();
+  });
+
+  test("loads a complete current experiment patch without rewriting the model run", async () => {
+    poolQuery.mockResolvedValueOnce([[
+      {
+        ...baseExperiment,
+        state_version: 11,
+        moving_average_completed: 1,
+        ensemble_weighted_completed: 1,
+        ensemble_weighted_base_models: JSON.stringify(["moving_average", "exponential_smoothing"]),
+        selected_best_model: "ensemble_weighted",
+        production_plan_completed: 1,
+      },
+    ]]);
+
+    const patch = await loadCurrentExperimentStatePatch(42, 20240002);
+
+    expect(patch).toMatchObject({
+      state_version: 11,
+      moving_average_completed: true,
+      ensemble_weighted_completed: true,
+      ensemble_weighted_base_models: ["moving_average", "exponential_smoothing"],
+      selected_best_model: "ensemble_weighted",
+      production_plan_completed: true,
+    });
+    expect(poolQuery).toHaveBeenCalledWith(
+      expect.stringContaining("FROM experiment_status"),
+      [42, 20240002],
+    );
+    expect(beginTransaction).not.toHaveBeenCalled();
   });
 
   test("activates the immutable run and authoritative experiment patch in one transaction", async () => {

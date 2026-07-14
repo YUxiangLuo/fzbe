@@ -14,15 +14,16 @@ export interface AdfInputPoint {
 
 export interface AdfResultItem {
   diff_order: number;
-  statistic: number | null;
-  p_value: number | null;
-  stationary: boolean | null;
+  statistic: number;
+  p_value: number;
+  used_lags: number;
+  n_obs: number;
+  stationary: boolean;
   critical_values: {
-    "1%": number | null;
-    "5%": number | null;
-    "10%": number | null;
-  } | null;
-  error?: string;
+    "1%": number;
+    "5%": number;
+    "10%": number;
+  };
 }
 
 export type AdfResult = AdfResultItem[];
@@ -33,6 +34,79 @@ export class AdfValidationError extends Error {
     this.name = "AdfValidationError";
   }
 }
+
+const isFiniteNumber = (value: unknown): value is number =>
+  typeof value === "number" && Number.isFinite(value);
+
+const isNonNegativeSafeInteger = (value: unknown): value is number =>
+  typeof value === "number" && Number.isSafeInteger(value) && value >= 0;
+
+const isPositiveSafeInteger = (value: unknown): value is number =>
+  typeof value === "number" && Number.isSafeInteger(value) && value >= 1;
+
+export const parseAdfResultPayload = (value: unknown): AdfResult => {
+  if (!Array.isArray(value)) {
+    throw new Error("[PYTHON_DATA] ADF result must be an array");
+  }
+  if (value.length > 3) {
+    throw new Error("[PYTHON_DATA] ADF result cannot contain more than three rows");
+  }
+
+  const validResults: AdfResult = [];
+  const seenDiffOrders = new Set<number>();
+  value.forEach((candidate, index) => {
+    if (!candidate || typeof candidate !== "object" || Array.isArray(candidate)) {
+      throw new Error(`[PYTHON_DATA] ADF result ${index} must be an object`);
+    }
+    const item = candidate as Record<string, unknown>;
+    if (typeof item.error === "string" && item.error.length > 0) {
+      return;
+    }
+    const criticalValues = item.critical_values;
+    if (!criticalValues || typeof criticalValues !== "object" || Array.isArray(criticalValues)) {
+      throw new Error(`[PYTHON_DATA] ADF result ${index} has invalid critical values`);
+    }
+    const critical = criticalValues as Record<string, unknown>;
+    if (
+      !isNonNegativeSafeInteger(item.diff_order)
+      || item.diff_order > 2
+      || !isFiniteNumber(item.statistic)
+      || !isFiniteNumber(item.p_value)
+      || item.p_value < 0
+      || item.p_value > 1
+      || !isNonNegativeSafeInteger(item.used_lags)
+      || !isPositiveSafeInteger(item.n_obs)
+      || typeof item.stationary !== "boolean"
+      || !isFiniteNumber(critical["1%"])
+      || !isFiniteNumber(critical["5%"])
+      || !isFiniteNumber(critical["10%"])
+    ) {
+      throw new Error(`[PYTHON_DATA] ADF result ${index} has invalid fields`);
+    }
+    if (seenDiffOrders.has(item.diff_order)) {
+      throw new Error(`[PYTHON_DATA] ADF result ${index} repeats a differencing order`);
+    }
+    seenDiffOrders.add(item.diff_order);
+    validResults.push({
+      diff_order: item.diff_order,
+      statistic: item.statistic,
+      p_value: item.p_value,
+      used_lags: item.used_lags,
+      n_obs: item.n_obs,
+      stationary: item.stationary,
+      critical_values: {
+        "1%": critical["1%"],
+        "5%": critical["5%"],
+        "10%": critical["10%"],
+      },
+    });
+  });
+
+  if (validResults.length === 0) {
+    throw new AdfValidationError("数据量不足，无法进行 ADF 检测");
+  }
+  return validResults;
+};
 
 const getTerminationError = (signal: AbortSignal) => signal.reason instanceof Error
   ? signal.reason
@@ -116,12 +190,7 @@ export async function runAdf(
         throw new Error(`ADF 执行失败: ${message}`);
       }
 
-      const parsed = JSON.parse(stdout) as AdfResult;
-      const validResults = parsed.filter((item) => !item.error);
-      if (validResults.length === 0) {
-        throw new AdfValidationError("数据量不足，无法进行 ADF 检测");
-      }
-      return validResults;
+      return parseAdfResultPayload(JSON.parse(stdout) as unknown);
     } catch (error) {
       if (error instanceof Error) throw error;
       throw new Error("Failed to parse ADF result");

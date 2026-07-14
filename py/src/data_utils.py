@@ -352,41 +352,6 @@ def _data_error(message: str) -> ValueError:
     return ValueError(f"[DATA] {message}")
 
 
-def _parse_records(
-    records: List[Dict[str, Any]],
-    target_key: str,
-    time_key: Optional[str] = None,
-    feature_keys: Optional[List[str]] = None,
-) -> ParsedData:
-    """
-    Internal helper to process a list of records into a ParsedData object.
-    """
-    df = pd.DataFrame(records)
-
-    # Verify all necessary keys exist
-    required_keys = [target_key] + (feature_keys or [])
-    for key in required_keys:
-        if key not in df.columns:
-            raise _data_error(f"Error processing records: missing key '{key}'")
-
-    # Attempt to convert numeric columns, coercing errors
-    numeric_cols = [target_key] + (feature_keys or [])
-    for col in numeric_cols:
-        # This check is to avoid converting categorical features that are passed in feature_keys
-        if pd.api.types.is_numeric_dtype(df[col]):
-             df[col] = pd.to_numeric(df[col], errors='coerce')
-
-    if df[required_keys].isnull().values.any():
-        raise _data_error("Error processing records: contains null or non-numeric values in required columns.")
-
-    return ParsedData(
-        df=df,
-        target_key=target_key,
-        time_key=time_key,
-        feature_keys=feature_keys,
-    )
-
-
 def load_data_from_json(
     json_string: str,
     target_key: Optional[str] = None,
@@ -448,8 +413,10 @@ def load_data_from_json(
                 log.info("Converted '年份' and '月份' to numeric types for use as features")
             except Exception as e:
                 log.warning(f"Could not create composite timestamp: {e}. Falling back to simpler time key.")
-                if "月份" in df.columns: time_key = "月份"
-                elif "年份" in df.columns: time_key = "年份"
+                if "月份" in df.columns:
+                    time_key = "月份"
+                elif "年份" in df.columns:
+                    time_key = "年份"
 
         elif "month" in df.columns:
             time_key = "month"

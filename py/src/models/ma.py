@@ -9,9 +9,13 @@ from collections import deque
 from typing import Any, Dict, List, Optional, Tuple, Union
 
 import numpy as np
-import pandas as pd
 
-from data_utils import ParsedData, load_data_from_json
+from data_utils import load_data_from_json
+from forecast_utils import (
+    DEMAND_PREDICTION_DOMAIN,
+    apply_prediction_domain,
+    resolve_prediction_domain,
+)
 from logger import log, get_log_contents
 from metrics import mae, mape, r2, rmse
 from model_info import attach_method_metadata, ensure_state_metadata
@@ -22,44 +26,14 @@ METHOD_NAME = "递推移动平均"
 FORECAST_STRATEGY = "recursive_roll_forward"
 IMPLEMENTATION_NOTES = [
     "教科书移动平均通常用最后一个窗口均值预测下一期。",
+    "本系统要求窗口 n >= 2；n=1 等同于朴素的上一期值预测，不能体现移动平均的平滑特性，因此不作为教学选项。",
     "本系统预测多期未来销量时，将每期预测值滚入窗口继续递推，避免使用评估集或未来真实值。",
-    "预测值附带的 std_dev 是评估段残差的常数标准差，不随预测步长增长，与 ARIMA 随步长展宽的置信区间口径不同。",
+    "移动平均原始输出通常在非负销量输入下自然非负；本系统仍将最终销量点预测按 max(0, y_hat) 截断，并用截断后的值计算残差与指标。该后处理不是教科书移动平均公式的一部分。",
+    "预测值附带的 std_dev 通常是评估段残差的样本标准差；评估不足 2 点时退回训练序列波动。该值不随预测步长增长，与 ARIMA 随步长展宽的置信区间口径不同。",
 ]
 
 # Type alias for input flexibility
 ArrayLike = Union[List[float], np.ndarray]
-
-
-# ---------- core ----------
-def moving_average_forecast(
-    series: ArrayLike, eval_range: range, window: int, min_index: int = 0
-) -> Tuple[List[int], List[float]]:
-    """
-    Generate one-step-ahead forecasts using moving average.
-    """
-    log.debug(f"moving_average_forecast called with window={window}, eval_range={eval_range}, min_index={min_index}")
-    if window <= 0:
-        raise ValueError("[VALIDATION] Moving average window must be greater than 0.")
-    idxs, preds = [], []
-    series = np.asarray(series)
-    log.debug(f"Series length: {len(series)}")
-
-    skipped_points = 0
-    for t in eval_range:
-        start = t - window
-        if start < min_index:
-            skipped_points += 1
-            continue
-        avg_value = float(np.mean(series[start:t]))
-        preds.append(avg_value)
-        idxs.append(t)
-        log.debug(f"  t={t}: averaging series[{start}:{t}] = {avg_value:.4f}")
-
-    if skipped_points > 0:
-        log.warning(f"Skipped {skipped_points} evaluation points due to insufficient history (window={window})")
-    log.info(f"Generated {len(preds)} predictions out of {len(list(eval_range))} requested evaluation points")
-
-    return idxs, preds
 
 
 def _format_predictions(preds: List[float], std_dev: float) -> List[Dict[str, float]]:
@@ -76,6 +50,12 @@ def _load_state(model_path: str) -> Dict[str, Any]:
     state = load_model(model_path)
     if not isinstance(state, dict) or state.get("model_type") != MODEL_TYPE:
         raise ValueError("[VALIDATION] Invalid MA model file.")
+    try:
+        window = int(state["window"])
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ValueError("[VALIDATION] Invalid MA model window.") from exc
+    if window < 2:
+        raise ValueError(f"[VALIDATION] Window must be >= 2, got {window}")
     return ensure_state_metadata(state, METHOD_NAME, FORECAST_STRATEGY, IMPLEMENTATION_NOTES)
 
 
@@ -92,8 +72,8 @@ def _forecast_future(
     if steps <= 0:
         raise ValueError("[VALIDATION] steps must be > 0 for forecasting.")
 
-    if window <= 0:
-        raise ValueError("[VALIDATION] Moving average window must be greater than 0.")
+    if window < 2:
+        raise ValueError(f"[VALIDATION] Window must be >= 2, got {window}")
 
     initial_history = list(history)[-window:]
     if len(initial_history) < window:
@@ -130,6 +110,7 @@ def predict(
     model_path: str,
     steps: int,
     state: Optional[Dict[str, Any]] = None,
+    allow_negative_predictions: bool = False,
 ) -> Tuple[List[float], float]:
     """
     Forecast future values using a saved MA model.
@@ -139,8 +120,15 @@ def predict(
     history = list(state["history"])
     std_dev_residuals = float(state.get("std_dev_residuals", 0.0))
 
-    predictions = _forecast_future(history, window, steps)
-    return predictions, std_dev_residuals
+    prediction_domain = resolve_prediction_domain(
+        state,
+        allow_negative_predictions=allow_negative_predictions,
+    )
+    predictions = apply_prediction_domain(
+        _forecast_future(history, window, steps),
+        prediction_domain,
+    )
+    return predictions.tolist(), std_dev_residuals
 
 
 def train_and_evaluate(
@@ -149,6 +137,7 @@ def train_and_evaluate(
     train_range: range,
     eval_range: range,
     window: int,
+    prediction_domain: str = DEMAND_PREDICTION_DOMAIN,
 ) -> Tuple[Dict[str, Any], float, np.ndarray, np.ndarray]:
     """
     Evaluate the moving average model on a test set.
@@ -180,7 +169,7 @@ def train_and_evaluate(
         raise ValueError("[VALIDATION] 无法为全部评估区间生成移动平均预测。")
 
     y_true = series[idxs]
-    y_pred = np.array(preds)
+    y_pred = apply_prediction_domain(preds, prediction_domain)
     residuals = y_true - y_pred
     std_dev_residuals = _estimate_std_dev(residuals, train_history)
 
@@ -217,6 +206,10 @@ def run(args) -> None:
             raise ValueError("[VALIDATION] --save-model is required for fit-only mode.")
 
         state = _load_state(load_path) if load_path else {}
+        prediction_domain = resolve_prediction_domain(
+            state,
+            allow_negative_predictions=bool(getattr(args, "allow_negative_predictions", False)),
+        )
         parsed_data = load_data_from_json(args.data)
         y = parsed_data.y
 
@@ -236,6 +229,7 @@ def run(args) -> None:
             "train_end_index": te,
             "history": history.tolist(),
             "std_dev_residuals": std_dev_residuals,
+            "prediction_domain": prediction_domain,
         }
         attach_method_metadata(next_state, METHOD_NAME, FORECAST_STRATEGY, IMPLEMENTATION_NOTES)
         dump_model(next_state, save_path)
@@ -258,7 +252,12 @@ def run(args) -> None:
             raise ValueError("[VALIDATION] --forecast_steps must be > 0.")
 
         log.info(f"Starting prediction with {steps} forecast steps")
-        preds, std_dev = predict(load_path, steps, state=state)
+        preds, std_dev = predict(
+            load_path,
+            steps,
+            state=state,
+            allow_negative_predictions=bool(getattr(args, "allow_negative_predictions", False)),
+        )
         log.info(f"Generated {len(preds)} predictions")
         predictions_with_std = _format_predictions(preds, std_dev)
 
@@ -299,10 +298,18 @@ def run(args) -> None:
         log.debug(f"Training params: window={window}")
 
         _validate_training_args(y, ts, te, es, ee, window)
+        prediction_domain = resolve_prediction_domain(
+            allow_negative_predictions=bool(getattr(args, "allow_negative_predictions", False)),
+        )
 
         log.info("Starting model training and evaluation...")
         metrics, std_dev_residuals, y_true, y_pred = train_and_evaluate(
-            y, timestamps, range(ts, te + 1), range(es, ee + 1), window
+            y,
+            timestamps,
+            range(ts, te + 1),
+            range(es, ee + 1),
+            window,
+            prediction_domain,
         )
 
         predictions_with_std = _format_predictions(y_pred.tolist(), std_dev_residuals)
@@ -327,6 +334,7 @@ def run(args) -> None:
                 "model_type": MODEL_TYPE, "window": window, "train_end_index": te,
                 "history": history.tolist(),
                 "std_dev_residuals": std_dev_residuals,
+                "prediction_domain": prediction_domain,
             }
             attach_method_metadata(state, METHOD_NAME, FORECAST_STRATEGY, IMPLEMENTATION_NOTES)
             dump_model(state, save_path)
@@ -349,8 +357,8 @@ def _validate_fit_args(sales: ArrayLike, ts: int, te: int, w: int) -> None:
 
     if not (0 <= ts <= te < n_total):
         raise ValueError(f"[VALIDATION] Invalid training range [{ts}, {te}], must be within [0, {n_total-1}]")
-    if w < 1:
-        raise ValueError(f"[VALIDATION] Window must be >= 1, got {w}")
+    if w < 2:
+        raise ValueError(f"[VALIDATION] Window must be >= 2, got {w}")
 
     train_size = te - ts + 1
     if train_size < w:
@@ -374,9 +382,9 @@ def _validate_training_args(sales: ArrayLike, ts: int, te: int, es: int, ee: int
     if es <= te:
         log.error(f"Evaluation start {es} must be after training end {te}")
         raise ValueError(f"[VALIDATION] Evaluation start ({es}) must be after training end ({te}).")
-    if w < 1:
-        log.error(f"Window {w} must be >= 1")
-        raise ValueError(f"[VALIDATION] Window must be >= 1, got {w}")
+    if w < 2:
+        log.error(f"Window {w} must be >= 2")
+        raise ValueError(f"[VALIDATION] Window must be >= 2, got {w}")
 
     # Additional helpful validations
     train_size = te - ts + 1

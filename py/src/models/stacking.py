@@ -22,9 +22,10 @@ from data_utils import (
     load_data_from_json,
 )
 from ensemble_utils import (
-    build_lstm_params_from_source_state,
     build_ensemble_subprocess_data,
+    can_refit_source_artifact_for_internal_holdout,
     compute_phase1_train_size,
+    estimate_residual_std,
     fit_and_predict_from_source_model,
     format_predictions,
     get_lstm_source_forecast_strategy,
@@ -32,10 +33,12 @@ from ensemble_utils import (
     load_lstm_source_state,
     normalize_demand_forecast,
     parse_base_model_files_arg,
+    parse_base_model_names,
     parse_feature_name_list,
     persist_member_model_artifact,
     prepare_lstm_source_model_for_requested_steps,
-    resolve_lstm_reuse_production_horizon,
+    resolve_base_model_artifact_configs,
+    validate_base_model_names,
     validate_internal_split_base_params,
 )
 from metrics import mae, mape, r2, rmse
@@ -53,19 +56,18 @@ METHOD_NAME = "时间顺序留出 Stacking 融合"
 FORECAST_STRATEGY = "holdout_meta_weighted_blend"
 IMPLEMENTATION_NOTES = [
     "教科书 Stacking 用基础模型预测作为二级特征，再训练元学习器组合预测。",
-    "本系统按时间顺序将训练区间拆成 Level-0 和 Level-1，避免普通 K 折交叉验证破坏时间序列顺序。",
-    "元模型使用非负线性回归且无截距，并将系数归一化为权重；样本不足或共线性严重时回退为 inverse-MAE 权重。",
-    "训练数据较少或基础模型较多时，Level-1 样本数不足会触发 inverse-MAE 回退，此时 Stacking 实际退化为逆误差加权，具体策略与原因见 meta_model 字段。",
-    "预测值附带的 std_dev 是评估段残差的常数标准差，不随预测步长增长，与 ARIMA 随步长展宽的置信区间口径不同。",
+    "本系统按时间顺序拆分：训练点 n<=15 时 Level-0 长度为 max(n-3, floor(0.85n))（本项目最少 n=8，因而 Level-1 为 2-3 点），n>15 时 Level-0 为 floor(0.8n)；实体销量成员预测和最终组合结果均截断到不小于 0。",
+    "Level-0 重训沿用 MA 窗口、ES 的 alpha，以及 LSTM 的 look_back、epochs、特征和归一化配置；LSTM 动态结构按当前子训练段与 Level-1 跨度依同一规则重算。ARIMA 只沿用用户固定的 d，并在 Level-0 重新执行 AIC/BIC stepwise 搜索，避免把完整训练段选出的 p、q 泄漏给 Level-1；独立评估再复用完整训练产物。",
+    "元模型先拟合无截距、非负线性回归，再把系数归一化为和为 1 的组合权重；这是为了小样本稳定性和可解释性采用的凸混合近似，并非教科书对 Stacking 元学习器的必要限制。",
+    "当 Level-1 样本数不大于基础模型数加 1、预测矩阵奇异、条件数非有限或大于 1e6 时，回退为 inverse-MAE 权重；此时实际退化为逆误差加权，原因记录在 meta_model 字段。",
+    "std_dev 优先取独立评估段残差的样本标准差；不足 2 点时退回 Level-1 组合残差。该常数不随预测步长增长。",
 ]
 
 
 # ---------- utilities ----------
 _parse_feature_name_list = parse_feature_name_list
 _load_lstm_source_state = load_lstm_source_state
-_build_lstm_params_from_source_state = build_lstm_params_from_source_state
 _get_lstm_source_forecast_strategy = get_lstm_source_forecast_strategy
-_resolve_lstm_reuse_production_horizon = resolve_lstm_reuse_production_horizon
 _prepare_lstm_source_model_for_requested_steps = prepare_lstm_source_model_for_requested_steps
 _format_predictions = format_predictions
 _compute_phase1_train_size = compute_phase1_train_size
@@ -110,10 +112,11 @@ def _fit_meta_model(
 ) -> Dict[str, Any]:
     """Fit a stable meta-model for stacking.
 
-    Small level1 samples are common in this project. When the meta feature matrix is
-    underdetermined or strongly collinear, unconstrained linear regression easily
-    produces extreme coefficients and catastrophic forecasts. In those cases we fall
-    back to inverse-MAE weights computed on level1 predictions.
+    Small level1 samples are common in this project. The ``n_models + 1`` cutoff is a
+    conservative stability margin rather than the parameter count of the no-intercept
+    regression. When that guard is hit, or the meta feature matrix is singular or
+    strongly collinear, we fall back to inverse-MAE weights computed on level1
+    predictions.
     """
     n_samples, n_models = X_meta_train.shape
     if n_models == 0:
@@ -127,7 +130,7 @@ def _fit_meta_model(
     fallback_reason = None
     if n_samples <= n_models + 1:
         fallback_reason = (
-            f"meta_samples({n_samples}) <= model_parameters({n_models + 1})"
+            f"meta_samples({n_samples}) <= stability_threshold({n_models + 1})"
         )
     elif not np.isfinite(condition_number):
         fallback_reason = "meta_feature_matrix is singular"
@@ -161,22 +164,17 @@ def _fit_meta_model(
     }
 
 
-def _predict_with_meta_model(meta_model: Any, X_meta: np.ndarray) -> np.ndarray:
-    """Predict with either the new weight-based meta-model or a legacy sklearn model."""
+def _predict_with_meta_model(meta_model: Dict[str, Any], X_meta: np.ndarray) -> np.ndarray:
+    """Predict with the persisted convex-blend meta-model."""
     X_meta = np.asarray(X_meta, dtype=float)
-
-    if isinstance(meta_model, dict):
-        weights = np.asarray(meta_model.get("weights", []), dtype=float).reshape(-1)
-        if weights.size != X_meta.shape[1]:
-            raise ValueError(
-                "[VALIDATION] Saved Stacking meta-model weights do not match base model count."
-            )
-        return X_meta @ weights
-
-    if hasattr(meta_model, "predict"):
-        return np.asarray(meta_model.predict(X_meta), dtype=float)
-
-    raise ValueError("[VALIDATION] Unsupported Stacking meta-model state.")
+    if not isinstance(meta_model, dict) or meta_model.get("kind") != "weighted_blend":
+        raise ValueError("[VALIDATION] Saved Stacking meta-model state is invalid.")
+    weights = np.asarray(meta_model.get("weights", []), dtype=float).reshape(-1)
+    if weights.size != X_meta.shape[1] or not np.isfinite(weights).all():
+        raise ValueError(
+            "[VALIDATION] Saved Stacking meta-model weights do not match base model count."
+        )
+    return X_meta @ weights
 
 
 def _load_state(model_path: str) -> Dict[str, Any]:
@@ -184,6 +182,7 @@ def _load_state(model_path: str) -> Dict[str, Any]:
     state = load_model(model_path)
     if not isinstance(state, dict) or state.get("model_type") != MODEL_TYPE:
         raise ValueError("[VALIDATION] Invalid Stacking model file.")
+    validate_base_model_names(state.get("models"), "Saved Stacking model")
     return ensure_state_metadata(state, METHOD_NAME, FORECAST_STRATEGY, IMPLEMENTATION_NOTES)
 
 
@@ -198,9 +197,10 @@ def _validate_fit_args(
     if not (0 <= ts <= te < n):
         raise ValueError(f"[VALIDATION] Invalid train range: [{ts},{te}], n_obs={n}")
 
-    models_to_use = state.get("models")
-    if not isinstance(models_to_use, list) or len(models_to_use) < 2:
-        raise ValueError("[VALIDATION] Saved Stacking model is missing valid base models.")
+    models_to_use = validate_base_model_names(
+        state.get("models"),
+        "Saved Stacking model",
+    )
 
     base_model_states = state.get("base_model_states")
     if not isinstance(base_model_states, dict):
@@ -283,20 +283,7 @@ def _validate_training_args(
     """Validate training and evaluation parameters for Stacking."""
     n = parsed_data.n_obs
 
-    # Supported base models
-    SUPPORTED_BASE_MODELS = ["ma", "es", "arima", "lstm"]
-
-    # Validate models list
-    if not models_to_use:
-        raise ValueError("[VALIDATION] models_to_use cannot be empty.")
-
-    if len(models_to_use) < 2:
-        raise ValueError("[VALIDATION] Stacking requires at least 2 base models.")
-
-    # Validate all models are known
-    for model_name in models_to_use:
-        if model_name not in SUPPORTED_BASE_MODELS:
-            raise ValueError(f"[VALIDATION] Unknown model: {model_name}")
+    validate_base_model_names(models_to_use, "Stacking")
 
     # Validate train range
     if not (0 <= ts <= te < n):
@@ -337,13 +324,13 @@ def _validate_training_args(
         elif model_name == "ma":
             if "window" not in params:
                 raise ValueError("[VALIDATION] MA requires 'window' parameter.")
-            if params["window"] < 1:
-                raise ValueError("[VALIDATION] MA window must be >= 1.")
+            if params["window"] < 2:
+                raise ValueError("[VALIDATION] MA window must be >= 2.")
 
         elif model_name == "lstm":
             source_model_file = (base_model_files or {}).get(model_name)
             source_model_state = None
-            if source_model_file and os.path.exists(source_model_file):
+            if source_model_file:
                 source_model_state = _load_lstm_source_state(
                     source_model_file,
                     "Saved Stacking LSTM base model",
@@ -454,6 +441,7 @@ def predict(
 
     X_meta_future = np.array(base_predictions).T
     final_predictions = _predict_with_meta_model(meta_model, X_meta_future)
+    final_predictions = normalize_demand_forecast(final_predictions)
 
     return final_predictions.tolist(), std_dev_residuals
 
@@ -498,7 +486,7 @@ def train_and_evaluate(
     level0_train_range = range(train_range.start, train_range.start + level0_split)
     level1_train_range = range(train_range.start + level0_split, train_range.stop)
 
-    print(f"[Stacking] 数据划分:", file=sys.stderr)
+    print("[Stacking] 数据划分:", file=sys.stderr)
     print(f"  Level-0 训练集: {level0_train_range} ({len(level0_train_range)} points)", file=sys.stderr)
     print(f"  Level-1 训练集 (元模型): {level1_train_range} ({len(level1_train_range)} points)", file=sys.stderr)
     print(f"  评估集: {eval_range} ({len(eval_range)} points)", file=sys.stderr)
@@ -511,7 +499,7 @@ def train_and_evaluate(
     )
 
     # === Step 2: Phase 1 - Train base models on level0, predict on level1 ===
-    print(f"\n[Stacking Phase 1] 训练基础模型（level0）并生成level1预测", file=sys.stderr)
+    print("\n[Stacking Phase 1] 训练基础模型（level0）并生成level1预测", file=sys.stderr)
     level1_predictions = []
 
     # Calculate dynamic timeout for LSTM models
@@ -525,7 +513,10 @@ def train_and_evaluate(
         source_model_file = (base_model_files or {}).get(model_name)
 
         print(f"  训练 {model_name} 在 level0，预测 level1...", file=sys.stderr)
-        if source_model_file and os.path.exists(source_model_file):
+        if (
+            source_model_file
+            and can_refit_source_artifact_for_internal_holdout(model_name)
+        ):
             adjusted_source_model_file = source_model_file
             temp_source_model_file = None
             try:
@@ -568,7 +559,7 @@ def train_and_evaluate(
         print(f"    ✓ 生成 {len(y_pred_level1)} 个level1预测", file=sys.stderr)
 
     # === Step 3: Train meta-model on level1 predictions ===
-    print(f"\n[Stacking Phase 2] 训练元模型（在level1预测上）", file=sys.stderr)
+    print("\n[Stacking Phase 2] 训练元模型（在level1预测上）", file=sys.stderr)
     X_meta_train = np.column_stack(level1_predictions)  # ✅ level1 的时间顺序留出预测
     y_meta_train = parsed_data.y[level1_train_range]  # ✅ level1的标签
 
@@ -589,7 +580,7 @@ def train_and_evaluate(
             print(f"    {model_name}: weight={float(weight):.6f}", file=sys.stderr)
 
     # === Step 4: Phase 2 - Retrain base models on full train_range ===
-    print(f"\n[Stacking Phase 3] 在完整训练集上重新训练基础模型", file=sys.stderr)
+    print("\n[Stacking Phase 3] 在完整训练集上重新训练基础模型", file=sys.stderr)
     eval_predictions = []
     base_model_states = {}
     eval_forecast_steps = eval_range.stop - train_range.stop
@@ -599,7 +590,7 @@ def train_and_evaluate(
         params = model_params[model_name]
         source_model_file = (base_model_files or {}).get(model_name)
 
-        if source_model_file and os.path.exists(source_model_file):
+        if source_model_file:
             if model_name == "lstm":
                 source_model_state = _load_lstm_source_state(
                     source_model_file,
@@ -708,14 +699,23 @@ def train_and_evaluate(
         print(f"    ✓ 生成 {len(y_pred_eval)} 个eval预测", file=sys.stderr)
 
     # === Step 5: Final prediction and evaluation on eval_range ===
-    print(f"\n[Stacking Phase 4] 元模型最终预测和评估", file=sys.stderr)
+    print("\n[Stacking Phase 4] 元模型最终预测和评估", file=sys.stderr)
     X_meta_eval = np.column_stack(eval_predictions)  # ✅ eval_range的预测
     y_pred_final = _predict_with_meta_model(meta_model, X_meta_eval)  # ✅ 元模型在独立测试集上预测
+    y_pred_final = normalize_demand_forecast(y_pred_final)
     y_true_final = parsed_data.y[eval_range]  # ✅ 真实标签
 
     # Calculate residuals and standard deviation
     residuals = y_true_final - y_pred_final
-    std_dev_residuals = float(np.std(residuals, ddof=1)) if len(residuals) > 1 else 0.0
+    level1_blend = normalize_demand_forecast(
+        _predict_with_meta_model(meta_model, X_meta_train)
+    )
+    level1_residuals = y_meta_train - level1_blend
+    std_dev_residuals = estimate_residual_std(
+        residuals,
+        level1_residuals,
+        parsed_data.y[train_range],
+    )
 
     # ✅ 在独立的eval_range上计算指标
     timestamps = parsed_data.timestamps
@@ -841,7 +841,7 @@ def run(args) -> None:
     parsed_data = load_data_from_json(args.data)
     ts, te = int(args.train_start), int(args.train_end)
     es, ee = int(args.eval_start), int(args.eval_end)
-    models_to_use = [model.strip() for model in args.models.split(',')]
+    models_to_use = parse_base_model_names(args.models, "Stacking")
 
     # Build model_params from the arguments passed by models.ts
     # models.ts sends: --d, --alpha, --window, --look-back, --epochs, --feature-types, etc.
@@ -872,7 +872,8 @@ def run(args) -> None:
     else:
         auto_max_pq = max(1, min(5, level0_size // 6))
 
-    auto_epochs = 20 if train_size <= 15 else 30  # Conservative for ensemble base models
+    # Keep the no-artifact fallback aligned with standalone LSTM training.
+    auto_epochs = 20
 
     model_params = {}
     base_model_files = parse_base_model_files_arg(get_arg("base_model_files", None))
@@ -920,19 +921,15 @@ def run(args) -> None:
         if lstm_features_str:
             lstm_params["lstm_features"] = lstm_features_str
 
-        source_lstm_file = base_model_files.get("lstm")
-        if source_lstm_file and os.path.exists(source_lstm_file):
-            source_lstm_state = _load_lstm_source_state(
-                source_lstm_file,
-                "Saved Stacking LSTM base model",
-            )
-            lstm_params = _build_lstm_params_from_source_state(
-                parsed_data,
-                source_lstm_state,
-                lstm_params,
-            )
-
         model_params["lstm"] = lstm_params
+
+    model_params, base_model_files = resolve_base_model_artifact_configs(
+        parsed_data,
+        models_to_use,
+        model_params,
+        base_model_files,
+        "Stacking",
+    )
 
     # Validate all parameters
     _validate_training_args(parsed_data, ts, te, es, ee, models_to_use, model_params, base_model_files)

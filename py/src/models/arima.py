@@ -10,7 +10,12 @@ from typing import Any, Dict, List, Optional, Tuple
 import numpy as np
 import pmdarima as pm
 
-from data_utils import ParsedData, load_data_from_json
+from data_utils import load_data_from_json
+from forecast_utils import (
+    DEMAND_PREDICTION_DOMAIN,
+    apply_prediction_domain,
+    resolve_prediction_domain,
+)
 from logger import log, get_log_contents
 from log_safety import summarize_cli_args
 from metrics import mae, mape, r2, rmse
@@ -22,8 +27,10 @@ METHOD_NAME = "ARIMA 自动定阶"
 FORECAST_STRATEGY = "arima_multi_step_forecast"
 IMPLEMENTATION_NOTES = [
     "教科书 ARIMA 通常通过平稳性检验、ACF/PACF 和信息准则定阶。",
-    "本系统由用户指定差分阶数 d，并用 AIC/BIC 自动搜索 p 和 q，适合教学系统中的销量预测练习。",
-    "预测未来销量时使用拟合后的 ARIMA 模型直接生成多步 forecast，并将 95% 置信区间近似换算为标准差。",
+    "本系统由用户根据 ADF 结果指定差分阶数 d；模型固定为非季节 ARIMA，并分别执行以 AIC、BIC 为目标的 stepwise 搜索来选择 p 和 q，而不是穷举所有组合。",
+    "p/q 搜索上限随训练样本量自动收紧；训练样本少于 30 时优先比较两个搜索胜出模型的 BIC，否则优先比较 AIC。",
+    "预测未来销量时使用拟合后的 ARIMA 模型直接生成多步 forecast；原始点预测可能为负，本系统将用于残差、指标和输出的销量点预测按 max(0, y_hat) 截断。该约束是业务后处理，不属于教科书 ARIMA。",
+    "默认 95% 预测区间仍由未截断的 ARIMA 预测分布计算，本系统只取区间宽度除以 3.92 近似换算为正态标准差，因此区间本身并不是截断正态区间。",
 ]
 
 
@@ -67,6 +74,10 @@ def _run_auto_arima_search(
     max_q: int,
     criterion: str,
 ) -> Any:
+    if d < 0:
+        raise ValueError(f"[VALIDATION] ARIMA d must be >= 0, got {d}")
+    if max_p < 0 or max_q < 0:
+        raise ValueError("[VALIDATION] ARIMA max_p and max_q must be >= 0")
     try:
         return pm.auto_arima(
             y_train,
@@ -104,6 +115,7 @@ def predict(
     model_path: str,
     steps: int,
     state: Optional[Dict[str, Any]] = None,
+    allow_negative_predictions: bool = False,
 ) -> Tuple[List[float], List[List[float]]]:
     """
     Forecast using a saved ARIMA model.
@@ -122,6 +134,11 @@ def predict(
 
     log.info(f"Generating {steps}-step forecast with order (p={order.get('p')}, d={order.get('d')}, q={order.get('q')})")
     y_pred, conf_int = model.predict(n_periods=steps, return_conf_int=True)
+    prediction_domain = resolve_prediction_domain(
+        state,
+        allow_negative_predictions=allow_negative_predictions,
+    )
+    y_pred = apply_prediction_domain(y_pred, prediction_domain)
     log.info(f"Generated {len(y_pred)} predictions with confidence intervals")
 
     return y_pred.tolist(), conf_int.tolist()
@@ -136,6 +153,7 @@ def train_and_evaluate(
     d: int,
     max_p: int = 5,
     max_q: int = 5,
+    prediction_domain: str = DEMAND_PREDICTION_DOMAIN,
 ) -> Tuple[Dict[str, Any], Any, Dict[str, int], Dict[str, Any], List[float], List[float], List[List[float]]]:
     """
     Trains an ARIMA model by searching for the best p and q using both AIC and BIC,
@@ -311,6 +329,7 @@ def train_and_evaluate(
         raise ValueError(
             "[VALIDATION] ARIMA forecast did not cover the configured evaluation range"
         )
+    y_pred = apply_prediction_domain(y_pred, prediction_domain)
     y_true = y_eval.tolist()
 
     # Check convergence
@@ -365,6 +384,10 @@ def run(args) -> None:
             raise ValueError("[VALIDATION] --load-model is required for fit-only mode.")
 
         state = _load_state(load_path)
+        prediction_domain = resolve_prediction_domain(
+            state,
+            allow_negative_predictions=bool(getattr(args, "allow_negative_predictions", False)),
+        )
         parsed_data = load_data_from_json(args.data)
         y = parsed_data.y
         ts, te = int(args.train_start), int(args.train_end)
@@ -393,6 +416,7 @@ def run(args) -> None:
             "model": fitted_model,
             "order": {"p": order[0], "d": order[1], "q": order[2]},
             "d": order[1],
+            "prediction_domain": prediction_domain,
         }
         attach_method_metadata(next_state, METHOD_NAME, FORECAST_STRATEGY, IMPLEMENTATION_NOTES)
         dump_model(next_state, save_path)
@@ -417,7 +441,12 @@ def run(args) -> None:
             raise ValueError("[VALIDATION] --forecast_steps must be > 0 for prediction mode.")
 
         log.info(f"Starting prediction with {steps} forecast steps")
-        preds, conf_int = predict(load_path, steps, state=state)
+        preds, conf_int = predict(
+            load_path,
+            steps,
+            state=state,
+            allow_negative_predictions=bool(getattr(args, "allow_negative_predictions", False)),
+        )
         predictions_with_std = _format_predictions(preds, conf_int)
 
         out: Dict[str, Any] = {
@@ -494,8 +523,18 @@ def run(args) -> None:
     log.info(f"Validation passed: train_size={train_size}, eval_size={eval_size}, d={d}, max_p={max_p}, max_q={max_q}")
 
     log.info("Starting model training and evaluation...")
+    prediction_domain = resolve_prediction_domain(
+        allow_negative_predictions=bool(getattr(args, "allow_negative_predictions", False)),
+    )
     metrics, best_model, best_order, search_summary, y_true, y_pred, conf_int = train_and_evaluate(
-        y, timestamps, range(ts, te + 1), range(es, ee + 1), d, max_p, max_q
+        y,
+        timestamps,
+        range(ts, te + 1),
+        range(es, ee + 1),
+        d,
+        max_p,
+        max_q,
+        prediction_domain,
     )
     log.info(f"Training finished. Best order: {best_order}, Metrics: {metrics}")
     log.debug(f"Search summary: {search_summary}")
@@ -524,6 +563,7 @@ def run(args) -> None:
             "model": best_model,
             "order": best_order,
             "d": d,
+            "prediction_domain": prediction_domain,
         }
         attach_method_metadata(state, METHOD_NAME, FORECAST_STRATEGY, IMPLEMENTATION_NOTES)
         dump_model(state, save_path)
