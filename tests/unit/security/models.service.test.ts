@@ -4,6 +4,7 @@ import * as actualFs from "node:fs";
 import { unlink, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { Readable } from "node:stream";
+import { TIMEOUTS } from "../../../src/utils/constants";
 
 mock.restore();
 
@@ -729,7 +730,18 @@ describe("models service", () => {
   });
 
   test("does not create a guided session after its operation deadline expires during dataset loading", async () => {
-    jest.useFakeTimers();
+    const originalSetTimeout = globalThis.setTimeout;
+    let triggerOperationDeadline: (() => void) | undefined;
+    const setTimeoutSpy = jest.spyOn(globalThis, "setTimeout");
+    setTimeoutSpy.mockImplementation(((...timerArgs: Parameters<typeof setTimeout>) => {
+      const timer = originalSetTimeout(...timerArgs);
+      const [callback, timeout, ...callbackArgs] = timerArgs;
+      if (timeout === TIMEOUTS.MODEL_SINGLE_OPERATION) {
+        triggerOperationDeadline = () => callback(...callbackArgs);
+      }
+      return timer;
+    }) as typeof setTimeout);
+
     let resolveDatasetQuery!: (value: unknown) => void;
     const datasetQuery = new Promise((resolve) => {
       resolveDatasetQuery = resolve;
@@ -742,28 +754,31 @@ describe("models service", () => {
       Readable.from([modelDatasetCsv]) as unknown as ReturnType<typeof createReadStream>
     );
 
-    const result = trainModel("ma", 20240002, {
-      experiment_id: 990002,
-      moving_average_window: 4,
-    });
-    for (let attempt = 0; attempt < 10 && poolQuery.mock.calls.length < 2; attempt += 1) {
-      await Promise.resolve();
+    try {
+      const result = trainModel("ma", 20240002, {
+        experiment_id: 990002,
+        moving_average_window: 4,
+      });
+      for (let attempt = 0; attempt < 10 && poolQuery.mock.calls.length < 2; attempt += 1) {
+        await Promise.resolve();
+      }
+      expect(poolQuery.mock.calls.length).toBe(2);
+
+      expect(triggerOperationDeadline).toBeDefined();
+      triggerOperationDeadline?.();
+      resolveDatasetQuery([[{ file_path: datasetCsvPath }]]);
+
+      await expect(result).rejects.toMatchObject({
+        code: "MODEL_OPERATION_DEADLINE_EXCEEDED",
+        operation: "guided_training_session",
+      });
+      expect(mkdirSync).not.toHaveBeenCalled();
+      expect(poolQuery.mock.calls.some(([sql]) => String(sql).includes("INSERT INTO model_guided_training_sessions")))
+        .toBe(false);
+    } finally {
+      setTimeoutSpy.mockRestore();
     }
-    expect(poolQuery.mock.calls.length).toBe(2);
-
-    jest.advanceTimersByTime(700_000);
-    resolveDatasetQuery([[{ file_path: datasetCsvPath }]]);
-
-    await expect(result).rejects.toMatchObject({
-      code: "MODEL_OPERATION_DEADLINE_EXCEEDED",
-      operation: "guided_training_session",
-    });
-    expect(mkdirSync).not.toHaveBeenCalled();
-    expect(poolQuery.mock.calls.some(([sql]) => String(sql).includes("INSERT INTO model_guided_training_sessions")))
-      .toBe(false);
-  // Bun 1.3.14's 700-second fake-clock jump conflicts with the default
-  // five-second runner timeout, so keep the override scoped to this test.
-  }, 30_000);
+  });
 
   test("keeps a completed guided session current after its own authoritative config commit", async () => {
     const requestBody = {
