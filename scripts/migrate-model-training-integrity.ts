@@ -49,7 +49,9 @@ try {
       parameters JSON NOT NULL,
       metrics JSON NOT NULL,
       artifact_path VARCHAR(1024) NOT NULL,
+      artifact_sha256 CHAR(64) DEFAULT NULL,
       production_artifact_path VARCHAR(1024) DEFAULT NULL,
+      production_artifact_sha256 CHAR(64) DEFAULT NULL,
       is_active BOOLEAN NOT NULL DEFAULT true,
       created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
       activated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
@@ -79,8 +81,20 @@ try {
   await addColumnIfMissing(
     connection,
     "model_training_runs",
+    "artifact_sha256",
+    "CHAR(64) NULL AFTER artifact_path",
+  );
+  await addColumnIfMissing(
+    connection,
+    "model_training_runs",
+    "production_artifact_sha256",
+    "CHAR(64) NULL AFTER production_artifact_path",
+  );
+  await addColumnIfMissing(
+    connection,
+    "model_training_runs",
     "production_artifact_forecast_steps",
-    "TINYINT UNSIGNED NULL AFTER production_artifact_path",
+    "TINYINT UNSIGNED NULL AFTER production_artifact_sha256",
   );
   await addColumnIfMissing(
     connection,

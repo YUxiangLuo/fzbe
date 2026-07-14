@@ -42,6 +42,29 @@ const modelDatasetCsv =
   "2025-05,260,2.8,2.4\n" +
   "2025-06,270,2.9,2.5\n";
 
+const ENSEMBLE_MODEL_TYPES = ["weighted_avg", "boosting", "stacking"];
+// The ensemble manifest is produced inside the (mocked) Python digest script, so
+// tests only need a stable value shared between buildActiveRun and the spawn stub.
+const ENSEMBLE_ARTIFACT_DIGEST = "e".repeat(64);
+
+const mockArtifactSha256 = (modelType: string) => {
+  if (ENSEMBLE_MODEL_TYPES.includes(modelType)) {
+    return ENSEMBLE_ARTIFACT_DIGEST;
+  }
+  const fileSha256 = crypto.createHash("sha256").update(modelDatasetCsv).digest("hex");
+  const manifest = crypto.createHash("sha256");
+  manifest.update("fz-base-model-artifact-v1");
+  manifest.update("\0");
+  manifest.update(modelType);
+  manifest.update("\0state\0");
+  manifest.update(fileSha256);
+  if (modelType === "lstm") {
+    manifest.update("\0keras\0");
+    manifest.update(fileSha256);
+  }
+  return manifest.digest("hex");
+};
+
 const poolQuery = mock(async () => [[]]);
 const poolGetConnection = mock(async () => {
   throw new Error("pool.getConnection should not be called in this test");
@@ -80,6 +103,24 @@ const createSpawnResult = (stdout = "", stderr = "", exitCode = 0) => ({
   pid: 4321,
   kill: mock(() => {}),
 });
+// Ensemble verification spawns auxiliary Python (digest + member validation +
+// sidecar canonicalization). Route those by their inlined script markers so a
+// test only has to describe the actual model run(s).
+const withEnsembleAuxiliarySpawns = (
+  modelRun: (command: string[], options: Record<string, unknown>) => ReturnType<typeof createSpawnResult>,
+) => (command: string[], options: Record<string, unknown>) => {
+  const joined = command.join(" ");
+  if (joined.includes("fz-ensemble-model-artifact-v1")) {
+    return createSpawnResult(JSON.stringify({ ok: true, digest: ENSEMBLE_ARTIFACT_DIGEST }));
+  }
+  if (joined.includes("keras path is not the canonical sidecar")) {
+    return createSpawnResult('{"ok":true}');
+  }
+  if (joined.includes("base_model_states")) {
+    return createSpawnResult('{"valid":true}');
+  }
+  return modelRun(command, options);
+};
 const spawnMock = mock((_: string[], __: Record<string, unknown>) => (
   createSpawnResult('{"predictions":[]}')
 ));
@@ -100,6 +141,13 @@ const getActiveModelTrainingRun = mock(async (
   runtime_revision?: string;
 });
 const setProductionArtifactForRun = mock(async (_runId: string, _artifactPath: string) => true);
+const backfillArtifactSha256ForRun = mock(async (_runId: string, _sha256: string) => true);
+const backfillProductionArtifactSha256ForRun = mock(async (
+  _runId: string,
+  _productionRevision: string,
+  _sha256: string,
+) => true);
+const clearProductionArtifactForRun = mock(async (_runId: string, _productionRevision: string) => true);
 const originalSpawn = Bun.spawn;
 const acquireModelExecutionLock = mock(async () => ({
   name: "test-execution-lock",
@@ -221,8 +269,11 @@ const buildModelTrainingRequestHash = mock(() => "request-hash");
 const loadCurrentExperimentStatePatch = mock(async () => ({ state_version: 1 }));
 
 mock.module(modelRunStoreModulePath, () => ({
+  backfillArtifactSha256ForRun,
+  backfillProductionArtifactSha256ForRun,
   buildExperimentTrainingRevision,
   buildModelTrainingRequestHash,
+  clearProductionArtifactForRun,
   commitModelTrainingRun,
   getActiveModelTrainingRun,
   loadCurrentExperimentStatePatch,
@@ -257,6 +308,7 @@ const {
   prepareExperimentModelForProduction,
   predictExperimentModel,
   ModelAccessError,
+  ModelArtifactError,
   ModelNotFoundError,
   ModelTimeoutError,
 } = await import(freshModelsServiceModulePath);
@@ -342,7 +394,9 @@ const buildActiveRun = (
       mockedTrainedModelsRoot,
       `exp990002-student20240002-${modelType}-${runId}-backtest.pkl`,
     ),
+    artifact_sha256: mockArtifactSha256(modelType),
     production_artifact_path: productionArtifactPath,
+    production_artifact_sha256: productionArtifactPath ? mockArtifactSha256(modelType) : null,
     production_artifact_forecast_steps: productionArtifactPath ? 12 : null,
     production_revision: productionArtifactPath ? preparationToken : null,
     parameters: {},
@@ -357,6 +411,58 @@ const useActiveRuns = (...runs: ReturnType<typeof buildActiveRun>[]) => {
     runsByModel.get(modelType) ?? null
   ));
 };
+
+const guidedSessionArtifactRecoveryCases = [
+  {
+    modelType: "ma",
+    requestParams: { moving_average_window: 4 },
+  },
+  {
+    modelType: "es",
+    requestParams: { exponential_smoothing_alpha: 0.35 },
+  },
+  {
+    modelType: "arima",
+    requestParams: { arimaD: 1 },
+  },
+  {
+    modelType: "lstm",
+    requestParams: {
+      lstmNormalization: "minmax",
+      lstmTargetFeature: "销售数量",
+      lstmFeatures: JSON.stringify(["价格指数", "产能利用率"]),
+    },
+  },
+  {
+    modelType: "weighted_avg",
+    requestParams: {
+      models: "ma,es",
+      moving_average_window: 4,
+      exponential_smoothing_alpha: 0.35,
+    },
+  },
+  {
+    modelType: "boosting",
+    requestParams: {
+      models: "ma,es",
+      moving_average_window: 4,
+      exponential_smoothing_alpha: 0.35,
+    },
+  },
+  {
+    modelType: "stacking",
+    requestParams: {
+      models: "ma,es",
+      moving_average_window: 4,
+      exponential_smoothing_alpha: 0.35,
+    },
+  },
+] as const;
+
+const invalidLegacyStdDevCases = [
+  { label: "negative", value: -1 },
+  { label: "nonnumeric", value: "invalid" },
+] as const;
 
 const mockExperimentAndDatasetQueries = (
   experiment = buildExperimentContextRow(),
@@ -392,6 +498,12 @@ describe("models service", () => {
     loadCurrentExperimentStatePatch.mockResolvedValue({ state_version: 1 });
     setProductionArtifactForRun.mockReset();
     setProductionArtifactForRun.mockResolvedValue(true);
+    backfillArtifactSha256ForRun.mockReset();
+    backfillArtifactSha256ForRun.mockResolvedValue(true);
+    backfillProductionArtifactSha256ForRun.mockReset();
+    backfillProductionArtifactSha256ForRun.mockResolvedValue(true);
+    clearProductionArtifactForRun.mockReset();
+    clearProductionArtifactForRun.mockResolvedValue(true);
     commitModelTrainingRun.mockReset();
     commitModelTrainingRun.mockImplementation(async ({ runId, sessionId }: {
       runId?: string;
@@ -426,6 +538,35 @@ describe("models service", () => {
     spawnMock.mockReset();
     spawnMock.mockImplementation(() => createSpawnResult('{"predictions":[]}'));
     (Bun as { spawn: typeof Bun.spawn }).spawn = spawnMock as typeof Bun.spawn;
+  });
+
+  test("rejects malformed model dataset rows instead of silently skipping them", async () => {
+    const cases = [
+      {
+        csv: "年份,月份,销售数量\n2024,13,100\n",
+        field: "年份/月份",
+      },
+      {
+        csv: "年份,月份,销售数量\n2024,1,Infinity\n",
+        field: "销售数量",
+      },
+    ];
+
+    for (const testCase of cases) {
+      await writeFile(datasetCsvPath, testCase.csv);
+      poolQuery.mockReset();
+      poolQuery.mockResolvedValueOnce([[{ file_path: datasetCsvPath }]]);
+
+      await expect(
+        loadDatasetFromDb("制造业", "样本企业", "样本产品"),
+      ).rejects.toMatchObject({
+        details: {
+          row: 1,
+          field: testCase.field,
+          code: "DATASET_ROW_INVALID",
+        },
+      });
+    }
   });
 
   test("clamps dynamic ensemble budgets to the ten-minute hard cap", () => {
@@ -650,6 +791,19 @@ describe("models service", () => {
     });
   });
 
+  test("maps a Python model artifact tag to the typed artifact error", async () => {
+    existsSync.mockReturnValue(true);
+    spawnMock.mockImplementationOnce(() =>
+      createSpawnResult("", "[MODEL] Failed to load model: invalid pickle", 1)
+    );
+
+    const error = await runPythonModel("ma", { data: "[]" }, 5_000)
+      .catch((caughtError) => caughtError);
+
+    expect(error).toBeInstanceOf(ModelArtifactError);
+    expect(error).toMatchObject({ code: "MODEL_ARTIFACT_INVALID" });
+  });
+
   test("clamps a direct Python runner timeout to the immutable hard cap", async () => {
     existsSync.mockImplementation((filePath: string) => filePath.endsWith("/run_model.py"));
     let inheritedDeadline = 0;
@@ -849,6 +1003,70 @@ describe("models service", () => {
     expect(commitModelTrainingRun).not.toHaveBeenCalled();
   });
 
+  test("keeps legacy artifact validation out of guided session metadata reads", async () => {
+    const requestBody = {
+      experiment_id: 990002,
+      selected_industry: "制造业",
+      selected_company: "样本企业",
+      selected_product: "样本产品",
+      data_window_train_start_index: 0,
+      data_window_train_end_index: 11,
+      data_window_evaluate_start_index: 12,
+      data_window_evaluate_end_index: 17,
+      moving_average_window: 4,
+    };
+    poolQuery.mockReset();
+    createReadStream.mockImplementation(() =>
+      Readable.from([modelDatasetCsv]) as unknown as ReturnType<typeof createReadStream>
+    );
+    poolQuery.mockResolvedValueOnce([[{ file_path: datasetCsvPath }]]);
+    const currentDataset = await loadDatasetFromDb("制造业", "样本企业", "样本产品");
+    const completedSession = buildGuidedSessionRow({
+      session_id: "guided-legacy-metadata-read",
+      dataset_revision: hashDatasetSnapshot(JSON.stringify(currentDataset)),
+      runtime_revision: getModelRuntimeRevision(true),
+      request_payload: JSON.stringify(requestBody),
+      status: "completed",
+      current_step_id: null,
+      result_payload: JSON.stringify({
+        status: "success",
+        results: { metrics: { rmse: 1, mae: 1, r2: 0.9 } },
+      }),
+    });
+    const activeRun = buildActiveRun("ma", {
+      session_id: completedSession.session_id,
+      request_hash: completedSession.request_hash,
+      dataset_revision: completedSession.dataset_revision,
+      runtime_revision: completedSession.runtime_revision,
+      artifact_sha256: null,
+    });
+    useActiveRuns(activeRun);
+    let artifactReadCount = 0;
+    createReadStream.mockImplementation((filePath: string) => {
+      if (filePath === activeRun.artifact_path) artifactReadCount += 1;
+      return Readable.from([modelDatasetCsv]) as unknown as ReturnType<typeof createReadStream>;
+    });
+    poolQuery.mockImplementation(async (sql: string) => {
+      if (sql.includes("FROM model_guided_training_sessions")) return [[completedSession]];
+      if (sql.includes("FROM dataset_segments")) return [[{ file_path: datasetCsvPath }]];
+      return [[buildExperimentContextRow()]];
+    });
+    existsSync.mockReturnValue(true);
+
+    const session = await getGuidedTrainingSession(
+      "ma",
+      20240002,
+      completedSession.session_id,
+    );
+
+    expect(session.status).toBe("completed");
+    expect(artifactReadCount).toBe(0);
+    expect(spawnMock).not.toHaveBeenCalled();
+    expect(backfillArtifactSha256ForRun).not.toHaveBeenCalled();
+    expect(acquireModelSlot).not.toHaveBeenCalled();
+    expect(acquireModelExecutionLock).not.toHaveBeenCalled();
+  });
+
   test("refreshes the experiment patch before reusing a completed guided session", async () => {
     const requestBody = {
       experiment_id: 990002,
@@ -972,6 +1190,154 @@ describe("models service", () => {
     expect(poolQuery.mock.calls.some(([sql]) => String(sql).includes("INSERT INTO model_guided_training_sessions"))).toBe(false);
     expect(commitModelTrainingRun).not.toHaveBeenCalled();
   });
+
+  for (const recoveryCase of guidedSessionArtifactRecoveryCases) {
+    test(`rebuilds a completed ${recoveryCase.modelType} guided session when its own artifact is corrupt`, async () => {
+      const requestBody = {
+        experiment_id: 990002,
+        selected_industry: "制造业",
+        selected_company: "样本企业",
+        selected_product: "样本产品",
+        data_window_train_start_index: 0,
+        data_window_train_end_index: 11,
+        data_window_evaluate_start_index: 12,
+        data_window_evaluate_end_index: 17,
+        ...recoveryCase.requestParams,
+      };
+      createReadStream.mockImplementation(() =>
+        Readable.from([modelDatasetCsv]) as unknown as ReturnType<typeof createReadStream>
+      );
+      poolQuery.mockReset();
+      poolQuery.mockResolvedValueOnce([[{ file_path: datasetCsvPath }]]);
+      const currentDataset = await loadDatasetFromDb("制造业", "样本企业", "样本产品");
+      const datasetRevision = hashDatasetSnapshot(JSON.stringify(currentDataset));
+      const runtimeRevision = getModelRuntimeRevision(true);
+      const oldSessionId = `guided-corrupt-${recoveryCase.modelType}`;
+      const oldArtifactDir = path.join(
+        mockedGuidedTrainingRoot,
+        `exp990002-student20240002-${recoveryCase.modelType}-${oldSessionId}`,
+      );
+      const completedSession = buildGuidedSessionRow({
+        session_id: oldSessionId,
+        model_type: recoveryCase.modelType,
+        request_hash: "request-hash",
+        dataset_revision: datasetRevision,
+        runtime_revision: runtimeRevision,
+        request_payload: JSON.stringify(requestBody),
+        status: "completed",
+        current_step_id: null,
+        completed_step_ids: JSON.stringify(["save_artifact"]),
+        result_payload: JSON.stringify({
+          status: "success",
+          results: { metrics: { rmse: 1, mae: 1, r2: 0.9 } },
+        }),
+        artifact_dir: oldArtifactDir,
+      });
+      const activeRun = buildActiveRun(recoveryCase.modelType, {
+        session_id: oldSessionId,
+        request_hash: "request-hash",
+        dataset_revision: datasetRevision,
+        runtime_revision: runtimeRevision,
+        ...(recoveryCase.modelType === "ma"
+          || recoveryCase.modelType === "es"
+          || recoveryCase.modelType === "arima"
+          || recoveryCase.modelType === "lstm"
+          ? { artifact_sha256: "0".repeat(64) }
+          : {}),
+      });
+      const dependencyRuns = recoveryCase.modelType === "weighted_avg"
+        || recoveryCase.modelType === "boosting"
+        || recoveryCase.modelType === "stacking"
+        ? [
+          buildActiveRun("ma", { dataset_revision: datasetRevision, runtime_revision: runtimeRevision }),
+          buildActiveRun("es", { dataset_revision: datasetRevision, runtime_revision: runtimeRevision }),
+        ]
+        : [];
+      useActiveRuns(activeRun, ...dependencyRuns);
+      existsSync.mockReturnValue(true);
+      if (dependencyRuns.length > 0) {
+        spawnMock.mockImplementation(() => createSpawnResult('{"valid":false}'));
+      }
+
+      let insertedSession: Record<string, unknown> | null = null;
+      let newArtifactDir: string | null = null;
+      poolQuery.mockImplementation(async (sql: string, params: unknown[] = []) => {
+        if (sql.includes("FROM dataset_segments")) {
+          return [[{ file_path: datasetCsvPath }]];
+        }
+        if (sql.includes("SET status = 'superseded'")) {
+          return [{ affectedRows: 1 }];
+        }
+        if (sql.includes("DELETE FROM model_guided_training_sessions")) {
+          return [{ affectedRows: 1 }];
+        }
+        if (sql.includes("INSERT INTO model_guided_training_sessions")) {
+          newArtifactDir = String(params[12]);
+          insertedSession = buildGuidedSessionRow({
+            session_id: String(params[0]),
+            experiment_id: params[1],
+            student_id: params[2],
+            model_type: params[3],
+            request_hash: params[4],
+            dataset_revision: params[5],
+            runtime_revision: params[6],
+            protocol_version: 2,
+            request_payload: params[7],
+            status: "ready",
+            current_step_id: params[8],
+            completed_step_ids: params[9],
+            step_outputs: params[10],
+            step_plan: params[11],
+            result_payload: null,
+            artifact_dir: newArtifactDir,
+          });
+          return [{ affectedRows: 1 }];
+        }
+        if (sql.includes("FROM model_guided_training_sessions")) {
+          if (sql.includes("WHERE session_id = ?")) {
+            return [insertedSession ? [insertedSession] : []];
+          }
+          return [[completedSession]];
+        }
+        return [[buildExperimentContextRow()]];
+      });
+
+      try {
+        const session = await createOrResumeGuidedTrainingSession(
+          recoveryCase.modelType,
+          20240002,
+          requestBody,
+        );
+
+        expect(session).toMatchObject({
+          status: "ready",
+          result: null,
+        });
+        expect(session.session_id).not.toBe(oldSessionId);
+        expect(session.next_step_id).toBeTruthy();
+        expect(rmSync).toHaveBeenCalledWith(oldArtifactDir, { recursive: true, force: true });
+        expect(acquireModelSlot).toHaveBeenCalledTimes(1);
+        expect(acquireModelExecutionLock).toHaveBeenCalledTimes(1);
+
+        const queries = poolQuery.mock.calls.map(([sql]) => String(sql));
+        const supersedeIndex = queries.findIndex((sql) => sql.includes("SET status = 'superseded'"));
+        const deleteIndex = queries.findIndex((sql) => sql.includes("DELETE FROM model_guided_training_sessions"));
+        const insertIndex = queries.findIndex((sql) => sql.includes("INSERT INTO model_guided_training_sessions"));
+        expect(supersedeIndex).toBeGreaterThanOrEqual(0);
+        expect(deleteIndex).toBeGreaterThan(supersedeIndex);
+        expect(insertIndex).toBeGreaterThan(deleteIndex);
+        expect(insertedSession).toMatchObject({
+          session_id: session.session_id,
+          model_type: recoveryCase.modelType,
+          status: "ready",
+        });
+      } finally {
+        if (newArtifactDir) {
+          await actualFs.promises.rm(newArtifactDir, { recursive: true, force: true });
+        }
+      }
+    });
+  }
 
   test("supersedes a completed guided session that has no matching active run", async () => {
     createReadStream.mockImplementation(() =>
@@ -1792,13 +2158,15 @@ describe("models service", () => {
     createReadStream.mockImplementation(() =>
       Readable.from([modelDatasetCsv]) as unknown as ReturnType<typeof createReadStream>
     );
-    spawnMock
-      .mockImplementationOnce(() => createSpawnResult('{"mode":"weighted_avg_fit_only"}'))
-      .mockImplementationOnce(() => createSpawnResult('{"valid":true}'));
+    spawnMock.mockImplementation(withEnsembleAuxiliarySpawns(() =>
+      createSpawnResult('{"mode":"weighted_avg_fit_only"}')
+    ));
 
     const result = await prepareExperimentModelForProduction("weighted_avg", 20240002, 990002);
 
-    const [command] = spawnMock.mock.calls[0] ?? [];
+    const command = (spawnMock.mock.calls
+      .map(([cmd]) => cmd)
+      .find((cmd) => cmd.includes("--fit-only")) ?? []) as string[];
     const saveModelIndex = command.indexOf("--save-model");
     const candidatePath = command[saveModelIndex + 1];
     expect(candidatePath).toMatch(
@@ -1827,7 +2195,61 @@ describe("models service", () => {
       candidatePath,
       6,
       expect.any(String),
+      ENSEMBLE_ARTIFACT_DIGEST,
     );
+  });
+
+  test("rejects a tampered ensemble backtest artifact with a retrain action", async () => {
+    const activeRun = buildActiveRun("weighted_avg");
+    useActiveRuns(activeRun);
+    mockExperimentAndDatasetQueries();
+    existsSync.mockReturnValue(true);
+    createReadStream.mockImplementation(() =>
+      Readable.from([modelDatasetCsv]) as unknown as ReturnType<typeof createReadStream>
+    );
+    // The digest script reports a value that no longer matches the stored checksum.
+    spawnMock.mockImplementation((command: string[]) => {
+      const joined = command.join(" ");
+      if (joined.includes("fz-ensemble-model-artifact-v1")) {
+        return createSpawnResult(JSON.stringify({ ok: true, digest: "d".repeat(64) }));
+      }
+      if (joined.includes("base_model_states")) return createSpawnResult('{"valid":true}');
+      return createSpawnResult('{"mode":"weighted_avg_fit_only"}');
+    });
+
+    await expect(
+      prepareExperimentModelForProduction("weighted_avg", 20240002, 990002),
+    ).rejects.toMatchObject({
+      code: "MODEL_ARTIFACT_INVALID",
+      details: { required_action: "retrain" },
+    });
+    expect(setProductionArtifactForRun).not.toHaveBeenCalled();
+  });
+
+  test("treats a missing ensemble backtest artifact as retrain-required", async () => {
+    const activeRun = buildActiveRun("weighted_avg");
+    useActiveRuns(activeRun);
+    mockExperimentAndDatasetQueries();
+    existsSync.mockReturnValue(true);
+    createReadStream.mockImplementation(() =>
+      Readable.from([modelDatasetCsv]) as unknown as ReturnType<typeof createReadStream>
+    );
+    // The digest script cannot read/enumerate the ensemble (missing member or root escape).
+    spawnMock.mockImplementation((command: string[]) => {
+      const joined = command.join(" ");
+      if (joined.includes("fz-ensemble-model-artifact-v1")) {
+        return createSpawnResult(JSON.stringify({ ok: false, reason: "ensemble root artifact missing or outside root" }));
+      }
+      return createSpawnResult('{"valid":true}');
+    });
+
+    await expect(
+      prepareExperimentModelForProduction("weighted_avg", 20240002, 990002),
+    ).rejects.toMatchObject({
+      code: "MODEL_ARTIFACT_INVALID",
+      details: { required_action: "retrain" },
+    });
+    expect(setProductionArtifactForRun).not.toHaveBeenCalled();
   });
 
   test("rejects a legacy production artifact without a verifiable active run", async () => {
@@ -1850,7 +2272,6 @@ describe("models service", () => {
     createReadStream.mockImplementation(() =>
       Readable.from([modelDatasetCsv]) as unknown as ReturnType<typeof createReadStream>
     );
-
     const result = await prepareExperimentModelForProduction("ma", 20240002, 990002);
 
     expect(result).toEqual({
@@ -1868,6 +2289,182 @@ describe("models service", () => {
     );
   });
 
+  test("semantically validates and backfills a legacy production artifact checksum", async () => {
+    const productionPath = path.join(mockedTrainedModelsRoot, "ma-legacy-production.pkl");
+    const activeRun = buildActiveRun("ma", {
+      production_artifact_path: productionPath,
+      production_artifact_sha256: null,
+    });
+    useActiveRuns(activeRun);
+    mockExperimentAndDatasetQueries();
+    existsSync.mockReturnValue(true);
+    createReadStream.mockImplementation(() =>
+      Readable.from([modelDatasetCsv]) as unknown as ReturnType<typeof createReadStream>
+    );
+    spawnMock.mockImplementationOnce(() =>
+      createSpawnResult('{"predictions":[{"prediction":101.2,"std_dev":1.5}]}')
+    );
+
+    const result = await prepareExperimentModelForProduction("ma", 20240002, 990002);
+
+    expect(result.results).toMatchObject({
+      preparation_token: preparationToken,
+      reused_existing: true,
+    });
+    expect(backfillProductionArtifactSha256ForRun).toHaveBeenCalledWith(
+      activeRun.run_id,
+      preparationToken,
+      mockArtifactSha256("ma"),
+    );
+    expect(setProductionArtifactForRun).not.toHaveBeenCalled();
+    expect(spawnMock).toHaveBeenCalledTimes(1);
+  });
+
+  test("blesses a legacy LSTM backtest artifact only when its sidecar is canonical", async () => {
+    const activeRun = buildActiveRun("lstm", { artifact_sha256: null });
+    useActiveRuns(activeRun);
+    mockExperimentAndDatasetQueries();
+    existsSync.mockReturnValue(true);
+    createReadStream.mockImplementation(() =>
+      Readable.from([modelDatasetCsv]) as unknown as ReturnType<typeof createReadStream>
+    );
+    // Semantic predict succeeds and the sidecar script confirms the canonical path.
+    spawnMock.mockImplementation(withEnsembleAuxiliarySpawns(() =>
+      createSpawnResult('{"predictions":[{"prediction":101.2,"std_dev":1.5}]}')
+    ));
+
+    await prepareExperimentModelForProduction("lstm", 20240002, 990002);
+
+    expect(backfillArtifactSha256ForRun).toHaveBeenCalledWith(
+      activeRun.run_id,
+      mockArtifactSha256("lstm"),
+    );
+    // The sidecar canonicalization script must have been consulted.
+    expect(
+      spawnMock.mock.calls.some(([cmd]) =>
+        cmd.join(" ").includes("keras path is not the canonical sidecar")
+      ),
+    ).toBe(true);
+  });
+
+  test("rejects a legacy LSTM backtest artifact whose sidecar is not canonical", async () => {
+    const activeRun = buildActiveRun("lstm", { artifact_sha256: null });
+    useActiveRuns(activeRun);
+    mockExperimentAndDatasetQueries();
+    existsSync.mockReturnValue(true);
+    createReadStream.mockImplementation(() =>
+      Readable.from([modelDatasetCsv]) as unknown as ReturnType<typeof createReadStream>
+    );
+    // The pickle points keras_model_path at a non-canonical file: refuse to bless.
+    spawnMock.mockImplementation((command: string[]) => {
+      const joined = command.join(" ");
+      if (joined.includes("keras path is not the canonical sidecar")) {
+        return createSpawnResult('{"ok":false,"reason":"keras path is not the canonical sidecar"}');
+      }
+      return createSpawnResult('{"predictions":[{"prediction":101.2,"std_dev":1.5}]}');
+    });
+
+    await expect(
+      prepareExperimentModelForProduction("lstm", 20240002, 990002),
+    ).rejects.toMatchObject({
+      code: "MODEL_ARTIFACT_INVALID",
+      details: { required_action: "retrain" },
+    });
+    expect(backfillArtifactSha256ForRun).not.toHaveBeenCalled();
+  });
+
+  for (const invalidStdDev of invalidLegacyStdDevCases) {
+    test(`refits a legacy production artifact with ${invalidStdDev.label} std_dev instead of backfilling it`, async () => {
+      const productionPath = path.join(
+        mockedTrainedModelsRoot,
+        `ma-legacy-${invalidStdDev.label}-std-dev-production.pkl`,
+      );
+      const activeRun = buildActiveRun("ma", {
+        production_artifact_path: productionPath,
+        production_artifact_sha256: null,
+      });
+      useActiveRuns(activeRun);
+      mockExperimentAndDatasetQueries();
+      existsSync.mockReturnValue(true);
+      createReadStream.mockImplementation(() =>
+        Readable.from([modelDatasetCsv]) as unknown as ReturnType<typeof createReadStream>
+      );
+      spawnMock
+        .mockImplementationOnce(() => createSpawnResult(JSON.stringify({
+          predictions: [{ prediction: 101.2, std_dev: invalidStdDev.value }],
+        })))
+        .mockImplementationOnce(() => createSpawnResult('{"mode":"ma_fit_only"}'))
+        .mockImplementationOnce(() => createSpawnResult(
+          '{"predictions":[{"prediction":101.2,"std_dev":1.5}]}',
+        ));
+
+      const result = await prepareExperimentModelForProduction("ma", 20240002, 990002);
+
+      expect(result.results).toMatchObject({ reused_existing: false });
+      expect(backfillProductionArtifactSha256ForRun).not.toHaveBeenCalled();
+      expect(clearProductionArtifactForRun).toHaveBeenCalledWith(
+        activeRun.run_id,
+        preparationToken,
+      );
+      expect(setProductionArtifactForRun).toHaveBeenCalledTimes(1);
+      expect(spawnMock).toHaveBeenCalledTimes(3);
+    });
+  }
+
+  test("rejects a corrupt backtest artifact with an explicit retrain action", async () => {
+    const activeRun = buildActiveRun("ma", {
+      artifact_sha256: "0".repeat(64),
+    });
+    useActiveRuns(activeRun);
+    mockExperimentAndDatasetQueries();
+    existsSync.mockReturnValue(true);
+    createReadStream.mockImplementation(() =>
+      Readable.from([modelDatasetCsv]) as unknown as ReturnType<typeof createReadStream>
+    );
+
+    await expect(
+      prepareExperimentModelForProduction("ma", 20240002, 990002),
+    ).rejects.toMatchObject({
+      code: "MODEL_ARTIFACT_INVALID",
+      details: { required_action: "retrain" },
+    });
+    expect(spawnMock).not.toHaveBeenCalled();
+    expect(setProductionArtifactForRun).not.toHaveBeenCalled();
+  });
+
+  test("clears and refits a corrupt cached production artifact in the same prepare request", async () => {
+    const staleProductionPath = path.join(mockedTrainedModelsRoot, "ma-corrupt-production.pkl");
+    const activeRun = buildActiveRun("ma", {
+      production_artifact_path: staleProductionPath,
+      production_artifact_sha256: "0".repeat(64),
+    });
+    useActiveRuns(activeRun);
+    mockExperimentAndDatasetQueries();
+    existsSync.mockReturnValue(true);
+    createReadStream.mockImplementation(() =>
+      Readable.from([modelDatasetCsv]) as unknown as ReturnType<typeof createReadStream>
+    );
+    spawnMock
+      .mockImplementationOnce(() => createSpawnResult('{"mode":"ma_fit_only"}'))
+      .mockImplementationOnce(() => createSpawnResult(
+        '{"predictions":[{"prediction":101.2,"std_dev":1.5}]}',
+      ));
+
+    const result = await prepareExperimentModelForProduction("ma", 20240002, 990002);
+
+    expect(result.results).toMatchObject({ reused_existing: false });
+    expect(clearProductionArtifactForRun).toHaveBeenCalledWith(activeRun.run_id, preparationToken);
+    expect(unlinkSync).toHaveBeenCalledWith(staleProductionPath);
+    expect(setProductionArtifactForRun).toHaveBeenCalledWith(
+      activeRun.run_id,
+      expect.not.stringMatching(staleProductionPath),
+      6,
+      expect.any(String),
+      mockArtifactSha256("ma"),
+    );
+    expect(spawnMock).toHaveBeenCalledTimes(2);
+  });
+
   test("fits a production artifact from the backtest model with fit-only parameters", async () => {
     const activeRun = buildActiveRun("ma");
     useActiveRuns(activeRun);
@@ -1876,6 +2473,11 @@ describe("models service", () => {
     createReadStream.mockImplementation(() =>
       Readable.from([modelDatasetCsv]) as unknown as ReturnType<typeof createReadStream>
     );
+    spawnMock
+      .mockImplementationOnce(() => createSpawnResult('{"mode":"ma_fit_only"}'))
+      .mockImplementationOnce(() => createSpawnResult(
+        '{"predictions":[{"prediction":101.2,"std_dev":1.5}]}',
+      ));
 
     const result = await prepareExperimentModelForProduction("ma", 20240002, 990002);
 
@@ -1915,7 +2517,29 @@ describe("models service", () => {
       candidatePath,
       6,
       expect.any(String),
+      mockArtifactSha256("ma"),
     );
+  });
+
+  test("rejects a backtest artifact that changes during production fitting", async () => {
+    const activeRun = buildActiveRun("ma");
+    useActiveRuns(activeRun);
+    mockExperimentAndDatasetQueries();
+    existsSync.mockReturnValue(true);
+    let artifactRead = 0;
+    createReadStream.mockImplementation(() => Readable.from([
+      artifactRead++ === 0 ? modelDatasetCsv : "mutated-backtest-artifact",
+    ]) as unknown as ReturnType<typeof createReadStream>);
+    spawnMock.mockImplementationOnce(() => createSpawnResult('{"mode":"ma_fit_only"}'));
+
+    await expect(
+      prepareExperimentModelForProduction("ma", 20240002, 990002),
+    ).rejects.toMatchObject({
+      code: "MODEL_ARTIFACT_INVALID",
+      details: { required_action: "retrain" },
+    });
+    expect(setProductionArtifactForRun).not.toHaveBeenCalled();
+    expect(spawnMock).toHaveBeenCalledTimes(1);
   });
 
   test("rejects prediction when the experiment belongs to another student", async () => {
@@ -1956,6 +2580,55 @@ describe("models service", () => {
     expect(existsSync).toHaveBeenCalledWith(
       activeRun.production_artifact_path,
     );
+  });
+
+  test("invalidates a corrupt production artifact before prediction", async () => {
+    const productionPath = path.join(mockedTrainedModelsRoot, "ma-corrupt-production.pkl");
+    const activeRun = buildActiveRun("ma", {
+      production_artifact_path: productionPath,
+      production_artifact_sha256: "f".repeat(64),
+    });
+    useActiveRuns(activeRun);
+    mockExperimentAndDatasetQueries();
+    existsSync.mockReturnValue(true);
+    createReadStream.mockImplementation(() =>
+      Readable.from([modelDatasetCsv]) as unknown as ReturnType<typeof createReadStream>
+    );
+
+    await expect(
+      predictExperimentModel("ma", 20240002, 990002, 6, preparationToken),
+    ).rejects.toMatchObject({
+      code: "PRODUCTION_PREPARATION_REQUIRED",
+      details: { required_action: "prepare" },
+    });
+    expect(clearProductionArtifactForRun).toHaveBeenCalledWith(activeRun.run_id, preparationToken);
+    expect(unlinkSync).toHaveBeenCalledWith(productionPath);
+    expect(spawnMock).not.toHaveBeenCalled();
+  });
+
+  test("treats a changed LSTM sidecar as production artifact corruption", async () => {
+    const productionPath = path.join(mockedTrainedModelsRoot, "lstm-current-production.pkl");
+    const activeRun = buildActiveRun("lstm", {
+      production_artifact_path: productionPath,
+    });
+    useActiveRuns(activeRun);
+    mockExperimentAndDatasetQueries();
+    existsSync.mockReturnValue(true);
+    createReadStream.mockImplementation((filePath: string) =>
+      Readable.from([
+        filePath.endsWith("_keras_model.h5") ? "tampered-keras-sidecar" : modelDatasetCsv,
+      ]) as unknown as ReturnType<typeof createReadStream>
+    );
+
+    await expect(
+      predictExperimentModel("lstm", 20240002, 990002, 3, preparationToken),
+    ).rejects.toMatchObject({ code: "PRODUCTION_PREPARATION_REQUIRED" });
+
+    expect(createReadStream).toHaveBeenCalledWith(
+      productionPath.replace(/\.pkl$/, "_keras_model.h5"),
+    );
+    expect(clearProductionArtifactForRun).toHaveBeenCalledWith(activeRun.run_id, preparationToken);
+    expect(spawnMock).not.toHaveBeenCalled();
   });
 
   test("rejects prediction when the model is not ready for production", async () => {
@@ -2045,7 +2718,7 @@ describe("models service", () => {
       stdout: new ReadableStream({
         start(controller) {
           controller.enqueue(new TextEncoder().encode(
-            '{"predictions":[{"prediction":101.2},{"prediction":98.4},{"prediction":99.1},{"prediction":100.3},{"prediction":102.0},{"prediction":103.2}]}',
+            '{"predictions":[{"prediction":101.2,"std_dev":1.1},{"prediction":98.4,"std_dev":1.2},{"prediction":99.1,"std_dev":1.3},{"prediction":100.3,"std_dev":1.4},{"prediction":102.0,"std_dev":1.5},{"prediction":103.2,"std_dev":1.6}]}',
           ));
           controller.close();
         },
@@ -2068,12 +2741,12 @@ describe("models service", () => {
       status: "success",
       results: {
         predictions: [
-          { prediction: 101.2 },
-          { prediction: 98.4 },
-          { prediction: 99.1 },
-          { prediction: 100.3 },
-          { prediction: 102 },
-          { prediction: 103.2 },
+          { prediction: 101.2, std_dev: 1.1 },
+          { prediction: 98.4, std_dev: 1.2 },
+          { prediction: 99.1, std_dev: 1.3 },
+          { prediction: 100.3, std_dev: 1.4 },
+          { prediction: 102, std_dev: 1.5 },
+          { prediction: 103.2, std_dev: 1.6 },
         ],
       },
     });
@@ -2091,6 +2764,61 @@ describe("models service", () => {
       stdout: "pipe",
       stderr: "pipe",
     });
+  });
+
+  for (const invalidStdDev of invalidLegacyStdDevCases) {
+    test(`invalidates checksummed production output with ${invalidStdDev.label} std_dev`, async () => {
+      const productionPath = path.join(
+        mockedTrainedModelsRoot,
+        `ma-invalid-${invalidStdDev.label}-std-dev-production.pkl`,
+      );
+      const activeRun = buildActiveRun("ma", { production_artifact_path: productionPath });
+      useActiveRuns(activeRun);
+      mockExperimentAndDatasetQueries();
+      existsSync.mockReturnValue(true);
+      createReadStream.mockImplementation(() =>
+        Readable.from([modelDatasetCsv]) as unknown as ReturnType<typeof createReadStream>
+      );
+      spawnMock.mockImplementationOnce(() => createSpawnResult(JSON.stringify({
+        predictions: [{ prediction: 101.2, std_dev: invalidStdDev.value }],
+      })));
+
+      await expect(
+        predictExperimentModel("ma", 20240002, 990002, 1, preparationToken),
+      ).rejects.toMatchObject({
+        code: "PRODUCTION_PREPARATION_REQUIRED",
+        details: { required_action: "prepare" },
+      });
+      expect(clearProductionArtifactForRun).toHaveBeenCalledWith(
+        activeRun.run_id,
+        preparationToken,
+      );
+      expect(unlinkSync).toHaveBeenCalledWith(productionPath);
+    });
+  }
+
+  test("invalidates a production artifact that changes during prediction", async () => {
+    const productionPath = path.join(mockedTrainedModelsRoot, "ma-changing-production.pkl");
+    const activeRun = buildActiveRun("ma", { production_artifact_path: productionPath });
+    useActiveRuns(activeRun);
+    mockExperimentAndDatasetQueries();
+    existsSync.mockReturnValue(true);
+    let artifactRead = 0;
+    createReadStream.mockImplementation(() => Readable.from([
+      artifactRead++ === 0 ? modelDatasetCsv : "mutated-production-artifact",
+    ]) as unknown as ReturnType<typeof createReadStream>);
+    spawnMock.mockImplementationOnce(() => createSpawnResult(
+      '{"predictions":[{"prediction":101.2},{"prediction":98.4}]}',
+    ));
+
+    await expect(
+      predictExperimentModel("ma", 20240002, 990002, 2, preparationToken),
+    ).rejects.toMatchObject({
+      code: "PRODUCTION_PREPARATION_REQUIRED",
+      details: { required_action: "prepare" },
+    });
+    expect(clearProductionArtifactForRun).toHaveBeenCalledWith(activeRun.run_id, preparationToken);
+    expect(unlinkSync).toHaveBeenCalledWith(productionPath);
   });
 
   test("floors negative production demand predictions at the API boundary", async () => {
@@ -2248,6 +2976,7 @@ describe("models service", () => {
       run_id: "ma-run-a",
       artifact_path: "/tmp/fangzhen-py/trained_models/ma-run-a.pkl",
       production_artifact_path: productionPath,
+      production_artifact_sha256: mockArtifactSha256("ma"),
       production_artifact_forecast_steps: 6,
       production_revision: preparationToken,
       model_type: "ma",
@@ -2256,6 +2985,7 @@ describe("models service", () => {
       run_id: "ma-run-b",
       artifact_path: "/tmp/fangzhen-py/trained_models/ma-run-b.pkl",
       production_artifact_path: "/tmp/fangzhen-py/trained_models/ma-run-b-production.pkl",
+      production_artifact_sha256: mockArtifactSha256("ma"),
       production_artifact_forecast_steps: 6,
       production_revision: "223e4567-e89b-42d3-a456-426614174000",
       model_type: "ma",
@@ -2370,11 +3100,147 @@ describe("models service", () => {
     expect(getActiveModelTrainingRun).toHaveBeenCalledTimes(2);
   });
 
+  test("rejects a tampered base artifact before fingerprinting an ensemble session", async () => {
+    const maRun = buildActiveRun("ma", { artifact_sha256: "0".repeat(64) });
+    const lstmRun = buildActiveRun("lstm");
+    useActiveRuns(maRun, lstmRun);
+    mockExperimentAndDatasetQueries();
+    existsSync.mockReturnValue(true);
+    createReadStream.mockImplementation(() =>
+      Readable.from([modelDatasetCsv]) as unknown as ReturnType<typeof createReadStream>
+    );
+
+    await expect(trainModel("weighted_avg", 20240002, {
+      experiment_id: 990002,
+      selected_industry: "制造业",
+      selected_company: "样本企业",
+      selected_product: "样本产品",
+      data_window_train_start_index: 0,
+      data_window_train_end_index: 11,
+      data_window_evaluate_start_index: 12,
+      data_window_evaluate_end_index: 17,
+      models: "ma,lstm",
+      moving_average_window: 4,
+      lstmNormalization: "minmax",
+      lstmTargetFeature: "销售数量",
+      lstmFeatures: "价格指数,产能利用率",
+    })).rejects.toMatchObject({
+      message: "融合模型依赖的 MA 基础模型产物已损坏，请重新训练该基础模型",
+      details: {
+        code: "MODEL_ARTIFACT_INVALID",
+        required_action: "retrain",
+        base_model: "ma",
+      },
+    });
+
+    expect(getActiveModelTrainingRun).toHaveBeenCalledTimes(1);
+    expect(spawnMock).not.toHaveBeenCalled();
+  });
+
+  test("rechecks base artifact digests immediately before an ensemble Python step", async () => {
+    const ensembleBody = {
+      experiment_id: 990002,
+      selected_industry: "制造业",
+      selected_company: "样本企业",
+      selected_product: "样本产品",
+      data_window_train_start_index: 0,
+      data_window_train_end_index: 11,
+      data_window_evaluate_start_index: 12,
+      data_window_evaluate_end_index: 17,
+      models: "ma,lstm",
+      moving_average_window: 4,
+      lstmNormalization: "minmax",
+      lstmTargetFeature: "销售数量",
+      lstmFeatures: "价格指数,产能利用率",
+    };
+    const maRun = buildActiveRun("ma");
+    const lstmRun = buildActiveRun("lstm");
+    useActiveRuns(maRun, lstmRun);
+
+    createReadStream.mockImplementation(() =>
+      Readable.from([modelDatasetCsv]) as unknown as ReturnType<typeof createReadStream>
+    );
+    poolQuery.mockResolvedValueOnce([[{ file_path: datasetCsvPath }]]);
+    const currentDataset = await loadDatasetFromDb("制造业", "样本企业", "样本产品");
+    const row = buildGuidedSessionRow({
+      model_type: "weighted_avg",
+      request_payload: JSON.stringify(ensembleBody),
+      dataset_revision: hashDatasetSnapshot(JSON.stringify(currentDataset)),
+      runtime_revision: getModelRuntimeRevision(true),
+    });
+
+    let attempt: Record<string, unknown> | null = null;
+    const connection = {
+      beginTransaction: mock(async () => undefined),
+      commit: mock(async () => undefined),
+      rollback: mock(async () => undefined),
+      release: mock(() => undefined),
+      query: mock(async (sql: string, params: unknown[] = []) => {
+        if (sql.includes("FROM model_guided_training_sessions")) return [[row]];
+        if (sql.includes("INSERT INTO model_guided_training_step_attempts")) {
+          attempt = {
+            attempt_id: params[0],
+            session_id: params[1],
+            step_id: params[2],
+            status: "running",
+            input_state_path: params[3],
+            input_state_sha256: params[4],
+            candidate_state_path: params[5],
+            receipt_path: params[6],
+            lease_expires_at: new Date(Date.now() + 60_000),
+            error_message: null,
+          };
+          return [{ affectedRows: 1 }];
+        }
+        if (sql.includes("FROM model_guided_training_step_attempts")) return [[attempt]];
+        return [{ affectedRows: 1 }];
+      }),
+    };
+    poolGetConnection.mockResolvedValue(connection as never);
+    poolQuery.mockImplementation(async (sql: string) => {
+      if (sql.includes("FROM model_guided_training_sessions")) return [[row]];
+      if (sql.includes("FROM dataset_segments")) return [[{ file_path: datasetCsvPath }]];
+      return [[buildExperimentContextRow()]];
+    });
+    existsSync.mockImplementation((filePath: string) =>
+      !filePath.includes(`${path.sep}checkpoints${path.sep}`)
+    );
+    let maArtifactReads = 0;
+    createReadStream.mockImplementation((filePath: string) =>
+      Readable.from([
+        filePath === maRun.artifact_path && maArtifactReads++ > 0
+          ? "tampered-ma-artifact"
+          : modelDatasetCsv,
+      ]) as unknown as ReturnType<typeof createReadStream>
+    );
+
+    await expect(runGuidedTrainingStep(
+      "weighted_avg",
+      20240002,
+      row.session_id,
+      "prepare_data",
+    )).rejects.toMatchObject({
+      message: "融合模型依赖的 MA 基础模型产物已损坏，请重新训练该基础模型",
+      details: {
+        code: "MODEL_ARTIFACT_INVALID",
+        required_action: "retrain",
+        base_model: "ma",
+      },
+    });
+
+    expect(maArtifactReads).toBe(2);
+    expect(getActiveModelTrainingRun).toHaveBeenCalledTimes(3);
+    expect(spawnMock).not.toHaveBeenCalled();
+  });
+
   test("accepts persisted comma-containing LSTM feature names for guided ensemble creation", async () => {
     useActiveRuns(buildActiveRun("ma"), buildActiveRun("lstm"));
     const experiment = buildExperimentContextRow({
       lstm_features: JSON.stringify(["价格指数", "外部,指标"]),
     });
+    createReadStream.mockImplementation(() =>
+      Readable.from([modelDatasetCsv]) as unknown as ReturnType<typeof createReadStream>
+    );
     poolQuery.mockImplementation(async (sql: string) => {
       if (sql.includes("FROM dataset_segments")) return [[{ file_path: datasetCsvPath }]];
       if (sql.includes("FROM model_guided_training_sessions")) {
@@ -2482,7 +3348,8 @@ describe("models service", () => {
 
   test("rejects production output when python omits predictions", async () => {
     const productionPath = path.join(mockedTrainedModelsRoot, "lstm-current-production.pkl");
-    useActiveRuns(buildActiveRun("lstm", { production_artifact_path: productionPath }));
+    const activeRun = buildActiveRun("lstm", { production_artifact_path: productionPath });
+    useActiveRuns(activeRun);
     mockExperimentAndDatasetQueries();
     existsSync.mockImplementation(() => true);
     createReadStream.mockImplementation(() =>
@@ -2509,7 +3376,15 @@ describe("models service", () => {
 
     await expect(
       predictExperimentModel("lstm", 20240002, 990002, 3, preparationToken),
-    ).rejects.toThrow("[PYTHON_DATA] predictions must be an array");
+    ).rejects.toMatchObject({
+      code: "PRODUCTION_PREPARATION_REQUIRED",
+      details: { required_action: "prepare" },
+    });
+    expect(clearProductionArtifactForRun).toHaveBeenCalledWith(
+      activeRun.run_id,
+      preparationToken,
+    );
+    expect(unlinkSync).toHaveBeenCalledWith(productionPath);
   });
 
   test("rejects ensemble training when a requested base model is not completed", async () => {

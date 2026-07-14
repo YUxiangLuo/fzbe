@@ -50,9 +50,17 @@ jobs:
         run: bun audit
 
   python-smoke:
-    name: Python model smoke tests
+    name: Four-model lifecycle and parity
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 40
+    env:
+      TF_CPP_MIN_LOG_LEVEL: "3"
+      OMP_NUM_THREADS: "1"
+      OPENBLAS_NUM_THREADS: "1"
+      MKL_NUM_THREADS: "1"
+      NUMEXPR_NUM_THREADS: "1"
+      TF_NUM_INTRAOP_THREADS: "1"
+      TF_NUM_INTEROP_THREADS: "1"
 
     steps:
       - name: Check out repository
@@ -72,5 +80,20 @@ jobs:
       - name: Run metrics smoke test
         run: py/venv/bin/python py/test/metrics_smoke.py
 
+      - name: Verify dataset numeric contract
+        run: py/venv/bin/python py/test/data_contract_smoke.py
+
       - name: Run moving-average smoke test
         run: py/venv/bin/python py/test/ma_csv_smoke.py
+
+      - name: Run exponential-smoothing smoke test
+        run: py/venv/bin/python py/test/es_csv_smoke.py
+
+      - name: Run ARIMA smoke test
+        run: py/venv/bin/python py/test/arima_csv_smoke.py
+
+      - name: Run LSTM smoke test
+        run: py/venv/bin/python py/test/lstm_csv_smoke.py
+
+      - name: Verify guided and standalone lifecycle parity
+        run: py/venv/bin/python py/test/guided_standalone_parity.py

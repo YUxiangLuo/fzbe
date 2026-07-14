@@ -135,7 +135,9 @@ export interface ModelTrainingRunRow extends RowDataPacket {
   parameters: unknown;
   metrics: unknown;
   artifact_path: string;
+  artifact_sha256: string | null;
   production_artifact_path: string | null;
+  production_artifact_sha256: string | null;
   production_artifact_forecast_steps: number | null;
   production_revision: string | null;
   is_active: number | boolean;
@@ -175,6 +177,7 @@ interface CommitModelTrainingRunInput {
     experiment_state_patch?: Record<string, unknown>;
   };
   artifactPath: string;
+  artifactSha256?: string | null;
   guidedSession?: CompletedGuidedSessionUpdate;
 }
 
@@ -766,6 +769,13 @@ export async function commitModelTrainingRun(
     );
     const existingRun = await getExistingRunForSession(connection, input.sessionId);
     if (existingRun && Boolean(existingRun.is_active)) {
+      if (
+        input.artifactSha256
+        && existingRun.artifact_sha256
+        && existingRun.artifact_sha256.toLowerCase() !== input.artifactSha256.toLowerCase()
+      ) {
+        throw new ModelValidationError("已提交训练版本的模型产物校验和不一致，请重新创建训练会话");
+      }
       const stateVersion = Number(experiment.state_version ?? 0);
       input.result.experiment_state_patch = buildCurrentExperimentStatePatch(
         experiment,
@@ -778,6 +788,14 @@ export async function commitModelTrainingRun(
                   result_payload = ?
             WHERE session_id = ?`,
           [stateVersion, JSON.stringify(input.result), input.guidedSession.sessionId],
+        );
+      }
+      if (input.artifactSha256) {
+        await connection.query(
+          `UPDATE model_training_runs
+              SET artifact_sha256 = COALESCE(artifact_sha256, ?)
+            WHERE run_id = ?`,
+          [input.artifactSha256, existingRun.run_id],
         );
       }
       await connection.commit();
@@ -842,22 +860,24 @@ export async function commitModelTrainingRun(
       await connection.query(
         `UPDATE model_training_runs
             SET artifact_path = ?,
+                artifact_sha256 = ?,
                 parameters = ?,
                 metrics = ?,
                 production_artifact_path = NULL,
+                production_artifact_sha256 = NULL,
                 production_artifact_forecast_steps = NULL,
                 production_revision = NULL,
                 is_active = true,
                 activated_at = NOW()
           WHERE run_id = ?`,
-        [input.artifactPath, JSON.stringify(parameters), JSON.stringify(metrics), runId],
+        [input.artifactPath, input.artifactSha256 ?? null, JSON.stringify(parameters), JSON.stringify(metrics), runId],
       );
     } else {
       await connection.query(
         `INSERT INTO model_training_runs
            (run_id, session_id, experiment_id, student_id, model_type, request_hash,
-            dataset_revision, runtime_revision, parameters, metrics, artifact_path, is_active)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, true)`,
+            dataset_revision, runtime_revision, parameters, metrics, artifact_path, artifact_sha256, is_active)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, true)`,
         [
           runId,
           input.sessionId ?? null,
@@ -870,6 +890,7 @@ export async function commitModelTrainingRun(
           JSON.stringify(parameters),
           JSON.stringify(metrics),
           input.artifactPath,
+          input.artifactSha256 ?? null,
         ],
       );
     }
@@ -979,15 +1000,64 @@ export async function setProductionArtifactForRun(
   artifactPath: string,
   forecastSteps: number,
   productionRevision: string,
+  productionArtifactSha256: string | null = null,
 ) {
   const [result] = await pool.query(
     `UPDATE model_training_runs
         SET production_artifact_path = ?,
+            production_artifact_sha256 = ?,
             production_artifact_forecast_steps = ?,
             production_revision = ?
       WHERE run_id = ?
         AND is_active = true`,
-    [artifactPath, forecastSteps, productionRevision, runId],
+    [artifactPath, productionArtifactSha256, forecastSteps, productionRevision, runId],
+  );
+  return Number((result as { affectedRows?: number }).affectedRows ?? 0) === 1;
+}
+
+export async function backfillArtifactSha256ForRun(runId: string, artifactSha256: string) {
+  const [result] = await pool.query(
+    `UPDATE model_training_runs
+        SET artifact_sha256 = ?
+      WHERE run_id = ?
+        AND is_active = true
+        AND artifact_sha256 IS NULL`,
+    [artifactSha256, runId],
+  );
+  return Number((result as { affectedRows?: number }).affectedRows ?? 0) === 1;
+}
+
+export async function backfillProductionArtifactSha256ForRun(
+  runId: string,
+  productionRevision: string,
+  productionArtifactSha256: string,
+) {
+  const [result] = await pool.query(
+    `UPDATE model_training_runs
+        SET production_artifact_sha256 = ?
+      WHERE run_id = ?
+        AND is_active = true
+        AND production_revision = ?
+        AND production_artifact_sha256 IS NULL`,
+    [productionArtifactSha256, runId, productionRevision],
+  );
+  return Number((result as { affectedRows?: number }).affectedRows ?? 0) === 1;
+}
+
+export async function clearProductionArtifactForRun(
+  runId: string,
+  productionRevision: string,
+) {
+  const [result] = await pool.query(
+    `UPDATE model_training_runs
+        SET production_artifact_path = NULL,
+            production_artifact_sha256 = NULL,
+            production_artifact_forecast_steps = NULL,
+            production_revision = NULL
+      WHERE run_id = ?
+        AND is_active = true
+        AND production_revision = ?`,
+    [runId, productionRevision],
   );
   return Number((result as { affectedRows?: number }).affectedRows ?? 0) === 1;
 }

@@ -7,6 +7,11 @@ interface TrainingMetricsPayload extends Record<string, unknown> {
 
 interface PredictionPoint extends Record<string, unknown> {
   prediction?: unknown;
+  std_dev?: unknown;
+}
+
+interface DemandPredictionNormalizationOptions {
+  requireStdDev?: boolean;
 }
 
 const METRIC_EPSILON = 1e-12;
@@ -14,6 +19,7 @@ const METRIC_EPSILON = 1e-12;
 export const normalizeDemandPredictionPoints = (
   value: unknown,
   expectedLength?: number,
+  options: DemandPredictionNormalizationOptions = {},
 ): PredictionPoint[] => {
   // Python applies the demand-domain constraint before residuals and metrics.
   // Keep this boundary clamp as defense in depth for malformed/custom runner
@@ -37,6 +43,12 @@ export const normalizeDemandPredictionPoints = (
     const prediction = point.prediction;
     if (typeof prediction !== "number" || !Number.isFinite(prediction)) {
       throw new Error(`[PYTHON_DATA] Prediction point ${index} is not finite`);
+    }
+    if (
+      options.requireStdDev
+      && (typeof point.std_dev !== "number" || !Number.isFinite(point.std_dev) || point.std_dev < 0)
+    ) {
+      throw new Error(`[PYTHON_DATA] Prediction point ${index} std_dev must be a nonnegative finite number`);
     }
     return {
       ...point,

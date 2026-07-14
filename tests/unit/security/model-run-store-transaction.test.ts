@@ -25,10 +25,14 @@ mock.module(configModulePath, () => ({
 }));
 
 const {
+  backfillArtifactSha256ForRun,
+  backfillProductionArtifactSha256ForRun,
   buildExperimentTrainingRevision,
   buildModelTrainingRequestHash,
+  clearProductionArtifactForRun,
   commitModelTrainingRun,
   loadCurrentExperimentStatePatch,
+  setProductionArtifactForRun,
 } = await import(freshStoreModulePath);
 
 const baseExperiment = {
@@ -140,6 +144,7 @@ describe("model run transactional activation", () => {
       body,
       result: resultPayload,
       artifactPath: "/models/run-ma-v1.pkl",
+      artifactSha256: "a".repeat(64),
     });
 
     expect(committed).toEqual({
@@ -151,7 +156,12 @@ describe("model run transactional activation", () => {
     expect(commit).toHaveBeenCalledTimes(1);
     expect(rollback).not.toHaveBeenCalled();
     expect(release).toHaveBeenCalledTimes(1);
-    expect(query.mock.calls.some(([sql]) => String(sql).includes("INSERT INTO model_training_runs"))).toBe(true);
+    const insertRunCall = query.mock.calls.find(([sql]) =>
+      String(sql).includes("INSERT INTO model_training_runs")
+    );
+    expect(insertRunCall).toBeDefined();
+    expect(String(insertRunCall?.[0])).toContain("artifact_sha256");
+    expect(insertRunCall?.[1]).toContain("a".repeat(64));
     expect(query.mock.calls.some(([sql]) => String(sql).includes("UPDATE experiment_status"))).toBe(true);
     expect(resultPayload.experiment_state_patch).toMatchObject({
       moving_average_completed: true,
@@ -159,6 +169,37 @@ describe("model run transactional activation", () => {
       moving_average_metrics_rmse: 1.2,
       state_version: 5,
     });
+  });
+
+  test("updates and conditionally clears production artifact integrity metadata", async () => {
+    poolQuery.mockResolvedValue([{ affectedRows: 1 }]);
+
+    expect(await setProductionArtifactForRun(
+      "run-ma-v1",
+      "/models/run-ma-v1-production.pkl",
+      6,
+      "revision-v1",
+      "b".repeat(64),
+    )).toBe(true);
+    expect(await backfillArtifactSha256ForRun("run-ma-v1", "a".repeat(64))).toBe(true);
+    expect(await backfillProductionArtifactSha256ForRun(
+      "run-ma-v1",
+      "revision-v1",
+      "b".repeat(64),
+    )).toBe(true);
+    expect(await clearProductionArtifactForRun("run-ma-v1", "revision-v1")).toBe(true);
+
+    expect(poolQuery.mock.calls[0]?.[1]).toEqual([
+      "/models/run-ma-v1-production.pkl",
+      "b".repeat(64),
+      6,
+      "revision-v1",
+      "run-ma-v1",
+    ]);
+    expect(String(poolQuery.mock.calls[1]?.[0])).toContain("artifact_sha256 IS NULL");
+    expect(String(poolQuery.mock.calls[2]?.[0])).toContain("production_revision = ?");
+    expect(String(poolQuery.mock.calls[3]?.[0])).toContain("production_artifact_path = NULL");
+    expect(poolQuery.mock.calls[3]?.[1]).toEqual(["run-ma-v1", "revision-v1"]);
   });
 
   test("returns the current authoritative experiment state when a completed session reuses its active run", async () => {
@@ -236,6 +277,41 @@ describe("model run transactional activation", () => {
     expect(JSON.parse(String(sessionUpdateValues[1])).experiment_state_patch).toEqual(
       resultPayload.experiment_state_patch,
     );
+  });
+
+  test("rejects idempotent reuse when the committed artifact checksum differs", async () => {
+    query.mockImplementation(async (sql: unknown) => {
+      const statement = String(sql);
+      if (statement.includes("SELECT *") && statement.includes("FROM experiment_status")) {
+        return [[baseExperiment]];
+      }
+      if (statement.includes("SELECT *") && statement.includes("FROM model_training_runs")) {
+        return [[{
+          run_id: "run-ma-v1",
+          is_active: 1,
+          artifact_sha256: "a".repeat(64),
+        }]];
+      }
+      return [{ affectedRows: 1 }];
+    });
+
+    await expect(commitModelTrainingRun({
+      runId: "run-ma-v1",
+      sessionId: "guided-ma-v1",
+      experimentId: 42,
+      studentId: 20240002,
+      modelType: "ma",
+      requestHash: "request-v1",
+      datasetRevision: "dataset-v1",
+      runtimeRevision: "runtime-v1",
+      body: { ...baseBody, moving_average_window: 6 },
+      result: successResult(),
+      artifactPath: "/models/run-ma-v1.pkl",
+      artifactSha256: "b".repeat(64),
+    })).rejects.toThrow("已提交训练版本的模型产物校验和不一致");
+
+    expect(commit).not.toHaveBeenCalled();
+    expect(rollback).toHaveBeenCalledTimes(1);
   });
 
   test("rolls back an ensemble commit if a base run changes during training", async () => {

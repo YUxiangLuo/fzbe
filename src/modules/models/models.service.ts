@@ -20,6 +20,7 @@ import {
 import { loadDatasetFromDb } from "./model-datasets";
 import {
   ModelAccessError,
+  ModelArtifactError,
   ModelConflictError,
   ModelNotFoundError,
   ModelTimeoutError,
@@ -39,8 +40,11 @@ import {
 } from "./model-python-runner";
 import { normalizeDemandPredictionPoints, transformTrainingResult } from "./model-results";
 import {
+  backfillArtifactSha256ForRun,
+  backfillProductionArtifactSha256ForRun,
   buildExperimentTrainingRevision,
   buildModelTrainingRequestHash,
+  clearProductionArtifactForRun,
   commitModelTrainingRun,
   getActiveModelTrainingRun,
   loadCurrentExperimentStatePatch,
@@ -63,6 +67,7 @@ import {
 export { loadDatasetFromDb } from "./model-datasets";
 export {
   ModelAccessError,
+  ModelArtifactError,
   ModelCapacityBusyError,
   ModelConflictError,
   ModelNotFoundError,
@@ -529,20 +534,417 @@ const hasCompleteEnsembleArtifact = async (
   }
 };
 
-const hasReusableSavedModelArtifact = async (
-  modelType: ModelType,
+const BASE_ARTIFACT_DIGEST_PROTOCOL = "fz-base-model-artifact-v1";
+
+const hashFileContents = async (
+  filePath: string,
+  terminationSignal?: AbortSignal,
+) => await new Promise<string>((resolve, reject) => {
+  if (terminationSignal?.aborted) {
+    reject(getAuxiliaryTerminationError(terminationSignal));
+    return;
+  }
+  const digest = crypto.createHash("sha256");
+  const stream = fs.createReadStream(filePath);
+  const onAbort = () => stream.destroy(getAuxiliaryTerminationError(terminationSignal!));
+  terminationSignal?.addEventListener("abort", onAbort, { once: true });
+  const cleanup = () => terminationSignal?.removeEventListener("abort", onAbort);
+  stream.on("data", (chunk) => digest.update(chunk));
+  stream.once("error", (error) => {
+    cleanup();
+    reject(error);
+  });
+  stream.once("end", () => {
+    cleanup();
+    resolve(digest.digest("hex"));
+  });
+});
+
+const getBaseArtifactFiles = (modelType: BaseModelType, modelPath: string) => {
+  const files = [{ role: "state", filePath: modelPath }];
+  if (modelType === "lstm") {
+    files.push({ role: "keras", filePath: getLstmSidecarPath(modelPath) });
+  }
+  return files;
+};
+
+const computeBaseModelArtifactSha256 = async (
+  modelType: BaseModelType,
   modelPath: string,
   terminationSignal?: AbortSignal,
 ) => {
   if (!hasSavedModelArtifact(modelType, modelPath)) {
-    return false;
+    throw new ModelArtifactError(`${modelType.toUpperCase()} 模型产物缺失或不完整`);
   }
 
-  if (!isEnsembleModelType(modelType)) {
-    return true;
+  try {
+    const manifest = crypto.createHash("sha256");
+    manifest.update(BASE_ARTIFACT_DIGEST_PROTOCOL);
+    manifest.update("\0");
+    manifest.update(modelType);
+    for (const artifact of getBaseArtifactFiles(modelType, modelPath)) {
+      if (terminationSignal?.aborted) throw getAuxiliaryTerminationError(terminationSignal);
+      manifest.update("\0");
+      manifest.update(artifact.role);
+      manifest.update("\0");
+      manifest.update(await hashFileContents(artifact.filePath, terminationSignal));
+    }
+    return manifest.digest("hex");
+  } catch (error) {
+    if (terminationSignal?.aborted) throw getAuxiliaryTerminationError(terminationSignal);
+    if (error instanceof ModelArtifactError) throw error;
+    throw new ModelArtifactError(
+      `${modelType.toUpperCase()} 模型产物无法读取：${error instanceof Error ? error.message : "未知错误"}`,
+    );
+  }
+};
+
+const artifactDigestMatches = (actual: string, expected: string) => {
+  if (!/^[a-f\d]{64}$/i.test(expected)) return false;
+  return crypto.timingSafeEqual(
+    Buffer.from(actual.toLowerCase(), "hex"),
+    Buffer.from(expected.toLowerCase(), "hex"),
+  );
+};
+
+// Enumerate an ensemble's real constituent files (root pickle + every member
+// state + LSTM member sidecars) using pickle-truth paths, then hash them into a
+// stable manifest. Member/sidecar paths only exist inside the root pickle, so
+// this must run in Python; every path is resolved and constrained to the
+// trained-models root to reject traversal or redirected artifacts.
+const ENSEMBLE_ARTIFACT_DIGEST_SCRIPT = `
+import hashlib
+import json
+import os
+import pickle
+import sys
+
+
+def sha256_file(path):
+    digest = hashlib.sha256()
+    with open(path, "rb") as handle:
+        for chunk in iter(lambda: handle.read(1048576), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def resolve_within(root, path):
+    if not isinstance(path, str) or not path:
+        return None
+    real = os.path.realpath(path)
+    if os.path.commonpath([real, root]) != root:
+        return None
+    if not os.path.isfile(real):
+        return None
+    return real
+
+
+def iter_model_states(base_model_states):
+    if not isinstance(base_model_states, dict):
+        return None
+    flattened = []
+    for outer_name, model_state in base_model_states.items():
+        if isinstance(model_state, dict) and isinstance(model_state.get("models"), list):
+            candidate_states = model_state.get("models", [])
+        else:
+            candidate_states = [model_state]
+        for candidate_state in candidate_states:
+            if not isinstance(candidate_state, dict):
+                return None
+            flattened.append((
+                str(candidate_state.get("model_type") or outer_name),
+                candidate_state.get("model_file"),
+                candidate_state.get("keras_model_path"),
+            ))
+    return flattened
+
+
+try:
+    model_type = sys.argv[1]
+    model_path = sys.argv[2]
+    root = os.path.realpath(sys.argv[3])
+    root_file = resolve_within(root, model_path)
+    if root_file is None:
+        raise ValueError("ensemble root artifact missing or outside root")
+    with open(root_file, "rb") as handle:
+        state = pickle.load(handle)
+    members = iter_model_states(state.get("base_model_states"))
+    if members is None or len(members) == 0:
+        raise ValueError("ensemble has no base members")
+    ordered = []
+    for member_type, member_file, member_keras in sorted(members, key=lambda item: (item[0], str(item[1]))):
+        member_real = resolve_within(root, member_file)
+        if member_real is None:
+            raise ValueError("ensemble member artifact missing or outside root")
+        ordered.append(("member:" + member_type, member_real))
+        if member_type == "lstm":
+            sidecar = member_keras if isinstance(member_keras, str) and member_keras else os.path.splitext(member_file)[0] + "_keras_model.h5"
+            sidecar_real = resolve_within(root, sidecar)
+            if sidecar_real is None:
+                raise ValueError("ensemble member keras sidecar missing or outside root")
+            ordered.append(("member_keras:" + member_type, sidecar_real))
+    manifest = hashlib.sha256()
+    manifest.update(b"fz-ensemble-model-artifact-v1")
+    manifest.update(b"\\0")
+    manifest.update(model_type.encode("utf-8"))
+    manifest.update(b"\\0root\\0")
+    manifest.update(sha256_file(root_file).encode("ascii"))
+    for role, filepath in ordered:
+        manifest.update(b"\\0")
+        manifest.update(role.encode("utf-8"))
+        manifest.update(b"\\0")
+        manifest.update(sha256_file(filepath).encode("ascii"))
+    print(json.dumps({"ok": True, "digest": manifest.hexdigest()}))
+except Exception as exc:
+    print(json.dumps({"ok": False, "reason": str(exc)}))
+`;
+
+// Confirm a legacy LSTM artifact's pickle points keras_model_path at exactly the
+// canonical sidecar (and inside the artifact root) before we bless a checksum.
+// Otherwise the digest could cover a decoy while Python loads a different H5.
+const LSTM_SIDECAR_CANONICAL_SCRIPT = `
+import json
+import os
+import pickle
+import sys
+
+try:
+    model_path = sys.argv[1]
+    expected_sidecar = sys.argv[2]
+    root = os.path.realpath(sys.argv[3])
+    with open(model_path, "rb") as handle:
+        state = pickle.load(handle)
+    keras_path = state.get("keras_model_path")
+    if not isinstance(keras_path, str) or not keras_path:
+        raise ValueError("missing keras_model_path")
+    real = os.path.realpath(keras_path)
+    expected_real = os.path.realpath(expected_sidecar)
+    if os.path.commonpath([real, root]) != root:
+        raise ValueError("keras path outside artifact root")
+    if real != expected_real:
+        raise ValueError("keras path is not the canonical sidecar")
+    print(json.dumps({"ok": True}))
+except Exception as exc:
+    print(json.dumps({"ok": False, "reason": str(exc)}))
+`;
+
+const runAuxiliaryModelJsonScript = async <T,>(
+  label: string,
+  script: string,
+  scriptArgs: string[],
+  terminationSignal?: AbortSignal,
+): Promise<T> => {
+  try {
+    const pythonExec = resolvePythonExecutable();
+    const auxiliaryCommand = buildAuxiliaryPythonCommand(pythonExec, "-c", script, ...scriptArgs);
+    const proc = Bun.spawn(auxiliaryCommand.command, {
+      cwd: PY_DIR,
+      stdout: "pipe",
+      stderr: "pipe",
+      env: {
+        ...process.env,
+        ...buildPythonModelProcessEnv(),
+        PATH: `${path.dirname(pythonExec)}${path.delimiter}${process.env.PATH ?? ""}`,
+      },
+    });
+    const { stdout, stderr } = await waitForAuxiliaryPythonProcess(proc, label, {
+      terminationSignal,
+      processGroup: auxiliaryCommand.processGroup,
+    });
+    if (proc.exitCode !== 0) {
+      throw new ModelArtifactError(`${label}失败：${stderr.slice(0, 500)}`);
+    }
+    return JSON.parse(stdout) as T;
+  } catch (error) {
+    if (terminationSignal?.aborted) throw getAuxiliaryTerminationError(terminationSignal);
+    if (error instanceof ModelTimeoutError || error instanceof ModelArtifactError) throw error;
+    throw new ModelArtifactError(`${label}失败：${error instanceof Error ? error.message : "未知错误"}`);
+  }
+};
+
+const computeEnsembleArtifactSha256 = async (
+  modelType: ModelType,
+  modelPath: string,
+  terminationSignal?: AbortSignal,
+): Promise<string> => {
+  const trainedModelsRoot = path.join(PY_DIR, "trained_models");
+  const payload = await runAuxiliaryModelJsonScript<{ ok?: unknown; digest?: unknown; reason?: unknown }>(
+    `${modelType.toUpperCase()} 融合模型产物摘要`,
+    ENSEMBLE_ARTIFACT_DIGEST_SCRIPT,
+    [modelType, modelPath, trainedModelsRoot],
+    terminationSignal,
+  );
+  if (payload.ok !== true || typeof payload.digest !== "string" || !/^[a-f\d]{64}$/i.test(payload.digest)) {
+    throw new ModelArtifactError(
+      `${modelType.toUpperCase()} 融合模型产物无法生成摘要：${typeof payload.reason === "string" ? payload.reason : "结构无效"}`,
+    );
+  }
+  return payload.digest.toLowerCase();
+};
+
+const assertLstmSidecarCanonical = async (
+  modelPath: string,
+  terminationSignal?: AbortSignal,
+) => {
+  const trainedModelsRoot = path.join(PY_DIR, "trained_models");
+  const payload = await runAuxiliaryModelJsonScript<{ ok?: unknown; reason?: unknown }>(
+    "LSTM 模型 sidecar 校验",
+    LSTM_SIDECAR_CANONICAL_SCRIPT,
+    [modelPath, getLstmSidecarPath(modelPath), trainedModelsRoot],
+    terminationSignal,
+  );
+  if (payload.ok !== true) {
+    throw new ModelArtifactError(
+      `LSTM 模型 sidecar 路径不可信：${typeof payload.reason === "string" ? payload.reason : "校验失败"}`,
+    );
+  }
+};
+
+const computeModelArtifactSha256 = async (
+  modelType: ModelType,
+  modelPath: string,
+  terminationSignal?: AbortSignal,
+): Promise<string> => {
+  if (isEnsembleModelType(modelType)) {
+    return await computeEnsembleArtifactSha256(modelType, modelPath, terminationSignal);
+  }
+  return await computeBaseModelArtifactSha256(modelType, modelPath, terminationSignal);
+};
+
+const validateBaseModelArtifactSemantically = async (
+  modelType: ModelType,
+  modelPath: string,
+  terminationSignal?: AbortSignal,
+) => {
+  if (isEnsembleModelType(modelType)) {
+    if (!await hasCompleteEnsembleArtifact(modelPath, terminationSignal)) {
+      throw new ModelArtifactError(`${modelType.toUpperCase()} 融合模型产物无法加载或成员缺失`);
+    }
+    return;
+  }
+  try {
+    const result = await runPythonModel(
+      modelType,
+      { loadModel: modelPath, forecastSteps: 1, pretty: true },
+      TIMEOUTS.MODEL_PREDICTION,
+      undefined,
+      terminationSignal,
+    ) as Record<string, unknown>;
+    normalizeDemandPredictionPoints(result.predictions, 1, { requireStdDev: true });
+  } catch (error) {
+    if (terminationSignal?.aborted || error instanceof ModelTimeoutError) throw error;
+    if (error instanceof ModelArtifactError) throw error;
+    if (error instanceof Error && /^\[PYTHON_(?:VALIDATION|DATA)\]/.test(error.message)) {
+      throw new ModelArtifactError(`${modelType.toUpperCase()} 模型产物无法加载：${error.message}`);
+    }
+    throw error;
+  }
+};
+
+interface BaseArtifactIntegrityResult {
+  sha256: string;
+  legacyChecksum: boolean;
+}
+
+const verifyBaseModelArtifactIntegrity = async (
+  modelType: ModelType,
+  modelPath: string,
+  expectedSha256: string | null | undefined,
+  terminationSignal?: AbortSignal,
+): Promise<BaseArtifactIntegrityResult> => {
+  const beforeValidationSha256 = await computeModelArtifactSha256(modelType, modelPath, terminationSignal);
+  if (expectedSha256) {
+    if (!artifactDigestMatches(beforeValidationSha256, expectedSha256)) {
+      throw new ModelArtifactError(`${modelType.toUpperCase()} 模型产物校验和不匹配`);
+    }
+    return { sha256: beforeValidationSha256, legacyChecksum: false };
   }
 
-  return await hasCompleteEnsembleArtifact(modelPath, terminationSignal);
+  await validateBaseModelArtifactSemantically(modelType, modelPath, terminationSignal);
+  // Legacy LSTM artifacts store their sidecar path inside the pickle; require it
+  // to be the canonical sidecar before blessing so the digest covers the file
+  // Python actually loads, not a decoy left at the derived path.
+  if (modelType === "lstm") {
+    await assertLstmSidecarCanonical(modelPath, terminationSignal);
+  }
+  const afterValidationSha256 = await computeModelArtifactSha256(modelType, modelPath, terminationSignal);
+  if (!artifactDigestMatches(afterValidationSha256, beforeValidationSha256)) {
+    throw new ModelArtifactError(`${modelType.toUpperCase()} 模型产物在加载校验期间发生变化`);
+  }
+  return { sha256: afterValidationSha256, legacyChecksum: true };
+};
+
+const verifyBacktestBaseArtifactForRun = async (
+  modelType: ModelType,
+  activeRun: ModelTrainingRunRow,
+  terminationSignal?: AbortSignal,
+) => {
+  const integrity = await verifyBaseModelArtifactIntegrity(
+    modelType,
+    activeRun.artifact_path,
+    activeRun.artifact_sha256,
+    terminationSignal,
+  );
+  if (integrity.legacyChecksum) {
+    await backfillArtifactSha256ForRun(activeRun.run_id, integrity.sha256);
+  }
+  return integrity.sha256;
+};
+
+const verifyEnsembleBaseArtifactForRun = async (
+  modelType: BaseModelType,
+  activeRun: ModelTrainingRunRow,
+  terminationSignal?: AbortSignal,
+) => {
+  try {
+    return await verifyBacktestBaseArtifactForRun(modelType, activeRun, terminationSignal);
+  } catch (error) {
+    if (!(error instanceof ModelArtifactError)) throw error;
+    throw new ModelValidationError(
+      `融合模型依赖的 ${modelType.toUpperCase()} 基础模型产物已损坏，请重新训练该基础模型`,
+      {
+        code: error.code,
+        required_action: "retrain",
+        base_model: modelType,
+      },
+    );
+  }
+};
+
+const verifyProductionBaseArtifactForRun = async (
+  modelType: ModelType,
+  activeRun: ModelTrainingRunRow,
+  terminationSignal?: AbortSignal,
+) => {
+  if (!activeRun.production_artifact_path || !activeRun.production_revision) {
+    throw new ModelArtifactError(`${modelType.toUpperCase()} 生产模型产物记录不完整`);
+  }
+  const integrity = await verifyBaseModelArtifactIntegrity(
+    modelType,
+    activeRun.production_artifact_path,
+    activeRun.production_artifact_sha256,
+    terminationSignal,
+  );
+  if (integrity.legacyChecksum) {
+    await backfillProductionArtifactSha256ForRun(
+      activeRun.run_id,
+      activeRun.production_revision,
+      integrity.sha256,
+    );
+  }
+  return integrity.sha256;
+};
+
+const invalidateProductionArtifactForRun = async (activeRun: ModelTrainingRunRow) => {
+  const artifactPath = activeRun.production_artifact_path;
+  const productionRevision = activeRun.production_revision;
+  if (!artifactPath || !productionRevision) return false;
+
+  const cleared = await clearProductionArtifactForRun(activeRun.run_id, productionRevision);
+  if (cleared) {
+    removeModelArtifactGroup(artifactPath);
+  }
+  return cleared;
 };
 
 const LSTM_ARTIFACT_COPY_SCRIPT = `
@@ -1027,12 +1429,18 @@ const writeGuidedDatasetSnapshot = async (artifactDir: string, datasetJson: stri
   return targetPath;
 };
 
-const buildVerifiedBaseRunContext = async (
+interface ArtifactValidationOptions {
+  verifyArtifacts?: boolean;
+  terminationSignal?: AbortSignal;
+}
+
+const buildBaseRunContext = async (
   experimentId: number,
   studentId: number,
   body: TrainInput,
   datasetRevision: string,
   runtimeRevision: string,
+  options: ArtifactValidationOptions = {},
 ) => {
   const fingerprint: Record<string, string> = {};
   const artifacts: Partial<Record<BaseModelType, string>> = {};
@@ -1045,6 +1453,9 @@ const buildVerifiedBaseRunContext = async (
       );
     }
     assertRunRevisionMatches(activeRun, datasetRevision, runtimeRevision, baseModel.toUpperCase());
+    if (options.verifyArtifacts !== false) {
+      await verifyEnsembleBaseArtifactForRun(baseModel, activeRun, options.terminationSignal);
+    }
     fingerprint[baseModel] = activeRun.run_id;
     artifacts[baseModel] = activeRun.artifact_path;
   }
@@ -1345,6 +1756,7 @@ const buildAvailableBaseModelArtifactMap = async (
   experimentId: number,
   studentId: number,
   modelsValue: string,
+  terminationSignal?: AbortSignal,
 ): Promise<Partial<Record<BaseModelType, string>>> => {
   const requestedModels = parseRequestedBaseModels(modelsValue);
   const availableModelFiles: Partial<Record<BaseModelType, string>> = {};
@@ -1357,6 +1769,7 @@ const buildAvailableBaseModelArtifactMap = async (
         `${modelName.toUpperCase()} 模型的当前训练产物已丢失，请重新训练该模型`,
       );
     }
+    await verifyEnsembleBaseArtifactForRun(modelName, activeRun, terminationSignal);
     availableModelFiles[modelName] = modelPath;
   }
 
@@ -1740,6 +2153,7 @@ interface GuidedTrainingIdentity {
 const computeCurrentGuidedTrainingIdentity = async (
   row: Pick<GuidedTrainingSessionRow, "experiment_id" | "model_type" | "request_payload">,
   studentId: number,
+  options: ArtifactValidationOptions = {},
 ): Promise<GuidedTrainingIdentity> => {
   const body = parseJsonColumn<TrainInput>(row.request_payload, {} as TrainInput);
   const experiment = await assertExperimentModelAccess(row.experiment_id, studentId);
@@ -1754,12 +2168,13 @@ const computeCurrentGuidedTrainingIdentity = async (
   const datasetRevision = hashDatasetSnapshot(JSON.stringify(allData));
   const runtimeRevision = getModelRuntimeRevision(true);
   const baseRunFingerprint = isEnsembleModelType(row.model_type)
-    ? (await buildVerifiedBaseRunContext(
+    ? (await buildBaseRunContext(
       row.experiment_id,
       studentId,
       canonicalBody,
       datasetRevision,
       runtimeRevision,
+      options,
     )).fingerprint
     : {};
   const experimentRevision = buildExperimentTrainingRevision(
@@ -1825,10 +2240,11 @@ const assertGuidedTrainingIdentityCurrent = async (
     "session_id" | "experiment_id" | "model_type" | "request_payload" | "request_hash" | "dataset_revision" | "runtime_revision"
   >,
   studentId: number,
+  options: ArtifactValidationOptions = {},
 ) => {
   let current: GuidedTrainingIdentity;
   try {
-    current = await computeCurrentGuidedTrainingIdentity(row, studentId);
+    current = await computeCurrentGuidedTrainingIdentity(row, studentId, options);
   } catch (error) {
     if (
       !(error instanceof ModelAccessError)
@@ -1863,9 +2279,10 @@ const assertCompletedGuidedTrainingRunCurrent = async (
     "session_id" | "experiment_id" | "student_id" | "model_type" | "request_payload" | "request_hash" | "dataset_revision" | "runtime_revision"
   >,
   studentId: number,
+  options: ArtifactValidationOptions = {},
 ) => {
   try {
-    const current = await computeCurrentGuidedTrainingIdentity(row, studentId);
+    const current = await computeCurrentGuidedTrainingIdentity(row, studentId, options);
     if (
       current.datasetRevision !== row.dataset_revision
       || current.runtimeRevision !== row.runtime_revision
@@ -1888,8 +2305,16 @@ const assertCompletedGuidedTrainingRunCurrent = async (
       throw new ModelValidationError("已完成会话不再对应当前生效的训练版本");
     }
 
-    if (!await hasReusableSavedModelArtifact(row.model_type, activeRun.artifact_path)) {
-      throw new ModelNotFoundError("已完成训练版本的模型产物已丢失");
+    if (options.verifyArtifacts === false) {
+      if (!hasSavedModelArtifact(row.model_type, activeRun.artifact_path)) {
+        throw new ModelNotFoundError("已完成训练版本的模型产物已丢失");
+      }
+    } else {
+      await verifyBacktestBaseArtifactForRun(
+        row.model_type,
+        activeRun,
+        options.terminationSignal,
+      );
     }
 
     if (isEnsembleModelType(row.model_type)) {
@@ -1921,6 +2346,7 @@ const assertCompletedGuidedTrainingRunCurrent = async (
       !(error instanceof ModelAccessError)
       && !(error instanceof ModelValidationError)
       && !(error instanceof ModelNotFoundError)
+      && !(error instanceof ModelArtifactError)
       && !(error instanceof ModelConflictError)
     ) {
       throw error;
@@ -2318,6 +2744,7 @@ const buildGuidedTrainingPythonParams = async (
   studentId: number,
   body: TrainInput,
   artifactDir: string,
+  terminationSignal?: AbortSignal,
 ): Promise<Record<string, unknown>> => {
   const experiment = await assertExperimentModelAccess(body.experiment_id, studentId);
   assertTrainingRequestMatchesExperiment(experiment, body);
@@ -2353,7 +2780,12 @@ const buildGuidedTrainingPythonParams = async (
 
   Object.assign(pythonParams, derivedModelParams);
   if (isEnsembleModelType(modelType) && body.models) {
-    const baseModelArtifactMap = await buildAvailableBaseModelArtifactMap(body.experiment_id, studentId, body.models);
+    const baseModelArtifactMap = await buildAvailableBaseModelArtifactMap(
+      body.experiment_id,
+      studentId,
+      body.models,
+      terminationSignal,
+    );
     if (Object.keys(baseModelArtifactMap).length > 0) {
       pythonParams.baseModelFiles = JSON.stringify(baseModelArtifactMap);
     }
@@ -2373,6 +2805,7 @@ const createOrResumeGuidedTrainingSessionInternal = async (
   studentId: number,
   body: TrainInput,
   operationContext: ModelOperationContext,
+  terminationSignal: AbortSignal,
 ): Promise<GuidedTrainingSessionPayload> => {
   const experiment = await assertExperimentModelAccess(body.experiment_id, studentId);
   operationContext.throwIfTerminated();
@@ -2402,12 +2835,13 @@ const createOrResumeGuidedTrainingSessionInternal = async (
   const datasetRevision = hashDatasetSnapshot(datasetJson);
   const runtimeRevision = getModelRuntimeRevision(true);
   const baseRunFingerprint = isEnsembleModelType(modelType)
-    ? (await buildVerifiedBaseRunContext(
+    ? (await buildBaseRunContext(
       canonicalBody.experiment_id,
       studentId,
       canonicalBody,
       datasetRevision,
       runtimeRevision,
+      { terminationSignal },
     )).fingerprint
     : {};
   operationContext.throwIfTerminated();
@@ -2465,7 +2899,7 @@ const createOrResumeGuidedTrainingSessionInternal = async (
       }
     } else if (existingSession.status === "completed") {
       try {
-        await assertCompletedGuidedTrainingRunCurrent(existingSession, studentId);
+        await assertCompletedGuidedTrainingRunCurrent(existingSession, studentId, { terminationSignal });
         return await buildRefreshedCompletedGuidedTrainingSessionPayload(existingSession, studentId);
       } catch (error) {
         if (!(error instanceof ModelConflictError) || error.code !== "GUIDED_SESSION_SUPERSEDED") {
@@ -2518,7 +2952,7 @@ const createOrResumeGuidedTrainingSessionInternal = async (
         && guidedRequestPayloadMatches(completedSession, canonicalBody)
       ) {
         try {
-          await assertCompletedGuidedTrainingRunCurrent(completedSession, studentId);
+          await assertCompletedGuidedTrainingRunCurrent(completedSession, studentId, { terminationSignal });
           return await buildRefreshedCompletedGuidedTrainingSessionPayload(completedSession, studentId);
         } catch (error) {
           if (!(error instanceof ModelConflictError) || error.code !== "GUIDED_SESSION_SUPERSEDED") {
@@ -2609,7 +3043,7 @@ const createOrResumeGuidedTrainingSessionInternal = async (
     operationContext.throwIfTerminated();
     if (racedRows[0]) {
       if (racedRows[0].status === "completed") {
-        await assertCompletedGuidedTrainingRunCurrent(racedRows[0], studentId);
+        await assertCompletedGuidedTrainingRunCurrent(racedRows[0], studentId, { terminationSignal });
         return await buildRefreshedCompletedGuidedTrainingSessionPayload(racedRows[0], studentId);
       }
       return buildGuidedTrainingSessionPayload(racedRows[0]);
@@ -2636,15 +3070,19 @@ export async function createOrResumeGuidedTrainingSession(
     throw new ModelValidationError("当前模型暂不支持分阶段训练");
   }
 
-  return await withModelOperationContext(
-    "guided_training_session",
-    async (operationContext) => await createOrResumeGuidedTrainingSessionInternal(
-      modelType,
-      studentId,
-      body,
+  return await withModelOperationContext("guided_training_session", async (operationContext) => {
+    return await withModelOperationLease(
       operationContext,
-    ),
-  );
+      { mode: "slot_and_execution", experimentId: body.experiment_id, modelType },
+      async (lease) => await createOrResumeGuidedTrainingSessionInternal(
+        modelType,
+        studentId,
+        body,
+        operationContext,
+        lease.terminationSignal,
+      ),
+    );
+  });
 }
 
 export async function getGuidedTrainingSession(
@@ -2668,11 +3106,13 @@ export async function getGuidedTrainingSession(
   await assertExperimentModelAccess(row.experiment_id, studentId);
   if (row.status !== "superseded") {
     try {
+      // Keep GET metadata reads free of artifact hashing and Python validation.
+      // The leased create/resume and step endpoints perform those checks.
       if (row.status === "completed") {
-        await assertCompletedGuidedTrainingRunCurrent(row, studentId);
+        await assertCompletedGuidedTrainingRunCurrent(row, studentId, { verifyArtifacts: false });
         return await buildRefreshedCompletedGuidedTrainingSessionPayload(row, studentId);
       } else {
-        await assertGuidedTrainingIdentityCurrent(row, studentId);
+        await assertGuidedTrainingIdentityCurrent(row, studentId, { verifyArtifacts: false });
       }
     } catch (error) {
       if (!(error instanceof ModelConflictError) || error.code !== "GUIDED_SESSION_SUPERSEDED") {
@@ -2761,8 +3201,16 @@ export async function runGuidedTrainingStep(
       }
 
       if (row.status === "completed") {
-        await assertCompletedGuidedTrainingRunCurrent(row, studentId);
-        return await buildRefreshedCompletedGuidedTrainingSessionPayload(row, studentId);
+        return await withModelOperationLease(
+          operationContext,
+          { mode: "slot_and_execution", experimentId: row.experiment_id, modelType },
+          async (lease) => {
+            await assertCompletedGuidedTrainingRunCurrent(row, studentId, {
+              terminationSignal: lease.terminationSignal,
+            });
+            return await buildRefreshedCompletedGuidedTrainingSessionPayload(row, studentId);
+          },
+        );
       }
       if (row.status === "superseded" || row.protocol_version !== 2) {
         if (row.status !== "superseded") {
@@ -2799,7 +3247,9 @@ export async function runGuidedTrainingStep(
         operationContext,
         { mode: "slot_and_execution", experimentId: row.experiment_id, modelType },
         async (lease) => {
-          await assertGuidedTrainingIdentityCurrent(row, studentId);
+          await assertGuidedTrainingIdentityCurrent(row, studentId, {
+            terminationSignal: lease.terminationSignal,
+          });
           const stepTimeoutMs = resolveGuidedStepTimeoutMs(modelType, stepId, body);
           const attemptContext = await beginGuidedStepAttempt(row, stepId, stepTimeoutMs);
           const activeAttempt = attemptContext.attempt;
@@ -2808,7 +3258,13 @@ export async function runGuidedTrainingStep(
 
           if (!receipt) {
             const sessionModelPath = getGuidedSessionModelPath(row.artifact_dir, modelType);
-            const pythonParams = await buildGuidedTrainingPythonParams(modelType, studentId, body, row.artifact_dir);
+            const pythonParams = await buildGuidedTrainingPythonParams(
+              modelType,
+              studentId,
+              body,
+              row.artifact_dir,
+              lease.terminationSignal,
+            );
             pythonParams.saveModel = sessionModelPath;
             await runPythonGuidedTrainingStep(
               modelType,
@@ -2828,7 +3284,9 @@ export async function runGuidedTrainingStep(
 
           await lease.verifyOwned();
           await recordGuidedAttemptPythonCompleted(activeAttempt, receipt);
-          await assertGuidedTrainingIdentityCurrent(row, studentId);
+            await assertGuidedTrainingIdentityCurrent(row, studentId, {
+              terminationSignal: lease.terminationSignal,
+            });
 
           const nextCompletedStepIds = [...completedStepIds, stepId];
           const stepOutputs = parseJsonColumn<Record<string, unknown>>(row.step_outputs, {});
@@ -2841,6 +3299,7 @@ export async function runGuidedTrainingStep(
           try {
             let transformedResult: ReturnType<typeof transformTrainingResult> | null = null;
             let versionedArtifactPath: string | null = null;
+            let artifactSha256: string | null = null;
             const receiptFinalResult = isRecordValue(receipt.final_result) ? receipt.final_result : null;
             if (receiptFinalResult) {
               const sourceModelPath = getGuidedSessionModelPath(row.artifact_dir, row.model_type);
@@ -2851,11 +3310,25 @@ export async function runGuidedTrainingStep(
                 row.session_id,
                 "backtest",
               );
-              const versionedArtifactWasReusable = await hasReusableSavedModelArtifact(
-                row.model_type,
-                versionedArtifactPath,
-                lease.terminationSignal,
-              );
+              let versionedArtifactWasReusable: boolean;
+              if (hasSavedModelArtifact(row.model_type, versionedArtifactPath)) {
+                try {
+                  const integrity = await verifyBaseModelArtifactIntegrity(
+                    row.model_type,
+                    versionedArtifactPath,
+                    null,
+                    lease.terminationSignal,
+                  );
+                  artifactSha256 = integrity.sha256;
+                  versionedArtifactWasReusable = true;
+                } catch (error) {
+                  if (!(error instanceof ModelArtifactError)) throw error;
+                  removeModelArtifactGroup(versionedArtifactPath);
+                  versionedArtifactWasReusable = false;
+                }
+              } else {
+                versionedArtifactWasReusable = false;
+              }
               if (!versionedArtifactWasReusable) {
                 await lease.verifyOwned();
                 cleanupUncommittedArtifactPath = versionedArtifactPath;
@@ -2865,6 +3338,17 @@ export async function runGuidedTrainingStep(
                   versionedArtifactPath,
                   lease.terminationSignal,
                 );
+                await lease.verifyOwned();
+              }
+              if (!artifactSha256) {
+                artifactSha256 = (
+                  await verifyBaseModelArtifactIntegrity(
+                    row.model_type,
+                    versionedArtifactPath,
+                    null,
+                    lease.terminationSignal,
+                  )
+                ).sha256;
                 await lease.verifyOwned();
               }
               receiptFinalResult.saved_model = versionedArtifactPath;
@@ -2894,6 +3378,7 @@ export async function runGuidedTrainingStep(
                 body,
                 result: transformedResult,
                 artifactPath: versionedArtifactPath,
+                artifactSha256,
                 guidedSession: {
                   sessionId,
                   currentStepId,
@@ -2970,10 +3455,6 @@ const getReusableProductionModelArtifactResult = async (
   ) {
     return null;
   }
-  if (!await hasReusableSavedModelArtifact(modelType, productionModelPath, terminationSignal)) {
-    return null;
-  }
-
   const trainingConfig = getExperimentTrainingConfig(experiment);
   const allData = await loadDatasetFromDb(
     trainingConfig.selected_industry,
@@ -2981,6 +3462,18 @@ const getReusableProductionModelArtifactResult = async (
     trainingConfig.selected_product,
   );
   validateActiveRunAgainstSnapshot(activeRun, JSON.stringify(allData));
+
+  try {
+    await verifyProductionBaseArtifactForRun(modelType, activeRun, terminationSignal);
+  } catch (error) {
+    if (!(error instanceof ModelArtifactError)) throw error;
+    logger.warn(
+      { err: error, runId: activeRun.run_id, modelType, productionModelPath },
+      "检测到无效生产模型产物，将在当前请求中重新拟合",
+    );
+    await invalidateProductionArtifactForRun(activeRun);
+    return null;
+  }
 
   return {
     status: "success",
@@ -3025,8 +3518,20 @@ const prepareExperimentModelForProductionWithLease = async (
     activeRun.run_id,
   );
   const backtestModelPath = activeRun.artifact_path;
-  if (!hasSavedModelArtifact(modelType, backtestModelPath)) {
-    throw new ModelNotFoundError(`未找到该实验的已训练 ${modelType.toUpperCase()} 回测模型`);
+  let verifiedBacktestSha256: string | null = null;
+  try {
+    verifiedBacktestSha256 = await verifyBacktestBaseArtifactForRun(
+      modelType,
+      activeRun,
+      lease.terminationSignal,
+    );
+  } catch (error) {
+    if (!(error instanceof ModelArtifactError)) throw error;
+    throw new ModelConflictError(
+      `${modelType.toUpperCase()} 回测模型产物已损坏或缺失，请重新训练该模型`,
+      "MODEL_ARTIFACT_INVALID",
+      { required_action: "retrain" },
+    );
   }
 
   const allData = await loadDatasetFromDb(
@@ -3044,6 +3549,7 @@ const prepareExperimentModelForProductionWithLease = async (
   const snapshotDir = fs.mkdtempSync(path.join(os.tmpdir(), "fz-production-snapshot-"));
   let productionArtifactPromoted = false;
   let productionRevision: string | null = null;
+  let productionArtifactSha256: string | null = null;
   try {
     const dataFile = path.join(snapshotDir, GUIDED_DATASET_FILE_NAME);
     await Bun.write(dataFile, JSON.stringify(allData));
@@ -3058,20 +3564,47 @@ const prepareExperimentModelForProductionWithLease = async (
       pretty: true,
     };
 
-    await runPythonModel(
-      modelType,
-      pythonParams,
-      resolveProductionPreparationTimeoutMs(modelType, activeRun),
-      undefined,
-      lease.terminationSignal,
-    );
-    if (!await hasReusableSavedModelArtifact(
-      modelType,
-      productionModelPath,
-      lease.terminationSignal,
-    )) {
-      throw new ModelValidationError("生产模型产物生成不完整，请重试");
+    try {
+      await runPythonModel(
+        modelType,
+        pythonParams,
+        resolveProductionPreparationTimeoutMs(modelType, activeRun),
+        undefined,
+        lease.terminationSignal,
+      );
+    } catch (error) {
+      if (!(error instanceof ModelArtifactError)) throw error;
+      throw new ModelConflictError(
+        `${modelType.toUpperCase()} 回测模型产物无法加载，请重新训练该模型`,
+        "MODEL_ARTIFACT_INVALID",
+        { required_action: "retrain" },
+      );
     }
+    if (verifiedBacktestSha256) {
+      try {
+        await verifyBaseModelArtifactIntegrity(
+          modelType,
+          backtestModelPath,
+          verifiedBacktestSha256,
+          lease.terminationSignal,
+        );
+      } catch (error) {
+        if (!(error instanceof ModelArtifactError)) throw error;
+        throw new ModelConflictError(
+          `${modelType.toUpperCase()} 回测模型产物在生产拟合期间发生变化，请重新训练该模型`,
+          "MODEL_ARTIFACT_INVALID",
+          { required_action: "retrain" },
+        );
+      }
+    }
+    productionArtifactSha256 = (
+      await verifyBaseModelArtifactIntegrity(
+        modelType,
+        productionModelPath,
+        null,
+        lease.terminationSignal,
+      )
+    ).sha256;
 
     await lease.verifyOwned();
     productionRevision = crypto.randomUUID();
@@ -3080,6 +3613,7 @@ const prepareExperimentModelForProductionWithLease = async (
       productionModelPath,
       forecastSteps,
       productionRevision,
+      productionArtifactSha256,
     );
     if (!recorded) {
       throw new ModelValidationError("模型版本已变化，已放弃本次生产模型，请重试");
@@ -3337,17 +3871,26 @@ const predictExperimentModelWithLease = async (
     );
   }
   const productionModelPath = activeRun.production_artifact_path;
-  if (
-    !productionModelPath
-    || !await hasReusableSavedModelArtifact(
-      modelType,
-      productionModelPath,
-      lease.terminationSignal,
-    )
-  ) {
+  if (!productionModelPath) {
     throw new ModelConflictError(
       `未找到该实验已准备的 ${modelType.toUpperCase()} 生产预测模型`,
       "PRODUCTION_PREPARATION_REQUIRED",
+    );
+  }
+  let verifiedProductionSha256: string | null = null;
+  try {
+    verifiedProductionSha256 = await verifyProductionBaseArtifactForRun(
+      modelType,
+      activeRun,
+      lease.terminationSignal,
+    );
+  } catch (error) {
+    if (!(error instanceof ModelArtifactError)) throw error;
+    await invalidateProductionArtifactForRun(activeRun);
+    throw new ModelConflictError(
+      `${modelType.toUpperCase()} 生产模型产物已失效，请重新准备生产模型`,
+      "PRODUCTION_PREPARATION_REQUIRED",
+      { required_action: "prepare" },
     );
   }
 
@@ -3365,13 +3908,34 @@ const predictExperimentModelWithLease = async (
     pretty: true,
   };
 
-  const result = (await runPythonModel(
-    modelType,
-    pythonParams,
-    TIMEOUTS.MODEL_PREDICTION,
-    undefined,
-    lease.terminationSignal,
-  )) as Record<string, unknown>;
+  let result: Record<string, unknown>;
+  try {
+    result = (await runPythonModel(
+      modelType,
+      pythonParams,
+      TIMEOUTS.MODEL_PREDICTION,
+      undefined,
+      lease.terminationSignal,
+    )) as Record<string, unknown>;
+  } catch (error) {
+    if (!(error instanceof ModelArtifactError)) throw error;
+    const currentRun = await getActiveModelTrainingRun(experimentId, studentId, modelType);
+    if (
+      currentRun?.run_id !== activeRun.run_id
+      || currentRun.production_revision !== preparationToken
+    ) {
+      throw new ModelConflictError(
+        "预测期间模型版本已变化，请重新准备生产模型",
+        "PRODUCTION_PREPARATION_STALE",
+      );
+    }
+    await invalidateProductionArtifactForRun(activeRun);
+    throw new ModelConflictError(
+      `${modelType.toUpperCase()} 生产模型产物无法加载，请重新准备生产模型`,
+      "PRODUCTION_PREPARATION_REQUIRED",
+      { required_action: "prepare" },
+    );
+  }
   lease.throwIfTerminated();
   const currentRun = await getActiveModelTrainingRun(experimentId, studentId, modelType);
   if (
@@ -3383,7 +3947,44 @@ const predictExperimentModelWithLease = async (
       "PRODUCTION_PREPARATION_STALE",
     );
   }
+  if (verifiedProductionSha256) {
+    try {
+      await verifyBaseModelArtifactIntegrity(
+        modelType,
+        productionModelPath,
+        verifiedProductionSha256,
+        lease.terminationSignal,
+      );
+    } catch (error) {
+      if (!(error instanceof ModelArtifactError)) throw error;
+      await invalidateProductionArtifactForRun(activeRun);
+      throw new ModelConflictError(
+        `${modelType.toUpperCase()} 生产模型产物在预测期间发生变化，请重新准备生产模型`,
+        "PRODUCTION_PREPARATION_REQUIRED",
+        { required_action: "prepare" },
+      );
+    }
+  }
   await lease.verifyOwned();
+
+  let predictions: ReturnType<typeof normalizeDemandPredictionPoints>;
+  try {
+    predictions = normalizeDemandPredictionPoints(
+      result.predictions,
+      forecastSteps,
+      { requireStdDev: true },
+    );
+  } catch (error) {
+    if (!(error instanceof Error) || !error.message.startsWith("[PYTHON_DATA]")) {
+      throw error;
+    }
+    await invalidateProductionArtifactForRun(activeRun);
+    throw new ModelConflictError(
+      `${modelType.toUpperCase()} 生产模型返回了无效预测结果，请重新准备生产模型`,
+      "PRODUCTION_PREPARATION_REQUIRED",
+      { required_action: "prepare" },
+    );
+  }
 
   const metadata = Object.fromEntries(
     ["method_name", "forecast_strategy", "implementation_notes"]
@@ -3394,7 +3995,7 @@ const predictExperimentModelWithLease = async (
   return {
     status: "success",
     results: {
-      predictions: normalizeDemandPredictionPoints(result.predictions, forecastSteps),
+      predictions,
       ...metadata,
     },
   };
