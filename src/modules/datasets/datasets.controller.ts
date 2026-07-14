@@ -96,6 +96,9 @@ datasetsController.get("/api/v1/datasets/industries/:industry/companies/:company
     const result = await getProductSales(industry, company, product);
     if ("error" in result) {
       if (result.error === "not_found") return c.json({ error: "未找到产品分段" }, 404);
+      if (result.error === "invalid_data") {
+        return c.json({ error: result.details.message, code: "DATASET_ROW_INVALID", ...result.details }, 422);
+      }
       return c.json({ error: "产品销售数据文件丢失" }, 404);
     }
     return c.json(result.data);

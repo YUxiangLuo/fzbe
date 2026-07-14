@@ -7,6 +7,7 @@ import { validateFile, generateUniqueFilename, FileValidationError } from "../..
 import { logWarning } from "../../utils/error-handler";
 import { FILE_SIZE_LIMITS } from "../../utils/constants";
 import type { UpdateDatasetInput } from "./datasets.schema";
+import { normalizeSalesValue, normalizeYearMonth } from "./dataset-values";
 
 interface DatasetRow extends RowDataPacket {
   dataset_id: number;
@@ -108,8 +109,8 @@ export async function uploadDataset(file: File, dataName: string, description?: 
           return { error: "数据格式错误", status: 400 as const, details: { message: `产品 "${segment.productName}" 第 ${i + 1} 行月份格式错误` } };
         }
 
-        const normalizedMonth = monthRaw.padStart(2, "0");
-        const currentTime = `${yearRaw}-${normalizedMonth}`;
+        const normalizedTime = normalizeYearMonth(yearRaw, monthRaw)!;
+        const currentTime = `${normalizedTime.year}-${normalizedTime.month}`;
 
         if (timePoints.has(currentTime)) {
           return { error: "数据重复", status: 400 as const, details: { message: `产品 "${segment.productName}" 存在重复的时间点: ${currentTime}` } };
@@ -121,10 +122,8 @@ export async function uploadDataset(file: File, dataName: string, description?: 
         }
         previousTime = currentTime;
 
-        const salesRaw = row["销售数量"];
-        const salesCleaned = salesRaw ? salesRaw.replace(/,/g, "").trim() : "";
-        const salesNum = Number(salesCleaned);
-        if (salesCleaned === "" || Number.isNaN(salesNum) || salesNum < 0) {
+        const sales = normalizeSalesValue(row["销售数量"]);
+        if (!sales) {
           return { error: "数据格式错误", status: 400 as const, details: { message: `产品 "${segment.productName}" 第 ${i + 1} 行销售数量无效` } };
         }
 
@@ -132,6 +131,13 @@ export async function uploadDataset(file: File, dataName: string, description?: 
         if (unitRaw !== expectedUnit) {
           return { error: "数据不一致", status: 400 as const, details: { message: `产品 "${segment.productName}" 第 ${i + 1} 行数量单位不一致` } };
         }
+
+        // Segment files are the canonical model input. Keep the original upload
+        // untouched for audit, but never persist presentation formatting here.
+        row["年份"] = normalizedTime.year;
+        row["月份"] = normalizedTime.month;
+        row["销售数量"] = sales.canonical;
+        row["数量单位"] = unitRaw;
       }
     }
 
@@ -294,22 +300,28 @@ export async function getProductSales(industry: string, company: string, product
   let unit = "";
 
   const rows = await readCsvRows(filePath);
-  for (const row of rows) {
+  for (const [rowIndex, row] of rows.entries()) {
     if (headers.length === 0) { headers = Object.keys(row); csvData.push(headers); }
     csvData.push(headers.map((header) => String(row[header] ?? "").trim()));
 
-    const yearRaw = String(row["年份"] ?? "").trim();
-    const monthRaw = String(row["月份"] ?? "").trim();
-    const year = yearRaw.match(/\d{4}/)?.[0] || yearRaw;
-    const month = (monthRaw.match(/\d+/)?.[0] || monthRaw).padStart(2, "0");
-    if (!year || !month) continue;
+    const time = normalizeYearMonth(row["年份"], row["月份"]);
+    if (!time) {
+      return {
+        error: "invalid_data" as const,
+        details: { row: rowIndex + 1, field: "年份/月份", message: `第 ${rowIndex + 1} 行年月格式无效` },
+      };
+    }
 
-    const salesRaw = String(row["销售数量"] ?? "").trim().replace(/,/g, "");
-    const salesValue = Number(salesRaw);
-    if (!Number.isFinite(salesValue)) continue;
+    const sales = normalizeSalesValue(row["销售数量"]);
+    if (!sales) {
+      return {
+        error: "invalid_data" as const,
+        details: { row: rowIndex + 1, field: "销售数量", message: `第 ${rowIndex + 1} 行销售数量无效` },
+      };
+    }
 
     if (!unit && row["数量单位"]) unit = String(row["数量单位"]).trim();
-    monthlySales.push({ month: `${year}-${month}`, sales: salesValue });
+    monthlySales.push({ month: `${time.year}-${time.month}`, sales: sales.value });
   }
 
   return { data: { meta: { industry, company, product, name: product, description: "", unit }, monthlySales, csvData } };

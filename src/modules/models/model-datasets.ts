@@ -1,6 +1,7 @@
 import type { RowDataPacket } from "mysql2/promise";
 import { pool } from "../../config";
 import { CsvEncodingError, CsvRowLimitError, readCsvRows } from "../../utils/csv-processor";
+import { normalizeSalesValue, normalizeYearMonth } from "../datasets/dataset-values";
 import { ModelValidationError } from "./model-errors";
 
 interface SegmentRow extends RowDataPacket {
@@ -22,7 +23,37 @@ export async function loadDatasetFromDb(
   }
 
   try {
-    return await readCsvRows(segmentRows[0]!.file_path);
+    const rows = await readCsvRows(segmentRows[0]!.file_path);
+    return rows.map((row, index) => {
+      const separateTime = normalizeYearMonth(row["年份"], row["月份"]);
+      const combinedMonthMatch = String(row["月份"] ?? "").trim().match(/^(\d{4})-(0?[1-9]|1[0-2])$/);
+      const combinedTime = combinedMonthMatch
+        ? normalizeYearMonth(combinedMonthMatch[1], combinedMonthMatch[2])
+        : null;
+      const time = separateTime ?? combinedTime;
+      if (!time) {
+        throw new ModelValidationError(`数据集第 ${index + 1} 行年月格式无效`, {
+          row: index + 1,
+          field: "年份/月份",
+          code: "DATASET_ROW_INVALID",
+        });
+      }
+      const sales = normalizeSalesValue(row["销售数量"]);
+      if (!sales) {
+        throw new ModelValidationError(`数据集第 ${index + 1} 行销售数量无效`, {
+          row: index + 1,
+          field: "销售数量",
+          code: "DATASET_ROW_INVALID",
+        });
+      }
+      const normalizedRow = {
+        ...row,
+        "销售数量": sales.canonical,
+      };
+      return separateTime
+        ? { ...normalizedRow, "年份": time.year, "月份": time.month }
+        : { ...normalizedRow, "月份": `${time.year}-${time.month}` };
+    });
   } catch (error) {
     if (error instanceof CsvEncodingError || error instanceof CsvRowLimitError) {
       throw new ModelValidationError(error.message);

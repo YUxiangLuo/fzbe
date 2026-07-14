@@ -106,4 +106,35 @@ describe("datasets service CSV encoding", () => {
       },
     ]);
   });
+
+  test("reads legacy grouped sales without changing row cardinality", async () => {
+    await writeFile(
+      datasetFilePath,
+      "行业名称,公司名称,产品名称,年份,月份,销售数量,数量单位\n制造业,样本企业,样本产品,2024,1,\"1,234.50\",件\n",
+    );
+
+    const result = await getProductSales("制造业", "样本企业", "样本产品");
+
+    expect(result).toMatchObject({
+      data: {
+        monthlySales: [{ month: "2024-01", sales: 1234.5 }],
+      },
+    });
+  });
+
+  test("reports invalid legacy rows instead of silently dropping them", async () => {
+    await writeFile(
+      datasetFilePath,
+      "行业名称,公司名称,产品名称,年份,月份,销售数量,数量单位\n制造业,样本企业,样本产品,2024,1,1e309,件\n",
+    );
+
+    await expect(getProductSales("制造业", "样本企业", "样本产品")).resolves.toEqual({
+      error: "invalid_data",
+      details: {
+        row: 1,
+        field: "销售数量",
+        message: "第 1 行销售数量无效",
+      },
+    });
+  });
 });

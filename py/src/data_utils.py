@@ -16,6 +16,22 @@ import pandas as pd
 from logger import log
 
 
+def _coerce_numeric_series(series: pd.Series) -> pd.Series:
+    """Parse numeric-like values while accepting presentation-only commas."""
+    if pd.api.types.is_numeric_dtype(series):
+        return pd.to_numeric(series, errors="coerce")
+
+    normalized = series.map(
+        lambda value: value.replace(",", "").strip() if isinstance(value, str) else value
+    )
+    return pd.to_numeric(normalized, errors="coerce")
+
+
+def _non_finite_mask(series: pd.Series) -> np.ndarray:
+    numeric_values = series.to_numpy(dtype=float, na_value=np.nan)
+    return ~np.isfinite(numeric_values)
+
+
 class ParsedData:
     """
     A container for parsed and prepared time series data, using a pandas DataFrame
@@ -83,11 +99,15 @@ def build_numeric_subprocess_records(parsed_data: "ParsedData") -> Tuple[List[Di
 
         series = parsed_data.df[feat_key]
         if pd.api.types.is_numeric_dtype(series):
+            if _non_finite_mask(series).any():
+                raise _data_error(f"Feature column '{feat_key}' contains non-finite values.")
             numeric_feature_keys.append(feat_key)
             continue
 
-        converted = pd.to_numeric(series, errors="coerce")
+        converted = _coerce_numeric_series(series)
         if converted.notna().all():
+            if _non_finite_mask(converted).any():
+                raise _data_error(f"Feature column '{feat_key}' contains non-finite values.")
             parsed_data.df[feat_key] = converted
             numeric_feature_keys.append(feat_key)
             continue
@@ -156,9 +176,13 @@ def build_subprocess_records(
     for feat_key in selected_feature_keys:
         series = parsed_data.df[feat_key]
         if pd.api.types.is_numeric_dtype(series):
+            if _non_finite_mask(series).any():
+                raise _data_error(f"Feature column '{feat_key}' contains non-finite values.")
             continue
-        converted = pd.to_numeric(series, errors="coerce")
+        converted = _coerce_numeric_series(series)
         if converted.notna().all():
+            if _non_finite_mask(converted).any():
+                raise _data_error(f"Feature column '{feat_key}' contains non-finite values.")
             parsed_data.df[feat_key] = converted
 
     data_dicts: List[Dict[str, Any]] = []
@@ -262,7 +286,7 @@ def _tokenize_feature_name(name: str) -> List[str]:
 
 
 def _is_integer_like(series: pd.Series) -> bool:
-    numeric = pd.to_numeric(series, errors="coerce")
+    numeric = _coerce_numeric_series(series)
     finite = numeric[np.isfinite(numeric)]
     if finite.empty:
         return False
@@ -277,7 +301,7 @@ def _infer_single_feature_type(feature_name: str, series: pd.Series) -> str:
     name_tokens = set(_tokenize_feature_name(feature_name))
     numeric_series = series
     if not pd.api.types.is_numeric_dtype(series):
-        numeric_series = pd.to_numeric(series, errors="coerce")
+        numeric_series = _coerce_numeric_series(series)
         if not numeric_series.notna().all():
             return "categorical"
 
@@ -339,7 +363,9 @@ def infer_feature_types(
         series = parsed_data.df[feat_key]
         inferred_type = _infer_single_feature_type(feat_key, series)
         if inferred_type == "numeric" and not pd.api.types.is_numeric_dtype(series):
-            converted = pd.to_numeric(series, errors="coerce")
+            converted = _coerce_numeric_series(series)
+            if converted.notna().any() and _non_finite_mask(converted.dropna()).any():
+                raise _data_error(f"Feature column '{feat_key}' contains non-finite values.")
             parsed_data.df[feat_key] = converted
         inferred[feat_key] = inferred_type
 
@@ -435,19 +461,26 @@ def load_data_from_json(
         feature_keys = detected_features if detected_features else []
         log.info(f"Auto-detected feature_keys: {feature_keys}")
         
-    # Target column must be numeric
-    if target_key in df.columns and not pd.api.types.is_numeric_dtype(df[target_key]):
-        df[target_key] = pd.to_numeric(df[target_key], errors='coerce')
-        if df[target_key].isnull().any():
-            raise _data_error(f"Target column '{target_key}' contains non-numeric values.")
-        log.debug(f"Converted target column '{target_key}' to numeric")
+    # Target column must be numeric and finite. Run this for numeric dtypes too,
+    # because pandas accepts values such as Infinity without producing nulls.
+    target_values = _coerce_numeric_series(df[target_key])
+    if target_values.isnull().any():
+        raise _data_error(f"Target column '{target_key}' contains non-numeric values.")
+    if _non_finite_mask(target_values).any():
+        raise _data_error(f"Target column '{target_key}' contains non-finite values.")
+    df[target_key] = target_values
+    log.debug(f"Converted target column '{target_key}' to finite numeric values")
 
     # Feature columns: convert if numeric-like, keep as-is if categorical
     for col in [fk for fk in (feature_keys or []) if fk != target_key and fk in df.columns]:
         if pd.api.types.is_numeric_dtype(df[col]):
+            if _non_finite_mask(df[col]).any():
+                raise _data_error(f"Feature column '{col}' contains non-finite values.")
             continue
-        converted = pd.to_numeric(df[col], errors='coerce')
+        converted = _coerce_numeric_series(df[col])
         if converted.isnull().sum() <= df[col].isnull().sum():
+            if _non_finite_mask(converted).any():
+                raise _data_error(f"Feature column '{col}' contains non-finite values.")
             df[col] = converted
             log.debug(f"Converted feature column '{col}' to numeric")
         else:
