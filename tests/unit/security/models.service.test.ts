@@ -761,7 +761,9 @@ describe("models service", () => {
     expect(mkdirSync).not.toHaveBeenCalled();
     expect(poolQuery.mock.calls.some(([sql]) => String(sql).includes("INSERT INTO model_guided_training_sessions")))
       .toBe(false);
-  });
+  // Bun 1.3.14's 700-second fake-clock jump conflicts with the default
+  // five-second runner timeout, so keep the override scoped to this test.
+  }, 30_000);
 
   test("keeps a completed guided session current after its own authoritative config commit", async () => {
     const requestBody = {
