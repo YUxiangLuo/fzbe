@@ -223,14 +223,14 @@ describe("app route smoke tests", () => {
     const longRunningPaths = [
       "/api/v1/models/ma/guided-training/sessions",
       "/api/v1/models/arima/guided-training/sessions/session-1/steps/fit/run",
-      "/api/v1/models/lstm/prepare-production",
+      "/api/v1/models/lstm/production-preparation/sessions/session-1/steps/fit_model/run",
       "/api/v1/models/weighted_avg/predict?trace=1",
       "/api/v1/tools/adf",
     ];
     const ordinaryPaths = [
       "/api/v1/models/ma/guided-training/sessions/session-1",
       "/api/v1/models/ma/guided-training/sessions/session-1/steps/fit",
-      "/api/v1/models/ma/prepare-production/extra",
+      "/api/v1/models/ma/prepare-production",
       "/api/v1/models/ma/predict/",
       "/api/v1/tools/adf/",
       "/api/v1/runtime-info",
@@ -253,7 +253,10 @@ describe("app route smoke tests", () => {
         pathname: "/api/v1/models/arima/guided-training/sessions/session-1/steps/fit/run",
         seconds: 0,
       },
-      { pathname: "/api/v1/models/lstm/prepare-production", seconds: 0 },
+      {
+        pathname: "/api/v1/models/lstm/production-preparation/sessions/session-1/steps/fit_model/run",
+        seconds: 0,
+      },
       { pathname: "/api/v1/models/weighted_avg/predict", seconds: 0 },
       { pathname: "/api/v1/tools/adf", seconds: 0 },
     ]);

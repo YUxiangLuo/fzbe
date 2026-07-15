@@ -153,7 +153,27 @@ const ensembleTrainSchema = withRangeValidation(
   trainSchemaBase.extend({
     models: ensembleModelsSchema,
   }),
-);
+).superRefine((data, context) => {
+  const includesLstm = data.models
+    .split(",")
+    .map((model) => model.trim())
+    .includes("lstm");
+  if (!includesLstm) return;
+
+  const requiredLstmFields = [
+    ["lstmFeatures", data.lstmFeatures],
+    ["lstmTargetFeature", data.lstmTargetFeature],
+    ["lstmNormalization", data.lstmNormalization],
+  ] as const;
+  for (const [field, value] of requiredLstmFields) {
+    if (value !== undefined) continue;
+    context.addIssue({
+      code: z.ZodIssueCode.custom,
+      message: "包含 LSTM 的融合模型必须显式提供特征列表、目标字段和归一化方式",
+      path: [field],
+    });
+  }
+});
 
 export function getTrainSchemaForModel(modelType: ModelType) {
   switch (modelType) {

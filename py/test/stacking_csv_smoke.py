@@ -8,6 +8,7 @@ import tempfile
 from pathlib import Path
 
 import numpy as np
+from scipy.optimize import nnls
 
 
 PY_ROOT = Path(__file__).resolve().parents[1]
@@ -22,8 +23,8 @@ BASE_MODEL_TRAIN_ARGS = {
 
 sys.path.insert(0, str(PY_ROOT / "src"))
 
-from model_metadata_assertions import assert_method_metadata
-from models.stacking import _fit_meta_model
+from model_metadata_assertions import assert_method_metadata  # noqa: E402
+from models.stacking import _fit_meta_model  # noqa: E402
 
 
 def load_csv_records(csv_path: Path) -> list[dict[str, str]]:
@@ -82,30 +83,8 @@ def compute_expected_stacking_weights(
     meta_target: np.ndarray,
 ) -> np.ndarray:
     meta_train = np.column_stack([level1_predictions[name] for name in model_names])
-    n_samples, n_models = meta_train.shape
-
-    try:
-        condition_number = float(np.linalg.cond(meta_train))
-    except np.linalg.LinAlgError:
-        condition_number = float("inf")
-
-    if n_samples <= n_models + 1 or not math.isfinite(condition_number) or condition_number > 1e6:
-        model_mae = np.array(
-            [np.mean(np.abs(meta_target - np.array(level1_predictions[name], dtype=float))) for name in model_names],
-            dtype=float,
-        )
-        inverse_mae = 1.0 / (model_mae + 1e-9)
-        return inverse_mae / np.sum(inverse_mae)
-
-    from sklearn.linear_model import LinearRegression
-
-    regression = LinearRegression(positive=True, fit_intercept=False)
-    regression.fit(meta_train, meta_target)
-    raw_weights = np.clip(np.asarray(regression.coef_, dtype=float), 0.0, None)
-    total = float(np.sum(raw_weights))
-    if total <= 1e-12:
-        return np.full(n_models, 1.0 / n_models, dtype=float)
-    return raw_weights / total
+    coefficients, _ = nnls(meta_train, meta_target)
+    return coefficients
 
 
 def blend_predictions(model_names: list[str], member_predictions: dict[str, list[float]], weights: np.ndarray) -> list[float]:
@@ -174,8 +153,10 @@ def main() -> None:
         np.array([10.5, 11.5, 12.5, 13.5], dtype=float),
         ["left", "right"],
     )
-    assert singular_meta_model["strategy"] == "inverse_mae_fallback"
-    assert singular_meta_model["condition_number"] is None
+    assert singular_meta_model["kind"] == "nnls"
+    assert singular_meta_model["strategy"] == "nonnegative_least_squares"
+    assert singular_meta_model["coefficients"] == [0.0, 0.0]
+    assert math.isfinite(float(singular_meta_model["residual_norm"]))
     json.dumps(singular_meta_model, allow_nan=False)
 
     records = load_csv_records(CSV_FIXTURE)
@@ -186,7 +167,7 @@ def main() -> None:
     train_end = 19
     eval_start = 20
     eval_end = 23
-    level0_train_end = 15
+    level0_train_end = 14
     future_steps = 3
 
     with tempfile.TemporaryDirectory(prefix="fangzhen-stacking-csv-") as temp_dir:
@@ -231,7 +212,7 @@ def main() -> None:
                     "--load-model",
                     str(refit_model_path),
                     "--forecast-steps",
-                    "4",
+                    "5",
                     "--pretty",
                 )
             )
@@ -247,7 +228,7 @@ def main() -> None:
                 )
             )
 
-        meta_target = np.array(sales[16:20], dtype=float)
+        meta_target = np.array(sales[15:20], dtype=float)
         expected_weights = compute_expected_stacking_weights(
             BASE_MODELS,
             level1_predictions,
@@ -293,9 +274,10 @@ def main() -> None:
         assert train_output["models"] == BASE_MODELS
         assert train_output["metrics"]["evaluate_months"] == timestamps[20:24]
         assert train_output["eval_y_true"] == sales[20:24]
+        assert train_output["meta_model"]["strategy"] == "nonnegative_least_squares"
+        assert_series_close(train_output["meta_model"]["coefficients"], expected_weights.tolist())
         assert_series_close(actual_eval_predictions, expected_eval_predictions)
         assert_all_finite(actual_eval_std_devs, "train_std_devs")
-        assert_predictions_within_member_envelope(BASE_MODELS, eval_predictions, actual_eval_predictions)
 
         stacking_model_production = temp_path / "stacking-production.pkl"
         fit_output = invoke_model(
@@ -367,7 +349,6 @@ def main() -> None:
         assert_series_close(future_predictions_one, future_predictions_two)
         assert_series_close(future_std_devs_one, future_std_devs_two)
         assert_all_finite(future_std_devs_one, "future_std_devs")
-        assert_predictions_within_member_envelope(BASE_MODELS, production_member_predictions, future_predictions_one)
 
     print(
         json.dumps(

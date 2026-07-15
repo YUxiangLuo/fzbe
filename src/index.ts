@@ -26,7 +26,11 @@ import { quizzesController } from "./modules/quizzes";
 import { reportsController } from "./modules/reports";
 import { getPdfQueueStats, holdPdfQueueSlotForTest } from "./modules/reports/reports.service";
 import { modelsController } from "./modules/models";
-import { cleanupExpiredGuidedTrainingSessions, cleanupStaleModelArtifacts } from "./modules/models/models.service";
+import {
+  cleanupExpiredGuidedTrainingSessions,
+  cleanupExpiredProductionPreparationSessions,
+  cleanupStaleModelArtifacts,
+} from "./modules/models/models.service";
 import {
   getModelOperationStats,
   withModelOperationContext,
@@ -701,7 +705,7 @@ app.onError((err, c) => {
 const RUNTIME_DISK_CLEANUP_INTERVAL_MS = 24 * 60 * 60 * 1000;
 let runtimeDiskCleanupTimer: ReturnType<typeof setInterval> | null = null;
 
-const longRunningRequestPathPattern = /^(?:\/api\/v1\/tools\/adf|\/api\/v1\/models\/[^/]+\/(?:prepare-production|predict|guided-training\/sessions(?:\/[^/]+\/steps\/[^/]+\/run)?))$/;
+const longRunningRequestPathPattern = /^(?:\/api\/v1\/tools\/adf|\/api\/v1\/models\/[^/]+\/(?:predict|(?:guided-training|production-preparation)\/sessions(?:\/[^/]+\/steps\/[^/]+\/run)?))$/;
 
 export async function runGuidedTrainingSessionCleanup(trigger = "manual") {
   try {
@@ -751,12 +755,18 @@ export async function runRuntimeDiskCleanup(trigger = "manual") {
   const guidedTraining = shouldSkipGuidedTrainingCleanupForTrigger(trigger)
     ? null
     : await runGuidedTrainingSessionCleanup(trigger);
+  const productionPreparation = await runCleanupStep(
+    trigger,
+    "production-preparation",
+    cleanupExpiredProductionPreparationSessions,
+  );
   const exportFiles = await runCleanupStep(trigger, "export-files", cleanupExpiredExportFiles);
   const uploadTempFiles = await runCleanupStep(trigger, "upload-temp-files", cleanupStaleUploadTempFiles);
   const modelArtifacts = await runCleanupStep(trigger, "model-artifacts", cleanupStaleModelArtifacts);
 
   return {
     guidedTraining,
+    productionPreparation,
     exportFiles,
     uploadTempFiles,
     modelArtifacts,

@@ -50,9 +50,37 @@ const runGuidedTrainingStep = mock(async () => ({
   error_message: null,
 }));
 const discardGuidedTrainingSession = mock(async () => ({ status: "success" }));
-const prepareExperimentModelForProduction = mock(async () => ({
+const createOrResumeProductionPreparationSession = mock(async () => ({
   status: "success",
   results: {
+    session_id: "production-1",
+    session_status: "ready",
+    completed_step_ids: [],
+    total_steps: 2,
+    next_step: { id: "initialize", label: "确认生产准备材料" },
+    error_message: null,
+  },
+}));
+const getProductionPreparationSession = mock(async () => ({
+  status: "success",
+  results: {
+    session_id: "production-1",
+    session_status: "ready",
+    completed_step_ids: [],
+    total_steps: 2,
+    next_step: { id: "initialize", label: "确认生产准备材料" },
+    error_message: null,
+  },
+}));
+const runProductionPreparationStep = mock(async () => ({
+  status: "success",
+  results: {
+    session_id: "production-1",
+    session_status: "completed",
+    completed_step_ids: ["initialize", "finalize"],
+    total_steps: 2,
+    next_step: null,
+    error_message: null,
     preparation_token: preparationToken,
     prepared_forecast_steps: 6,
     reused_existing: false,
@@ -115,7 +143,9 @@ mock.module("../../../src/modules/models/models.service", () => ({
   getGuidedTrainingSession,
   runGuidedTrainingStep,
   discardGuidedTrainingSession,
-  prepareExperimentModelForProduction,
+  createOrResumeProductionPreparationSession,
+  getProductionPreparationSession,
+  runProductionPreparationStep,
   predictExperimentModel,
   ModelValidationError,
   ModelNotFoundError,
@@ -170,7 +200,9 @@ describe("models controller", () => {
       getGuidedTrainingSession,
       runGuidedTrainingStep,
       discardGuidedTrainingSession,
-      prepareExperimentModelForProduction,
+      createOrResumeProductionPreparationSession,
+      getProductionPreparationSession,
+      runProductionPreparationStep,
       predictExperimentModel,
     ]) fn.mockClear();
   });
@@ -259,36 +291,64 @@ describe("models controller", () => {
     expect(discardGuidedTrainingSession).toHaveBeenCalledWith("ma", 20240002, "guided-1");
   });
 
-  test("delegates production preparation after validating the request", async () => {
+  test("removes the aggregate production preparation endpoint", async () => {
     const response = await request("/api/v1/models/ma/prepare-production", "POST", {
       experiment_id: 990002,
       forecast_steps: 6,
     });
+    expect(response.status).toBe(404);
+    expect(createOrResumeProductionPreparationSession).not.toHaveBeenCalled();
+  });
+
+  test("creates a resumable production preparation session", async () => {
+    const response = await request(
+      "/api/v1/models/ma/production-preparation/sessions",
+      "POST",
+      { experiment_id: 990002, forecast_steps: 6 },
+    );
     expect(response.status).toBe(200);
-    expect(prepareExperimentModelForProduction).toHaveBeenCalledWith(
+    expect((await response.json()).results).toMatchObject({
+      session_id: "production-1",
+      session_status: "ready",
+      next_step: { id: "initialize" },
+    });
+    expect(createOrResumeProductionPreparationSession).toHaveBeenCalledWith(
       "ma",
       20240002,
       990002,
       6,
-      false,
     );
   });
 
-  test("returns a reusable production artifact supplied by the service", async () => {
-    prepareExperimentModelForProduction.mockResolvedValueOnce({
-      status: "success",
-      results: {
-        preparation_token: preparationToken,
-        prepared_forecast_steps: 6,
-        reused_existing: true,
-      },
-    });
-    const response = await request("/api/v1/models/ma/prepare-production", "POST", {
-      experiment_id: 990002,
-      forecast_steps: 6,
-    });
+  test("reads an existing production preparation session", async () => {
+    const response = await request(
+      "/api/v1/models/ma/production-preparation/sessions/production-1",
+      "GET",
+    );
     expect(response.status).toBe(200);
-    expect(prepareExperimentModelForProduction).toHaveBeenCalledTimes(1);
+    expect(getProductionPreparationSession).toHaveBeenCalledWith(
+      "ma",
+      20240002,
+      "production-1",
+    );
+  });
+
+  test("executes exactly one production preparation step", async () => {
+    const response = await request(
+      "/api/v1/models/ma/production-preparation/sessions/production-1/steps/initialize/run",
+      "POST",
+    );
+    expect(response.status).toBe(200);
+    expect((await response.json()).results).toMatchObject({
+      session_status: "completed",
+      preparation_token: preparationToken,
+    });
+    expect(runProductionPreparationStep).toHaveBeenCalledWith(
+      "ma",
+      20240002,
+      "production-1",
+      "initialize",
+    );
   });
 
   test("predict requires and forwards the preparation token", async () => {
@@ -317,13 +377,13 @@ describe("models controller", () => {
   });
 
   test("returns 503 when lock ownership is lost", async () => {
-    prepareExperimentModelForProduction.mockRejectedValueOnce(
+    runProductionPreparationStep.mockRejectedValueOnce(
       new ModelServiceUnavailableError("数据库模型锁已失效", "MODEL_LOCK_LOST"),
     );
-    const response = await request("/api/v1/models/ma/prepare-production", "POST", {
-      experiment_id: 990002,
-      forecast_steps: 6,
-    });
+    const response = await request(
+      "/api/v1/models/ma/production-preparation/sessions/production-1/steps/initialize/run",
+      "POST",
+    );
     expect(response.status).toBe(503);
     expect(await response.json()).toEqual({
       error: "数据库模型锁已失效",
@@ -332,11 +392,11 @@ describe("models controller", () => {
   });
 
   test("returns structured 429 with Retry-After when admission is full", async () => {
-    prepareExperimentModelForProduction.mockRejectedValueOnce(new ModelCapacityBusyError());
-    const response = await request("/api/v1/models/ma/prepare-production", "POST", {
-      experiment_id: 990002,
-      forecast_steps: 6,
-    });
+    runProductionPreparationStep.mockRejectedValueOnce(new ModelCapacityBusyError());
+    const response = await request(
+      "/api/v1/models/ma/production-preparation/sessions/production-1/steps/initialize/run",
+      "POST",
+    );
 
     expect(response.status).toBe(429);
     expect(response.headers.get("Retry-After")).toBe("2");
@@ -410,17 +470,17 @@ describe("models controller", () => {
   });
 
   test("returns a structured 504 when production preparation times out", async () => {
-    prepareExperimentModelForProduction.mockRejectedValueOnce(
+    runProductionPreparationStep.mockRejectedValueOnce(
       new ModelTimeoutError("Python 执行超时", 600_000, "python_process"),
     );
-    const response = await request("/api/v1/models/weighted_avg/prepare-production", "POST", {
-      experiment_id: 990002,
-      forecast_steps: 6,
-    });
+    const response = await request(
+      "/api/v1/models/weighted_avg/production-preparation/sessions/production-1/steps/fit_member_lstm/run",
+      "POST",
+    );
 
     expect(response.status).toBe(504);
     expect(await response.json()).toEqual({
-      error: "生产模型准备超时，请稍后重试",
+      error: "生产准备步骤超时，请重试当前步骤",
       code: "MODEL_TIMEOUT",
       operation: "production_preparation",
       timeout_ms: 600_000,
@@ -449,13 +509,13 @@ describe("models controller", () => {
   });
 
   test("returns 409 when the service reports the experiment-scoped model is busy", async () => {
-    prepareExperimentModelForProduction.mockRejectedValueOnce(
+    runProductionPreparationStep.mockRejectedValueOnce(
       new ModelConflictError("同一模型正在训练或预测，请稍后再试", "MODEL_BUSY"),
     );
-    const response = await request("/api/v1/models/ma/prepare-production", "POST", {
-      experiment_id: 990002,
-      forecast_steps: 6,
-    });
+    const response = await request(
+      "/api/v1/models/ma/production-preparation/sessions/production-1/steps/initialize/run",
+      "POST",
+    );
     expect(response.status).toBe(409);
   });
 

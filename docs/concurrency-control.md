@@ -69,13 +69,14 @@ execution -> slot -> admission
 | 操作 | 模式 |
 | --- | --- |
 | guided training 正常 step | slot + execution |
-| prepare-production | slot + execution |
+| production preparation step | slot + execution |
 | predict | slot + execution |
 | ADF | slot only |
+| production preparation session 创建/读取 | metadata context only |
 | completed guided session 恢复/物化 | execution only |
 | guided session discard | execution only |
 
-可复用 production artifact 也必须先通过 admission、slot 和 execution lock，不存在 cached prepare 的容量绕过。
+融合模型的生产准备按成员或 boosting 阶段拆成可恢复步骤；每次 HTTP 请求最多运行一个 Python 子任务，并为该步骤单独获取 admission、slot 和 execution lock。可复用 production artifact 的完整性检查位于 `initialize` 步骤内，同样必须先通过这三层资源控制，不存在 cached prepare 的容量绕过。会话创建和读取只处理版本化元数据及数据快照，不执行模型子进程。
 
 ### 3.2 过载和互斥响应
 

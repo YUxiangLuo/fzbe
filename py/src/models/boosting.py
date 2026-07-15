@@ -22,8 +22,6 @@ from scipy.sparse import csr_matrix
 from data_utils import ParsedData, infer_feature_types, load_data_from_json
 from ensemble_utils import (
     build_ensemble_subprocess_data,
-    compute_phase1_train_size,
-    estimate_residual_std,
     format_predictions,
     get_lstm_source_forecast_strategy,
     get_member_model_path,
@@ -32,22 +30,26 @@ from ensemble_utils import (
     parse_base_model_files_arg,
     parse_base_model_names,
     parse_feature_name_list,
+    plan_ensemble_internal_holdout,
     persist_member_model_artifact,
     prepare_lstm_source_model_for_requested_steps,
     remove_member_model_artifact,
+    require_explicit_lstm_feature_names,
     resolve_base_model_artifact_configs,
     validate_base_model_names,
-    validate_internal_split_base_params,
 )
+from dynamic_config import derive_boosting_max_rounds
 from metrics import mae, mape, r2, rmse
 from model_info import attach_method_metadata, ensure_state_metadata
 from serialization import dump_model, load_model
 from subprocess_utils import (
     extract_predictions_from_result,
+    extract_uncertainty_profile_from_result,
     run_base_model_fit_subprocess,
     run_base_model_predict_subprocess,
     run_base_model_subprocess,
 )
+from uncertainty import ensemble_growth_profile
 
 MODEL_TYPE = "boosting"
 SUPPORTED_BASE_MODELS = ["ma", "es", "arima", "lstm"]
@@ -57,11 +59,11 @@ IMPLEMENTATION_NOTES = [
     "Boosting 的教科书核心是将多个弱学习器串行加到一个强学习器中，后续学习器重点修正前序误差。",
     "梯度提升在平方误差损失下等价于逐步拟合残差；本系统借鉴这一思想，但候选学习器是 MA、ES、ARIMA、LSTM 等时间序列模型。",
     "AdaBoost 通过样本权重实现错误关注；本系统的时间序列基础模型不支持样本权重，因此采用残差学习的加法模型。",
-    "系统按时间顺序留出末段：训练点 n<=15 时前段长度为 max(n-3, floor(0.85n))（本项目最少 n=8，因而留 2-3 点），n>15 时前段为 floor(0.8n)；每轮贪心地从全部候选中选择，同一类型可重复入选。",
-    "候选沿用已完成成员的核心配置：MA 窗口、ES 的 alpha、ARIMA 的 d 及 LSTM 的 look_back、epochs、特征和归一化。候选筛选只在内部前段拟合，所以 ARIMA 从第一轮起就针对当前训练目标和数据段重新搜索 p、q；第一轮目标是原销量，后续轮次才是有符号残差。",
+    "系统按时间顺序动态留出末段；每轮贪心地从全部候选中选择，同一类型可重复入选，最大轮数由 min(2×模型数, 验证点数-1) 决定。",
+    "候选只沿用用户选择的 MA 窗口、ES alpha、ARIMA d 及 LSTM 特征/归一化。ARIMA 阶数和 LSTM 隐藏参数针对每轮当前数据段与目标重新推导。",
     "更新训练段残差时，若某阶段在序列开头还没有可定义的样本内拟合值（如 MA 尚未凑满完整窗口、LSTM 尚未凑满 look_back），该前缀按零修正处理，即保持原残差；系统不会改用较短窗口伪造拟合值。",
-    "第一阶段系数固定为 1，后续阶段系数等于学习率（默认 0.3）；无候选继续改善时提前停止，选出的模型链再在完整训练区间逐级重训。",
-    "只有原始销量阶段和最终销量预测会截断到不小于 0，供中间阶段学习的有符号残差不会截断。std_dev 在评估不足 2 点时退回内部残差验证段估计。",
+    "每个候选阶段以平方损失的一维非负线搜索求系数 gamma=max(0,<r,h>/<h,h>)；短验证段要求至少 5% 相对改善，其余要求 1%，无足够改善即提前停止。选出的模型链在完整训练区间逐级重训并重新估计 gamma；若某级最优系数为零，则裁剪该级及其后的验证候选链。",
+    "只有原始销量阶段和最终销量预测会截断到不小于 0，中间残差保持有符号。std_dev、95% 区间和生产用 99% 上侧误差仅用与最终保留模型链对应的 actual-prediction 组合残差校准各阶段逐 horizon 的增长形状；经验分位数会保留稳定偏差，独立评估真实值不参与校准，信息不足时明确标记 fallback。",
 ]
 
 
@@ -71,7 +73,6 @@ _load_lstm_source_state = load_lstm_source_state
 _get_lstm_source_forecast_strategy = get_lstm_source_forecast_strategy
 _prepare_lstm_source_model_for_requested_steps = prepare_lstm_source_model_for_requested_steps
 _format_predictions = format_predictions
-_compute_phase1_train_size = compute_phase1_train_size
 
 
 def _load_state(model_path: str) -> Dict[str, Any]:
@@ -101,6 +102,21 @@ def _apply_stage_output_semantics(stage_idx: int, values: Any) -> np.ndarray:
     if stage_idx == 0:
         return normalize_demand_forecast(predictions)
     return predictions
+
+
+def _nonnegative_line_search(residual: Any, prediction: Any) -> float:
+    """Exact one-dimensional squared-error line search with gamma >= 0."""
+    residual_values = np.asarray(residual, dtype=float).reshape(-1)
+    prediction_values = np.asarray(prediction, dtype=float).reshape(-1)
+    if residual_values.size != prediction_values.size:
+        raise ValueError("[VALIDATION] Boosting line-search vectors have different lengths.")
+    denominator = float(np.dot(prediction_values, prediction_values))
+    if not np.isfinite(denominator) or denominator <= np.finfo(float).eps:
+        return 0.0
+    numerator = float(np.dot(residual_values, prediction_values))
+    if not np.isfinite(numerator):
+        return 0.0
+    return max(0.0, numerator / denominator)
 
 
 def _iter_stage_models(state: Dict[str, Any]):
@@ -262,7 +278,7 @@ def _predict_eval_segment(
     train_range: range,
     eval_range: range,
     timeout: int,
-) -> np.ndarray:
+) -> Tuple[np.ndarray, List[float]]:
     forecast_steps = eval_range.stop - train_range.stop
     forecast_offset = eval_range.start - train_range.stop
     result = run_base_model_predict_subprocess(
@@ -273,10 +289,11 @@ def _predict_eval_segment(
         timeout=timeout,
     )
     preds = np.asarray(extract_predictions_from_result(result), dtype=float)
+    profile = extract_uncertainty_profile_from_result(result)
     eval_preds = preds[forecast_offset: forecast_offset + len(eval_range)]
     if len(eval_preds) != len(eval_range):
         raise ValueError("[VALIDATION] Unable to generate full eval_range predictions for boosting stage.")
-    return eval_preds
+    return eval_preds, profile
 
 
 def _make_temp_model_path(prefix: str) -> str:
@@ -296,7 +313,7 @@ def _build_round_records(
 
 def _get_model_timeout(model_name: str, params: Dict[str, Any]) -> int:
     if model_name == "lstm":
-        return max(120, int(params.get("epochs", 20)) * 10)
+        return 600
     return 120
 
 
@@ -308,7 +325,7 @@ def _train_stage_model(
     eval_range: range,
     params: Dict[str, Any],
     timeout: int,
-) -> Tuple[str, np.ndarray]:
+) -> Tuple[str, np.ndarray, List[float]]:
     temp_model_file = _make_temp_model_path(f"boosting_stage_{model_name}_")
     params_with_save = params.copy()
     params_with_save["save_model"] = temp_model_file
@@ -321,13 +338,19 @@ def _train_stage_model(
         data=round_lstm_records if model_name == "lstm" else round_numeric_records,
         train_start=train_range.start,
         train_end=train_range.stop - 1,
-        eval_start=eval_range.start,
+        eval_start=train_range.stop,
         eval_end=eval_range.stop - 1,
         model_params=params_with_save,
         timeout=timeout,
     )
-    eval_predictions = np.asarray(extract_predictions_from_result(result), dtype=float)
-    return temp_model_file, eval_predictions
+    forecast_offset = eval_range.start - train_range.stop
+    full_predictions = np.asarray(extract_predictions_from_result(result), dtype=float)
+    eval_predictions = full_predictions[forecast_offset: forecast_offset + len(eval_range)]
+    return (
+        temp_model_file,
+        eval_predictions,
+        extract_uncertainty_profile_from_result(result),
+    )
 
 
 def _validate_fit_args(
@@ -421,10 +444,6 @@ def _validate_training_args(
     if es <= te:
         raise ValueError("[VALIDATION] eval_start must be > train_end.")
 
-    validate_internal_split_base_params(
-        models_to_use, model_params, te - ts + 1, "boosting"
-    )
-
     for model_name in models_to_use:
         if model_name not in model_params:
             raise ValueError(f"[VALIDATION] Missing parameters for model: {model_name}")
@@ -446,39 +465,6 @@ def _validate_training_args(
             if params["window"] < 2:
                 raise ValueError("[VALIDATION] MA window must be >= 2.")
         elif model_name == "lstm":
-            source_model_file = (base_model_files or {}).get(model_name)
-            source_model_state = None
-            if source_model_file:
-                source_model_state = _load_lstm_source_state(
-                    source_model_file,
-                    "Saved Boosting LSTM base model",
-                )
-            if "look_back" not in params:
-                raise ValueError("[VALIDATION] LSTM requires 'look_back' parameter.")
-            if "epochs" not in params:
-                raise ValueError("[VALIDATION] LSTM requires 'epochs' parameter.")
-            if params["look_back"] < 1:
-                raise ValueError("[VALIDATION] LSTM look_back must be >= 1.")
-            if params["epochs"] < 1:
-                raise ValueError("[VALIDATION] LSTM epochs must be >= 1.")
-            if te - ts + 1 <= params["look_back"]:
-                raise ValueError("[VALIDATION] Training range must be larger than LSTM look_back.")
-            train_size = te - ts + 1
-            boost_train_size = _compute_phase1_train_size(train_size)
-            boost_val_size = train_size - boost_train_size
-            if boost_train_size <= params["look_back"]:
-                raise ValueError(
-                    f"[VALIDATION] LSTM look_back ({params['look_back']}) is too large for "
-                    f"the boosting internal training split ({boost_train_size} points). "
-                    f"Please reduce look_back or increase training data."
-                )
-            if boost_train_size < params["look_back"] + boost_val_size:
-                raise ValueError(
-                    f"[VALIDATION] LSTM look_back ({params['look_back']}) is too large for "
-                    f"the boosting internal training split ({boost_train_size} points) "
-                    f"and validation horizon ({boost_val_size} points). Please reduce look_back "
-                    f"or increase training data."
-                )
             target_feature = str(params.get("lstm_target_feature", parsed_data.target_key) or parsed_data.target_key)
             if target_feature not in parsed_data.df.columns:
                 raise ValueError(f"[VALIDATION] LSTM target feature not found in dataset: {target_feature}")
@@ -491,35 +477,14 @@ def _validate_training_args(
                 raise ValueError(
                     f"[VALIDATION] LSTM feature columns not found in dataset: {missing_feature_names}"
                 )
-            if source_model_state is None:
-                continue
 
-            from models import lstm as lstm_model
-
-            forecast_strategy = _get_lstm_source_forecast_strategy(source_model_state)
-            fit_forecast_horizon = (
-                ee - te
-                if forecast_strategy == lstm_model.DIRECT_FORECAST_STRATEGY
-                else 0
-            )
-
-            try:
-                lstm_model._validate_fit_args(
-                    parsed_data,
-                    ts,
-                    te,
-                    params["look_back"],
-                    fit_forecast_horizon,
-                    forecast_strategy,
-                )
-            except ValueError as exc:
-                message = str(exc)
-                if message.startswith("[VALIDATION] "):
-                    message = message[len("[VALIDATION] "):]
-                raise ValueError(
-                    "[VALIDATION] Reused LSTM base model cannot be refit for the boosting final "
-                    f"evaluation stage: {message}"
-                ) from exc
+    plan_ensemble_internal_holdout(
+        parsed_data,
+        range(ts, te + 1),
+        models_to_use,
+        model_params,
+        "boosting",
+    )
 
 
 # ---------- predict ----------
@@ -527,14 +492,14 @@ def predict(
     model_path: str,
     steps: int,
     state: Optional[Dict[str, Any]] = None,
-) -> Tuple[List[float], float]:
+) -> Tuple[List[float], List[float], Dict[str, Any]]:
     if steps <= 0:
         raise ValueError("[VALIDATION] steps must be > 0 for forecasting.")
 
     state = state or _load_state(model_path)
-    std_dev_residuals = float(state.get("std_dev_residuals", 0.0))
-
     final_predictions: Optional[np.ndarray] = None
+    member_profiles: Dict[str, List[float]] = {}
+    coefficients: Dict[str, float] = {}
     for _stage_idx, model_name, coefficient, model_state in _iter_stage_models(state):
         model_file = model_state["model_file"]
         result = run_base_model_predict_subprocess(
@@ -548,6 +513,9 @@ def predict(
             _stage_idx,
             extract_predictions_from_result(result),
         )
+        stage_key = f"stage_{_stage_idx}_{model_name}"
+        member_profiles[stage_key] = extract_uncertainty_profile_from_result(result)
+        coefficients[stage_key] = coefficient
         if final_predictions is None:
             final_predictions = coefficient * stage_predictions
         else:
@@ -556,7 +524,21 @@ def predict(
     if final_predictions is None:
         raise ValueError("[VALIDATION] Saved Boosting model is empty.")
 
-    return normalize_demand_forecast(final_predictions).tolist(), std_dev_residuals
+    uncertainty_state = state.get("uncertainty") or {}
+    profile, summary = ensemble_growth_profile(
+        member_profiles,
+        coefficients,
+        uncertainty_state.get("calibration_residuals") or [],
+        uncertainty_state.get("reference_series") or [],
+        steps,
+        calibration_source=str(
+            uncertainty_state.get("calibration_source") or "internal_validation"
+        ),
+    )
+    summary.setdefault("calibration_source", str(
+        uncertainty_state.get("calibration_source") or "internal_validation"
+    ))
+    return normalize_demand_forecast(final_predictions).tolist(), profile, summary
 
 
 # ---------- train and evaluate ----------
@@ -569,12 +551,18 @@ def train_and_evaluate(
     learning_rate: float,
     max_rounds: int,
     base_model_files: Optional[Dict[str, str]] = None,
-) -> Tuple[Dict[str, Any], List[str], List[float], Dict[str, Any], List[float], List[float], float, Dict[str, Any]]:
+) -> Tuple[
+    Dict[str, Any], List[str], List[float], Dict[str, Any], List[float],
+    List[float], List[float], Dict[str, Any], Dict[str, Any],
+]:
     train_len = len(train_range)
     if train_len < 8:
         raise ValueError("[VALIDATION] train_range too small for boosting (需要至少8个点，推荐≥12点)")
 
-    boost_split = _compute_phase1_train_size(train_len)
+    split_plan = plan_ensemble_internal_holdout(
+        parsed_data, train_range, models_to_use, model_params, "boosting"
+    )
+    boost_split = int(split_plan["prefix_size"])
     boost_train_range = range(train_range.start, train_range.start + boost_split)
     boost_val_range = range(train_range.start + boost_split, train_range.stop)
 
@@ -582,24 +570,30 @@ def train_and_evaluate(
     print(f"  Boost Train Range: {boost_train_range} ({len(boost_train_range)} points)", file=sys.stderr)
     print(f"  Boost Val Range: {boost_val_range} ({len(boost_val_range)} points)", file=sys.stderr)
     print(f"  Eval Range: {eval_range} ({len(eval_range)} points)", file=sys.stderr)
-    print(f"  Learning Rate: {learning_rate}", file=sys.stderr)
+    max_rounds = derive_boosting_max_rounds(
+        len(models_to_use), len(boost_val_range)
+    )
+    minimum_relative_improvement = 0.05 if len(boost_val_range) < 5 else 0.01
     print(f"  Max Rounds: {max_rounds}", file=sys.stderr)
 
     y_true_val = np.asarray(parsed_data.y[boost_val_range], dtype=float)
     residual_train = np.asarray(parsed_data.y[boost_train_range], dtype=float).copy()
     residual_val = y_true_val.copy()
+    validation_residual_snapshots = [residual_val.copy()]
 
     model_chain: List[str] = []
     stage_coefficients: List[float] = []
     search_summary: Dict[str, Any] = {
         "algorithm": "residual_boosting",
-        "learning_rate": learning_rate,
+        "coefficient_strategy": "nonnegative_squared_error_line_search",
+        "minimum_relative_improvement": minimum_relative_improvement,
+        "max_rounds": max_rounds,
+        "split_plan": split_plan,
         "stages": [],
     }
 
     for round_idx in range(max_rounds):
-        coefficient = 1.0 if round_idx == 0 else learning_rate
-        current_rmse = float("inf") if round_idx == 0 else rmse(np.zeros_like(residual_val), residual_val)
+        current_rmse = rmse(np.zeros_like(residual_val), residual_val)
         round_parsed_data = _build_residual_parsed_data(parsed_data, boost_train_range, residual_train)
 
         stage_results: List[Dict[str, Any]] = []
@@ -611,7 +605,7 @@ def train_and_evaluate(
                 model_name,
                 params,
             )
-            temp_model_file, stage_predictions = _train_stage_model(
+            temp_model_file, stage_predictions, _stage_profile = _train_stage_model(
                 model_name,
                 round_numeric_records,
                 round_lstm_records,
@@ -631,6 +625,7 @@ def train_and_evaluate(
                 round_idx,
                 fitted_train_predictions,
             )
+            coefficient = _nonnegative_line_search(residual_val, stage_predictions)
             next_residual_val = residual_val - coefficient * stage_predictions
             next_rmse = rmse(np.zeros_like(next_residual_val), next_residual_val)
             stage_results.append({
@@ -644,23 +639,32 @@ def train_and_evaluate(
             print(f"  Round {round_idx + 1} candidate {model_name}: residual RMSE={next_rmse:.4f}", file=sys.stderr)
 
         best_result = min(stage_results, key=lambda result: result["rmse"])
-        improvement = float("inf") if current_rmse == float("inf") else current_rmse - best_result["rmse"]
+        improvement = current_rmse - best_result["rmse"]
+        relative_improvement = improvement / max(current_rmse, np.finfo(float).eps)
         stage_summary = {
             "round": round_idx + 1,
             "objective": "validation_residual_rmse",
-            "coefficient": coefficient,
-            "previous_rmse": None if current_rmse == float("inf") else current_rmse,
-            "candidates": {result["model_name"]: result["rmse"] for result in stage_results},
+            "previous_rmse": current_rmse,
+            "candidates": {
+                result["model_name"]: {
+                    "rmse": result["rmse"],
+                    "coefficient": result["coefficient"],
+                }
+                for result in stage_results
+            },
             "winner": best_result["model_name"],
             "winner_rmse": best_result["rmse"],
-            "improvement": None if improvement == float("inf") else improvement,
+            "coefficient": best_result["coefficient"],
+            "improvement": improvement,
+            "relative_improvement": relative_improvement,
         }
 
-        if best_result["rmse"] < current_rmse - 1e-12:
+        if relative_improvement >= minimum_relative_improvement:
             model_chain.append(best_result["model_name"])
-            stage_coefficients.append(coefficient)
-            residual_train = residual_train - coefficient * best_result["fitted_train_predictions"]
+            stage_coefficients.append(best_result["coefficient"])
+            residual_train = residual_train - best_result["coefficient"] * best_result["fitted_train_predictions"]
             residual_val = best_result["next_residual_val"]
+            validation_residual_snapshots.append(residual_val.copy())
             stage_summary["action"] = "selected"
             print(
                 f"  ✓ Selected {best_result['model_name']} (residual RMSE: {best_result['rmse']:.4f})",
@@ -690,14 +694,22 @@ def train_and_evaluate(
             "无法降低残差 RMSE。请检查所选数据区间的质量，或调整基础模型参数后重试。"
         )
 
+    selection_model_chain = list(model_chain)
+    selection_coefficients = list(stage_coefficients)
+    search_summary["selection_model_chain"] = selection_model_chain
+    refit_model_chain: List[str] = []
+    stage_coefficients = []
     final_eval_preds = np.zeros(len(eval_range), dtype=float)
     residual_full_train = np.asarray(parsed_data.y[train_range], dtype=float).copy()
     y_true_eval = np.asarray(parsed_data.y[eval_range], dtype=float)
     timestamps = parsed_data.timestamps
     base_model_states: Dict[str, Any] = {}
+    full_uncertainty_profiles: Dict[str, List[float]] = {}
+    uncertainty_coefficients: Dict[str, float] = {}
+    eval_forecast_steps = eval_range.stop - train_range.stop
+    eval_forecast_offset = eval_range.start - train_range.stop
 
-    for stage_idx, model_name in enumerate(model_chain):
-        coefficient = stage_coefficients[stage_idx]
+    for stage_idx, model_name in enumerate(selection_model_chain):
         params = model_params[model_name]
         timeout = _get_model_timeout(model_name, params)
         round_parsed_data = _build_residual_parsed_data(parsed_data, train_range, residual_full_train)
@@ -730,7 +742,7 @@ def train_and_evaluate(
                             source_model_state,
                             requested_steps=eval_range.stop - train_range.stop,
                         )
-                        run_base_model_fit_subprocess(
+                        fit_result = run_base_model_fit_subprocess(
                             model_type=model_name,
                             data=round_lstm_records,
                             train_start=train_range.start,
@@ -738,22 +750,24 @@ def train_and_evaluate(
                             source_model_file=adjusted_source_model_file,
                             save_model_file=stage_model_file,
                             fit_forecast_steps=eval_range.stop - train_range.stop,
+                            predict_steps=eval_range.stop - train_range.stop,
                             allow_negative_predictions=True,
                             timeout=timeout,
                         )
                     finally:
                         if temp_source_model_file and os.path.exists(temp_source_model_file):
                             os.remove(temp_source_model_file)
-                    stage_eval_predictions = _predict_eval_segment(
-                        model_name,
-                        stage_model_file,
-                        train_range,
-                        eval_range,
-                        timeout,
+                    full_predictions = np.asarray(
+                        extract_predictions_from_result(fit_result),
+                        dtype=float,
                     )
+                    stage_eval_predictions = full_predictions[
+                        eval_forecast_offset: eval_forecast_offset + len(eval_range)
+                    ]
+                    stage_uncertainty_profile = extract_uncertainty_profile_from_result(fit_result)
                 else:
                     stage_model_file = source_model_file
-                    stage_eval_predictions = _predict_eval_segment(
+                    stage_eval_predictions, stage_uncertainty_profile = _predict_eval_segment(
                         model_name,
                         stage_model_file,
                         train_range,
@@ -763,7 +777,7 @@ def train_and_evaluate(
                     artifact_origin = "standalone_base"
             else:
                 stage_model_file = source_model_file
-                stage_eval_predictions = _predict_eval_segment(
+                stage_eval_predictions, stage_uncertainty_profile = _predict_eval_segment(
                     model_name,
                     stage_model_file,
                     train_range,
@@ -777,7 +791,7 @@ def train_and_evaluate(
                 model_name,
                 params,
             )
-            stage_model_file, stage_eval_predictions = _train_stage_model(
+            stage_model_file, stage_eval_predictions, stage_uncertainty_profile = _train_stage_model(
                 model_name,
                 round_numeric_records,
                 round_lstm_records,
@@ -798,8 +812,27 @@ def train_and_evaluate(
             stage_idx,
             fitted_train_predictions,
         )
+        coefficient = _nonnegative_line_search(
+            residual_full_train,
+            fitted_train_predictions,
+        )
+        if coefficient <= np.finfo(float).eps:
+            if artifact_origin == "temporary_training":
+                remove_member_model_artifact(model_name, stage_model_file)
+            search_summary["refit_stop"] = {
+                "stage": stage_idx + 1,
+                "model_name": model_name,
+                "reason": "nonpositive_full_refit_coefficient",
+                "coefficient": coefficient,
+            }
+            break
+        refit_model_chain.append(model_name)
+        stage_coefficients.append(coefficient)
         final_eval_preds += coefficient * stage_eval_predictions
         residual_full_train = residual_full_train - coefficient * fitted_train_predictions
+        stage_key = f"stage_{stage_idx}_{model_name}"
+        full_uncertainty_profiles[stage_key] = stage_uncertainty_profile
+        uncertainty_coefficients[stage_key] = coefficient
 
         base_model_states.setdefault(model_name, {"models": []})["models"].append({
             "model_type": model_name,
@@ -815,13 +848,26 @@ def train_and_evaluate(
             file=sys.stderr,
         )
 
+    if not refit_model_chain:
+        raise ValueError(
+            "[MODEL] Boosting selected a validation chain, but its first stage had "
+            "no positive contribution after full-range refitting."
+        )
+    model_chain = refit_model_chain
+    calibration_residuals = validation_residual_snapshots[len(model_chain)]
+
     final_eval_preds = normalize_demand_forecast(final_eval_preds)
-    final_residuals = y_true_eval - final_eval_preds
-    std_dev_residuals = estimate_residual_std(
-        final_residuals,
-        residual_val,
+    full_uncertainty_profile, uncertainty_summary = ensemble_growth_profile(
+        full_uncertainty_profiles,
+        uncertainty_coefficients,
+        calibration_residuals,
         parsed_data.y[train_range],
+        eval_forecast_steps,
     )
+    uncertainty_profile = full_uncertainty_profile[
+        eval_forecast_offset: eval_forecast_offset + len(eval_range)
+    ]
+    uncertainty_summary.setdefault("calibration_source", "internal_validation")
     metrics = {
         "rmse": rmse(y_true_eval, final_eval_preds),
         "mae": mae(y_true_eval, final_eval_preds),
@@ -833,6 +879,9 @@ def train_and_evaluate(
 
     print(f"  ✓ Final RMSE: {metrics['rmse']:.4f}, R²: {metrics['r2']:.4f}", file=sys.stderr)
     print(f"  ✓ Model chain: {' → '.join(model_chain)}", file=sys.stderr)
+    search_summary["selection_coefficients"] = selection_coefficients
+    search_summary["refit_model_chain"] = model_chain
+    search_summary["refit_coefficients"] = stage_coefficients
 
     return (
         metrics,
@@ -841,8 +890,18 @@ def train_and_evaluate(
         base_model_states,
         y_true_eval.tolist(),
         final_eval_preds.tolist(),
-        std_dev_residuals,
+        uncertainty_profile,
         search_summary,
+        {
+            "split": split_plan,
+            "uncertainty": {
+                "calibration_residuals": calibration_residuals.tolist(),
+                "calibration_source": "internal_validation",
+                "reference_series": parsed_data.y[train_range].tolist(),
+                "profile": full_uncertainty_profile,
+                "summary": uncertainty_summary,
+            },
+        },
     )
 
 
@@ -924,8 +983,8 @@ def run(args) -> None:
             "model_chain": state["model_chain"],
             "stage_coefficients": _get_stage_coefficients(state["model_chain"], state),
             "base_model_states": next_base_model_states,
-            "learning_rate": float(state.get("learning_rate", 0.3)),
-            "std_dev_residuals": float(state.get("std_dev_residuals", 0.0)),
+            "split_plan": state.get("split_plan", {}),
+            "uncertainty": state.get("uncertainty", {}),
         }
         attach_method_metadata(next_state, METHOD_NAME, FORECAST_STRATEGY, IMPLEMENTATION_NOTES)
         dump_model(next_state, save_path)
@@ -941,11 +1000,17 @@ def run(args) -> None:
 
     if load_path:
         steps = int(getattr(args, "forecast_steps", 0))
-        preds, std_dev = predict(load_path, steps)
+        state = _load_state(load_path)
+        prepared = state.get("prepared_predictions")
+        if isinstance(prepared, list) and len(prepared) >= steps:
+            predictions = [dict(point) for point in prepared[:steps]]
+        else:
+            preds, uncertainty_profile, uncertainty_summary = predict(load_path, steps, state=state)
+            predictions = _format_predictions(preds, uncertainty_profile, uncertainty_summary)
         out = {
             "mode": "boosting_loaded_predict",
             "forecast_steps": steps,
-            "predictions": _format_predictions(preds, std_dev),
+            "predictions": predictions,
         }
         attach_method_metadata(out, METHOD_NAME, FORECAST_STRATEGY, IMPLEMENTATION_NOTES)
         print(json.dumps(out, ensure_ascii=False, indent=2 if pretty else None))
@@ -969,47 +1034,28 @@ def run(args) -> None:
             return cast_type(val)
         return val
 
-    learning_rate = get_arg("learning_rate", 0.3, float)
-    max_rounds = get_arg("max_rounds", len(models_to_use), int)
-    if not (0 < learning_rate <= 1):
-        raise ValueError("[VALIDATION] learning_rate must be in (0, 1]")
-    if max_rounds < 1:
-        raise ValueError("[VALIDATION] max_rounds must be >= 1")
-
-    train_size = te - ts + 1
-    boost_train_size = _compute_phase1_train_size(train_size)
-    auto_window = max(3, min(12, boost_train_size // 4))
-    auto_look_back = max(3, min(12, boost_train_size // 4))
-    if boost_train_size <= 12:
-        auto_max_pq = 1
-    elif boost_train_size <= 20:
-        auto_max_pq = 2
-    else:
-        auto_max_pq = max(1, min(5, boost_train_size // 6))
-    # Keep the no-artifact fallback aligned with standalone LSTM training.
-    auto_epochs = 20
-
     model_params: Dict[str, Dict[str, Any]] = {}
     base_model_files = parse_base_model_files_arg(get_arg("base_model_files", None))
 
     if "arima" in models_to_use:
         model_params["arima"] = {
             "d": get_arg("d", 0, int),
-            "max_p": get_arg("max_p", auto_max_pq, int),
-            "max_q": get_arg("max_q", auto_max_pq, int),
         }
 
     if "es" in models_to_use:
         model_params["es"] = {"alpha": get_arg("alpha", 0.5, float)}
 
     if "ma" in models_to_use:
-        model_params["ma"] = {"window": get_arg("window", auto_window, int)}
+        model_params["ma"] = {"window": get_arg("window", 3, int)}
 
     if "lstm" in models_to_use:
         feature_types_str = get_arg("feature_types", None)
         lstm_features_str = get_arg("lstm_features", None)
         target_feature = get_arg("lstm_target_feature", parsed_data.target_key)
-        lstm_feature_names = _parse_feature_name_list(lstm_features_str) if lstm_features_str else parsed_data.feature_keys
+        lstm_feature_names = require_explicit_lstm_feature_names(
+            lstm_features_str,
+            "Boosting",
+        )
 
         if feature_types_str:
             feature_types = json.loads(feature_types_str)
@@ -1020,20 +1066,16 @@ def run(args) -> None:
                 feature_keys=lstm_feature_names,
             )
 
-        if lstm_feature_names:
-            allowed_keys = set(lstm_feature_names + [target_feature])
-            feature_types = {k: v for k, v in feature_types.items() if k in allowed_keys}
+        allowed_keys = set(lstm_feature_names + [target_feature])
+        feature_types = {k: v for k, v in feature_types.items() if k in allowed_keys}
         feature_types[target_feature] = "numeric"
 
         lstm_params = {
-            "look_back": get_arg("look_back", auto_look_back, int),
-            "epochs": get_arg("epochs", auto_epochs, int),
             "feature_types": feature_types,
             "normalization": get_arg("normalization", "minmax"),
             "lstm_target_feature": target_feature,
+            "lstm_features": json.dumps(lstm_feature_names, ensure_ascii=False),
         }
-        if lstm_features_str:
-            lstm_params["lstm_features"] = lstm_features_str
 
         model_params["lstm"] = lstm_params
 
@@ -1054,16 +1096,17 @@ def run(args) -> None:
         base_model_states,
         y_true,
         y_pred,
-        std_dev,
+        uncertainty_profile,
         summary,
+        training_details,
     ) = train_and_evaluate(
         parsed_data,
         train_range,
         eval_range,
         models_to_use,
         model_params,
-        learning_rate,
-        max_rounds,
+        0.0,
+        0,
         base_model_files,
     )
 
@@ -1072,11 +1115,18 @@ def run(args) -> None:
         "models": models_to_use,
         "model_chain": model_chain,
         "stage_coefficients": stage_coefficients,
-        "learning_rate": learning_rate,
+        "split_plan": training_details["split"],
         "metrics": metrics,
         "search_summary": summary,
         "eval_y_true": y_true,
-        "predictions": _format_predictions(y_pred, std_dev),
+        "predictions": _format_predictions(
+            y_pred,
+            uncertainty_profile,
+            {
+                **training_details["uncertainty"]["summary"],
+                "horizon_start": int(args.eval_start) - int(args.train_end),
+            },
+        ),
     }
     attach_method_metadata(out, METHOD_NAME, FORECAST_STRATEGY, IMPLEMENTATION_NOTES)
 
@@ -1100,8 +1150,8 @@ def run(args) -> None:
             "model_chain": model_chain,
             "stage_coefficients": stage_coefficients,
             "base_model_states": base_model_states,
-            "learning_rate": learning_rate,
-            "std_dev_residuals": std_dev,
+            "split_plan": training_details["split"],
+            "uncertainty": training_details["uncertainty"],
         }
         attach_method_metadata(state, METHOD_NAME, FORECAST_STRATEGY, IMPLEMENTATION_NOTES)
         dump_model(state, save_path)

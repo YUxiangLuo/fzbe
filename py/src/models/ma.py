@@ -20,6 +20,7 @@ from logger import log, get_log_contents
 from metrics import mae, mape, r2, rmse
 from model_info import attach_method_metadata, ensure_state_metadata
 from serialization import dump_model, load_model
+from uncertainty import format_predictions, moving_average_profile, profile_for_steps
 
 MODEL_TYPE = "ma"
 METHOD_NAME = "递推移动平均"
@@ -29,18 +30,23 @@ IMPLEMENTATION_NOTES = [
     "本系统要求窗口 n >= 2；n=1 等同于朴素的上一期值预测，不能体现移动平均的平滑特性，因此不作为教学选项。",
     "本系统预测多期未来销量时，将每期预测值滚入窗口继续递推，避免使用评估集或未来真实值。",
     "移动平均原始输出通常在非负销量输入下自然非负；本系统仍将最终销量点预测按 max(0, y_hat) 截断，并用截断后的值计算残差与指标。该后处理不是教科书移动平均公式的一部分。",
-    "预测值附带的 std_dev 通常是评估段残差的样本标准差；评估不足 2 点时退回训练序列波动。该值不随预测步长增长，与 ARIMA 随步长展宽的置信区间口径不同。",
+    "std_dev 按训练段 rolling-origin 多步残差逐 horizon 估计；95% 区间和生产用 99% 上侧误差直接取同一组 actual-prediction 残差的经验分位数，因此会保留稳定偏差。某个 horizon 样本不足时使用明确标记的一阶差分 sqrt(h) 正态近似回退。",
 ]
 
 # Type alias for input flexibility
 ArrayLike = Union[List[float], np.ndarray]
 
 
-def _format_predictions(preds: List[float], std_dev: float) -> List[Dict[str, float]]:
+def _format_predictions(
+    preds: List[float],
+    std_dev: Any,
+    metadata: Optional[Dict[str, Any]] = None,
+) -> List[Dict[str, Any]]:
     """
     Format predictions with standard deviation for JSON output.
     """
-    return [{"prediction": p, "std_dev": std_dev} for p in preds]
+    profile = list(std_dev) if isinstance(std_dev, (list, tuple, np.ndarray)) else [float(std_dev)] * len(preds)
+    return format_predictions(preds, profile, metadata or {"source": "empirical", "fallback": False})
 
 
 def _load_state(model_path: str) -> Dict[str, Any]:
@@ -92,33 +98,19 @@ def _forecast_future(
     return preds
 
 
-def _estimate_std_dev(residuals: ArrayLike, reference_series: ArrayLike) -> float:
-    residuals_array = np.asarray(residuals, dtype=float)
-    if residuals_array.size > 1:
-        return float(np.std(residuals_array, ddof=1))
-
-    reference_array = np.asarray(reference_series, dtype=float)
-    if reference_array.size > 1:
-        return float(np.std(reference_array, ddof=1))
-
-    baseline = abs(float(np.mean(reference_array))) if reference_array.size else 0.0
-    return float(max(baseline * 0.05, 1.0))
-
-
 # ---------- predict (for ensemble / CLI load) ----------
 def predict(
     model_path: str,
     steps: int,
     state: Optional[Dict[str, Any]] = None,
     allow_negative_predictions: bool = False,
-) -> Tuple[List[float], float]:
+) -> Tuple[List[float], List[float]]:
     """
     Forecast future values using a saved MA model.
     """
     state = state or _load_state(model_path)
     window = int(state["window"])
     history = list(state["history"])
-    std_dev_residuals = float(state.get("std_dev_residuals", 0.0))
 
     prediction_domain = resolve_prediction_domain(
         state,
@@ -128,7 +120,13 @@ def predict(
         _forecast_future(history, window, steps),
         prediction_domain,
     )
-    return predictions.tolist(), std_dev_residuals
+    uncertainty_profile, _ = profile_for_steps(
+        state.get("uncertainty_profile"),
+        steps,
+        state.get("reference_series", history),
+        state.get("uncertainty_summary"),
+    )
+    return predictions.tolist(), uncertainty_profile
 
 
 def train_and_evaluate(
@@ -171,7 +169,8 @@ def train_and_evaluate(
     y_true = series[idxs]
     y_pred = apply_prediction_domain(preds, prediction_domain)
     residuals = y_true - y_pred
-    std_dev_residuals = _estimate_std_dev(residuals, train_history)
+    one_step_profile, _ = moving_average_profile(train_history, window, 1)
+    std_dev_residuals = float(one_step_profile[0])
 
     log.info(f"Calculated residuals: mean={np.mean(residuals):.4f}, std_dev={std_dev_residuals:.4f}")
 
@@ -221,7 +220,9 @@ def run(args) -> None:
 
         history_start = max(ts, te - window + 1)
         history = y[history_start : te + 1]
-        std_dev_residuals = float(state.get("std_dev_residuals", _estimate_std_dev([], history)))
+        reference_series = np.asarray(y)[range(ts, te + 1)]
+        profile, uncertainty_summary = moving_average_profile(reference_series, window, 12)
+        std_dev_residuals = float(profile[0])
 
         next_state = {
             "model_type": MODEL_TYPE,
@@ -229,6 +230,9 @@ def run(args) -> None:
             "train_end_index": te,
             "history": history.tolist(),
             "std_dev_residuals": std_dev_residuals,
+            "uncertainty_profile": profile,
+            "uncertainty_summary": uncertainty_summary,
+            "reference_series": reference_series.tolist(),
             "prediction_domain": prediction_domain,
         }
         attach_method_metadata(next_state, METHOD_NAME, FORECAST_STRATEGY, IMPLEMENTATION_NOTES)
@@ -240,6 +244,22 @@ def run(args) -> None:
             "train_end_index": te,
             "saved_model": save_path,
         }
+        fit_predict_steps = int(getattr(args, "fit_predict_steps", 0) or 0)
+        if fit_predict_steps > 0:
+            preds, resolved_profile = predict(
+                save_path,
+                fit_predict_steps,
+                state=next_state,
+                allow_negative_predictions=bool(getattr(args, "allow_negative_predictions", False)),
+            )
+            _, resolved_summary = profile_for_steps(
+                next_state["uncertainty_profile"],
+                fit_predict_steps,
+                next_state["reference_series"],
+                next_state["uncertainty_summary"],
+            )
+            out["forecast_steps"] = fit_predict_steps
+            out["predictions"] = _format_predictions(preds, resolved_profile, resolved_summary)
         attach_method_metadata(out, METHOD_NAME, FORECAST_STRATEGY, IMPLEMENTATION_NOTES)
         out["logs"] = get_log_contents()
         print(json.dumps(out, ensure_ascii=False, indent=2 if pretty else None))
@@ -252,14 +272,28 @@ def run(args) -> None:
             raise ValueError("[VALIDATION] --forecast_steps must be > 0.")
 
         log.info(f"Starting prediction with {steps} forecast steps")
-        preds, std_dev = predict(
-            load_path,
-            steps,
-            state=state,
-            allow_negative_predictions=bool(getattr(args, "allow_negative_predictions", False)),
-        )
-        log.info(f"Generated {len(preds)} predictions")
-        predictions_with_std = _format_predictions(preds, std_dev)
+        prepared = state.get("prepared_predictions")
+        if (
+            not bool(getattr(args, "allow_negative_predictions", False))
+            and isinstance(prepared, list)
+            and len(prepared) >= steps
+        ):
+            predictions_with_std = [dict(point) for point in prepared[:steps]]
+        else:
+            preds, profile = predict(
+                load_path,
+                steps,
+                state=state,
+                allow_negative_predictions=bool(getattr(args, "allow_negative_predictions", False)),
+            )
+            _, resolved_uncertainty_summary = profile_for_steps(
+                state.get("uncertainty_profile"),
+                steps,
+                state.get("reference_series") or state.get("history") or [],
+                state.get("uncertainty_summary") or {},
+            )
+            predictions_with_std = _format_predictions(preds, profile, resolved_uncertainty_summary)
+        log.info(f"Generated {len(predictions_with_std)} predictions")
 
         out: Dict[str, Any] = {
             "mode": "ma_loaded_predict",
@@ -312,7 +346,18 @@ def run(args) -> None:
             prediction_domain,
         )
 
-        predictions_with_std = _format_predictions(y_pred.tolist(), std_dev_residuals)
+        full_profile, uncertainty_summary = moving_average_profile(
+            np.asarray(y)[range(ts, te + 1)],
+            window,
+            max(12, ee - te),
+        )
+        forecast_offset = es - te - 1
+        evaluation_profile = full_profile[forecast_offset : forecast_offset + len(y_pred)]
+        predictions_with_std = _format_predictions(
+            y_pred.tolist(),
+            evaluation_profile,
+            {**uncertainty_summary, "horizon_start": forecast_offset + 1},
+        )
 
         out: Dict[str, Any] = {
             "mode": "fixed_window_only",
@@ -322,6 +367,7 @@ def run(args) -> None:
             "metrics": metrics,
             "eval_y_true": y_true.tolist(),
             "predictions": predictions_with_std,
+            "uncertainty_summary": uncertainty_summary,
         }
         attach_method_metadata(out, METHOD_NAME, FORECAST_STRATEGY, IMPLEMENTATION_NOTES)
 
@@ -333,7 +379,10 @@ def run(args) -> None:
             state = {
                 "model_type": MODEL_TYPE, "window": window, "train_end_index": te,
                 "history": history.tolist(),
-                "std_dev_residuals": std_dev_residuals,
+                "std_dev_residuals": float(full_profile[0]),
+                "uncertainty_profile": full_profile[:12],
+                "uncertainty_summary": uncertainty_summary,
+                "reference_series": np.asarray(y)[range(ts, te + 1)].tolist(),
                 "prediction_domain": prediction_domain,
             }
             attach_method_metadata(state, METHOD_NAME, FORECAST_STRATEGY, IMPLEMENTATION_NOTES)

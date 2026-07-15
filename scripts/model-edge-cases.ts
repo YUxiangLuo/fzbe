@@ -361,6 +361,54 @@ async function trainGuidedModel(
   return session.result;
 }
 
+async function prepareProductionModel(
+  app: AppLike,
+  token: string,
+  experimentId: number,
+  modelType: ModelType,
+  forecastSteps: number,
+) {
+  let response = assertStatus<any>(
+    await requestApp(app, `/api/v1/models/${modelType}/production-preparation/sessions`, {
+      method: "POST",
+      token,
+      body: { experiment_id: experimentId, forecast_steps: forecastSteps },
+    }),
+    200,
+    `${modelType} production preparation session creation`,
+  );
+
+  for (let stepCount = 0; stepCount < 64; stepCount += 1) {
+    const session = response?.results;
+    if (session?.session_status === "completed") {
+      if (typeof session.preparation_token !== "string") {
+        throw new Error(`${modelType} completed production session has no token: ${JSON.stringify(response)}`);
+      }
+      return session;
+    }
+    if (session?.session_status === "failed" || session?.session_status === "superseded") {
+      throw new Error(
+        `${modelType} production session became ${session.session_status}: ${JSON.stringify(response)}`,
+      );
+    }
+    if (typeof session?.session_id !== "string" || typeof session?.next_step?.id !== "string") {
+      throw new Error(`${modelType} production session has no runnable next step: ${JSON.stringify(response)}`);
+    }
+    response = assertStatus<any>(
+      await requestApp(
+        app,
+        `/api/v1/models/${modelType}/production-preparation/sessions/${session.session_id}`
+          + `/steps/${session.next_step.id}/run`,
+        { method: "POST", token, body: {} },
+      ),
+      200,
+      `${modelType} production preparation step ${session.next_step.id}`,
+    );
+  }
+
+  throw new Error(`${modelType} production preparation exceeded the step limit: ${JSON.stringify(response)}`);
+}
+
 async function login(app: AppLike) {
   const payload = assertStatus<any>(
     await requestApp(app, "/api/v1/sessions", {
@@ -455,24 +503,16 @@ async function runApiLayer() {
   }
 
   const notReadyExperimentId = await createModelExperiment(app, token);
-  const notReadyPrepare = await requestApp(app, "/api/v1/models/ma/prepare-production", {
+  const notReadyPrepare = await requestApp(app, "/api/v1/models/ma/production-preparation/sessions", {
     method: "POST",
     token,
     body: { experiment_id: notReadyExperimentId, forecast_steps: 3 },
   });
-  assertStatus(notReadyPrepare, 400, "prepare-production should reject incomplete models");
+  assertStatus(notReadyPrepare, 400, "production session should reject incomplete models");
 
   for (const modelType of trainedModels) {
     console.error(`[model-edge] api production predict: ${modelType}`);
-    const preparation = assertStatus<any>(
-      await requestApp(app, `/api/v1/models/${modelType}/prepare-production`, {
-        method: "POST",
-        token,
-        body: { experiment_id: experimentId, forecast_steps: 3 },
-      }),
-      200,
-      `${modelType} prepare-production`,
-    );
+    const preparation = await prepareProductionModel(app, token, experimentId, modelType, 3);
     const prediction = assertStatus<any>(
       await requestApp(app, `/api/v1/models/${modelType}/predict`, {
         method: "POST",
@@ -480,7 +520,7 @@ async function runApiLayer() {
         body: {
           experiment_id: experimentId,
           forecast_steps: 3,
-          preparation_token: preparation.results?.preparation_token,
+          preparation_token: preparation.preparation_token,
         },
       }),
       200,
@@ -492,15 +532,7 @@ async function runApiLayer() {
   const expandedHorizonModels: ModelType[] = ["lstm", ...ENSEMBLE_MODELS];
   for (const modelType of expandedHorizonModels) {
     console.error(`[model-edge] api expand production horizon: ${modelType}`);
-    const preparation = assertStatus<any>(
-      await requestApp(app, `/api/v1/models/${modelType}/prepare-production`, {
-        method: "POST",
-        token,
-        body: { experiment_id: experimentId, forecast_steps: 8 },
-      }),
-      200,
-      `${modelType} expanded-horizon prepare-production`,
-    );
+    const preparation = await prepareProductionModel(app, token, experimentId, modelType, 8);
     const prediction = assertStatus<any>(
       await requestApp(app, `/api/v1/models/${modelType}/predict`, {
         method: "POST",
@@ -508,7 +540,7 @@ async function runApiLayer() {
         body: {
           experiment_id: experimentId,
           forecast_steps: 8,
-          preparation_token: preparation.results?.preparation_token,
+          preparation_token: preparation.preparation_token,
         },
       }),
       200,

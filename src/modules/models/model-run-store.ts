@@ -464,9 +464,8 @@ export const buildAuthoritativeResult = (
         normalization: body.lstmNormalization,
         target_field: body.lstmTargetFeature,
         features,
-        look_back: result.results.look_back ?? null,
-        epochs: result.results.epochs ?? null,
         forecast_horizon: result.results.forecast_horizon ?? null,
+        training_regime: result.results.training_regime ?? null,
       });
       Object.assign(experimentPatch, {
         lstm_completed: 1,
@@ -1002,6 +1001,7 @@ export async function setProductionArtifactForRun(
   forecastSteps: number,
   productionRevision: string,
   productionArtifactSha256: string | null = null,
+  expectedProductionRevision: string | null = null,
 ) {
   const [result] = await queryWithTimeout(pool,
     `UPDATE model_training_runs
@@ -1010,8 +1010,21 @@ export async function setProductionArtifactForRun(
             production_artifact_forecast_steps = ?,
             production_revision = ?
       WHERE run_id = ?
-        AND is_active = true`,
-    [artifactPath, productionArtifactSha256, forecastSteps, productionRevision, runId],
+        AND is_active = true
+        AND production_revision <=> ?
+        AND (
+          production_artifact_forecast_steps IS NULL
+          OR production_artifact_forecast_steps < ?
+        )`,
+    [
+      artifactPath,
+      productionArtifactSha256,
+      forecastSteps,
+      productionRevision,
+      runId,
+      expectedProductionRevision,
+      forecastSteps,
+    ],
   );
   return Number((result as { affectedRows?: number }).affectedRows ?? 0) === 1;
 }

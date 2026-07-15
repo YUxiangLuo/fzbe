@@ -385,7 +385,7 @@ def main() -> None:
             "[VALIDATION] LSTM feature columns not found in dataset: ['不存在字段']",
         )
 
-        oversized_look_back_result = run_command(
+        hidden_params_ignored_output = invoke_model(
             "weighted_avg",
             data_json,
             "--train-start",
@@ -409,10 +409,8 @@ def main() -> None:
             "--lstm-features",
             "价格指数,促销投入,库存水平,搜索热度",
         )
-        assert_error(
-            oversized_look_back_result,
-            "[VALIDATION] LSTM look_back (9) is too large for the weighted average internal training split (10 points) and validation horizon (2 points).",
-        )
+        assert hidden_params_ignored_output["mode"] == "weighted_avg_train_eval"
+        assert hidden_params_ignored_output["split_plan"]["validation_size"] >= 2
 
         short_fit_result = run_command(
             "weighted_avg",
@@ -420,7 +418,7 @@ def main() -> None:
             "--train-start",
             "0",
             "--train-end",
-            "3",
+            "6",
             "--load-model",
             str(weighted_model_backtest),
             "--save-model",
@@ -430,7 +428,7 @@ def main() -> None:
         )
         assert_error(
             short_fit_result,
-            "[VALIDATION] Weighted Average fit-only member lstm cannot be refit: Training range must be larger than look_back.",
+            "Training range is too short for a direct LSTM forecast",
         )
 
         missing_feature_fit_result = run_command(
@@ -493,7 +491,10 @@ def main() -> None:
             reused_short_source_state["base_model_states"]["lstm"]["model_file"]
         )
         reused_short_source_member_state = load_pickled_state(reused_short_source_member)
-        assert reused_short_source_member_state["look_back"] == 4
+        assert reused_short_source_member_state["look_back"] == reused_short_source_member_state["derived_config"]["look_back"]
+        assert reused_short_source_member_state["feature_keys"] == LSTM_FEATURE_KEYS
+        assert "look_back" not in reused_short_source_state["base_model_states"]["lstm"]["params"]
+        assert "epochs" not in reused_short_source_state["base_model_states"]["lstm"]["params"]
         assert reused_short_source_member_state["forecast_strategy"] == "direct_multi_horizon"
         assert reused_short_source_member_state["forecast_horizon"] == len(reused_short_source_predictions)
 
@@ -508,7 +509,7 @@ def main() -> None:
                 "reused_base_models": BASE_MODELS,
                 "edge_cases": [
                     "missing_lstm_feature",
-                    "oversized_look_back",
+                    "hidden_lstm_params_ignored",
                     "fit_only_short_window",
                     "fit_only_missing_saved_feature",
                     "reused_short_horizon_source",

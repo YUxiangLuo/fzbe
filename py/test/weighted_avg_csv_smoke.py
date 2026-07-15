@@ -13,7 +13,7 @@ RUN_MODEL = PY_ROOT / "run_model.py"
 CSV_FIXTURE = Path(__file__).resolve().parent / "fixtures" / "core_models_smoke.csv"
 BASE_MODELS = ["ma", "es", "arima"]
 
-from model_metadata_assertions import assert_method_metadata
+from model_metadata_assertions import assert_method_metadata  # noqa: E402
 
 
 def load_csv_records(csv_path: Path) -> list[dict[str, str]]:
@@ -74,16 +74,25 @@ def normalized_inverse_residual_mse_weights(
     predictions_by_model: dict[str, list[float]],
     y_true: list[float],
 ) -> dict[str, float]:
+    scale = max(1.0, sum(value * value for value in y_true) / len(y_true))
+    epsilon = max(1e-12, sys.float_info.epsilon * scale)
     raw_weights: dict[str, float] = {}
     total = 0.0
     for model_name, predictions in predictions_by_model.items():
         residuals = [target - prediction for target, prediction in zip(y_true, predictions)]
         residual_mse = sum(value * value for value in residuals) / len(residuals)
-        inverse_error = 1.0 / (residual_mse + 1e-9)
+        inverse_error = 1.0 / (residual_mse + epsilon)
         raw_weights[model_name] = inverse_error
         total += inverse_error
 
-    return {model_name: weight / total for model_name, weight in raw_weights.items()}
+    normalized = {model_name: weight / total for model_name, weight in raw_weights.items()}
+    model_count = len(normalized)
+    reliability = len(y_true) / (len(y_true) + model_count + 1.0)
+    uniform = 1.0 / model_count
+    return {
+        model_name: reliability * weight + (1.0 - reliability) * uniform
+        for model_name, weight in normalized.items()
+    }
 
 
 def weighted_sum(predictions_by_model: dict[str, list[float]], weights: dict[str, float]) -> list[float]:

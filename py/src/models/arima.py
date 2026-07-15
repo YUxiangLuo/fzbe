@@ -2,13 +2,14 @@
 # -*- coding: utf-8 -*-
 """
 ARIMA model with automatic order selection for p and q.
-User specifies d, and the model searches for optimal p and q using AIC and BIC.
+User specifies d, and the model searches for p and q using AICc.
 """
 import json
 from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 import pmdarima as pm
+from statsmodels.stats.diagnostic import acorr_ljungbox
 
 from data_utils import load_data_from_json
 from forecast_utils import (
@@ -21,29 +22,81 @@ from log_safety import summarize_cli_args
 from metrics import mae, mape, r2, rmse
 from model_info import attach_method_metadata, ensure_state_metadata
 from serialization import dump_model, load_model
+from dynamic_config import derive_arima_search_limit
+from uncertainty import NORMAL_95, NORMAL_99
 
 MODEL_TYPE = "arima"
 METHOD_NAME = "ARIMA 自动定阶"
 FORECAST_STRATEGY = "arima_multi_step_forecast"
 IMPLEMENTATION_NOTES = [
     "教科书 ARIMA 通常通过平稳性检验、ACF/PACF 和信息准则定阶。",
-    "本系统由用户根据 ADF 结果指定差分阶数 d；模型固定为非季节 ARIMA，并分别执行以 AIC、BIC 为目标的 stepwise 搜索来选择 p 和 q，而不是穷举所有组合。",
-    "p/q 搜索上限随训练样本量自动收紧；训练样本少于 30 时优先比较两个搜索胜出模型的 BIC，否则优先比较 AIC。",
+    "本系统由用户根据 ADF 结果指定差分阶数 d；模型固定为非季节 ARIMA，并执行一次以 AICc 为目标的 stepwise 搜索来选择 p、q 和是否包含截距。",
+    "p/q 搜索上限按差分后的有效样本量自动收紧；少于 6 个有效样本时拒绝拟合，不用不可靠结果冒充完整 ARIMA。",
+    "选中模型必须收敛；首次搜索结果未收敛时按完整规格将最大迭代数加倍重拟合一次，并记录 Ljung-Box 白噪声诊断。",
     "预测未来销量时使用拟合后的 ARIMA 模型直接生成多步 forecast；原始点预测可能为负，本系统将用于残差、指标和输出的销量点预测按 max(0, y_hat) 截断。该约束是业务后处理，不属于教科书 ARIMA。",
-    "默认 95% 预测区间仍由未截断的 ARIMA 预测分布计算，本系统只取区间宽度除以 3.92 近似换算为正态标准差，因此区间本身并不是截断正态区间。",
+    "默认 95% 预测区间仍由未截断的 ARIMA 预测分布计算；std_dev 按该分布的精确 95% 正态临界值由区间宽度反推，生产用 99% 上侧误差也由同一未截断分布计算。区间本身不是截断正态区间。",
 ]
 
 
 # ---------- utilities ----------
-def _format_predictions(preds: List[float], conf_intervals: List[List[float]]) -> List[Dict[str, float]]:
+def _format_predictions(
+    preds: List[float],
+    conf_intervals: List[List[float]],
+    calibration_mean_error: float | None = None,
+    calibration_count: int | None = None,
+) -> List[Dict[str, Any]]:
     """
-    Format predictions with confidence intervals for JSON output.
-    Converts 95% confidence interval to approximate std_dev.
+    Format predictions with 95% prediction intervals for JSON output.
+    Converts interval width to its Gaussian std_dev while preserving the
+    model's original, untruncated interval bounds.
     """
-    return [
-        {"prediction": float(p), "std_dev": float((ci[1] - ci[0]) / 3.92)}
-        for p, ci in zip(preds, conf_intervals)
-    ]
+    has_mean = calibration_mean_error is not None
+    has_count = calibration_count is not None
+    if has_mean != has_count:
+        raise ValueError("[MODEL] ARIMA bias calibration must provide both mean error and sample count.")
+    if has_mean:
+        try:
+            numeric_mean_error = float(calibration_mean_error)
+            raw_numeric_count = float(calibration_count)
+            numeric_count = int(raw_numeric_count)
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise ValueError("[MODEL] ARIMA bias calibration is invalid.") from exc
+        if (
+            not np.isfinite(numeric_mean_error)
+            or not np.isfinite(raw_numeric_count)
+            or isinstance(calibration_count, bool)
+            or numeric_count <= 0
+            or raw_numeric_count != numeric_count
+        ):
+            raise ValueError("[MODEL] ARIMA bias calibration is invalid.")
+    else:
+        numeric_mean_error = None
+        numeric_count = None
+
+    points: List[Dict[str, Any]] = []
+    for prediction, interval in zip(preds, conf_intervals):
+        numeric_prediction = float(prediction)
+        lower = float(interval[0])
+        upper = float(interval[1])
+        std_dev = max(0.0, (upper - lower) / (2.0 * NORMAL_95))
+        raw_distribution_mean = (lower + upper) / 2.0
+        points.append({
+            "prediction": numeric_prediction,
+            "std_dev": std_dev,
+            "uncertainty_source": "model",
+            "calibration_source": "arima_forecast_distribution",
+            "calibration_mean_error": numeric_mean_error,
+            "calibration_count": numeric_count,
+            "interval_lower": lower,
+            "interval_upper": upper,
+            "interval_level": 0.95,
+            "interval_kind": "model_prediction_interval",
+            "upper_error_p99": max(
+                0.0,
+                raw_distribution_mean + NORMAL_99 * std_dev - numeric_prediction,
+            ),
+        })
+    return points
 
 
 def _load_state(model_path: str) -> Dict[str, Any]:
@@ -55,16 +108,10 @@ def _load_state(model_path: str) -> Dict[str, Any]:
 
 
 def _validate_arima_train_size(train_size: int, d: int, context: str) -> int:
-    if train_size < 2:
-        raise ValueError(f"[VALIDATION] {context} must contain at least 2 points for ARIMA fitting.")
-
-    effective_train_size = train_size - d
-    if d > 0 and effective_train_size < 2:
-        raise ValueError(
-            f"[VALIDATION] {context} must contain at least d + 2 points for ARIMA fitting "
-            f"(got train_size={train_size}, d={d})."
-        )
-    return effective_train_size
+    try:
+        return int(derive_arima_search_limit(train_size, d)["effective_train_size"])
+    except ValueError as exc:
+        raise ValueError(f"{exc} Context: {context}.") from exc
 
 
 def _run_auto_arima_search(
@@ -72,7 +119,7 @@ def _run_auto_arima_search(
     d: int,
     max_p: int,
     max_q: int,
-    criterion: str,
+    criterion: str = "aicc",
 ) -> Any:
     if d < 0:
         raise ValueError(f"[VALIDATION] ARIMA d must be >= 0, got {d}")
@@ -91,6 +138,8 @@ def _run_auto_arima_search(
             suppress_warnings=True,
             error_action="ignore",
             information_criterion=criterion,
+            with_intercept="auto",
+            maxiter=50,
             trace=False,
         )
     except Exception as exc:
@@ -99,15 +148,109 @@ def _run_auto_arima_search(
         ) from exc
 
 
-def _fit_arima_order(y_train: np.ndarray, order: Tuple[int, int, int], context: str) -> Any:
+def _model_spec(model: Any) -> Dict[str, Any]:
+    return {
+        "order": [int(value) for value in model.order],
+        "seasonal_order": [int(value) for value in getattr(model, "seasonal_order", (0, 0, 0, 0))],
+        "with_intercept": bool(getattr(model, "with_intercept", False)),
+        "trend": getattr(model, "trend", None),
+    }
+
+
+def _is_converged(model: Any) -> bool:
+    return bool(getattr(model, "arima_res_", None) is not None and model.arima_res_.mle_retvals.get("converged", False))
+
+
+def _fit_arima_spec(
+    y_train: np.ndarray,
+    spec: Dict[str, Any],
+    context: str,
+    maxiter: int = 100,
+) -> Any:
     try:
-        fitted_model = pm.ARIMA(order=order, seasonal=False, suppress_warnings=True)
+        order = tuple(int(value) for value in spec["order"])
+        seasonal_order = tuple(int(value) for value in spec.get("seasonal_order", (0, 0, 0, 0)))
+        fitted_model = pm.ARIMA(
+            order=order,
+            seasonal_order=seasonal_order,
+            with_intercept=bool(spec.get("with_intercept", False)),
+            trend=spec.get("trend"),
+            suppress_warnings=True,
+            maxiter=maxiter,
+        )
         fitted_model.fit(y_train)
         return fitted_model
     except Exception as exc:
         raise ValueError(
-            f"[VALIDATION] {context} failed to fit ARIMA order {order}: {exc}"
+            f"[VALIDATION] {context} failed to fit ARIMA specification {spec}: {exc}"
         ) from exc
+
+
+def _fit_arima_order(y_train: np.ndarray, order: Tuple[int, int, int], context: str) -> Any:
+    return _fit_arima_spec(
+        y_train,
+        {"order": list(order), "seasonal_order": [0, 0, 0, 0], "with_intercept": False, "trend": None},
+        context,
+    )
+
+
+def _is_deterministic_boundary_case(model: Any, y_train: np.ndarray) -> bool:
+    """Recognize a zero-innovation random walk/drift likelihood boundary."""
+    order = tuple(int(value) for value in model.order)
+    if order[0] != 0 or order[2] != 0:
+        return False
+    effective = np.diff(np.asarray(y_train, dtype=float), n=order[1]) if order[1] else np.asarray(y_train, dtype=float)
+    if effective.size < 2 or not np.isfinite(effective).all():
+        return False
+    scale = max(1.0, float(np.max(np.abs(effective))))
+    return bool(float(np.ptp(effective)) <= np.sqrt(np.finfo(float).eps) * scale)
+
+
+def _ensure_converged(model: Any, y_train: np.ndarray, context: str) -> Tuple[Any, bool]:
+    if _is_converged(model):
+        return model, False
+    retried = _fit_arima_spec(y_train, _model_spec(model), context, maxiter=100)
+    if not _is_converged(retried):
+        if _is_deterministic_boundary_case(retried, y_train):
+            log.warning(
+                "%s reached the zero-innovation likelihood boundary; accepting the "
+                "finite ARIMA(0,d,0) forecast as a deterministic teaching case.",
+                context,
+            )
+            return retried, True
+        raise ValueError(
+            f"[MODEL] {context} did not converge after retrying the selected ARIMA specification."
+        )
+    return retried, True
+
+
+def _residual_diagnostics(model: Any, effective_train_size: int) -> Dict[str, Any]:
+    order = tuple(int(value) for value in model.order)
+    lag = min(10, effective_train_size // 5)
+    model_df = order[0] + order[2]
+    if lag <= model_df or lag < 1:
+        return {
+            "ljung_box_lag": None,
+            "ljung_box_pvalue": None,
+            "residual_white_noise": None,
+            "warning": "effective sample is too short for a degrees-of-freedom adjusted Ljung-Box test",
+        }
+    residuals = np.asarray(model.arima_res_.resid, dtype=float)
+    result = acorr_ljungbox(residuals, lags=[lag], model_df=model_df, return_df=True)
+    pvalue = float(result["lb_pvalue"].iloc[-1])
+    if not np.isfinite(pvalue):
+        return {
+            "ljung_box_lag": lag,
+            "ljung_box_pvalue": None,
+            "residual_white_noise": None,
+            "warning": "residual variance is degenerate, so Ljung-Box is undefined",
+        }
+    return {
+        "ljung_box_lag": lag,
+        "ljung_box_pvalue": pvalue,
+        "residual_white_noise": pvalue >= 0.05,
+        "warning": None if pvalue >= 0.05 else "residual autocorrelation remains at the 5% level",
+    }
 
 
 # ---------- predict ----------
@@ -122,7 +265,7 @@ def predict(
 
     Returns:
         predictions: List of forecasted values
-        conf_int: List of [lower, upper] confidence interval bounds
+        conf_int: List of [lower, upper] prediction interval bounds
     """
     log.debug(f"ARIMA predict called with steps={steps}, model_path={model_path}")
     if steps <= 0:
@@ -139,7 +282,7 @@ def predict(
         allow_negative_predictions=allow_negative_predictions,
     )
     y_pred = apply_prediction_domain(y_pred, prediction_domain)
-    log.info(f"Generated {len(y_pred)} predictions with confidence intervals")
+    log.info(f"Generated {len(y_pred)} predictions with prediction intervals")
 
     return y_pred.tolist(), conf_int.tolist()
 
@@ -156,8 +299,7 @@ def train_and_evaluate(
     prediction_domain: str = DEMAND_PREDICTION_DOMAIN,
 ) -> Tuple[Dict[str, Any], Any, Dict[str, int], Dict[str, Any], List[float], List[float], List[List[float]]]:
     """
-    Trains an ARIMA model by searching for the best p and q using both AIC and BIC,
-    and evaluates the best resulting model.
+    Train a fixed-d non-seasonal ARIMA selected by AICc stepwise search.
 
     Args:
         y: Full time series
@@ -172,10 +314,10 @@ def train_and_evaluate(
         metrics: Evaluation metrics dict
         best_model: The selected ARIMA model
         best_order: Dict with p, d, q
-        search_summary: Summary of AIC/BIC model search
+        search_summary: Summary of AICc model search
         y_true: True evaluation values
         y_pred: Predicted evaluation values
-        conf_int: Confidence intervals
+        conf_int: Prediction intervals
     """
     log.info(f"Starting ARIMA train_and_evaluate: d={d}, max_p={max_p}, max_q={max_q}, train_range={train_range}, eval_range={eval_range}")
 
@@ -213,70 +355,20 @@ def train_and_evaluate(
             log.warning(f"Small effective sample size ({effective_train_size}) after differencing. "
                        f"Model may have limited predictive power. Consider simpler models.")
 
-    # --- Run auto_arima for both AIC and BIC ---
-    log.info(f"Running auto_arima with AIC criterion: searching p in [0, {max_p}], q in [0, {max_q}], d={d}")
-    aic_model = _run_auto_arima_search(
+    log.info(f"Running auto_arima with AICc criterion: searching p in [0, {max_p}], q in [0, {max_q}], d={d}")
+    best_model = _run_auto_arima_search(
         y_train=y_train,
         d=d,
         max_p=max_p,
         max_q=max_q,
-        criterion="aic",
+        criterion="aicc",
     )
-    log.debug(f"AIC-optimized model found: order={aic_model.order}")
-
-    log.info(f"Running auto_arima with BIC criterion: searching p in [0, {max_p}], q in [0, {max_q}], d={d}")
-    bic_model = _run_auto_arima_search(
-        y_train=y_train,
-        d=d,
-        max_p=max_p,
-        max_q=max_q,
-        criterion="bic",
+    best_model, convergence_retried = _ensure_converged(
+        best_model,
+        y_train,
+        "Selected ARIMA model",
     )
-    log.debug(f"BIC-optimized model found: order={bic_model.order}")
-
-    # --- Compare and select the best model ---
-    aic_order = aic_model.order
-    bic_order = bic_model.order
-
-    aic_aic = aic_model.aic()
-    aic_bic = aic_model.bic()
-    bic_aic = bic_model.aic()
-    bic_bic = bic_model.bic()
-
-    log.debug(f"AIC model: order={aic_order}, AIC={aic_aic:.4f}, BIC={aic_bic:.4f}")
-    log.debug(f"BIC model: order={bic_order}, AIC={bic_aic:.4f}, BIC={bic_bic:.4f}")
-
-    # Selection strategy: for small samples, prioritize BIC to prevent overfitting
-    train_size = len(y_train)
-    selection_criterion = "aic_optimized"
-    best_model = aic_model
-
-    if train_size < 30:
-        # Small sample: prioritize BIC (stronger penalty against complexity)
-        log.info(f"Using BIC-priority selection for small sample (n={train_size})")
-        if bic_bic < aic_bic:
-            best_model = bic_model
-            selection_criterion = "bic_preferred_small_sample"
-            log.info(f"Selected BIC-optimized model (better BIC, small sample): order={bic_order}")
-        elif bic_bic == aic_bic and bic_aic <= aic_aic:
-            best_model = bic_model
-            selection_criterion = "bic_tie_better_or_equal_aic"
-            log.info(f"Selected BIC-optimized model (tie BIC, AIC not worse): order={bic_order}")
-        else:
-            log.info(f"Selected AIC-optimized model (better BIC even in small sample): order={aic_order}")
-    else:
-        # Large sample: prioritize AIC (asymptotically efficient)
-        log.info(f"Using AIC-priority selection for larger sample (n={train_size})")
-        if bic_aic < aic_aic:
-            best_model = bic_model
-            selection_criterion = "bic_optimized_better_aic"
-            log.info(f"Selected BIC-optimized model (better AIC): order={bic_order}")
-        elif bic_aic == aic_aic and bic_bic < aic_bic:
-            best_model = bic_model
-            selection_criterion = "bic_tie_aic_better_bic"
-            log.info(f"Selected BIC-optimized model (tie AIC, better BIC): order={bic_order}")
-        else:
-            log.info(f"Selected AIC-optimized model: order={aic_order}")
+    log.debug(f"AICc-optimized model found: order={best_model.order}, spec={_model_spec(best_model)}")
 
     best_order = {"p": best_model.order[0], "d": best_model.order[1], "q": best_model.order[2]}
 
@@ -292,20 +384,20 @@ def train_and_evaluate(
     else:
         log.info(f"Final selected order: (p={best_order['p']}, d={best_order['d']}, q={best_order['q']}) - Random walk model")
 
-    # Search summary for transparency
+    diagnostics = _residual_diagnostics(best_model, effective_train_size)
     search_summary = {
-        "aic_optimized_model": {
-            "order": {"p": aic_order[0], "d": aic_order[1], "q": aic_order[2]},
-            "aic": float(aic_aic),
-            "bic": float(aic_bic),
-        },
-        "bic_optimized_model": {
-            "order": {"p": bic_order[0], "d": bic_order[1], "q": bic_order[2]},
-            "aic": float(bic_aic),
-            "bic": float(bic_bic),
-        },
-        "selected_model": "aic_optimized" if best_model is aic_model else "bic_optimized",
-        "selection_criterion": selection_criterion,
+        "selection_criterion": "aicc",
+        "effective_train_size": effective_train_size,
+        "max_p": max_p,
+        "max_q": max_q,
+        "selected_order": best_order,
+        "model_spec": _model_spec(best_model),
+        "aic": float(best_model.aic()),
+        "aicc": float(best_model.aicc()),
+        "bic": float(best_model.bic()),
+        "convergence_retried": convergence_retried,
+        "convergence_boundary_case": not _is_converged(best_model),
+        "diagnostics": diagnostics,
     }
 
     # --- Evaluate the best model ---
@@ -332,12 +424,7 @@ def train_and_evaluate(
     y_pred = apply_prediction_domain(y_pred, prediction_domain)
     y_true = y_eval.tolist()
 
-    # Check convergence
-    converged = bool(best_model.arima_res_.mle_retvals.get("converged", False))
-    if converged:
-        log.info("Model converged successfully")
-    else:
-        log.warning("Model did not converge properly")
+    converged = _is_converged(best_model)
 
     residuals = np.array(y_true) - y_pred
     log.info(f"Calculated residuals: mean={np.mean(residuals):.4f}, std_dev={np.std(residuals):.4f}")
@@ -348,8 +435,11 @@ def train_and_evaluate(
         "mape": mape(y_eval, y_pred),
         "r2": r2(y_eval, y_pred),
         "aic": float(best_model.aic()),
+        "aicc": float(best_model.aicc()),
         "bic": float(best_model.bic()),
         "converged": converged,
+        "convergence_boundary_case": not converged and _is_deterministic_boundary_case(best_model, y_train),
+        "diagnostics": diagnostics,
         "evaluated_points": len(y_eval),
         "evaluate_indices": list(eval_range),
         "evaluate_months": [timestamps[i] for i in eval_range] if timestamps else [],
@@ -393,30 +483,41 @@ def run(args) -> None:
         ts, te = int(args.train_start), int(args.train_end)
         _validate_fit_args(y, ts, te)
 
-        order_info = state.get("order", {})
-        order = (
-            int(order_info.get("p", 0)),
-            int(order_info.get("d", state.get("d", 0))),
-            int(order_info.get("q", 0)),
-        )
+        model_spec = state.get("model_spec")
+        if not isinstance(model_spec, dict):
+            raise ValueError("[MODEL] Saved ARIMA model is missing its complete specification.")
+        order = tuple(int(value) for value in model_spec.get("order", []))
+        if len(order) != 3:
+            raise ValueError("[MODEL] Saved ARIMA order is invalid.")
         train_size = te - ts + 1
         _validate_arima_train_size(
             train_size=train_size,
             d=order[1],
             context="ARIMA fit-only training range",
         )
-        fitted_model = _fit_arima_order(
+        fitted_model = _fit_arima_spec(
             y_train=y[ts : te + 1],
-            order=order,
+            spec=model_spec,
             context="ARIMA fit-only",
         )
+        fitted_model, convergence_retried = _ensure_converged(
+            fitted_model,
+            y[ts : te + 1],
+            "ARIMA fit-only",
+        )
+        diagnostics = _residual_diagnostics(fitted_model, train_size - order[1])
 
         next_state = {
             "model_type": MODEL_TYPE,
             "model": fitted_model,
             "order": {"p": order[0], "d": order[1], "q": order[2]},
             "d": order[1],
+            "model_spec": _model_spec(fitted_model),
+            "search_summary": state.get("search_summary"),
+            "diagnostics": diagnostics,
             "prediction_domain": prediction_domain,
+            "calibration_mean_error": state.get("calibration_mean_error"),
+            "calibration_count": state.get("calibration_count"),
         }
         attach_method_metadata(next_state, METHOD_NAME, FORECAST_STRATEGY, IMPLEMENTATION_NOTES)
         dump_model(next_state, save_path)
@@ -426,7 +527,25 @@ def run(args) -> None:
             "order": next_state["order"],
             "train_end_index": te,
             "saved_model": save_path,
+            "convergence_retried": convergence_retried,
+            "convergence_boundary_case": not _is_converged(fitted_model),
+            "diagnostics": diagnostics,
         }
+        fit_predict_steps = int(getattr(args, "fit_predict_steps", 0) or 0)
+        if fit_predict_steps > 0:
+            preds, confidence_intervals = predict(
+                save_path,
+                fit_predict_steps,
+                state=next_state,
+                allow_negative_predictions=bool(getattr(args, "allow_negative_predictions", False)),
+            )
+            out["forecast_steps"] = fit_predict_steps
+            out["predictions"] = _format_predictions(
+                preds,
+                confidence_intervals,
+                next_state.get("calibration_mean_error"),
+                next_state.get("calibration_count"),
+            )
         attach_method_metadata(out, METHOD_NAME, FORECAST_STRATEGY, IMPLEMENTATION_NOTES)
         out["logs"] = get_log_contents()
         print(json.dumps(out, ensure_ascii=False, indent=2 if pretty else None))
@@ -441,13 +560,26 @@ def run(args) -> None:
             raise ValueError("[VALIDATION] --forecast_steps must be > 0 for prediction mode.")
 
         log.info(f"Starting prediction with {steps} forecast steps")
-        preds, conf_int = predict(
-            load_path,
-            steps,
-            state=state,
-            allow_negative_predictions=bool(getattr(args, "allow_negative_predictions", False)),
-        )
-        predictions_with_std = _format_predictions(preds, conf_int)
+        prepared = state.get("prepared_predictions")
+        if (
+            not bool(getattr(args, "allow_negative_predictions", False))
+            and isinstance(prepared, list)
+            and len(prepared) >= steps
+        ):
+            predictions_with_std = [dict(point) for point in prepared[:steps]]
+        else:
+            preds, conf_int = predict(
+                load_path,
+                steps,
+                state=state,
+                allow_negative_predictions=bool(getattr(args, "allow_negative_predictions", False)),
+            )
+            predictions_with_std = _format_predictions(
+                preds,
+                conf_int,
+                state.get("calibration_mean_error"),
+                state.get("calibration_count"),
+            )
 
         out: Dict[str, Any] = {
             "mode": "arima_loaded_predict",
@@ -480,31 +612,9 @@ def run(args) -> None:
     es, ee = int(args.eval_start), int(args.eval_end)
     d = int(args.d)
 
-    max_p_arg = getattr(args, "max_p", None)
-    max_q_arg = getattr(args, "max_q", None)
-
-    if max_p_arg is not None and max_q_arg is not None:
-        max_p = int(max_p_arg)
-        max_q = int(max_q_arg)
-        log.debug(f"Using user-specified max_p={max_p}, max_q={max_q}")
-    else:
-        # Auto-select max_p and max_q based on training data size
-        # For small datasets, use conservative limits to prevent overfitting
-        train_size = te - ts + 1
-        if train_size <= 12:
-            auto_max = 1  # ARIMA(1,d,1): max 2 parameters, avoid overfitting
-            log.info(f"Small dataset detected (train_size={train_size}), using conservative max_p=max_q={auto_max}")
-        elif train_size <= 20:
-            auto_max = 2  # ARIMA(2,d,2): max 4 parameters
-            log.info(f"Medium-small dataset detected (train_size={train_size}), using moderate max_p=max_q={auto_max}")
-        else:
-            auto_max = max(1, min(5, train_size // 6))  # Rule of thumb: params < train_size/6
-            log.info(f"Using calculated max_p=max_q={auto_max} based on train_size={train_size}")
-
-        max_p = int(max_p_arg) if max_p_arg is not None else auto_max
-        max_q = int(max_q_arg) if max_q_arg is not None else auto_max
-        if max_p_arg is None or max_q_arg is None:
-            log.info(f"Auto-selected max_p={max_p}, max_q={max_q} for preventing overfitting")
+    search_config = derive_arima_search_limit(te - ts + 1, d)
+    max_p = int(search_config["max_p"])
+    max_q = int(search_config["max_q"])
     log.debug(f"Training params: d={d}, max_p={max_p}, max_q={max_q}")
 
     if not (0 <= ts <= te < len(y)):
@@ -539,7 +649,14 @@ def run(args) -> None:
     log.info(f"Training finished. Best order: {best_order}, Metrics: {metrics}")
     log.debug(f"Search summary: {search_summary}")
 
-    predictions_with_std = _format_predictions(y_pred, conf_int)
+    calibration_mean_error = float(np.mean(np.asarray(y_true, dtype=float) - np.asarray(y_pred, dtype=float)))
+    calibration_count = len(y_true)
+    predictions_with_std = _format_predictions(
+        y_pred,
+        conf_int,
+        calibration_mean_error,
+        calibration_count,
+    )
 
     out: Dict[str, Any] = {
         "mode": "arima_search_pq_fixed_d",
@@ -552,6 +669,7 @@ def run(args) -> None:
         "eval_y_true": y_true,
         "predictions": predictions_with_std,
         "search_summary": search_summary,
+        "diagnostics": search_summary["diagnostics"],
     }
     attach_method_metadata(out, METHOD_NAME, FORECAST_STRATEGY, IMPLEMENTATION_NOTES)
 
@@ -563,7 +681,12 @@ def run(args) -> None:
             "model": best_model,
             "order": best_order,
             "d": d,
+            "model_spec": _model_spec(best_model),
+            "search_summary": search_summary,
+            "diagnostics": search_summary["diagnostics"],
             "prediction_domain": prediction_domain,
+            "calibration_mean_error": calibration_mean_error,
+            "calibration_count": calibration_count,
         }
         attach_method_metadata(state, METHOD_NAME, FORECAST_STRATEGY, IMPLEMENTATION_NOTES)
         dump_model(state, save_path)

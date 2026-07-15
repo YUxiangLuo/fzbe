@@ -22,6 +22,8 @@ function parsePositiveIntegerEnv(name: string): number | null {
 
 /** 模型执行的不可配置硬上限：10 分钟。 */
 export const MODEL_EXECUTION_HARD_CAP_MS = 10 * 60 * 1000;
+/** A guided/production orchestration process may give one nested model the full cap. */
+export const MODEL_ORCHESTRATION_HARD_CAP_MS = 630_000;
 
 function parseModelTimeoutEnv(name: string, fallbackMs: number): number {
   const value = parsePositiveIntegerEnv(name) ?? fallbackMs;
@@ -165,6 +167,8 @@ export const CONTENT_LIMITS = {
 export const TIMEOUTS = {
   /** 所有 Python 模型任务都不可突破的硬上限 */
   MODEL_EXECUTION_HARD_CAP: MODEL_EXECUTION_HARD_CAP_MS,
+  /** 只允许编排一个嵌套模型任务的 Python 父进程硬上限。 */
+  MODEL_ORCHESTRATION_HARD_CAP: MODEL_ORCHESTRATION_HARD_CAP_MS,
   /** 单次后端模型操作的总时限；每个 guided step / prepare / predict 独立计时。 */
   MODEL_SINGLE_OPERATION: MODEL_SINGLE_OPERATION_TIMEOUT_MS,
   /** 当前终止、解锁和 nginx 预算下允许的单次操作最大值。 */
@@ -244,6 +248,8 @@ export const CLEANUP_RETENTION = {
   TEMP_FILES_MS: (parsePositiveIntegerEnv("TEMP_FILE_RETENTION_HOURS") ?? 24) * 60 * 60 * 1000,
   /** guided training 无 DB 记录的孤儿目录默认保留 24 小时，避开创建会话的短暂窗口 */
   GUIDED_TRAINING_ORPHAN_MS: (parsePositiveIntegerEnv("GUIDED_TRAINING_ORPHAN_RETENTION_HOURS") ?? 24) * 60 * 60 * 1000,
+  /** production preparation 无 DB 记录的孤儿目录默认保留 24 小时 */
+  PRODUCTION_PREPARATION_ORPHAN_MS: (parsePositiveIntegerEnv("PRODUCTION_PREPARATION_ORPHAN_RETENTION_HOURS") ?? 24) * 60 * 60 * 1000,
   /** 普通模型产物默认保留 30 天；仅清理已完成、无记录或长期无活动的实验产物 */
   MODEL_ARTIFACTS_MS: (parsePositiveIntegerEnv("MODEL_ARTIFACT_RETENTION_DAYS") ?? 30) * 24 * 60 * 60 * 1000,
 } as const;

@@ -197,8 +197,7 @@ export const buildExperimentFlowGradeValues = (
   const hasMpsTable = parseArray(experiment.production_mps_table).length > 0;
   const hasProductionPlan = toBoolean(experiment.production_plan_completed) && hasForecastResults && hasMpsTable;
   const hasInventoryInputs = hasValue(experiment.production_initial_inventory);
-  const hasServiceLevelInputs = hasValue(experiment.production_target_service_level)
-    && hasValue(experiment.production_safety_stock_z_score);
+  const hasServiceLevelInputs = hasValue(experiment.production_target_service_level);
   const hasCapacityInputs = hasValue(experiment.production_capacity_mode)
     && (
       hasValue(experiment.production_capacity)

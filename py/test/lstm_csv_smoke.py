@@ -25,8 +25,9 @@ FEATURE_KEYS = [
 ]
 sys.path.insert(0, str(PY_ROOT / "src"))
 
-from data_utils import infer_feature_types, load_data_from_json
-from model_metadata_assertions import assert_method_metadata
+from data_utils import infer_feature_types, load_data_from_json  # noqa: E402
+from dynamic_config import lstm_parameter_count  # noqa: E402
+from model_metadata_assertions import assert_method_metadata  # noqa: E402
 
 
 INFERRED_SELECTED_FEATURE_TYPES = {
@@ -190,10 +191,11 @@ def main() -> None:
         assert train_output["data_points"] == len(records)
         assert train_output["target_key"] == "销售数量"
         assert train_output["feature_types"] == INFERRED_SELECTED_FEATURE_TYPES
-        assert train_output["look_back"] == 4
-        assert train_output["epochs"] == 2
+        assert "look_back" not in train_output
+        assert "epochs" not in train_output
         assert train_output["normalization"] == "minmax"
         assert train_output["forecast_horizon"] == 3
+        assert train_output["training_regime"] in {"standard", "teaching_demo"}
         assert train_output["metrics"]["evaluate_months"] == timestamps[28:31]
         assert train_output["metrics"]["forecast_horizon"] == 3
         assert len(train_output["eval_y_true"]) == 3
@@ -203,6 +205,10 @@ def main() -> None:
         assert_all_finite(train_std_devs, "train_std_devs")
         if not all(std_dev > 0 for std_dev in train_std_devs):
             raise AssertionError(f"expected positive std_dev values, got {train_std_devs}")
+        backtest_state = load_pickled_state(backtest_model)
+        assert backtest_state["look_back"] == backtest_state["derived_config"]["look_back"]
+        assert backtest_state["derived_config"]["max_epochs"] != 2
+        assert backtest_state["derived_config"]["regime"] == train_output["training_regime"]
 
         fit_output = invoke_lstm(
             data_json,
@@ -219,8 +225,8 @@ def main() -> None:
         )
         assert fit_output["mode"] == "lstm_fit_only"
         assert_method_metadata(fit_output, "lstm_direct")
-        assert fit_output["look_back"] == 4
-        assert fit_output["epochs"] == 2
+        assert "look_back" not in fit_output
+        assert "epochs" not in fit_output
         assert fit_output["normalization"] == "minmax"
         assert fit_output["forecast_horizon"] == 6
         assert fit_output["target_key"] == "销售数量"
@@ -232,6 +238,15 @@ def main() -> None:
         assert_method_metadata(production_state, "lstm_direct")
         assert production_state["forecast_horizon"] == 6
         assert production_state["production_forecast_horizon"] == 6
+        assert production_state["derived_config"]["regime"] == fit_output["training_regime"]
+        if production_state["derived_config"]["regime"] == "standard":
+            config = production_state["derived_config"]
+            assert config["validation_preprocessor_fit_points"] < 36
+            assert config["selection_parameter_count"] == lstm_parameter_count(
+                config["selection_units"],
+                config["validation_feature_count"],
+                config["forecast_horizon"],
+            )
 
         predict_output_one = invoke_lstm(
             None,
@@ -299,6 +314,7 @@ def main() -> None:
             {"y": 6, "x": 15},
             {"y": 7, "x": 16},
             {"y": 8, "x": 17},
+            {"y": 9, "x": 18},
         ]
         small_data_json = json.dumps(small_records, ensure_ascii=False)
         small_backtest_model = temp_path / "lstm-small-backtest.pkl"
@@ -309,11 +325,11 @@ def main() -> None:
             "--train-start",
             "0",
             "--train-end",
-            "5",
-            "--eval-start",
             "6",
-            "--eval-end",
+            "--eval-start",
             "7",
+            "--eval-end",
+            "8",
             "--look-back",
             "4",
             "--epochs",
@@ -343,7 +359,7 @@ def main() -> None:
         )
         if rejected_fit.returncode == 0:
             raise AssertionError("expected short direct LSTM production refit to fail")
-        if "too short to preserve the evaluated direct LSTM strategy" not in rejected_fit.stderr:
+        if "Training range is too short for a direct LSTM forecast" not in rejected_fit.stderr:
             raise AssertionError(
                 "missing explicit direct-strategy validation error\n"
                 f"stdout:\n{rejected_fit.stdout}\n"

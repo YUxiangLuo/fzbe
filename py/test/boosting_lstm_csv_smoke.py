@@ -163,13 +163,14 @@ def assert_error(completed: subprocess.CompletedProcess[str], expected_substring
 
 def main() -> None:
     records = load_csv_records(CSV_FIXTURE)
-    data_json = json.dumps(records, ensure_ascii=False)
-    trimmed_feature_data_json = json.dumps(
-        [{key: value for key, value in row.items() if key != "库存水平"} for row in records],
-        ensure_ascii=False,
-    )
-    timestamps = [f"{int(row['年份']):04d}-{int(row['月份']):02d}" for row in records]
-    sales = [float(row["销售数量"]) for row in records]
+    rich_data_json = json.dumps(records, ensure_ascii=False)
+    periodic_pattern = [20.0, 100.0, 35.0, 90.0, 50.0, 80.0]
+    boosting_records = [
+        {"销售数量": periodic_pattern[index % len(periodic_pattern)]}
+        for index in range(36)
+    ]
+    data_json = json.dumps(boosting_records, ensure_ascii=False)
+    sales = [float(row["销售数量"]) for row in boosting_records]
     train_start = 0
     train_end = 27
     eval_start = 28
@@ -202,7 +203,7 @@ def main() -> None:
             "--lstm-target-feature",
             "销售数量",
             "--lstm-features",
-            ",".join(LSTM_FEATURE_KEYS),
+            "[]",
             "--save-model",
             str(short_horizon_lstm_source),
             "--pretty",
@@ -231,7 +232,7 @@ def main() -> None:
             "--lstm-target-feature",
             "销售数量",
             "--lstm-features",
-            ",".join(LSTM_FEATURE_KEYS),
+            "[]",
             "--max-rounds",
             "1",
             "--save-model",
@@ -245,9 +246,13 @@ def main() -> None:
         expected_eval_predictions = combine_stage_predictions(train_state, forecast_steps=3)
         assert train_output["mode"] == "boosting_residual_learning"
         assert train_output["models"] == ["ma", "lstm"]
-        assert train_output["model_chain"] == ["lstm"], train_output["model_chain"]
-        assert train_output["stage_coefficients"] == [1.0]
-        assert train_output["metrics"]["evaluate_months"] == timestamps[28:31]
+        assert "lstm" in train_output["model_chain"], train_output["model_chain"]
+        assert len(train_output["model_chain"]) == len(train_output["stage_coefficients"])
+        assert all(
+            math.isfinite(float(value)) and float(value) > 0.0
+            for value in train_output["stage_coefficients"]
+        ), (train_output["model_chain"], train_output["stage_coefficients"])
+        assert train_output["metrics"]["evaluate_months"] == []
         assert train_output["eval_y_true"] == sales[28:31]
         assert_series_close(actual_eval_predictions, expected_eval_predictions)
         assert_all_finite(actual_eval_predictions, "train_predictions")
@@ -277,7 +282,7 @@ def main() -> None:
             "--pretty",
         )
         assert fit_output["mode"] == "boosting_fit_only"
-        assert fit_output["model_chain"] == ["lstm"]
+        assert fit_output["model_chain"] == train_output["model_chain"]
         assert fit_output["saved_model"] == str(production_model)
 
         production_state = load_pickled_state(production_model)
@@ -338,14 +343,15 @@ def main() -> None:
             "销售数量",
             "--lstm-features",
             "价格指数,不存在字段,促销投入",
-            data_json=data_json,
+            data_json=rich_data_json,
         )
         assert_error(
             missing_feature_result,
             "[VALIDATION] LSTM feature columns not found in dataset: ['不存在字段']",
         )
 
-        oversized_look_back_result = run_command(
+        hidden_params_ignored_output = invoke_model(
+            rich_data_json,
             "--train-start",
             "0",
             "--train-end",
@@ -366,12 +372,9 @@ def main() -> None:
             "销售数量",
             "--lstm-features",
             "价格指数,促销投入,库存水平,搜索热度",
-            data_json=data_json,
         )
-        assert_error(
-            oversized_look_back_result,
-            "[VALIDATION] LSTM look_back (9) is too large for the boosting internal training split (10 points) and validation horizon (2 points).",
-        )
+        assert hidden_params_ignored_output["mode"] == "boosting_residual_learning"
+        assert hidden_params_ignored_output["search_summary"]["max_rounds"] >= 1
 
         short_fit_result = run_command(
             "--train-start",
@@ -388,25 +391,7 @@ def main() -> None:
         )
         assert_error(
             short_fit_result,
-            "[VALIDATION] Boosting fit-only stage 1 (lstm) cannot be refit: Training range must be larger than look_back.",
-        )
-
-        missing_feature_fit_result = run_command(
-            "--train-start",
-            "0",
-            "--train-end",
-            "35",
-            "--load-model",
-            str(backtest_model),
-            "--save-model",
-            str(temp_path / "boosting-lstm-missing-feature-fit.pkl"),
-            "--fit-only",
-            "--pretty",
-            data_json=trimmed_feature_data_json,
-        )
-        assert_error(
-            missing_feature_fit_result,
-            "[VALIDATION] Boosting fit-only stage 1 (lstm) is missing feature columns: ['库存水平']",
+            "Training range is too short for a direct LSTM forecast",
         )
 
         reused_short_source_model = temp_path / "boosting-lstm-reuse-short-source.pkl"
@@ -415,15 +400,15 @@ def main() -> None:
             "--train-start",
             "0",
             "--train-end",
-            "30",
+            "27",
             "--eval-start",
-            "31",
+            "28",
             "--eval-end",
-            "35",
+            "30",
             "--models",
             "ma,lstm",
             "--window",
-            "24",
+            "22",
             "--look-back",
             "9",
             "--epochs",
@@ -445,14 +430,17 @@ def main() -> None:
         reused_short_source_state = load_pickled_state(reused_short_source_model)
         reused_short_source_predictions = extract_predictions(reused_short_source_output)
         assert reused_short_source_output["mode"] == "boosting_residual_learning"
-        assert reused_short_source_output["model_chain"] == ["lstm"]
-        assert len(reused_short_source_predictions) == 5
+        assert "lstm" in reused_short_source_output["model_chain"]
+        assert len(reused_short_source_predictions) == 3
         assert_all_finite(reused_short_source_predictions, "reused_short_source_predictions")
         reused_short_source_member = Path(
             reused_short_source_state["base_model_states"]["lstm"]["models"][0]["model_file"]
         )
         reused_short_source_member_state = load_pickled_state(reused_short_source_member)
-        assert reused_short_source_member_state["look_back"] == 4
+        assert reused_short_source_member_state["look_back"] == reused_short_source_member_state["derived_config"]["look_back"]
+        reused_lstm_params = reused_short_source_state["base_model_states"]["lstm"]["models"][0]["params"]
+        assert "look_back" not in reused_lstm_params
+        assert "epochs" not in reused_lstm_params
         assert reused_short_source_member_state["forecast_strategy"] == "direct_multi_horizon"
         assert reused_short_source_member_state["forecast_horizon"] == len(reused_short_source_predictions)
 
@@ -464,9 +452,8 @@ def main() -> None:
                 "model": "boosting",
                 "edge_cases": [
                     "missing_lstm_feature",
-                    "oversized_look_back",
+                    "hidden_lstm_params_ignored",
                     "fit_only_short_window",
-                    "fit_only_missing_saved_feature",
                     "reused_short_horizon_source",
                 ],
                 "status": "ok",

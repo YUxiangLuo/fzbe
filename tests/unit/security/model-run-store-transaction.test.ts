@@ -180,6 +180,7 @@ describe("model run transactional activation", () => {
       6,
       "revision-v1",
       "b".repeat(64),
+      "observed-revision",
     )).toBe(true);
     expect(await backfillArtifactSha256ForRun("run-ma-v1", "a".repeat(64))).toBe(true);
     expect(await backfillProductionArtifactSha256ForRun(
@@ -195,7 +196,11 @@ describe("model run transactional activation", () => {
       6,
       "revision-v1",
       "run-ma-v1",
+      "observed-revision",
+      6,
     ]);
+    expect(String(poolQuery.mock.calls[0]?.[0])).toContain("production_revision <=> ?");
+    expect(String(poolQuery.mock.calls[0]?.[0])).toContain("production_artifact_forecast_steps < ?");
     expect(String(poolQuery.mock.calls[1]?.[0])).toContain("artifact_sha256 IS NULL");
     expect(String(poolQuery.mock.calls[2]?.[0])).toContain("production_revision = ?");
     expect(String(poolQuery.mock.calls[3]?.[0])).toContain("production_artifact_path = NULL");

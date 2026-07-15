@@ -1,7 +1,6 @@
 import path from "path";
 import fs from "fs";
 import crypto from "crypto";
-import os from "node:os";
 import type { Stats } from "node:fs";
 import type { PoolConnection, RowDataPacket } from "mysql2/promise";
 import { pool } from "../../config";
@@ -37,6 +36,7 @@ import {
   allPossiblePythonParams,
   buildPythonModelProcessEnv,
   runPythonGuidedTrainingStep,
+  runPythonProductionPreparationStep,
   runPythonModel,
 } from "./model-python-runner";
 import { normalizeDemandPredictionPoints, transformTrainingResult } from "./model-results";
@@ -82,12 +82,16 @@ export { transformTrainingResult } from "./model-results";
 export type { GuidedTrainingSessionPayload, GuidedTrainingStepDefinition } from "./model-types";
 
 const TRAINING_TIMEOUT = TIMEOUTS.MODEL_TRAINING;
-const MODEL_EXECUTION_HARD_CAP = TIMEOUTS.MODEL_EXECUTION_HARD_CAP;
+const MODEL_ORCHESTRATION_HARD_CAP = TIMEOUTS.MODEL_ORCHESTRATION_HARD_CAP;
+const GUIDED_TRAINING_PROTOCOL_VERSION = 3;
+const PRODUCTION_PREPARATION_PROTOCOL_VERSION = 1;
 const DEFAULT_PRODUCTION_FORECAST_STEPS = 6;
 const MIN_TRAINING_POINTS = 8;
 const MIN_EVALUATION_POINTS = 2;
 const GUIDED_TRAINING_CLEANUP_BATCH_SIZE = 500;
+const PRODUCTION_PREPARATION_CLEANUP_BATCH_SIZE = 500;
 const GUIDED_DATASET_FILE_NAME = "dataset.json";
+const PRODUCTION_PREPARATION_ROOT = path.join(PY_DIR, "production_preparation");
 const MODEL_PIPELINE_REVISION = "model-run-v3";
 let cachedModelRuntimeRevision: string | null = null;
 
@@ -175,9 +179,79 @@ interface GuidedTrainingStepAttemptRow extends RowDataPacket {
   lease_expires_at: Date | string | null;
 }
 
+type ProductionPreparationStatus = "ready" | "running" | "failed" | "completed" | "superseded";
+
+interface ProductionPreparationStepDefinition {
+  id: string;
+  label: string;
+}
+
+interface ProductionPreparationSessionRow extends RowDataPacket {
+  session_id: string;
+  experiment_id: number;
+  student_id: number;
+  run_id: string;
+  model_type: ModelType;
+  request_hash: string;
+  dataset_revision: string;
+  runtime_revision: string;
+  protocol_version: number;
+  forecast_steps: number;
+  status: ProductionPreparationStatus;
+  current_step_id: string | null;
+  completed_step_ids: unknown;
+  step_plan: unknown;
+  artifact_dir: string;
+  candidate_model_path: string;
+  committed_state_path: string | null;
+  committed_state_sha256: string | null;
+  active_attempt_id: string | null;
+  observed_production_revision: string | null;
+  production_revision: string | null;
+  error_message: string | null;
+  superseded_reason: string | null;
+  expires_at: Date | string | null;
+}
+
+interface ProductionPreparationAttemptRow extends RowDataPacket {
+  attempt_id: string;
+  session_id: string;
+  step_id: string;
+  status: "running" | "committed" | "failed";
+  input_state_path: string | null;
+  input_state_sha256: string | null;
+  candidate_state_path: string;
+  candidate_state_sha256: string | null;
+  receipt_path: string;
+  output_payload: unknown;
+  error_message: string | null;
+  lease_expires_at: Date | string | null;
+}
+
+export interface ProductionPreparationSessionPayload {
+  status: "success";
+  results: {
+    session_id: string;
+    session_status: ProductionPreparationStatus;
+    completed_step_ids: string[];
+    total_steps: number;
+    next_step: ProductionPreparationStepDefinition | null;
+    error_message: string | null;
+    preparation_token?: string;
+    prepared_forecast_steps?: number;
+    reused_existing?: boolean;
+  };
+}
+
 interface GuidedTrainingCleanupRow extends RowDataPacket {
   session_id: string;
   artifact_dir: string;
+}
+
+interface ProductionPreparationCleanupRow extends GuidedTrainingCleanupRow {
+  status: ProductionPreparationStatus;
+  candidate_model_path: string;
+  candidate_is_active: number | boolean | string;
 }
 
 interface ModelTrainingDependencyRow extends RowDataPacket {
@@ -831,7 +905,11 @@ const validateBaseModelArtifactSemantically = async (
       undefined,
       terminationSignal,
     ) as Record<string, unknown>;
-    normalizeDemandPredictionPoints(result.predictions, 1, { requireStdDev: true });
+    normalizeDemandPredictionPoints(result.predictions, 1, {
+      requireStdDev: true,
+      requireUpperErrorP99: true,
+      requireCalibrationDiagnostics: true,
+    });
   } catch (error) {
     if (terminationSignal?.aborted || error instanceof ModelTimeoutError) throw error;
     if (error instanceof ModelArtifactError) throw error;
@@ -1198,6 +1276,19 @@ const removeGuidedTrainingArtifactDir = (artifactDir: string) => {
   return true;
 };
 
+const removeProductionPreparationArtifactDir = (artifactDir: string) => {
+  if (!isPathInsideDirectory(artifactDir, PRODUCTION_PREPARATION_ROOT)) {
+    logger.warn(
+      { artifactDir, productionPreparationRoot: PRODUCTION_PREPARATION_ROOT },
+      "跳过不安全的 production preparation 工件目录清理",
+    );
+    return false;
+  }
+
+  fs.rmSync(artifactDir, { recursive: true, force: true });
+  return true;
+};
+
 const deleteGuidedTrainingSession = async (
   row: Pick<GuidedTrainingSessionRow, "session_id" | "artifact_dir">,
 ) => {
@@ -1350,6 +1441,153 @@ export async function cleanupExpiredGuidedTrainingSessions(
   };
 }
 
+const cleanupOrphanProductionPreparationArtifactDirs = async (
+  now: Date,
+  maxAgeMs: number,
+) => {
+  let entries: string[];
+  try {
+    entries = fs.readdirSync(PRODUCTION_PREPARATION_ROOT);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return 0;
+    throw error;
+  }
+
+  let deletedArtifactDirs = 0;
+  for (const entry of entries) {
+    const artifactDir = path.join(PRODUCTION_PREPARATION_ROOT, entry);
+    let stats: Stats;
+    try {
+      stats = fs.statSync(artifactDir);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
+        logger.warn({ err: error, artifactDir }, "读取 production preparation 工件目录状态失败");
+      }
+      continue;
+    }
+    if (!stats.isDirectory() || now.getTime() - stats.mtimeMs < maxAgeMs) continue;
+
+    const [rows] = await queryWithTimeout<RowDataPacket[]>(pool,
+      `SELECT session_id
+         FROM model_production_preparation_sessions
+        WHERE artifact_dir = ?
+        LIMIT 1`,
+      [artifactDir],
+    );
+    if (rows.length > 0) continue;
+    try {
+      if (removeProductionPreparationArtifactDir(artifactDir)) deletedArtifactDirs += 1;
+    } catch (error) {
+      logger.warn(
+        {
+          err: error instanceof Error ? { message: error.message, stack: error.stack } : { message: String(error) },
+          artifactDir,
+        },
+        "清理 orphan production preparation 工件目录失败",
+      );
+    }
+  }
+  return deletedArtifactDirs;
+};
+
+export async function cleanupExpiredProductionPreparationSessions(
+  options: { now?: Date; limit?: number; orphanMaxAgeMs?: number } = {},
+) {
+  const now = options.now ?? new Date();
+  const rawLimit = options.limit ?? PRODUCTION_PREPARATION_CLEANUP_BATCH_SIZE;
+  const limit = Number.isInteger(rawLimit) && rawLimit > 0
+    ? Math.min(rawLimit, PRODUCTION_PREPARATION_CLEANUP_BATCH_SIZE)
+    : PRODUCTION_PREPARATION_CLEANUP_BATCH_SIZE;
+  const expirationCutoffExpression = options.now ? "?" : "NOW()";
+  const expirationCutoffParams = options.now ? [options.now, options.now] : [];
+  const [rows] = await queryWithTimeout<ProductionPreparationCleanupRow[]>(pool,
+    `SELECT sessions.session_id,
+            sessions.artifact_dir,
+            sessions.status,
+            sessions.candidate_model_path,
+            EXISTS (
+              SELECT 1
+                FROM model_training_runs AS active_runs
+               WHERE active_runs.is_active = TRUE
+                 AND (active_runs.artifact_path = sessions.candidate_model_path
+                      OR active_runs.production_artifact_path = sessions.candidate_model_path)
+            ) AS candidate_is_active
+       FROM model_production_preparation_sessions AS sessions
+       LEFT JOIN model_production_preparation_step_attempts AS attempts
+         ON attempts.attempt_id = sessions.active_attempt_id
+      WHERE sessions.expires_at IS NOT NULL
+        AND sessions.expires_at <= ${expirationCutoffExpression}
+        AND NOT (
+          sessions.status = 'running'
+          AND attempts.status = 'running'
+          AND attempts.lease_expires_at IS NOT NULL
+          AND attempts.lease_expires_at > ${expirationCutoffExpression}
+        )
+      ORDER BY sessions.expires_at ASC
+      LIMIT ${limit}`,
+    expirationCutoffParams,
+  );
+
+  let deletedArtifactDirs = 0;
+  const sessionIdsToDelete: string[] = [];
+  for (const row of rows) {
+    try {
+      if (row.status !== "superseded") {
+        const claimCutoffParams = options.now ? [row.session_id, options.now, options.now] : [row.session_id];
+        const [claimResult] = await queryWithTimeout(pool,
+          `UPDATE model_production_preparation_sessions AS sessions
+           LEFT JOIN model_production_preparation_step_attempts AS attempts
+             ON attempts.attempt_id = sessions.active_attempt_id
+              SET sessions.status = 'superseded',
+                  sessions.current_step_id = NULL,
+                  sessions.active_attempt_id = NULL,
+                  sessions.superseded_reason = 'Production preparation session expired'
+            WHERE sessions.session_id = ?
+              AND sessions.expires_at IS NOT NULL
+              AND sessions.expires_at <= ${expirationCutoffExpression}
+              AND sessions.status <> 'superseded'
+              AND NOT (
+                sessions.status = 'running'
+                AND attempts.status = 'running'
+                AND attempts.lease_expires_at IS NOT NULL
+                AND attempts.lease_expires_at > ${expirationCutoffExpression}
+              )`,
+          claimCutoffParams,
+        );
+        if (Number((claimResult as { affectedRows?: number }).affectedRows ?? 0) !== 1) continue;
+      }
+      if (!removeProductionPreparationArtifactDir(row.artifact_dir)) continue;
+      deletedArtifactDirs += 1;
+      if (!Boolean(Number(row.candidate_is_active))) {
+        removeModelArtifactGroup(row.candidate_model_path);
+      }
+      sessionIdsToDelete.push(row.session_id);
+    } catch (error) {
+      logger.warn(
+        {
+          err: error instanceof Error ? { message: error.message, stack: error.stack } : { message: String(error) },
+          sessionId: row.session_id,
+          artifactDir: row.artifact_dir,
+        },
+        "清理过期 production preparation 工件目录失败",
+      );
+    }
+  }
+  if (sessionIdsToDelete.length > 0) {
+    const placeholders = sessionIdsToDelete.map(() => "?").join(", ");
+    await queryWithTimeout(pool,
+      `DELETE FROM model_production_preparation_sessions
+        WHERE session_id IN (${placeholders})`,
+      sessionIdsToDelete,
+    );
+  }
+  deletedArtifactDirs += await cleanupOrphanProductionPreparationArtifactDirs(
+    now,
+    options.orphanMaxAgeMs ?? CLEANUP_RETENTION.PRODUCTION_PREPARATION_ORPHAN_MS,
+  );
+  return { deletedSessions: sessionIdsToDelete.length, deletedArtifactDirs };
+}
+
 const collectPythonRuntimeFiles = (directoryPath: string): string[] => {
   if (!fs.existsSync(directoryPath)) return [];
   const files: string[] = [];
@@ -1374,6 +1612,7 @@ export const getModelRuntimeRevision = (fresh = false) => {
   const runtimeFiles = [
     path.join(PY_DIR, "guided_model.py"),
     path.join(PY_DIR, "guided_ensemble_model.py"),
+    path.join(PY_DIR, "production_prepare_model.py"),
     path.join(PY_DIR, "run_model.py"),
     path.join(PY_DIR, "requirements.txt"),
     ...collectPythonRuntimeFiles(path.join(PY_DIR, "src")),
@@ -1553,7 +1792,7 @@ const BASE_MODEL_TIMEOUT_SECONDS: Record<BaseModelType, number> = {
   ma: 120,
   es: 120,
   arima: 120,
-  lstm: 300,
+  lstm: 600,
 };
 
 export const resolveGuidedStepTimeoutMs = (
@@ -1562,56 +1801,19 @@ export const resolveGuidedStepTimeoutMs = (
   body: TrainInput,
 ) => {
   if (!isEnsembleModelType(modelType) || !body.models) return TRAINING_TIMEOUT;
-  const models = parseRequestedBaseModels(body.models);
-  const sumBudgetSeconds = models.reduce(
-    (sum, model) => sum + BASE_MODEL_TIMEOUT_SECONDS[model],
-    30,
-  );
-  if (
-    (modelType === "weighted_avg" && ["validation_predictions", "eval_predictions"].includes(stepId))
-    || (modelType === "stacking" && ["level1_predictions", "eval_predictions"].includes(stepId))
-    || (modelType === "boosting" && /^round_\d+_evaluate_candidates$/.test(stepId))
-  ) {
+  parseRequestedBaseModels(body.models);
+  const memberMatch = /_(ma|es|arima|lstm)$/.exec(stepId);
+  if (memberMatch) {
+    const member = memberMatch[1] as BaseModelType;
     return Math.min(
-      MODEL_EXECUTION_HARD_CAP,
-      Math.max(TRAINING_TIMEOUT, sumBudgetSeconds * 1000),
+      MODEL_ORCHESTRATION_HARD_CAP,
+      Math.max(TRAINING_TIMEOUT, BASE_MODEL_TIMEOUT_SECONDS[member] * 1000 + 30_000),
     );
   }
-  if (modelType === "boosting" && stepId === "retrain_chain") {
-    const maxCandidateSeconds = Math.max(...models.map((model) => BASE_MODEL_TIMEOUT_SECONDS[model]));
-    return Math.min(
-      MODEL_EXECUTION_HARD_CAP,
-      Math.max(TRAINING_TIMEOUT, (models.length * maxCandidateSeconds + 30) * 1000),
-    );
-  }
+  // Protocol-v2 sessions are superseded before execution; this only keeps the
+  // old aggregate id safely bounded during a rolling deployment.
+  if (stepId === "retrain_chain") return MODEL_ORCHESTRATION_HARD_CAP;
   return TRAINING_TIMEOUT;
-};
-
-export const resolveProductionPreparationTimeoutMs = (
-  modelType: ModelType,
-  activeRun: ModelTrainingRunRow,
-) => {
-  if (!isEnsembleModelType(modelType)) return TRAINING_TIMEOUT;
-  const parameters = parseJsonColumn<Record<string, unknown>>(activeRun.parameters, {});
-  const rawModels = Array.isArray(parameters.models)
-    ? parameters.models.filter((model): model is BaseModelType => BASE_MODEL_TYPES.has(model as ModelType))
-    : [];
-  const models = rawModels.length > 0 ? rawModels : [...BASE_MODEL_TYPES] as BaseModelType[];
-  if (modelType === "boosting") {
-    const maxCandidateSeconds = Math.max(...models.map((model) => BASE_MODEL_TIMEOUT_SECONDS[model]));
-    return Math.min(
-      MODEL_EXECUTION_HARD_CAP,
-      Math.max(TRAINING_TIMEOUT, (models.length * maxCandidateSeconds + 60) * 1000),
-    );
-  }
-  const sumBudgetSeconds = models.reduce(
-    (sum, model) => sum + BASE_MODEL_TIMEOUT_SECONDS[model],
-    60,
-  );
-  return Math.min(
-    MODEL_EXECUTION_HARD_CAP,
-    Math.max(TRAINING_TIMEOUT, sumBudgetSeconds * 1000),
-  );
 };
 
 const assertRequestMatchesPersistedValue = (
@@ -1637,27 +1839,15 @@ const assertRequestMatchesPersistedValue = (
   }
 };
 
-export const computeEnsemblePhase1TrainSize = (trainSize: number) => {
-  if (trainSize <= 15) {
-    return Math.max(trainSize - 3, Math.trunc(trainSize * 0.85));
-  }
-  return Math.max(3, Math.trunc(trainSize * 0.8));
-};
-
 const buildEnsemblePythonParams = (
   experiment: ExperimentModelContextRow,
   body: TrainInput,
-  trainingConfig: ExperimentTrainingConfig,
 ): Record<string, unknown> => {
   if (!body.models) {
     throw new ModelValidationError("融合模型缺少基础模型列表");
   }
 
   const requestedModels = parseRequestedBaseModels(body.models);
-  const trainSize = trainingConfig.data_window_train_end_index
-    - trainingConfig.data_window_train_start_index
-    + 1;
-  const internalTrainingSize = computeEnsemblePhase1TrainSize(trainSize);
   const pythonParams: Record<string, unknown> = {
     models: requestedModels.join(","),
   };
@@ -1676,15 +1866,6 @@ const buildEnsemblePythonParams = (
           body.moving_average_window,
           experiment.moving_average_window,
         );
-        if (Number(experiment.moving_average_window) > internalTrainingSize) {
-          throw new ModelValidationError(
-            "移动平均时间窗口超过融合模型内部训练区间长度",
-            {
-              moving_average_window: Number(experiment.moving_average_window),
-              internal_training_length: internalTrainingSize,
-            },
-          );
-        }
         pythonParams.moving_average_window = experiment.moving_average_window;
         break;
       }
@@ -1711,16 +1892,6 @@ const buildEnsemblePythonParams = (
           throw new ModelValidationError("融合模型依赖的 ARIMA 基础模型缺少差分阶数配置");
         }
         assertRequestMatchesPersistedValue("ARIMA 差分阶数", body.arimaD, experiment.arima_d);
-        if (internalTrainingSize < Number(experiment.arima_d) + 2) {
-          throw new ModelValidationError(
-            "融合模型内部训练区间不足以拟合当前 ARIMA 差分阶数",
-            {
-              arima_d: Number(experiment.arima_d),
-              internal_training_length: internalTrainingSize,
-              minimum_training_length: Number(experiment.arima_d) + 2,
-            },
-          );
-        }
         pythonParams.arimaD = experiment.arima_d;
         break;
       }
@@ -1961,22 +2132,44 @@ const assertModelReadyForProduction = (
   }
 };
 
-const buildBoostingRoundStepDefinitions = (maxRounds: number): GuidedTrainingStepDefinition[] => {
+const BASE_MODEL_LABELS: Record<BaseModelType, string> = {
+  ma: "移动平均",
+  es: "指数平滑",
+  arima: "ARIMA",
+  lstm: "LSTM",
+};
+
+const buildMemberStepDefinitions = (
+  models: BaseModelType[],
+  idPrefix: string,
+  labelPrefix: string,
+  description: (model: BaseModelType) => string,
+): GuidedTrainingStepDefinition[] => models.map((model) => ({
+  id: `${idPrefix}_${model}`,
+  label: `${labelPrefix}：${BASE_MODEL_LABELS[model]}`,
+  description: description(model),
+  actionLabel: `执行 ${BASE_MODEL_LABELS[model]}`,
+}));
+
+const buildBoostingRoundStepDefinitions = (
+  maxRounds: number,
+  models: BaseModelType[],
+): GuidedTrainingStepDefinition[] => {
   const steps: GuidedTrainingStepDefinition[] = [];
   for (let round = 1; round <= maxRounds; round += 1) {
     steps.push(
-      {
-        id: `round_${round}_evaluate_candidates`,
-        label: `第 ${round} 轮评估候选模型`,
-        description: round === 1
-          ? "用原始销量训练全部候选，将候选阶段输出截断为非负后比较验证RMSE；胜出者作为第一阶段，系数为1。"
-          : `用当前有正有负的残差训练全部候选，保留其有符号输出，再比较乘以默认学习率0.3后降低验证残差RMSE的能力；候选类型可重复入选（第${round}轮）。`,
-        actionLabel: "评估候选",
-      },
+      ...buildMemberStepDefinitions(
+        models,
+        `round_${round}_evaluate`,
+        `第 ${round} 轮评估候选`,
+        (model) => round === 1
+          ? `用原始销量训练 ${BASE_MODEL_LABELS[model]}，通过非负平方损失线搜索求阶段系数并记录验证残差 RMSE。`
+          : `用当前有正有负的残差训练 ${BASE_MODEL_LABELS[model]}，动态求非负阶段系数并记录第 ${round} 轮验证残差 RMSE。`,
+      ),
       {
         id: `round_${round}_select_winner`,
         label: `第 ${round} 轮选择胜出模型`,
-        description: "选择本轮使同一时间留出验证段 RMSE 最小且确有改善的模型加入链；若所有候选都没有改善，则提前停止。",
+        description: "选择本轮使时间留出验证段 RMSE 最小且达到相对改善阈值的模型；短验证段要求更强改善，无候选达标则提前停止。",
         actionLabel: "选择模型",
       },
     );
@@ -1988,18 +2181,60 @@ const buildGuidedTrainingStepPlan = (
   modelType: GuidedModelType,
   body: TrainInput,
 ): GuidedTrainingStepDefinition[] => {
-  if (modelType !== "boosting") {
+  if (!isEnsembleModelType(modelType)) {
     return GUIDED_TRAINING_STEPS[modelType];
   }
 
   const requestedModels = body.models ? parseRequestedBaseModels(body.models) : [];
-  const maxRounds = Math.max(1, requestedModels.length);
+  if (modelType === "weighted_avg") {
+    return GUIDED_TRAINING_STEPS.weighted_avg.flatMap((step) => {
+      if (step.id === "validation_predictions") {
+        return buildMemberStepDefinitions(
+          requestedModels,
+          "validation_prediction",
+          "生成权重验证预测",
+          (model) => `只在权重训练段拟合 ${BASE_MODEL_LABELS[model]}，并为时间留出的权重验证段生成预测。`,
+        );
+      }
+      if (step.id === "eval_predictions") {
+        return buildMemberStepDefinitions(
+          requestedModels,
+          "eval_prediction",
+          "生成评估预测",
+          (model) => `在完整训练区间拟合或复用 ${BASE_MODEL_LABELS[model]}，生成独立评估区间预测。`,
+        );
+      }
+      return [step];
+    });
+  }
+  if (modelType === "stacking") {
+    return GUIDED_TRAINING_STEPS.stacking.flatMap((step) => {
+      if (step.id === "level1_predictions") {
+        return buildMemberStepDefinitions(
+          requestedModels,
+          "level1_prediction",
+          "生成 Level-1 特征",
+          (model) => `只在 Level-0 拟合 ${BASE_MODEL_LABELS[model]}，生成 Level-1 时间留出预测。`,
+        );
+      }
+      if (step.id === "eval_predictions") {
+        return buildMemberStepDefinitions(
+          requestedModels,
+          "eval_prediction",
+          "生成评估预测",
+          (model) => `在完整训练区间拟合或复用 ${BASE_MODEL_LABELS[model]}，生成独立评估区间预测。`,
+        );
+      }
+      return [step];
+    });
+  }
+  const maxRounds = Math.max(1, requestedModels.length * 2);
   const [prepareStep, splitStep, retrainStep, combineStep, saveStep] = GUIDED_TRAINING_STEPS.boosting;
 
   return [
     prepareStep!,
     splitStep!,
-    ...buildBoostingRoundStepDefinitions(maxRounds),
+    ...buildBoostingRoundStepDefinitions(maxRounds, requestedModels),
     retrainStep!,
     combineStep!,
     saveStep!,
@@ -2048,7 +2283,7 @@ const shouldTrimBoostingRoundSteps = (
     return false;
   }
 
-  return output.action === "early_stop";
+  return output.action === "early_stop" || output.stop_reason === "round_budget";
 };
 
 const trimBoostingStepPlanAfterEarlyStop = (
@@ -2065,6 +2300,52 @@ const trimBoostingStepPlanAfterEarlyStop = (
     ...stepPlan.slice(0, currentIndex + 1),
     ...stepPlan.filter((step, index) => index > currentIndex && finalStepIds.has(step.id)),
   ];
+};
+
+const expandBoostingRefitSteps = (
+  stepPlan: GuidedTrainingStepDefinition[],
+  output: Record<string, unknown>,
+) => {
+  const rawChain = output.model_chain;
+  const modelChain = Array.isArray(rawChain)
+    ? rawChain.filter((model): model is BaseModelType => (
+      typeof model === "string" && BASE_MODEL_TYPES.has(model as ModelType)
+    ))
+    : [];
+  const refitSteps: GuidedTrainingStepDefinition[] = [
+    {
+      id: "initialize_refit",
+      label: "初始化完整训练重拟合",
+      description: "按验证阶段选出的模型链初始化完整训练残差、评估预测和成员产物 checkpoint。",
+      actionLabel: "初始化重拟合",
+    },
+    ...modelChain.map((model, index) => ({
+      id: `refit_stage_${index + 1}_${model}`,
+      label: `重拟合第 ${index + 1} 阶段：${BASE_MODEL_LABELS[model]}`,
+      description: `在当前完整训练残差上拟合 ${BASE_MODEL_LABELS[model]}，重新计算非负阶段系数并提交该阶段 checkpoint。`,
+      actionLabel: `重拟合第 ${index + 1} 阶段`,
+    })),
+  ];
+  return stepPlan.flatMap((step) => step.id === "retrain_chain" ? refitSteps : [step]);
+};
+
+const trimBoostingRefitSteps = (
+  stepPlan: GuidedTrainingStepDefinition[],
+  stepId: string,
+  output: unknown,
+) => {
+  if (
+    !/^refit_stage_\d+_(?:ma|es|arima|lstm)$/.test(stepId)
+    || !isRecordValue(output)
+    || output.action !== "trim_refit_chain"
+  ) {
+    return stepPlan;
+  }
+  const currentIndex = stepPlan.findIndex((step) => step.id === stepId);
+  if (currentIndex < 0) return stepPlan;
+  return stepPlan.filter((step, index) => (
+    index <= currentIndex || !/^refit_stage_\d+_(?:ma|es|arima|lstm)$/.test(step.id)
+  ));
 };
 
 const buildGuidedTrainingSessionPayload = (
@@ -2425,7 +2706,7 @@ const parseGuidedAttemptReceipt = (
     return null;
   }
   if (
-    receipt.protocol_version !== 2
+    receipt.protocol_version !== GUIDED_TRAINING_PROTOCOL_VERSION
     || receipt.attempt_id !== attempt.attempt_id
     || receipt.step_id !== attempt.step_id
     || receipt.candidate_state_path !== attempt.candidate_state_path
@@ -2755,7 +3036,7 @@ const buildGuidedTrainingPythonParams = async (
     validateMovingAverageWindow(trainingConfig, canonicalBody.moving_average_window);
   }
   const derivedModelParams: Record<string, unknown> = isEnsembleModelType(modelType)
-    ? buildEnsemblePythonParams(experiment, body, trainingConfig)
+    ? buildEnsemblePythonParams(experiment, body)
     : {};
   const datasetFile = path.join(artifactDir, GUIDED_DATASET_FILE_NAME);
   if (!fs.existsSync(datasetFile)) {
@@ -2795,7 +3076,7 @@ const buildGuidedTrainingPythonParams = async (
   return pythonParams;
 };
 
-const isDuplicateGuidedTrainingRequestError = (error: unknown) => {
+const isDuplicateModelSessionRequestError = (error: unknown) => {
   if (!error || typeof error !== "object") return false;
   const candidate = error as { code?: string; errno?: number };
   return candidate.code === "ER_DUP_ENTRY" || candidate.errno === 1062;
@@ -2817,7 +3098,7 @@ const createOrResumeGuidedTrainingSessionInternal = async (
     validateMovingAverageWindow(trainingConfig, canonicalBody.moving_average_window);
   }
   if (isEnsembleModelType(modelType)) {
-    buildEnsemblePythonParams(experiment, canonicalBody, trainingConfig);
+    buildEnsemblePythonParams(experiment, canonicalBody);
   }
 
   const allData = await loadDatasetFromDb(
@@ -2891,7 +3172,7 @@ const createOrResumeGuidedTrainingSessionInternal = async (
 
   const existingSession = existingRows[0];
   if (existingSession) {
-    if (existingSession.status === "superseded" || existingSession.protocol_version !== 2) {
+    if (existingSession.status === "superseded" || existingSession.protocol_version !== GUIDED_TRAINING_PROTOCOL_VERSION) {
       operationContext.throwIfTerminated();
       const deletedSession = await deleteGuidedTrainingSession(existingSession);
       operationContext.throwIfTerminated();
@@ -2947,7 +3228,7 @@ const createOrResumeGuidedTrainingSessionInternal = async (
       if (
         completedSession
         && completedSession.status === "completed"
-        && completedSession.protocol_version === 2
+        && completedSession.protocol_version === GUIDED_TRAINING_PROTOCOL_VERSION
         && completedSession.model_type === modelType
         && completedSession.student_id === studentId
         && guidedRequestPayloadMatches(completedSession, canonicalBody)
@@ -3001,7 +3282,7 @@ const createOrResumeGuidedTrainingSessionInternal = async (
         result_payload,
         artifact_dir,
         expires_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?, 2, ?, 'ready', ?, ?, ?, ?, NULL, ?, DATE_ADD(NOW(), INTERVAL 7 DAY))`,
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'ready', ?, ?, ?, ?, NULL, ?, DATE_ADD(NOW(), INTERVAL 7 DAY))`,
       [
         sessionId,
         canonicalBody.experiment_id,
@@ -3010,6 +3291,7 @@ const createOrResumeGuidedTrainingSessionInternal = async (
         requestHash,
         datasetRevision,
         runtimeRevision,
+        GUIDED_TRAINING_PROTOCOL_VERSION,
         JSON.stringify(canonicalBody),
         currentStepId,
         JSON.stringify(completedStepIds),
@@ -3020,7 +3302,7 @@ const createOrResumeGuidedTrainingSessionInternal = async (
     );
     operationContext.throwIfTerminated();
   } catch (error) {
-    if (!isDuplicateGuidedTrainingRequestError(error)) {
+    if (!isDuplicateModelSessionRequestError(error)) {
       // If no INSERT was sent, this directory cannot be referenced by a DB
       // row. Once INSERT starts its outcome can be ambiguous on connection
       // errors, so leave cleanup to the stale-artifact sweeper.
@@ -3192,62 +3474,67 @@ export async function runGuidedTrainingStep(
 
   try {
     return await withModelOperationContext("guided_training_step", async (operationContext) => {
-      const row = await fetchGuidedTrainingSessionRow(sessionId);
+      const initialRow = await fetchGuidedTrainingSessionRow(sessionId);
       operationContext.throwIfTerminated();
-      if (!row || row.model_type !== modelType) {
+      if (!initialRow || initialRow.model_type !== modelType) {
         throw new ModelNotFoundError("未找到分阶段训练会话");
       }
-      if (row.student_id !== studentId) {
+      if (initialRow.student_id !== studentId) {
         throw new ModelAccessError("权限不足：该训练会话不属于当前用户", 403);
-      }
-
-      if (row.status === "completed") {
-        return await withModelOperationLease(
-          operationContext,
-          { mode: "slot_and_execution", experimentId: row.experiment_id, modelType },
-          async (lease) => {
-            await assertCompletedGuidedTrainingRunCurrent(row, studentId, {
-              terminationSignal: lease.terminationSignal,
-            });
-            return await buildRefreshedCompletedGuidedTrainingSessionPayload(row, studentId);
-          },
-        );
-      }
-      if (row.status === "superseded" || row.protocol_version !== 2) {
-        if (row.status !== "superseded") {
-          await markGuidedTrainingSessionSuperseded(row, "训练会话协议已升级，请重新创建训练会话");
-        }
-        throw new ModelConflictError(
-          row.superseded_reason ?? "训练会话已失效，请重新创建训练会话",
-          "GUIDED_SESSION_SUPERSEDED",
-        );
-      }
-
-      const body = parseJsonColumn<TrainInput>(row.request_payload, {} as TrainInput);
-      const evaluationStart = Number(body.data_window_evaluate_start_index);
-      const evaluationEnd = Number(body.data_window_evaluate_end_index);
-      const expectedEvaluationLength = evaluationEnd - evaluationStart + 1;
-      if (
-        !Number.isSafeInteger(evaluationStart)
-        || !Number.isSafeInteger(evaluationEnd)
-        || !Number.isSafeInteger(expectedEvaluationLength)
-        || expectedEvaluationLength <= 0
-      ) {
-        throw new ModelValidationError("训练会话缺少有效的评估区间");
-      }
-      const completedStepIds = parseJsonColumn<string[]>(row.completed_step_ids, []);
-      if (completedStepIds.includes(stepId)) return buildGuidedTrainingSessionPayload(row);
-
-      const stepPlan = getGuidedTrainingSteps(row);
-      const nextStepId = getGuidedNextStepId(stepPlan, completedStepIds);
-      if (stepId !== nextStepId) {
-        throw new ModelValidationError("只能按训练流程顺序执行下一个阶段");
       }
 
       return await withModelOperationLease(
         operationContext,
-        { mode: "slot_and_execution", experimentId: row.experiment_id, modelType },
+        { mode: "slot_and_execution", experimentId: initialRow.experiment_id, modelType },
         async (lease) => {
+          // Another request may have completed this step after the initial
+          // metadata read but before this request acquired the advisory lock.
+          // Re-read under the lock and use only this fresh row from here on.
+          const row = await fetchGuidedTrainingSessionRow(sessionId);
+          operationContext.throwIfTerminated();
+          if (!row || row.model_type !== modelType) {
+            throw new ModelNotFoundError("未找到分阶段训练会话");
+          }
+          if (row.student_id !== studentId) {
+            throw new ModelAccessError("权限不足：该训练会话不属于当前用户", 403);
+          }
+          if (row.status === "completed") {
+            await assertCompletedGuidedTrainingRunCurrent(row, studentId, {
+              terminationSignal: lease.terminationSignal,
+            });
+            return await buildRefreshedCompletedGuidedTrainingSessionPayload(row, studentId);
+          }
+          if (row.status === "superseded" || row.protocol_version !== GUIDED_TRAINING_PROTOCOL_VERSION) {
+            if (row.status !== "superseded") {
+              await markGuidedTrainingSessionSuperseded(row, "训练会话协议已升级，请重新创建训练会话");
+            }
+            throw new ModelConflictError(
+              row.superseded_reason ?? "训练会话已失效，请重新创建训练会话",
+              "GUIDED_SESSION_SUPERSEDED",
+            );
+          }
+
+          const body = parseJsonColumn<TrainInput>(row.request_payload, {} as TrainInput);
+          const evaluationStart = Number(body.data_window_evaluate_start_index);
+          const evaluationEnd = Number(body.data_window_evaluate_end_index);
+          const expectedEvaluationLength = evaluationEnd - evaluationStart + 1;
+          if (
+            !Number.isSafeInteger(evaluationStart)
+            || !Number.isSafeInteger(evaluationEnd)
+            || !Number.isSafeInteger(expectedEvaluationLength)
+            || expectedEvaluationLength <= 0
+          ) {
+            throw new ModelValidationError("训练会话缺少有效的评估区间");
+          }
+          const completedStepIds = parseJsonColumn<string[]>(row.completed_step_ids, []);
+          if (completedStepIds.includes(stepId)) return buildGuidedTrainingSessionPayload(row);
+
+          const stepPlan = getGuidedTrainingSteps(row);
+          const nextStepId = getGuidedNextStepId(stepPlan, completedStepIds);
+          if (stepId !== nextStepId) {
+            throw new ModelValidationError("只能按训练流程顺序执行下一个阶段");
+          }
+
           await assertGuidedTrainingIdentityCurrent(row, studentId, {
             terminationSignal: lease.terminationSignal,
           });
@@ -3285,16 +3572,23 @@ export async function runGuidedTrainingStep(
 
           await lease.verifyOwned();
           await recordGuidedAttemptPythonCompleted(activeAttempt, receipt);
-            await assertGuidedTrainingIdentityCurrent(row, studentId, {
-              terminationSignal: lease.terminationSignal,
-            });
+          await assertGuidedTrainingIdentityCurrent(row, studentId, {
+            terminationSignal: lease.terminationSignal,
+          });
 
           const nextCompletedStepIds = [...completedStepIds, stepId];
           const stepOutputs = parseJsonColumn<Record<string, unknown>>(row.step_outputs, {});
           const nextStepOutputs = { ...stepOutputs, [stepId]: receipt.output ?? {} };
-          const nextStepPlan = shouldTrimBoostingRoundSteps(modelType, stepId, receipt.output)
-            ? trimBoostingStepPlanAfterEarlyStop(stepPlan, stepId)
-            : stepPlan;
+          let nextStepPlan = stepPlan;
+          if (shouldTrimBoostingRoundSteps(modelType, stepId, receipt.output)) {
+            nextStepPlan = trimBoostingStepPlanAfterEarlyStop(nextStepPlan, stepId);
+            if (isRecordValue(receipt.output)) {
+              nextStepPlan = expandBoostingRefitSteps(nextStepPlan, receipt.output);
+            }
+          }
+          if (modelType === "boosting") {
+            nextStepPlan = trimBoostingRefitSteps(nextStepPlan, stepId, receipt.output);
+          }
 
           let cleanupUncommittedArtifactPath: string | null = null;
           try {
@@ -3342,14 +3636,16 @@ export async function runGuidedTrainingStep(
                 await lease.verifyOwned();
               }
               if (!artifactSha256) {
-                artifactSha256 = (
-                  await verifyBaseModelArtifactIntegrity(
-                    row.model_type,
-                    versionedArtifactPath,
-                    null,
-                    lease.terminationSignal,
-                  )
-                ).sha256;
+                // The current guided step has just produced a validated result
+                // and copyModelArtifact created this destination from that
+                // committed session artifact.  Hash the new output directly;
+                // semantic Python validation is reserved for recovering a
+                // pre-existing, otherwise untrusted destination above.
+                artifactSha256 = await computeModelArtifactSha256(
+                  row.model_type,
+                  versionedArtifactPath,
+                  lease.terminationSignal,
+                );
                 await lease.verifyOwned();
               }
               receiptFinalResult.saved_model = versionedArtifactPath;
@@ -3438,6 +3734,825 @@ export async function runGuidedTrainingStep(
   }
 }
 
+const parseProductionPreparationStepPlan = (value: unknown): ProductionPreparationStepDefinition[] => {
+  if (!Array.isArray(value)) return [];
+  return value.filter((item): item is ProductionPreparationStepDefinition => (
+    isRecordValue(item)
+    && typeof item.id === "string"
+    && item.id.length > 0
+    && typeof item.label === "string"
+    && item.label.length > 0
+  ));
+};
+
+const buildProductionPreparationPayload = (
+  row: ProductionPreparationSessionRow,
+  reusedExisting = false,
+): ProductionPreparationSessionPayload => {
+  const completedStepIds = parseJsonColumn<string[]>(row.completed_step_ids, []);
+  const stepPlan = parseProductionPreparationStepPlan(parseJsonColumn<unknown>(row.step_plan, []));
+  const completed = new Set(completedStepIds);
+  const nextStep = row.status === "completed" || row.status === "superseded"
+    ? null
+    : stepPlan.find((step) => !completed.has(step.id)) ?? null;
+  return {
+    status: "success",
+    results: {
+      session_id: row.session_id,
+      session_status: row.status,
+      completed_step_ids: completedStepIds,
+      total_steps: stepPlan.length,
+      next_step: nextStep,
+      error_message: row.error_message,
+      ...(row.status === "completed" && row.production_revision
+        ? {
+          preparation_token: row.production_revision,
+          prepared_forecast_steps: Number(row.forecast_steps),
+          reused_existing: reusedExisting,
+        }
+        : {}),
+    },
+  };
+};
+
+const completeProductionPreparationWithReusableArtifact = async (
+  row: ProductionPreparationSessionRow,
+  stepPlan: ProductionPreparationStepDefinition[],
+  activeRun: ModelTrainingRunRow,
+  preparationToken: string,
+) => {
+  const allStepIds = stepPlan.map((step) => step.id);
+  await queryWithTimeout(pool,
+    `UPDATE model_production_preparation_sessions
+        SET status = 'completed',
+            current_step_id = NULL,
+            completed_step_ids = ?,
+            active_attempt_id = NULL,
+            observed_production_revision = ?,
+            production_revision = ?,
+            error_message = NULL,
+            expires_at = DATE_ADD(NOW(), INTERVAL 7 DAY)
+      WHERE session_id = ?
+        AND status <> 'superseded'`,
+    [
+      JSON.stringify(allStepIds),
+      activeRun.production_revision,
+      preparationToken,
+      row.session_id,
+    ],
+  );
+  if (
+    row.candidate_model_path !== activeRun.production_artifact_path
+    && row.candidate_model_path !== activeRun.artifact_path
+  ) {
+    removeModelArtifactGroup(row.candidate_model_path);
+  }
+  const completed = await fetchProductionPreparationSession(row.session_id);
+  if (!completed) throw new Error("生产准备会话完成后无法读取");
+  return buildProductionPreparationPayload(completed, true);
+};
+
+const fetchProductionPreparationSession = async (sessionId: string) => {
+  const [rows] = await queryWithTimeout<ProductionPreparationSessionRow[]>(pool,
+    `SELECT session_id,
+            experiment_id,
+            student_id,
+            run_id,
+            model_type,
+            request_hash,
+            dataset_revision,
+            runtime_revision,
+            protocol_version,
+            forecast_steps,
+            status,
+            current_step_id,
+            completed_step_ids,
+            step_plan,
+            artifact_dir,
+            candidate_model_path,
+            committed_state_path,
+            committed_state_sha256,
+            active_attempt_id,
+            observed_production_revision,
+            production_revision,
+            error_message,
+            superseded_reason,
+            expires_at
+       FROM model_production_preparation_sessions
+      WHERE session_id = ?
+      LIMIT 1`,
+    [sessionId],
+  );
+  return rows[0] ?? null;
+};
+
+const buildProductionPreparationArtifactDir = (
+  experimentId: number,
+  studentId: number,
+  modelType: ModelType,
+  sessionId: string,
+) => path.join(
+  PRODUCTION_PREPARATION_ROOT,
+  `exp${experimentId}-student${studentId}-${modelType}-${sessionId}`,
+);
+
+const buildProductionPreparationRequestHash = (input: {
+  runId: string;
+  datasetRevision: string;
+  runtimeRevision: string;
+  forecastSteps: number;
+}) => crypto.createHash("sha256").update(JSON.stringify(input)).digest("hex");
+
+interface ProductionPreparationIdentity {
+  experiment: ExperimentModelContextRow;
+  trainingConfig: ReturnType<typeof getExperimentTrainingConfig>;
+  activeRun: ModelTrainingRunRow;
+  datasetRevision: string;
+  runtimeRevision: string;
+  requestHash: string;
+}
+
+const markProductionPreparationSessionSuperseded = async (
+  row: Pick<ProductionPreparationSessionRow, "session_id">,
+  reason: string,
+) => {
+  await queryWithTimeout(pool,
+    `UPDATE model_production_preparation_sessions
+        SET status = 'superseded',
+            current_step_id = NULL,
+            active_attempt_id = NULL,
+            superseded_reason = ?,
+            error_message = NULL
+      WHERE session_id = ?
+        AND status <> 'superseded'`,
+    [reason, row.session_id],
+  );
+};
+
+const computeCurrentProductionPreparationIdentity = async (
+  row: Pick<
+    ProductionPreparationSessionRow,
+    "experiment_id" | "model_type" | "forecast_steps"
+  >,
+  studentId: number,
+): Promise<ProductionPreparationIdentity> => {
+  const experiment = await assertExperimentModelAccess(row.experiment_id, studentId);
+  assertModelReadyForProduction(experiment, row.model_type);
+  const activeRun = await requireActiveModelTrainingRun(
+    row.experiment_id,
+    studentId,
+    row.model_type,
+  );
+  const trainingConfig = getExperimentTrainingConfig(experiment);
+  const allData = await loadDatasetFromDb(
+    trainingConfig.selected_industry,
+    trainingConfig.selected_company,
+    trainingConfig.selected_product,
+  );
+  const datasetJson = JSON.stringify(allData);
+  const datasetRevision = hashDatasetSnapshot(datasetJson);
+  const runtimeRevision = getModelRuntimeRevision(true);
+  assertRunRevisionMatches(activeRun, datasetRevision, runtimeRevision);
+  return {
+    experiment,
+    trainingConfig,
+    activeRun,
+    datasetRevision,
+    runtimeRevision,
+    requestHash: buildProductionPreparationRequestHash({
+      runId: activeRun.run_id,
+      datasetRevision,
+      runtimeRevision,
+      forecastSteps: Number(row.forecast_steps),
+    }),
+  };
+};
+
+const assertProductionPreparationIdentityCurrent = async (
+  row: Pick<
+    ProductionPreparationSessionRow,
+    | "session_id"
+    | "experiment_id"
+    | "model_type"
+    | "forecast_steps"
+    | "run_id"
+    | "request_hash"
+    | "dataset_revision"
+    | "runtime_revision"
+  >,
+  studentId: number,
+): Promise<ProductionPreparationIdentity> => {
+  let current: ProductionPreparationIdentity;
+  try {
+    current = await computeCurrentProductionPreparationIdentity(row, studentId);
+  } catch (error) {
+    if (
+      !(error instanceof ModelAccessError)
+      && !(error instanceof ModelValidationError)
+      && !(error instanceof ModelNotFoundError)
+      && !(error instanceof ModelConflictError)
+    ) {
+      throw error;
+    }
+    const reason = error instanceof Error
+      ? `生产准备依赖已变化：${error.message}`
+      : "生产准备依赖已变化";
+    await markProductionPreparationSessionSuperseded(row, reason);
+    throw new ModelConflictError(reason, "PRODUCTION_PREPARATION_STALE");
+  }
+
+  if (
+    current.activeRun.run_id !== row.run_id
+    || current.datasetRevision !== row.dataset_revision
+    || current.runtimeRevision !== row.runtime_revision
+    || current.requestHash !== row.request_hash
+  ) {
+    const reason = "训练版本、当前数据集或模型运行环境已变化，请重新训练后再准备生产模型";
+    await markProductionPreparationSessionSuperseded(row, reason);
+    throw new ModelConflictError(reason, "PRODUCTION_PREPARATION_STALE");
+  }
+  return current;
+};
+
+const buildProductionStepLabel = (stepId: string) => {
+  const modelLabels: Record<string, string> = {
+    ma: "移动平均",
+    es: "指数平滑",
+    arima: "ARIMA",
+    lstm: "LSTM",
+  };
+  if (stepId === "initialize") return "确认生产准备材料";
+  if (stepId === "fit_model") return "重拟合生产模型";
+  if (stepId === "finalize") return "组装并校验生产产物";
+  const member = /^fit_member_(ma|es|arima|lstm)$/.exec(stepId);
+  if (member) return `重拟合成员：${modelLabels[member[1]!]}`;
+  const stage = /^fit_stage_(\d+)_(ma|es|arima|lstm)$/.exec(stepId);
+  if (stage) return `重拟合第 ${stage[1]} 阶段：${modelLabels[stage[2]!]}`;
+  throw new ModelValidationError("生产准备返回了未知步骤");
+};
+
+const expandProductionPreparationPlan = (
+  currentPlan: ProductionPreparationStepDefinition[],
+  output: unknown,
+) => {
+  if (!isRecordValue(output) || !Array.isArray(output.work_items)) {
+    throw new ModelValidationError("生产准备初始化未返回有效工作项");
+  }
+  const workItems = output.work_items.map((item) => {
+    if (!isRecordValue(item) || typeof item.id !== "string") {
+      throw new ModelValidationError("生产准备初始化返回了无效工作项");
+    }
+    if (!/^(?:fit_model|fit_member_(?:ma|es|arima|lstm)|fit_stage_\d+_(?:ma|es|arima|lstm))$/.test(item.id)) {
+      throw new ModelValidationError("生产准备初始化返回了未知工作项");
+    }
+    return { id: item.id, label: buildProductionStepLabel(item.id) };
+  });
+  const deduped = new Set(workItems.map((item) => item.id));
+  if (deduped.size !== workItems.length || workItems.length === 0) {
+    throw new ModelValidationError("生产准备初始化返回了重复或空工作项");
+  }
+  return [currentPlan[0]!, ...workItems, currentPlan[currentPlan.length - 1]!];
+};
+
+const resolveProductionPreparationStepTimeoutMs = (modelType: ModelType, stepId: string) => {
+  const member = (
+    stepId === "fit_model" && isBaseModelType(modelType)
+      ? modelType
+      : /_(ma|es|arima|lstm)$/.exec(stepId)?.[1]
+  ) as BaseModelType | undefined;
+  if (!member) return TRAINING_TIMEOUT;
+  return Math.min(
+    MODEL_ORCHESTRATION_HARD_CAP,
+    Math.max(TRAINING_TIMEOUT, BASE_MODEL_TIMEOUT_SECONDS[member] * 1000 + 30_000),
+  );
+};
+
+export async function createOrResumeProductionPreparationSession(
+  modelType: ModelType,
+  studentId: number,
+  experimentId: number,
+  forecastSteps = DEFAULT_PRODUCTION_FORECAST_STEPS,
+): Promise<ProductionPreparationSessionPayload> {
+  return await withModelOperationContext("production_preparation", async (operationContext) => {
+    const experiment = await assertExperimentModelAccess(experimentId, studentId);
+    assertModelReadyForProduction(experiment, modelType);
+    const activeRun = await requireActiveModelTrainingRun(experimentId, studentId, modelType);
+    const trainingConfig = getExperimentTrainingConfig(experiment);
+    const allData = await loadDatasetFromDb(
+      trainingConfig.selected_industry,
+      trainingConfig.selected_company,
+      trainingConfig.selected_product,
+    );
+    operationContext.throwIfTerminated();
+    const datasetJson = JSON.stringify(allData);
+    validateActiveRunAgainstSnapshot(activeRun, datasetJson);
+    const datasetRevision = hashDatasetSnapshot(datasetJson);
+    const runtimeRevision = getModelRuntimeRevision(true);
+    const requestHash = buildProductionPreparationRequestHash({
+      runId: activeRun.run_id,
+      datasetRevision,
+      runtimeRevision,
+      forecastSteps,
+    });
+    const [existingRows] = await queryWithTimeout<ProductionPreparationSessionRow[]>(pool,
+      `SELECT session_id,
+              experiment_id,
+              student_id,
+              run_id,
+              model_type,
+              request_hash,
+              dataset_revision,
+              runtime_revision,
+              protocol_version,
+              forecast_steps,
+              status,
+              current_step_id,
+              completed_step_ids,
+              step_plan,
+              artifact_dir,
+              candidate_model_path,
+              committed_state_path,
+              committed_state_sha256,
+              active_attempt_id,
+              observed_production_revision,
+              production_revision,
+              error_message,
+              superseded_reason,
+              expires_at
+         FROM model_production_preparation_sessions
+        WHERE experiment_id = ?
+          AND student_id = ?
+          AND model_type = ?
+          AND request_hash = ?
+        LIMIT 1`,
+      [experimentId, studentId, modelType, requestHash],
+    );
+    const existing = existingRows[0];
+    // Finalization records the production artifact before marking the session
+    // completed. Re-read the active run before deciding that a completed
+    // session is stale; otherwise a concurrent create request that loaded the
+    // pre-finalization run could delete the artifact that just committed.
+    const currentActiveRun = existing?.status === "completed"
+      ? await requireActiveModelTrainingRun(experimentId, studentId, modelType)
+      : activeRun;
+    if (
+      currentActiveRun.run_id !== activeRun.run_id
+      || currentActiveRun.dataset_revision !== activeRun.dataset_revision
+      || currentActiveRun.runtime_revision !== activeRun.runtime_revision
+    ) {
+      throw new ModelConflictError(
+        "生产准备期间训练版本已变化，请重试",
+        "PRODUCTION_PREPARATION_STALE",
+      );
+    }
+    const completedSessionStillCurrent = existing?.status !== "completed" || (
+      Boolean(existing.production_revision)
+      && existing.production_revision === currentActiveRun.production_revision
+      && currentActiveRun.production_artifact_forecast_steps !== null
+      && Number(currentActiveRun.production_artifact_forecast_steps) >= forecastSteps
+    );
+    if (
+      existing
+      && existing.protocol_version === PRODUCTION_PREPARATION_PROTOCOL_VERSION
+      && existing.status !== "superseded"
+      && completedSessionStillCurrent
+    ) {
+      return buildProductionPreparationPayload(existing);
+    }
+    if (existing) {
+      if (existing.candidate_model_path !== currentActiveRun.production_artifact_path) {
+        removeModelArtifactGroup(existing.candidate_model_path);
+      }
+      if (!removeProductionPreparationArtifactDir(existing.artifact_dir)) {
+        throw new ModelValidationError("旧的生产准备会话工件目录不安全，无法重建会话");
+      }
+      await queryWithTimeout(pool,
+        "DELETE FROM model_production_preparation_sessions WHERE session_id = ?",
+        [existing.session_id],
+      );
+    }
+
+    const sessionId = crypto.randomUUID();
+    const artifactDir = buildProductionPreparationArtifactDir(
+      experimentId,
+      studentId,
+      modelType,
+      sessionId,
+    );
+    const candidateModelPath = buildProductionCandidateModelPath(
+      experimentId,
+      studentId,
+      modelType,
+      activeRun.run_id,
+    );
+    const stepPlan: ProductionPreparationStepDefinition[] = [
+      { id: "initialize", label: buildProductionStepLabel("initialize") },
+      { id: "finalize", label: buildProductionStepLabel("finalize") },
+    ];
+    let insertAttempted = false;
+    try {
+      fs.mkdirSync(artifactDir, { recursive: true });
+      await Bun.write(path.join(artifactDir, GUIDED_DATASET_FILE_NAME), datasetJson);
+      operationContext.throwIfTerminated();
+      insertAttempted = true;
+      await queryWithTimeout(pool,
+        `INSERT INTO model_production_preparation_sessions
+         (session_id, experiment_id, student_id, run_id, model_type, request_hash,
+          dataset_revision, runtime_revision, protocol_version, forecast_steps,
+          status, current_step_id, completed_step_ids, step_plan, artifact_dir,
+          candidate_model_path, observed_production_revision, expires_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'ready', 'initialize', ?, ?, ?, ?, ?, DATE_ADD(NOW(), INTERVAL 7 DAY))`,
+        [
+          sessionId,
+          experimentId,
+          studentId,
+          activeRun.run_id,
+          modelType,
+          requestHash,
+          datasetRevision,
+          runtimeRevision,
+          PRODUCTION_PREPARATION_PROTOCOL_VERSION,
+          forecastSteps,
+          JSON.stringify([]),
+          JSON.stringify(stepPlan),
+          artifactDir,
+          candidateModelPath,
+          activeRun.production_revision,
+        ],
+      );
+    } catch (error) {
+      if (!isDuplicateModelSessionRequestError(error)) {
+        // Once INSERT starts, its outcome can be ambiguous on connection
+        // failure. Leave such a directory for the orphan sweeper.
+        if (!insertAttempted) removeProductionPreparationArtifactDir(artifactDir);
+        throw error;
+      }
+      removeProductionPreparationArtifactDir(artifactDir);
+      operationContext.throwIfTerminated();
+      const [racedRows] = await queryWithTimeout<ProductionPreparationSessionRow[]>(pool,
+        `SELECT *
+           FROM model_production_preparation_sessions
+          WHERE experiment_id = ?
+            AND student_id = ?
+            AND model_type = ?
+            AND request_hash = ?
+          LIMIT 1`,
+        [experimentId, studentId, modelType, requestHash],
+      );
+      operationContext.throwIfTerminated();
+      if (racedRows[0]) return buildProductionPreparationPayload(racedRows[0]);
+      throw error;
+    }
+    const created = await fetchProductionPreparationSession(sessionId);
+    if (!created) throw new Error("生产准备会话创建后无法读取");
+    return buildProductionPreparationPayload(created);
+  });
+}
+
+export async function getProductionPreparationSession(
+  modelType: ModelType,
+  studentId: number,
+  sessionId: string,
+): Promise<ProductionPreparationSessionPayload> {
+  const row = await fetchProductionPreparationSession(sessionId);
+  if (!row || row.model_type !== modelType) throw new ModelNotFoundError("未找到生产准备会话");
+  if (row.student_id !== studentId) throw new ModelAccessError("无权访问该生产准备会话", 403);
+  await assertExperimentModelAccess(row.experiment_id, studentId);
+  return buildProductionPreparationPayload(row);
+}
+
+const validateProductionPreparationReceipt = async (
+  result: Awaited<ReturnType<typeof runPythonProductionPreparationStep>>,
+  attempt: ProductionPreparationAttemptRow,
+) => {
+  if (
+    result.protocol_version !== PRODUCTION_PREPARATION_PROTOCOL_VERSION
+    || result.attempt_id !== attempt.attempt_id
+    || result.step_id !== attempt.step_id
+    || result.candidate_state_path !== attempt.candidate_state_path
+    || !/^[a-f\d]{64}$/i.test(result.candidate_state_sha256)
+  ) {
+    throw new ModelValidationError("生产准备步骤返回了无效 checkpoint receipt");
+  }
+  if (attempt.input_state_path) {
+    if (
+      result.input_state_path !== attempt.input_state_path
+      || result.input_state_sha256 !== attempt.input_state_sha256
+      || await hashFileContents(attempt.input_state_path) !== attempt.input_state_sha256
+    ) {
+      throw new ModelValidationError("生产准备步骤输入 checkpoint 摘要不匹配");
+    }
+  } else if (result.input_state_path != null || result.input_state_sha256 != null) {
+    throw new ModelValidationError("生产准备初始化返回了意外的输入 checkpoint");
+  }
+  const actualDigest = await hashFileContents(attempt.candidate_state_path);
+  if (actualDigest !== result.candidate_state_sha256) {
+    throw new ModelValidationError("生产准备 checkpoint 摘要不匹配");
+  }
+  return result;
+};
+
+export async function runProductionPreparationStep(
+  modelType: ModelType,
+  studentId: number,
+  sessionId: string,
+  stepId: string,
+): Promise<ProductionPreparationSessionPayload> {
+  const operationContextName = "production_preparation" as const;
+  return await withModelOperationContext(operationContextName, async (operationContext) => {
+    const initialRow = await fetchProductionPreparationSession(sessionId);
+    if (!initialRow || initialRow.model_type !== modelType) {
+      throw new ModelNotFoundError("未找到生产准备会话");
+    }
+    if (initialRow.student_id !== studentId) throw new ModelAccessError("无权访问该生产准备会话", 403);
+    if (initialRow.protocol_version !== PRODUCTION_PREPARATION_PROTOCOL_VERSION || initialRow.status === "superseded") {
+      throw new ModelConflictError("生产准备会话已失效，请重新创建", "PRODUCTION_PREPARATION_STALE");
+    }
+    const completedStepIds = parseJsonColumn<string[]>(initialRow.completed_step_ids, []);
+    if (completedStepIds.includes(stepId)) return buildProductionPreparationPayload(initialRow);
+    const stepPlan = parseProductionPreparationStepPlan(parseJsonColumn<unknown>(initialRow.step_plan, []));
+    const nextStep = stepPlan.find((step) => !completedStepIds.includes(step.id));
+    if (!nextStep || nextStep.id !== stepId) {
+      throw new ModelConflictError("只能执行生产准备会话的下一步骤", "PRODUCTION_PREPARATION_STEP_CONFLICT");
+    }
+
+    const [refreshResult] = await queryWithTimeout(pool,
+      `UPDATE model_production_preparation_sessions
+          SET expires_at = CASE
+                WHEN expires_at IS NULL THEN DATE_ADD(NOW(), INTERVAL 7 DAY)
+                ELSE GREATEST(
+                  DATE_ADD(expires_at, INTERVAL 1 SECOND),
+                  DATE_ADD(NOW(), INTERVAL 7 DAY)
+                )
+              END
+        WHERE session_id = ?
+          AND status IN ('ready', 'failed', 'running')
+          AND (expires_at IS NULL OR expires_at > NOW())`,
+      [sessionId],
+    );
+    if (Number((refreshResult as { affectedRows?: number }).affectedRows ?? 0) !== 1) {
+      throw new ModelConflictError("生产准备会话已过期，请重新创建", "PRODUCTION_PREPARATION_STALE");
+    }
+
+    return await withModelOperationLease(
+      operationContext,
+      { mode: "slot_and_execution", experimentId: initialRow.experiment_id, modelType },
+      async (lease) => {
+        // A second tab may have waited for the same advisory lock while the
+        // first request committed this step. Re-read under the lock so stale
+        // checkpoint pointers can never replay or overwrite a later step.
+        const currentRow = await fetchProductionPreparationSession(sessionId);
+        if (!currentRow || currentRow.model_type !== modelType || currentRow.student_id !== studentId) {
+          throw new ModelNotFoundError("未找到生产准备会话");
+        }
+        if (
+          currentRow.protocol_version !== PRODUCTION_PREPARATION_PROTOCOL_VERSION
+          || currentRow.status === "superseded"
+        ) {
+          throw new ModelConflictError("生产准备会话已失效，请重新创建", "PRODUCTION_PREPARATION_STALE");
+        }
+        const currentCompletedStepIds = parseJsonColumn<string[]>(currentRow.completed_step_ids, []);
+        if (currentCompletedStepIds.includes(stepId)) {
+          return buildProductionPreparationPayload(currentRow);
+        }
+        const currentStepPlan = parseProductionPreparationStepPlan(
+          parseJsonColumn<unknown>(currentRow.step_plan, []),
+        );
+        const currentNextStep = currentStepPlan.find((step) => !currentCompletedStepIds.includes(step.id));
+        if (!currentNextStep || currentNextStep.id !== stepId) {
+          throw new ModelConflictError(
+            "只能执行生产准备会话的下一步骤",
+            "PRODUCTION_PREPARATION_STEP_CONFLICT",
+          );
+        }
+        let stepIdentity = await assertProductionPreparationIdentityCurrent(
+          currentRow,
+          studentId,
+        );
+        const reusable = await getReusableProductionModelArtifactResult(
+          modelType,
+          currentRow.forecast_steps,
+          stepIdentity.experiment,
+          stepIdentity.activeRun,
+          lease.terminationSignal,
+        );
+        if (reusable) {
+          return await completeProductionPreparationWithReusableArtifact(
+            currentRow,
+            currentStepPlan,
+            stepIdentity.activeRun,
+            reusable.results.preparation_token,
+          );
+        }
+        // A failed reusable-artifact verification clears that artifact from
+        // the active run. Re-read before recording the CAS baseline used by
+        // this attempt.
+        stepIdentity = await assertProductionPreparationIdentityCurrent(
+          currentRow,
+          studentId,
+        );
+        const { activeRun } = stepIdentity;
+
+        await verifyBacktestBaseArtifactForRun(modelType, activeRun, lease.terminationSignal);
+        const datasetSnapshotPath = path.join(currentRow.artifact_dir, GUIDED_DATASET_FILE_NAME);
+        const datasetSnapshotSha256 = await hashFileContents(datasetSnapshotPath, lease.terminationSignal);
+        if (datasetSnapshotSha256 !== currentRow.dataset_revision) {
+          throw new ModelConflictError(
+            "生产准备数据快照已损坏，请重新创建会话",
+            "PRODUCTION_PREPARATION_STALE",
+          );
+        }
+        if (currentRow.committed_state_path) {
+          if (
+            !currentRow.committed_state_sha256
+            || await hashFileContents(currentRow.committed_state_path, lease.terminationSignal)
+              !== currentRow.committed_state_sha256
+          ) {
+            throw new ModelConflictError(
+              "生产准备 checkpoint 已损坏，请重新创建会话",
+              "PRODUCTION_PREPARATION_STALE",
+            );
+          }
+        } else if (currentRow.committed_state_sha256) {
+          throw new ModelConflictError(
+            "生产准备 checkpoint 状态不完整，请重新创建会话",
+            "PRODUCTION_PREPARATION_STALE",
+          );
+        }
+        const timeoutMs = resolveProductionPreparationStepTimeoutMs(modelType, stepId);
+        const attemptLeaseSeconds = Math.ceil((timeoutMs + 60_000) / 1000);
+        const attemptId = crypto.randomUUID();
+        const attemptDir = path.join(currentRow.artifact_dir, "attempts", attemptId);
+        fs.mkdirSync(attemptDir, { recursive: true });
+        const attempt: ProductionPreparationAttemptRow = {
+          attempt_id: attemptId,
+          session_id: sessionId,
+          step_id: stepId,
+          status: "running",
+          input_state_path: currentRow.committed_state_path,
+          input_state_sha256: currentRow.committed_state_sha256,
+          candidate_state_path: path.join(attemptDir, "candidate.pkl"),
+          candidate_state_sha256: null,
+          receipt_path: path.join(attemptDir, "receipt.json"),
+          output_payload: null,
+          error_message: null,
+          lease_expires_at: null,
+        } as ProductionPreparationAttemptRow;
+        await queryWithTimeout(pool,
+          `INSERT INTO model_production_preparation_step_attempts
+           (attempt_id, session_id, step_id, status, input_state_path,
+            input_state_sha256, candidate_state_path, receipt_path, lease_expires_at)
+           VALUES (?, ?, ?, 'running', ?, ?, ?, ?, DATE_ADD(NOW(), INTERVAL ? SECOND))`,
+          [
+            attemptId,
+            sessionId,
+            stepId,
+            attempt.input_state_path,
+            attempt.input_state_sha256,
+            attempt.candidate_state_path,
+            attempt.receipt_path,
+            attemptLeaseSeconds,
+          ],
+        );
+        await queryWithTimeout(pool,
+          `UPDATE model_production_preparation_sessions
+              SET status = 'running', current_step_id = ?, active_attempt_id = ?,
+                  observed_production_revision = ?, error_message = NULL,
+                  expires_at = DATE_ADD(NOW(), INTERVAL 7 DAY)
+            WHERE session_id = ?`,
+          [stepId, attemptId, activeRun.production_revision, sessionId],
+        );
+
+        try {
+          const rawReceipt = await runPythonProductionPreparationStep(
+            modelType,
+            stepId,
+            {
+              dataFile: datasetSnapshotPath,
+              sourceModel: activeRun.artifact_path,
+              saveModel: currentRow.candidate_model_path,
+              trainStart: stepIdentity.trainingConfig.data_window_train_start_index,
+              trainEnd: stepIdentity.trainingConfig.data_window_evaluate_end_index,
+              forecastSteps: currentRow.forecast_steps,
+              pretty: true,
+            },
+            attemptId,
+            attempt.input_state_path,
+            attempt.candidate_state_path,
+            attempt.receipt_path,
+            currentRow.artifact_dir,
+            timeoutMs,
+            lease.terminationSignal,
+          );
+          const receipt = await validateProductionPreparationReceipt(rawReceipt, attempt);
+          await verifyBacktestBaseArtifactForRun(modelType, activeRun, lease.terminationSignal);
+          await assertProductionPreparationIdentityCurrent(currentRow, studentId);
+          await lease.verifyOwned();
+          const nextCompleted = [...currentCompletedStepIds, stepId];
+          let nextPlan = currentStepPlan;
+          if (stepId === "initialize") {
+            nextPlan = expandProductionPreparationPlan(currentStepPlan, receipt.output);
+          } else if (
+            /^fit_stage_\d+_(?:ma|es|arima|lstm)$/.test(stepId)
+            && isRecordValue(receipt.output)
+            && receipt.output.trim_remaining === true
+          ) {
+            nextPlan = currentStepPlan.filter((step) => (
+              !/^fit_stage_\d+_(?:ma|es|arima|lstm)$/.test(step.id)
+              || currentCompletedStepIds.includes(step.id)
+              || step.id === stepId
+            ));
+            const finalizeStep = currentStepPlan.find((step) => step.id === "finalize");
+            if (finalizeStep && !nextPlan.some((step) => step.id === "finalize")) {
+              nextPlan.push(finalizeStep);
+            }
+          }
+          const finalResult = isRecordValue(receipt.final_result) ? receipt.final_result : null;
+          let productionRevision: string | null = null;
+          let replacedProductionArtifactPath: string | null = null;
+          if (finalResult) {
+            const artifactSha256 = isBaseModelType(modelType)
+              ? await computeBaseModelArtifactSha256(modelType, currentRow.candidate_model_path, lease.terminationSignal)
+              : await computeEnsembleArtifactSha256(modelType, currentRow.candidate_model_path, lease.terminationSignal);
+            const commitIdentity = await assertProductionPreparationIdentityCurrent(
+              currentRow,
+              studentId,
+            );
+            replacedProductionArtifactPath = commitIdentity.activeRun.production_artifact_path;
+            await lease.verifyOwned();
+            productionRevision = crypto.randomUUID();
+            const recorded = await setProductionArtifactForRun(
+              commitIdentity.activeRun.run_id,
+              currentRow.candidate_model_path,
+              currentRow.forecast_steps,
+              productionRevision,
+              artifactSha256,
+              commitIdentity.activeRun.production_revision,
+            );
+            if (!recorded) throw new ModelConflictError("模型版本已变化，请重新准备", "PRODUCTION_PREPARATION_STALE");
+          }
+          const status: ProductionPreparationStatus = finalResult ? "completed" : "ready";
+          const nextStepId = finalResult
+            ? null
+            : nextPlan.find((step) => !nextCompleted.includes(step.id))?.id ?? null;
+          await queryWithTimeout(pool,
+            `UPDATE model_production_preparation_step_attempts
+                SET status = 'committed', candidate_state_sha256 = ?, output_payload = ?
+              WHERE attempt_id = ?`,
+            [receipt.candidate_state_sha256, JSON.stringify(receipt.output ?? {}), attemptId],
+          );
+          await queryWithTimeout(pool,
+            `UPDATE model_production_preparation_sessions
+                SET status = ?, current_step_id = ?, completed_step_ids = ?, step_plan = ?,
+                    committed_state_path = ?, committed_state_sha256 = ?, active_attempt_id = NULL,
+                    production_revision = ?, error_message = NULL,
+                    expires_at = DATE_ADD(NOW(), INTERVAL 7 DAY)
+              WHERE session_id = ?`,
+            [
+              status,
+              nextStepId,
+              JSON.stringify(nextCompleted),
+              JSON.stringify(nextPlan),
+              receipt.candidate_state_path,
+              receipt.candidate_state_sha256,
+              productionRevision,
+              sessionId,
+            ],
+          );
+          if (
+            finalResult
+            && replacedProductionArtifactPath
+            && replacedProductionArtifactPath !== currentRow.candidate_model_path
+            && replacedProductionArtifactPath !== activeRun.artifact_path
+          ) {
+            removeModelArtifactGroup(replacedProductionArtifactPath);
+          }
+          const updated = await fetchProductionPreparationSession(sessionId);
+          if (!updated) throw new Error("生产准备步骤提交后无法读取会话");
+          return buildProductionPreparationPayload(updated);
+        } catch (error) {
+          const message = error instanceof Error ? error.message : "生产准备步骤失败";
+          await queryWithTimeout(pool,
+            `UPDATE model_production_preparation_step_attempts
+                SET status = 'failed', error_message = ?
+              WHERE attempt_id = ?`,
+            [message.slice(0, 4000), attemptId],
+          ).catch(() => undefined);
+          await queryWithTimeout(pool,
+            `UPDATE model_production_preparation_sessions
+                SET status = 'failed', current_step_id = ?, active_attempt_id = NULL,
+                    error_message = ?, expires_at = DATE_ADD(NOW(), INTERVAL 7 DAY)
+              WHERE session_id = ?
+                AND status <> 'superseded'`,
+            [stepId, message.slice(0, 4000), sessionId],
+          ).catch(() => undefined);
+          throw error;
+        }
+      },
+    );
+  });
+}
+
 const getReusableProductionModelArtifactResult = async (
   modelType: ModelType,
   forecastSteps: number,
@@ -3484,197 +4599,6 @@ const getReusableProductionModelArtifactResult = async (
       reused_existing: true,
     },
   };
-}
-
-const prepareExperimentModelForProductionWithLease = async (
-  modelType: ModelType,
-  studentId: number,
-  experimentId: number,
-  forecastSteps: number,
-  forceRefit: boolean,
-  experiment: ExperimentModelContextRow,
-  lease: ModelOperationLease,
-) => {
-  const activeRun = await requireActiveModelTrainingRun(experimentId, studentId, modelType);
-  const reusableArtifact = forceRefit
-    ? null
-    : await getReusableProductionModelArtifactResult(
-      modelType,
-      forecastSteps,
-      experiment,
-      activeRun,
-      lease.terminationSignal,
-    );
-  if (reusableArtifact) {
-    await lease.verifyOwned();
-    return reusableArtifact;
-  }
-
-  const trainingConfig = getExperimentTrainingConfig(experiment);
-  const previousProductionModelPath = activeRun.production_artifact_path;
-  const productionModelPath = buildProductionCandidateModelPath(
-    experimentId,
-    studentId,
-    modelType,
-    activeRun.run_id,
-  );
-  const backtestModelPath = activeRun.artifact_path;
-  let verifiedBacktestSha256: string | null = null;
-  try {
-    verifiedBacktestSha256 = await verifyBacktestBaseArtifactForRun(
-      modelType,
-      activeRun,
-      lease.terminationSignal,
-    );
-  } catch (error) {
-    if (!(error instanceof ModelArtifactError)) throw error;
-    throw new ModelConflictError(
-      `${modelType.toUpperCase()} 回测模型产物已损坏或缺失，请重新训练该模型`,
-      "MODEL_ARTIFACT_INVALID",
-      { required_action: "retrain" },
-    );
-  }
-
-  const allData = await loadDatasetFromDb(
-    trainingConfig.selected_industry,
-    trainingConfig.selected_company,
-    trainingConfig.selected_product,
-  );
-
-  validateActiveRunAgainstSnapshot(activeRun, JSON.stringify(allData));
-
-  if (trainingConfig.data_window_evaluate_end_index >= allData.length) {
-    throw new ModelValidationError("数据窗口索引超出范围", { dataset_size: allData.length });
-  }
-
-  const snapshotDir = fs.mkdtempSync(path.join(os.tmpdir(), "fz-production-snapshot-"));
-  let productionArtifactPromoted = false;
-  let productionRevision: string | null = null;
-  let productionArtifactSha256: string | null = null;
-  try {
-    const dataFile = path.join(snapshotDir, GUIDED_DATASET_FILE_NAME);
-    await Bun.write(dataFile, JSON.stringify(allData));
-    const pythonParams: Record<string, unknown> = {
-      dataFile,
-      trainStart: trainingConfig.data_window_train_start_index,
-      trainEnd: trainingConfig.data_window_evaluate_end_index,
-      saveModel: productionModelPath,
-      loadModel: backtestModelPath,
-      fitOnly: true,
-      fitForecastSteps: forecastSteps,
-      pretty: true,
-    };
-
-    try {
-      await runPythonModel(
-        modelType,
-        pythonParams,
-        resolveProductionPreparationTimeoutMs(modelType, activeRun),
-        undefined,
-        lease.terminationSignal,
-      );
-    } catch (error) {
-      if (!(error instanceof ModelArtifactError)) throw error;
-      throw new ModelConflictError(
-        `${modelType.toUpperCase()} 回测模型产物无法加载，请重新训练该模型`,
-        "MODEL_ARTIFACT_INVALID",
-        { required_action: "retrain" },
-      );
-    }
-    if (verifiedBacktestSha256) {
-      try {
-        await verifyBaseModelArtifactIntegrity(
-          modelType,
-          backtestModelPath,
-          verifiedBacktestSha256,
-          lease.terminationSignal,
-        );
-      } catch (error) {
-        if (!(error instanceof ModelArtifactError)) throw error;
-        throw new ModelConflictError(
-          `${modelType.toUpperCase()} 回测模型产物在生产拟合期间发生变化，请重新训练该模型`,
-          "MODEL_ARTIFACT_INVALID",
-          { required_action: "retrain" },
-        );
-      }
-    }
-    productionArtifactSha256 = (
-      await verifyBaseModelArtifactIntegrity(
-        modelType,
-        productionModelPath,
-        null,
-        lease.terminationSignal,
-      )
-    ).sha256;
-
-    await lease.verifyOwned();
-    productionRevision = crypto.randomUUID();
-    const recorded = await setProductionArtifactForRun(
-      activeRun.run_id,
-      productionModelPath,
-      forecastSteps,
-      productionRevision,
-      productionArtifactSha256,
-    );
-    if (!recorded) {
-      throw new ModelValidationError("模型版本已变化，已放弃本次生产模型，请重试");
-    }
-    productionArtifactPromoted = true;
-  } catch (error) {
-    removeModelArtifactGroup(productionModelPath);
-    throw error;
-  } finally {
-    fs.rmSync(snapshotDir, { recursive: true, force: true });
-  }
-
-  if (
-    productionArtifactPromoted
-    && previousProductionModelPath
-    && previousProductionModelPath !== productionModelPath
-    && previousProductionModelPath !== backtestModelPath
-  ) {
-    removeModelArtifactGroup(previousProductionModelPath);
-  }
-  if (!productionRevision) {
-    throw new ModelValidationError("生产模型准备完成但版本标识缺失，请重试");
-  }
-
-  return {
-    status: "success",
-    results: {
-      preparation_token: productionRevision,
-      prepared_forecast_steps: forecastSteps,
-      reused_existing: false,
-    },
-  };
-};
-
-export async function prepareExperimentModelForProduction(
-  modelType: ModelType,
-  studentId: number,
-  experimentId: number,
-  forecastSteps = DEFAULT_PRODUCTION_FORECAST_STEPS,
-  forceRefit = false,
-) {
-  return await withModelOperationContext("production_preparation", async (operationContext) => {
-    const experiment = await assertExperimentModelAccess(experimentId, studentId);
-    assertModelReadyForProduction(experiment, modelType);
-    operationContext.throwIfTerminated();
-
-    return await withModelOperationLease(
-      operationContext,
-      { mode: "slot_and_execution", experimentId, modelType },
-      async (lease) => await prepareExperimentModelForProductionWithLease(
-        modelType,
-        studentId,
-        experimentId,
-        forecastSteps,
-        forceRefit,
-        experiment,
-        lease,
-      ),
-    );
-  });
 }
 
 export function cleanupExperimentModelArtifacts(experimentId: number, studentId: number) {
@@ -3973,7 +4897,11 @@ const predictExperimentModelWithLease = async (
     predictions = normalizeDemandPredictionPoints(
       result.predictions,
       forecastSteps,
-      { requireStdDev: true },
+      {
+        requireStdDev: true,
+        requireUpperErrorP99: true,
+        requireCalibrationDiagnostics: true,
+      },
     );
   } catch (error) {
     if (!(error instanceof Error) || !error.message.startsWith("[PYTHON_DATA]")) {

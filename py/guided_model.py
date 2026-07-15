@@ -231,21 +231,24 @@ def _run_ma(step_id: str, args, state: Dict[str, Any]) -> Dict[str, Any]:
         }
 
     if step_id == "estimate_residuals":
-        train_range, _ = _state_ranges(state)
+        train_range, eval_range = _state_ranges(state)
         y = np.asarray(state["y"])
-        y_true = np.asarray(state["y_true"])
-        y_pred = np.asarray(state["y_pred"])
-        residuals = y_true - y_pred
         train_history = y[train_range]
-        std_dev_residuals = ma._estimate_std_dev(residuals, train_history)
+        uncertainty_profile, uncertainty_summary = ma.moving_average_profile(
+            train_history,
+            int(state["window"]),
+            max(12, eval_range.stop - train_range.stop),
+        )
+        std_dev_residuals = float(uncertainty_profile[0])
         state.update({
-            "residuals": residuals.tolist(),
             "std_dev_residuals": std_dev_residuals,
+            "uncertainty_profile": uncertainty_profile,
+            "uncertainty_summary": uncertainty_summary,
         })
         return {
-            "residual_points": len(residuals),
-            "mean_residual": float(np.mean(residuals)) if len(residuals) else 0.0,
+            "forecast_horizon": len(uncertainty_profile),
             "std_dev_residuals": float(std_dev_residuals),
+            "uncertainty_summary": uncertainty_summary,
         }
 
     if step_id == "evaluate_metrics":
@@ -263,10 +266,23 @@ def _run_ma(step_id: str, args, state: Dict[str, Any]) -> Dict[str, Any]:
             "evaluate_indices": list(eval_range),
             "evaluate_months": _month_labels(timestamps, eval_range),
         }
-        predictions_with_std = ma._format_predictions(y_pred.tolist(), float(state["std_dev_residuals"]))
+        train_range, eval_range = _state_ranges(state)
+        forecast_offset = eval_range.start - train_range.stop
+        evaluation_profile = state["uncertainty_profile"][
+            forecast_offset : forecast_offset + len(y_pred)
+        ]
+        predictions_with_std = ma._format_predictions(
+            y_pred.tolist(),
+            evaluation_profile,
+            {
+                **state["uncertainty_summary"],
+                "horizon_start": forecast_offset + 1,
+            },
+        )
         state.update({
             "metrics": metrics,
             "predictions": predictions_with_std,
+            "uncertainty_summary": state["uncertainty_summary"],
         })
         return {"metrics": metrics}
 
@@ -303,6 +319,9 @@ def _run_ma(step_id: str, args, state: Dict[str, Any]) -> Dict[str, Any]:
                 "train_end_index": train_range.stop - 1,
                 "history": np.asarray(state["y"])[history_start:train_range.stop].tolist(),
                 "std_dev_residuals": float(state["std_dev_residuals"]),
+                "uncertainty_profile": state["uncertainty_profile"][:12],
+                "uncertainty_summary": state["uncertainty_summary"],
+                "reference_series": np.asarray(state["y"])[train_range].tolist(),
                 "prediction_domain": DEMAND_PREDICTION_DOMAIN,
             }
             attach_method_metadata(model_state, ma.METHOD_NAME, ma.FORECAST_STRATEGY, ma.IMPLEMENTATION_NOTES)
@@ -378,11 +397,19 @@ def _run_es(step_id: str, args, state: Dict[str, Any]) -> Dict[str, Any]:
         y_true = y[eval_range].tolist()
         y_pred = state["y_pred"]
         residuals = np.asarray(y_true) - np.asarray(y_pred)
-        std_dev_residuals = es._estimate_std_dev(residuals, y[train_range])
+        std_dev_residuals = es._training_residual_scale(state["model"], y[train_range])
+        profile, uncertainty_summary = es.ses_profile(
+            std_dev_residuals,
+            float(state["alpha"]),
+            max(12, eval_range.stop - train_range.stop),
+            es._training_residuals(state["model"], y[train_range]),
+        )
         state.update({
             "y_true": y_true,
             "residuals": residuals.tolist(),
             "std_dev_residuals": std_dev_residuals,
+            "uncertainty_profile": profile,
+            "uncertainty_summary": uncertainty_summary,
         })
         return {
             "residual_points": len(residuals),
@@ -405,10 +432,24 @@ def _run_es(step_id: str, args, state: Dict[str, Any]) -> Dict[str, Any]:
             "evaluate_indices": list(eval_range),
             "evaluate_months": _month_labels(timestamps, eval_range),
         }
-        predictions_with_std = es._format_predictions(y_pred, float(state["std_dev_residuals"]))
+        train_range, eval_range = _state_ranges(state)
+        forecast_offset = eval_range.start - train_range.stop
+        evaluation_profile = state["uncertainty_profile"][
+            forecast_offset : forecast_offset + len(y_pred)
+        ]
+        predictions_with_std = es._format_predictions(
+            y_pred,
+            evaluation_profile,
+            {
+                **state["uncertainty_summary"],
+                "horizon_start": forecast_offset + 1,
+            },
+        )
         state.update({
             "metrics": metrics,
             "predictions": predictions_with_std,
+            "initial_level": float(state["model"].params["initial_level"]),
+            "uncertainty_summary": state["uncertainty_summary"],
         })
         return {"metrics": metrics}
 
@@ -445,6 +486,10 @@ def _run_es(step_id: str, args, state: Dict[str, Any]) -> Dict[str, Any]:
                 "train_end_index": train_range.stop - 1,
                 "model": state["model"],
                 "std_dev_residuals": float(state["std_dev_residuals"]),
+                "initial_level": float(state["model"].params["initial_level"]),
+                "uncertainty_profile": state["uncertainty_profile"][:12],
+                "uncertainty_summary": state["uncertainty_summary"],
+                "reference_series": np.asarray(state["y"])[train_range].tolist(),
                 "prediction_domain": DEMAND_PREDICTION_DOMAIN,
             }
             attach_method_metadata(model_state, es.METHOD_NAME, es.FORECAST_STRATEGY, es.IMPLEMENTATION_NOTES)
@@ -457,18 +502,9 @@ def _run_es(step_id: str, args, state: Dict[str, Any]) -> Dict[str, Any]:
     raise ValueError(f"[VALIDATION] Unknown ES guided step: {step_id}")
 
 
-def _resolve_arima_limits(train_size: int, max_p_arg: Any, max_q_arg: Any) -> Tuple[int, int]:
-    if max_p_arg is not None and max_q_arg is not None:
-        return int(max_p_arg), int(max_q_arg)
-    if train_size <= 12:
-        auto_max = 1
-    elif train_size <= 20:
-        auto_max = 2
-    else:
-        auto_max = max(1, min(5, train_size // 6))
-    max_p = int(max_p_arg) if max_p_arg is not None else auto_max
-    max_q = int(max_q_arg) if max_q_arg is not None else auto_max
-    return max_p, max_q
+def _resolve_arima_limits(train_size: int, d: int) -> Tuple[int, int]:
+    config = arima.derive_arima_search_limit(train_size, d)
+    return int(config["max_p"]), int(config["max_q"])
 
 
 def _run_arima(step_id: str, args, state: Dict[str, Any]) -> Dict[str, Any]:
@@ -479,7 +515,7 @@ def _run_arima(step_id: str, args, state: Dict[str, Any]) -> Dict[str, Any]:
         ts, te, es_idx, ee = _parse_common_ranges(args)
         d = int(args.d)
         train_size = te - ts + 1
-        max_p, max_q = _resolve_arima_limits(train_size, getattr(args, "max_p", None), getattr(args, "max_q", None))
+        max_p, max_q = _resolve_arima_limits(train_size, d)
 
         if d < 0:
             raise ValueError(f"[VALIDATION] d must be >= 0, got {d}")
@@ -519,85 +555,56 @@ def _run_arima(step_id: str, args, state: Dict[str, Any]) -> Dict[str, Any]:
     if step_id == "aic_search":
         train_range, _ = _state_ranges(state)
         y_train = np.asarray(state["y"])[train_range]
-        aic_model = arima._run_auto_arima_search(
+        best_model = arima._run_auto_arima_search(
             y_train=y_train,
             d=int(state["d"]),
             max_p=int(state["max_p"]),
             max_q=int(state["max_q"]),
-            criterion="aic",
+            criterion="aicc",
         )
-        state["aic_model"] = aic_model
+        best_model, convergence_retried = arima._ensure_converged(
+            best_model,
+            y_train,
+            "Selected guided ARIMA model",
+        )
+        state["best_model"] = best_model
+        state["convergence_retried"] = convergence_retried
         return {
-            "order": {"p": aic_model.order[0], "d": aic_model.order[1], "q": aic_model.order[2]},
-            "aic": float(aic_model.aic()),
-            "bic": float(aic_model.bic()),
+            "criterion": "aicc",
+            "order": {"p": best_model.order[0], "d": best_model.order[1], "q": best_model.order[2]},
+            "aicc": float(best_model.aicc()),
+            "convergence_retried": convergence_retried,
         }
 
     if step_id == "bic_search":
         train_range, _ = _state_ranges(state)
-        y_train = np.asarray(state["y"])[train_range]
-        bic_model = arima._run_auto_arima_search(
-            y_train=y_train,
-            d=int(state["d"]),
-            max_p=int(state["max_p"]),
-            max_q=int(state["max_q"]),
-            criterion="bic",
+        diagnostics = arima._residual_diagnostics(
+            state["best_model"],
+            len(train_range) - int(state["d"]),
         )
-        state["bic_model"] = bic_model
-        return {
-            "order": {"p": bic_model.order[0], "d": bic_model.order[1], "q": bic_model.order[2]},
-            "aic": float(bic_model.aic()),
-            "bic": float(bic_model.bic()),
-        }
+        state["diagnostics"] = diagnostics
+        return diagnostics
 
     if step_id == "select_model":
         train_range, _ = _state_ranges(state)
-        aic_model = state["aic_model"]
-        bic_model = state["bic_model"]
-        aic_order = aic_model.order
-        bic_order = bic_model.order
-        aic_aic = aic_model.aic()
-        aic_bic = aic_model.bic()
-        bic_aic = bic_model.aic()
-        bic_bic = bic_model.bic()
-        train_size = len(np.asarray(state["y"])[train_range])
-        selection_criterion = "aic_optimized"
-        best_model = aic_model
-
-        if train_size < 30:
-            if bic_bic < aic_bic:
-                best_model = bic_model
-                selection_criterion = "bic_preferred_small_sample"
-            elif bic_bic == aic_bic and bic_aic <= aic_aic:
-                best_model = bic_model
-                selection_criterion = "bic_tie_better_or_equal_aic"
-        else:
-            if bic_aic < aic_aic:
-                best_model = bic_model
-                selection_criterion = "bic_optimized_better_aic"
-            elif bic_aic == aic_aic and bic_bic < aic_bic:
-                best_model = bic_model
-                selection_criterion = "bic_tie_aic_better_bic"
-
+        best_model = state["best_model"]
         best_order = {"p": best_model.order[0], "d": best_model.order[1], "q": best_model.order[2]}
         search_summary = {
-            "aic_optimized_model": {
-                "order": {"p": aic_order[0], "d": aic_order[1], "q": aic_order[2]},
-                "aic": float(aic_aic),
-                "bic": float(aic_bic),
-            },
-            "bic_optimized_model": {
-                "order": {"p": bic_order[0], "d": bic_order[1], "q": bic_order[2]},
-                "aic": float(bic_aic),
-                "bic": float(bic_bic),
-            },
-            "selected_model": "aic_optimized" if best_model is aic_model else "bic_optimized",
-            "selection_criterion": selection_criterion,
+            "selection_criterion": "aicc",
+            "effective_train_size": len(train_range) - int(state["d"]),
+            "max_p": int(state["max_p"]),
+            "max_q": int(state["max_q"]),
+            "selected_order": best_order,
+            "model_spec": arima._model_spec(best_model),
+            "aic": float(best_model.aic()),
+            "aicc": float(best_model.aicc()),
+            "bic": float(best_model.bic()),
+            "convergence_retried": bool(state["convergence_retried"]),
+            "diagnostics": state["diagnostics"],
         }
-        state["best_model"] = best_model
         state["best_order"] = best_order
         state["search_summary"] = search_summary
-        return {"best_order": best_order, "selection_criterion": selection_criterion}
+        return {"best_order": best_order, "selection_criterion": "aicc"}
 
     if step_id == "forecast":
         train_range, eval_range = _state_ranges(state)
@@ -622,7 +629,7 @@ def _run_arima(step_id: str, args, state: Dict[str, Any]) -> Dict[str, Any]:
             )
         y_pred = normalize_demand_forecast(y_pred)
         y_true = y_eval.tolist()
-        converged = bool(best_model.arima_res_.mle_retvals.get("converged", False))
+        converged = arima._is_converged(best_model)
         state.update({
             "y_true": y_true,
             "y_pred": y_pred.tolist(),
@@ -654,19 +661,27 @@ def _run_arima(step_id: str, args, state: Dict[str, Any]) -> Dict[str, Any]:
             "mape": mape(y_eval, y_pred),
             "r2": r2(y_eval, y_pred),
             "aic": float(best_model.aic()),
+            "aicc": float(best_model.aicc()),
             "bic": float(best_model.bic()),
             "converged": bool(state["converged"]),
+            "diagnostics": state["diagnostics"],
             "evaluated_points": len(y_eval),
             "evaluate_indices": list(eval_range),
             "evaluate_months": _month_labels(timestamps, eval_range),
         }
+        calibration_mean_error = float(np.mean(y_eval - y_pred))
+        calibration_count = int(len(y_eval))
         predictions_with_std = arima._format_predictions(
             y_pred.tolist(),
             state["confidence_intervals"],
+            calibration_mean_error,
+            calibration_count,
         )
         state.update({
             "metrics": metrics,
             "predictions": predictions_with_std,
+            "calibration_mean_error": calibration_mean_error,
+            "calibration_count": calibration_count,
         })
         return {"metrics": metrics, "best_order": state["best_order"]}
 
@@ -696,6 +711,7 @@ def _run_arima(step_id: str, args, state: Dict[str, Any]) -> Dict[str, Any]:
             "eval_y_true": y_true,
             "predictions": predictions_with_std,
             "search_summary": state["search_summary"],
+            "diagnostics": state["diagnostics"],
         }
         attach_method_metadata(final_result, arima.METHOD_NAME, arima.FORECAST_STRATEGY, arima.IMPLEMENTATION_NOTES)
 
@@ -705,7 +721,12 @@ def _run_arima(step_id: str, args, state: Dict[str, Any]) -> Dict[str, Any]:
                 "model": best_model,
                 "order": state["best_order"],
                 "d": int(state["d"]),
+                "model_spec": arima._model_spec(best_model),
+                "search_summary": state["search_summary"],
+                "diagnostics": state["diagnostics"],
                 "prediction_domain": DEMAND_PREDICTION_DOMAIN,
+                "calibration_mean_error": state["calibration_mean_error"],
+                "calibration_count": state["calibration_count"],
             }
             attach_method_metadata(model_state, arima.METHOD_NAME, arima.FORECAST_STRATEGY, arima.IMPLEMENTATION_NOTES)
             dump_model(model_state, state["save_model"])
@@ -729,13 +750,11 @@ def _build_lstm_model(config: Dict[str, Any]):
     from tensorflow.keras.optimizers import Adam
 
     model = Sequential([
-        Input(shape=(int(config["look_back"]), int(config["n_features_out"]))),
-        KerasLSTM(int(config["base_units"]), return_sequences=True),
-        KerasLSTM(int(config["secondary_units"])),
-        Dense(int(config["dense_units"]), activation="relu"),
+        Input(shape=(int(config["look_back"]), int(config["feature_count"]))),
+        KerasLSTM(int(config["units"])),
         Dense(int(config["forecast_horizon"])),
     ])
-    optimizer = Adam(learning_rate=float(config["initial_learning_rate"]), clipnorm=1.0)
+    optimizer = Adam(learning_rate=0.001, clipnorm=1.0)
     model.compile(loss="mean_squared_error", optimizer=optimizer)
     return model
 
@@ -758,13 +777,8 @@ def _run_lstm(step_id: str, args, state: Dict[str, Any]) -> Dict[str, Any]:
         lstm._validate_lstm_numeric_columns(parsed_data, feature_types)
 
         ts, te, es_idx, ee = _parse_common_ranges(args)
-        train_size = te - ts + 1
-        look_back_arg = getattr(args, "look_back", None)
-        look_back = int(look_back_arg) if look_back_arg is not None else max(3, min(12, train_size // 4))
-        epochs_arg = getattr(args, "epochs", None)
-        epochs = int(epochs_arg) if epochs_arg is not None else 20
         normalization = getattr(args, "normalization", None) or "minmax"
-        lstm._validate_training_args(parsed_data, ts, te, es_idx, ee, look_back)
+        lstm._validate_training_args(parsed_data, ts, te, es_idx, ee)
 
         state.clear()
         state.update({
@@ -772,8 +786,6 @@ def _run_lstm(step_id: str, args, state: Dict[str, Any]) -> Dict[str, Any]:
             "parsed_data": parsed_data,
             "feature_types": feature_types,
             "months": months,
-            "look_back": look_back,
-            "epochs": epochs,
             "normalization": normalization,
             "train_range": {"start_index": ts, "end_index": te},
             "evaluate_range": {"start_index": es_idx, "end_index": ee},
@@ -785,8 +797,6 @@ def _run_lstm(step_id: str, args, state: Dict[str, Any]) -> Dict[str, Any]:
             "target_key": parsed_data.target_key,
             "feature_keys": parsed_data.feature_keys,
             "feature_types": feature_types,
-            "look_back": look_back,
-            "epochs": epochs,
             "normalization": normalization,
         }
 
@@ -800,11 +810,20 @@ def _run_lstm(step_id: str, args, state: Dict[str, Any]) -> Dict[str, Any]:
             train_range,
             state["normalization"],
         )
+        config = lstm.derive_lstm_config(
+            len(train_range),
+            forecast_horizon,
+            int(scaled_series.shape[1]),
+        )
         train_data = scaled_series[train_range]
-        train_x, train_y = lstm._create_direct_dataset(train_data, int(state["look_back"]), forecast_horizon)
+        train_x, train_y = lstm._create_direct_dataset(
+            train_data,
+            int(config["look_back"]),
+            forecast_horizon,
+        )
         if train_x.size == 0:
             raise ValueError("[VALIDATION] Training range is too short for the requested LSTM look_back and forecast horizon.")
-        history_df = parsed_data.df.iloc[train_range.stop - int(state["look_back"]): train_range.stop].copy()
+        history_df = parsed_data.df.iloc[train_range.stop - int(config["look_back"]): train_range.stop].copy()
         state.update({
             "preprocessor": preprocessor,
             "train_x": train_x,
@@ -812,69 +831,55 @@ def _run_lstm(step_id: str, args, state: Dict[str, Any]) -> Dict[str, Any]:
             "history_df": history_df,
             "forecast_horizon": forecast_horizon,
             "n_features_out": int(scaled_series.shape[1]),
+            "derived_config": config,
         })
         return {
             "input_shape": list(train_x.shape),
             "target_shape": list(train_y.shape),
-            "encoded_feature_count": int(scaled_series.shape[1]),
             "forecast_horizon": forecast_horizon,
+            "training_regime": config["regime"],
+            "look_back": config["look_back"],
+            "window_count": config["windows"],
+            "validation_windows": config["validation_windows"],
+            "purge_windows": config["purge_windows"],
         }
 
     if step_id == "build_model":
-        train_x = state["train_x"]
-        n_features_out = int(state["n_features_out"])
-        base_units = max(16, min(64, n_features_out * 4, max(16, len(train_x) * 4)))
-        secondary_units = max(8, base_units // 2)
-        dense_units = max(8, secondary_units)
-        batch_size = max(1, min(8, len(train_x)))
-        config = {
-            "look_back": int(state["look_back"]),
-            "n_features_out": n_features_out,
-            "base_units": base_units,
-            "secondary_units": secondary_units,
-            "dense_units": dense_units,
-            "forecast_horizon": int(state["forecast_horizon"]),
-            "batch_size": batch_size,
-            "initial_learning_rate": 0.001,
-            "decay_rate": 0.98,
+        config = state["derived_config"]
+        return {
+            "training_regime": config["regime"],
+            "window_count": config["windows"],
+            "uses_validation": config["regime"] == "standard",
+            "units": config["units"],
+            "parameter_count": config["parameter_count"],
+            "parameter_budget": config["parameter_budget"],
+            "batch_size": config["batch_size"],
+            "max_epochs": config["max_epochs"],
+            "patience": config["patience"],
         }
-        state["model_config"] = config
-        return config
 
     if step_id == "train_model":
         os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
         import tensorflow as tf
-        from tensorflow.keras.callbacks import EarlyStopping, LearningRateScheduler
 
         tf.get_logger().setLevel("ERROR")
         tf.keras.utils.set_random_seed(42)
         _set_lstm_seed(42)
 
-        config = state["model_config"]
-        model = _build_lstm_model(config)
-        epochs = int(state["epochs"])
-        initial_learning_rate = float(config["initial_learning_rate"])
-        decay_rate = float(config["decay_rate"])
-
-        def lr_schedule(epoch):
-            return initial_learning_rate * (decay_rate ** epoch)
-
-        early_stopping = EarlyStopping(
-            monitor="loss",
-            patience=max(2, min(6, epochs // 4 or 2)),
-            restore_best_weights=True,
-        )
-        history = model.fit(
-            state["train_x"],
-            state["train_y"],
-            epochs=epochs,
-            batch_size=int(config["batch_size"]),
-            verbose=0,
-            callbacks=[
-                LearningRateScheduler(lr_schedule, verbose=0),
-                early_stopping,
-            ],
-            shuffle=False,
+        train_range, _ = _state_ranges(state)
+        (
+            model,
+            preprocessor,
+            history_df,
+            config,
+            uncertainty_profile,
+            uncertainty_summary,
+        ) = lstm._fit_direct_model(
+            state["parsed_data"],
+            state["feature_types"],
+            train_range,
+            state["normalization"],
+            int(state["forecast_horizon"]),
         )
 
         keras_model_path = os.path.join(args.artifact_dir, "lstm_trained_keras_model.h5")
@@ -889,19 +894,19 @@ def _run_lstm(step_id: str, args, state: Dict[str, Any]) -> Dict[str, Any]:
                 except OSError:
                     pass
 
-        loss_history = [float(value) for value in history.history.get("loss", [])]
         state.update({
             "trained_keras_model_path": keras_model_path,
-            "training_loss": loss_history,
-            "epochs_ran": len(loss_history),
-            "early_stopped": bool(getattr(early_stopping, "stopped_epoch", 0)),
+            "preprocessor": preprocessor,
+            "history_df": history_df,
+            "derived_config": config,
+            "uncertainty_profile": uncertainty_profile,
+            "uncertainty_summary": uncertainty_summary,
         })
         return {
-            "epochs_requested": epochs,
-            "epochs_ran": len(loss_history),
-            "batch_size": int(config["batch_size"]),
-            "final_loss": loss_history[-1] if loss_history else None,
-            "early_stopped": bool(getattr(early_stopping, "stopped_epoch", 0)),
+            "training_regime": config["regime"],
+            "used_validation": config["regime"] == "standard",
+            "epochs_ran": config["epochs_ran"],
+            "uncertainty_summary": uncertainty_summary,
         }
 
     if step_id == "forecast":
@@ -918,12 +923,15 @@ def _run_lstm(step_id: str, args, state: Dict[str, Any]) -> Dict[str, Any]:
         state_for_eval = {
             "keras_model": model,
             "preprocessor": state["preprocessor"],
-            "look_back": int(state["look_back"]),
+            "look_back": int(state["derived_config"]["look_back"]),
             "forecast_horizon": forecast_horizon,
             "forecast_strategy": lstm.DIRECT_FORECAST_STRATEGY,
             "history_df": state["history_df"],
             "normalization": state["normalization"],
             "prediction_domain": DEMAND_PREDICTION_DOMAIN,
+            "uncertainty_profile": state["uncertainty_profile"],
+            "uncertainty_summary": state["uncertainty_summary"],
+            "reference_series": parsed_data.df[parsed_data.target_key].values[train_range].tolist(),
         }
         full_forecast, _ = lstm._forecast_from_state(state_for_eval, forecast_horizon)
         y_pred = full_forecast[forecast_offset: forecast_offset + len(eval_range)]
@@ -951,22 +959,30 @@ def _run_lstm(step_id: str, args, state: Dict[str, Any]) -> Dict[str, Any]:
         y_true = np.asarray(state["y_true"], dtype=float)
         y_pred = np.asarray(state["y_pred"], dtype=float)
         residuals = y_true - y_pred
-        train_target_values = parsed_data.df[parsed_data.target_key].values[train_range]
-        std_dev_residuals = lstm._estimate_std_dev(residuals, train_target_values)
-        epochs = int(state["epochs"])
+        std_dev_residuals = float(state["uncertainty_profile"][0])
         metrics = {
             "rmse": rmse(y_true, y_pred),
             "mae": mae(y_true, y_pred),
             "mape": mape(y_true, y_pred),
             "r2": r2(y_true, y_pred),
-            "look_back": int(state["look_back"]),
-            "epochs": epochs,
             "forecast_horizon": forecast_horizon,
+            "training_regime": state["derived_config"]["regime"],
             "evaluated_points": len(y_true),
             "evaluate_indices": list(eval_range),
             "evaluate_months": _month_labels(state["months"], eval_range),
         }
-        predictions_with_std = lstm._format_predictions(y_pred, std_dev_residuals)
+        forecast_offset = eval_range.start - train_range.stop
+        evaluation_profile = state["uncertainty_profile"][
+            forecast_offset : forecast_offset + len(y_pred)
+        ]
+        predictions_with_std = lstm._format_predictions(
+            y_pred.tolist(),
+            evaluation_profile,
+            {
+                **state["uncertainty_summary"],
+                "horizon_start": forecast_offset + 1,
+            },
+        )
         state.update({
             "residuals": residuals.tolist(),
             "std_dev_residuals": std_dev_residuals,
@@ -978,7 +994,6 @@ def _run_lstm(step_id: str, args, state: Dict[str, Any]) -> Dict[str, Any]:
     if step_id == "save_artifact":
         train_range, eval_range = _state_ranges(state)
         parsed_data = state["parsed_data"]
-        epochs = int(state["epochs"])
         forecast_horizon = int(state["forecast_horizon"])
         metrics = state["metrics"]
         y_true = state["y_true"]
@@ -988,10 +1003,9 @@ def _run_lstm(step_id: str, args, state: Dict[str, Any]) -> Dict[str, Any]:
             "data_points": int(state["data_points"]),
             "target_key": parsed_data.target_key,
             "feature_types": state["feature_types"],
-            "look_back": int(state["look_back"]),
-            "epochs": epochs,
             "normalization": state["normalization"],
             "forecast_horizon": forecast_horizon,
+            "training_regime": state["derived_config"]["regime"],
             "train_range": {
                 "start_index": train_range.start,
                 "end_index": train_range.stop - 1,
@@ -1005,6 +1019,7 @@ def _run_lstm(step_id: str, args, state: Dict[str, Any]) -> Dict[str, Any]:
             "metrics": metrics,
             "eval_y_true": y_true,
             "predictions": predictions_with_std,
+            "uncertainty_summary": state["uncertainty_summary"],
         }
         attach_method_metadata(final_result, lstm.METHOD_NAME, lstm.DIRECT_FORECAST_STRATEGY, lstm.DIRECT_IMPLEMENTATION_NOTES)
 
@@ -1024,8 +1039,7 @@ def _run_lstm(step_id: str, args, state: Dict[str, Any]) -> Dict[str, Any]:
 
             model_state = {
                 "model_type": lstm.MODEL_TYPE,
-                "look_back": int(state["look_back"]),
-                "epochs": epochs,
+                "look_back": int(state["derived_config"]["look_back"]),
                 "normalization": state["normalization"],
                 "train_end_index": train_range.stop - 1,
                 "preprocessor": state["preprocessor"],
@@ -1040,6 +1054,10 @@ def _run_lstm(step_id: str, args, state: Dict[str, Any]) -> Dict[str, Any]:
                     eval_forecast_horizon=forecast_horizon
                 ),
                 "std_dev_residuals": float(state["std_dev_residuals"]),
+                "derived_config": state["derived_config"],
+                "uncertainty_profile": state["uncertainty_profile"],
+                "uncertainty_summary": state["uncertainty_summary"],
+                "reference_series": parsed_data.df[parsed_data.target_key].values[train_range].tolist(),
                 "prediction_domain": DEMAND_PREDICTION_DOMAIN,
             }
             attach_method_metadata(model_state, lstm.METHOD_NAME, lstm.DIRECT_FORECAST_STRATEGY, lstm.DIRECT_IMPLEMENTATION_NOTES)
@@ -1118,7 +1136,7 @@ def main() -> None:
 
     _save_state(args.output_state_file, state)
     payload = {
-        "protocol_version": 2,
+        "protocol_version": 3,
         "attempt_id": args.attempt_id,
         "step_id": args.step_id,
         "output": _jsonable(output),

@@ -102,4 +102,12 @@ describe("report submission policy", () => {
     expect(grades.exp_flow_production_plan_creation).toBe(0);
     expect(grades.exp_flow_report_submission).toBe(100);
   });
+
+  test("keeps service-level credit tied to workflow completion rather than scoring the Z value", () => {
+    const grades = buildExperimentFlowGradeValues(
+      buildExperiment({ production_safety_stock_z_score: null }),
+    );
+
+    expect(grades.exp_flow_production_service_level).toBe(100);
+  });
 });

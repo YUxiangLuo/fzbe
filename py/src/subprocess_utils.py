@@ -12,6 +12,8 @@ import tempfile
 import time
 from typing import Any, Dict, List, Optional
 
+import numpy as np
+
 
 MODEL_DEADLINE_ENV_NAME = "FZ_MODEL_DEADLINE_EPOCH_MS"
 
@@ -201,6 +203,7 @@ def run_base_model_fit_subprocess(
     source_model_file: str,
     save_model_file: str,
     fit_forecast_steps: Optional[int] = None,
+    predict_steps: Optional[int] = None,
     timeout: Optional[int] = 60,
     allow_negative_predictions: bool = False,
 ) -> Dict[str, Any]:
@@ -214,6 +217,8 @@ def run_base_model_fit_subprocess(
 
     if fit_forecast_steps is not None and int(fit_forecast_steps) <= 0:
         raise ValueError("fit_forecast_steps must be > 0 when provided")
+    if predict_steps is not None and int(predict_steps) <= 0:
+        raise ValueError("predict_steps must be > 0 when provided")
 
     # Keep deadline validation outside the snapshot lifecycle only while no
     # snapshot exists; every later failure is covered by the finally below.
@@ -233,6 +238,8 @@ def run_base_model_fit_subprocess(
     ]
     if fit_forecast_steps is not None:
         args.extend(["--fit-forecast-steps", str(int(fit_forecast_steps))])
+    if predict_steps is not None:
+        args.extend(["--fit-predict-steps", str(int(predict_steps))])
     if allow_negative_predictions:
         args.append("--allow-negative-predictions")
 
@@ -354,3 +361,19 @@ def extract_predictions_from_result(result: Dict[str, Any]) -> List[float]:
         return result["eval_predictions"]
 
     raise ValueError(f"Cannot extract predictions from result: {result.keys()}")
+
+
+def extract_uncertainty_profile_from_result(result: Dict[str, Any]) -> List[float]:
+    """Extract the per-horizon standard deviations from a model response."""
+    points = result.get("predictions")
+    if not isinstance(points, list) or not points:
+        raise ValueError("Base model result does not contain prediction uncertainty.")
+    profile: List[float] = []
+    for point in points:
+        if not isinstance(point, dict) or "std_dev" not in point:
+            raise ValueError("Base model prediction is missing std_dev.")
+        value = float(point["std_dev"])
+        if not np.isfinite(value) or value < 0:
+            raise ValueError("Base model prediction std_dev must be finite and nonnegative.")
+        profile.append(value)
+    return profile

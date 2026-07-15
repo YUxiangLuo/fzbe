@@ -31,7 +31,7 @@ EXPECTED_METHOD_METADATA = {
     },
     "stacking": {
         "method_name": "时间顺序留出 Stacking 融合",
-        "forecast_strategy": "holdout_meta_weighted_blend",
+        "forecast_strategy": "holdout_nonnegative_least_squares",
         "note_fragments": ("时间顺序", "无截距"),
     },
     "boosting": {

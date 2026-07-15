@@ -20,18 +20,36 @@ import numpy as np
 
 PY_ROOT = Path(__file__).resolve().parents[1]
 SRC_ROOT = PY_ROOT / "src"
+sys.path.insert(0, str(PY_ROOT))
 sys.path.insert(0, str(SRC_ROOT))
 
 from ensemble_utils import (  # noqa: E402
+    build_ensemble_subprocess_data,
     can_refit_source_artifact_for_internal_holdout,
-    compute_phase1_train_size,
+    estimate_lstm_encoded_feature_count,
     estimate_residual_std,
     normalize_demand_forecast,
     parse_base_model_files_arg,
     parse_base_model_names,
+    plan_ensemble_internal_holdout,
     persist_member_model_artifact,
+    require_explicit_lstm_feature_names,
     resolve_base_model_artifact_configs,
-    validate_internal_split_base_params,
+)
+from dynamic_config import (  # noqa: E402
+    derive_arima_search_limit,
+    derive_boosting_max_rounds,
+    derive_lstm_config,
+    plan_internal_holdout,
+)
+from model_info import MODEL_ALGORITHM_REVISION  # noqa: E402
+from uncertainty import (  # noqa: E402
+    NORMAL_95,
+    ensemble_growth_profile,
+    fallback_profile,
+    format_predictions,
+    moving_average_profile,
+    ses_profile,
 )
 from data_utils import load_data_from_json  # noqa: E402
 from adf.core import adf_fixed_d  # noqa: E402
@@ -44,6 +62,7 @@ from forecast_utils import (  # noqa: E402
 )
 from log_safety import summarize_cli_args  # noqa: E402
 from models import arima, boosting, es, lstm, ma, stacking, weighted_avg  # noqa: E402
+import guided_ensemble_model  # noqa: E402
 from subprocess_utils import (  # noqa: E402
     MODEL_DEADLINE_ENV_NAME,
     _resolve_subprocess_timeout,
@@ -259,6 +278,27 @@ def assert_obsolete_ensemble_states_are_rejected() -> None:
 
 def assert_target_only_lstm_training() -> None:
     records_json = json.dumps(sample_records(14), ensure_ascii=False)
+    missing_features = subprocess.run(
+        [
+            sys.executable,
+            str(PY_ROOT / "run_model.py"),
+            "lstm",
+            "--data", records_json,
+            "--train-start", "0",
+            "--train-end", "10",
+            "--eval-start", "11",
+            "--eval-end", "13",
+            "--lstm-target-feature", "销售数量",
+            "--normalization", "minmax",
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=120,
+    )
+    assert missing_features.returncode != 0
+    assert "requires an explicit feature list" in missing_features.stderr
+
     completed = subprocess.run(
         [
             sys.executable,
@@ -269,8 +309,6 @@ def assert_target_only_lstm_training() -> None:
             "--train-end", "10",
             "--eval-start", "11",
             "--eval-end", "13",
-            "--look-back", "3",
-            "--epochs", "1",
             "--feature-types", json.dumps({"销售数量": "numeric"}, ensure_ascii=False),
             "--lstm-features", "[]",
             "--lstm-target-feature", "销售数量",
@@ -288,29 +326,68 @@ def assert_target_only_lstm_training() -> None:
     payload = json.loads(completed.stdout)
     assert len(payload["predictions"]) == 3
     assert payload["feature_types"] == {"销售数量": "numeric"}
+    assert payload["training_regime"] in {"standard", "teaching_demo"}
+    assert "look_back" not in payload and "epochs" not in payload
+
+    with tempfile.TemporaryDirectory() as temp_dir:
+        missing_features_artifact = Path(temp_dir) / "lstm-missing-features.pkl"
+        with missing_features_artifact.open("wb") as handle:
+            pickle.dump(
+                {
+                    "model_type": "lstm",
+                    "algorithm_revision": MODEL_ALGORITHM_REVISION,
+                    "forecast_strategy": "direct_multi_horizon",
+                    "normalization": "minmax",
+                },
+                handle,
+            )
+        try:
+            lstm._load_state(str(missing_features_artifact))
+        except ValueError as exc:
+            assert "explicit feature list" in str(exc)
+        else:
+            raise AssertionError("LSTM artifact without feature_keys was accepted")
 
 
 def assert_internal_split_boundaries() -> None:
-    assert [compute_phase1_train_size(size) for size in (8, 12, 16)] == [6, 10, 12]
-    for size in (8, 12, 16):
-        phase1 = compute_phase1_train_size(size)
-        validate_internal_split_base_params(
+    parsed_data = load_data_from_json(json.dumps(sample_records(24), ensure_ascii=False))
+    params = {"ma": {"window": 3}, "es": {"alpha": 0.3}}
+    weighted = plan_ensemble_internal_holdout(
+        parsed_data, range(0, 20), ["ma", "es"], params, "weighted"
+    )
+    boosting_plan = plan_ensemble_internal_holdout(
+        parsed_data, range(0, 20), ["ma", "es"], params, "boosting"
+    )
+    stacking_plan = plan_ensemble_internal_holdout(
+        parsed_data, range(0, 20), ["ma", "es"], params, "stacking"
+    )
+    assert weighted["validation_size"] == 4
+    assert boosting_plan["validation_size"] == 4
+    assert stacking_plan["validation_size"] == 4
+    assert derive_boosting_max_rounds(2, boosting_plan["validation_size"]) == 3
+
+    shrunken_stacking = plan_internal_holdout(
+        "stacking",
+        30,
+        2,
+        lambda prefix_size, _validation_size: prefix_size >= 25,
+    )
+    assert shrunken_stacking["desired_validation_size"] == 6
+    assert shrunken_stacking["validation_size"] == 5
+    assert shrunken_stacking["teaching_small_sample"] is True
+
+    try:
+        plan_ensemble_internal_holdout(
+            parsed_data,
+            range(0, 8),
             ["ma", "es"],
-            {"ma": {"window": phase1}, "es": {"alpha": 0.3}},
-            size,
-            "regression",
+            {"ma": {"window": 8}, "es": {"alpha": 0.3}},
+            "stacking",
         )
-        try:
-            validate_internal_split_base_params(
-                ["ma", "es"],
-                {"ma": {"window": phase1 + 1}, "es": {"alpha": 0.3}},
-                size,
-                "regression",
-            )
-        except ValueError as exc:
-            assert str(exc).startswith("[VALIDATION] MA window")
-        else:
-            raise AssertionError("MA window above the internal split was accepted")
+    except ValueError as exc:
+        assert "No chronological internal holdout" in str(exc)
+    else:
+        raise AssertionError("infeasible stacking holdout was accepted")
 
 
 def assert_internal_holdout_configuration_boundaries() -> None:
@@ -318,6 +395,311 @@ def assert_internal_holdout_configuration_boundaries() -> None:
         assert can_refit_source_artifact_for_internal_holdout(model_name)
     assert not can_refit_source_artifact_for_internal_holdout("arima")
     assert not can_refit_source_artifact_for_internal_holdout("unknown")
+
+
+def assert_lstm_features_are_explicit_across_ensemble_planning() -> None:
+    feature_names = [f"x{index}" for index in range(40)]
+    records = [
+        {
+            "y": float(row + 1),
+            **{
+                feature_name: float(row + feature_index)
+                for feature_index, feature_name in enumerate(feature_names)
+            },
+        }
+        for row in range(24)
+    ]
+    parsed_data = load_data_from_json(
+        json.dumps(records),
+        target_key="y",
+        feature_keys=feature_names,
+    )
+    lstm_params = {
+        "lstm_target_feature": "y",
+        "normalization": "minmax",
+        "feature_types": {
+            "y": "numeric",
+            **{feature_name: "numeric" for feature_name in feature_names},
+        },
+    }
+    for missing_value in (None, ""):
+        try:
+            require_explicit_lstm_feature_names(missing_value, "Regression ensemble")
+        except ValueError as exc:
+            assert "explicit LSTM feature list" in str(exc)
+        else:
+            raise AssertionError("missing LSTM features were accepted")
+
+    try:
+        estimate_lstm_encoded_feature_count(parsed_data, lstm_params, 0, 19)
+    except ValueError as exc:
+        assert "explicit LSTM feature list" in str(exc)
+    else:
+        raise AssertionError("holdout planning inferred every dataset feature")
+
+    assert estimate_lstm_encoded_feature_count(
+        parsed_data,
+        {**lstm_params, "lstm_features": "[]"},
+        0,
+        19,
+    ) == 1
+
+    explicit_target_only = {**lstm_params, "lstm_features": "[]"}
+    for purpose in ("weighted", "stacking", "boosting"):
+        try:
+            plan_ensemble_internal_holdout(
+                parsed_data,
+                range(0, 24),
+                ["ma", "lstm"],
+                {"ma": {"window": 3}, "lstm": lstm_params},
+                purpose,
+            )
+        except ValueError as exc:
+            assert "explicit LSTM feature list" in str(exc)
+        else:
+            raise AssertionError(f"{purpose} inferred every dataset feature")
+
+        plan = plan_ensemble_internal_holdout(
+            parsed_data,
+            range(0, 24),
+            ["ma", "lstm"],
+            {"ma": {"window": 3}, "lstm": explicit_target_only},
+            purpose,
+        )
+        assert plan["prefix_size"] == 19
+        assert plan["validation_size"] == 5
+
+
+def assert_ensemble_entrypoints_require_lstm_features() -> None:
+    records_json = json.dumps(sample_records(24), ensure_ascii=False)
+    for model_type in ("weighted_avg", "stacking", "boosting"):
+        completed = subprocess.run(
+            [
+                sys.executable,
+                str(PY_ROOT / "run_model.py"),
+                model_type,
+                "--data", records_json,
+                "--train-start", "0",
+                "--train-end", "18",
+                "--eval-start", "19",
+                "--eval-end", "23",
+                "--models", "ma,lstm",
+                "--window", "3",
+                "--lstm-target-feature", "销售数量",
+                "--normalization", "minmax",
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=120,
+        )
+        assert completed.returncode != 0
+        assert "explicit LSTM feature list" in completed.stderr
+
+    parsed_data = load_data_from_json(records_json)
+    guided_args = argparse.Namespace(
+        model_type="weighted_avg",
+        window=3,
+        lstm_target_feature="销售数量",
+        lstm_features=None,
+        feature_types=None,
+        normalization="minmax",
+    )
+    try:
+        guided_ensemble_model._build_model_params(
+            parsed_data,
+            19,
+            ["ma", "lstm"],
+            guided_args,
+        )
+    except ValueError as exc:
+        assert "explicit LSTM feature list" in str(exc)
+    else:
+        raise AssertionError("guided ensemble inferred every dataset feature")
+
+    guided_args.lstm_features = "[]"
+    guided_params = guided_ensemble_model._build_model_params(
+        parsed_data,
+        19,
+        ["ma", "lstm"],
+        guided_args,
+    )
+    assert json.loads(guided_params["lstm"]["lstm_features"]) == []
+    assert guided_params["lstm"]["feature_types"] == {"销售数量": "numeric"}
+    _, lstm_records = build_ensemble_subprocess_data(
+        parsed_data,
+        ["ma", "lstm"],
+        guided_params,
+    )
+    assert all(set(record) == {"销售数量"} for record in lstm_records)
+
+
+def assert_dynamic_hidden_configuration() -> None:
+    assert derive_arima_search_limit(12, 1)["max_p"] == 1
+    assert derive_arima_search_limit(20, 1)["max_p"] == 2
+    assert derive_arima_search_limit(40, 1)["max_p"] == 5
+
+    demo = derive_lstm_config(14, 3, 1)
+    standard = derive_lstm_config(80, 4, 3)
+    assert demo["regime"] == "teaching_demo"
+    assert demo["units"] <= 4 and demo["validation_windows"] == 0
+    assert standard["regime"] == "standard"
+    assert standard["validation_windows"] >= 4
+    assert standard["parameter_count"] <= standard["parameter_budget"]
+    assert standard["max_epochs"] >= 50
+
+    try:
+        derive_lstm_config(7, 3, 1)
+    except ValueError as exc:
+        assert "at least two historical time steps" in str(exc)
+    else:
+        raise AssertionError("LSTM accepted a one-step look-back that cannot teach recurrence")
+
+
+def assert_horizon_aware_uncertainty_profiles() -> None:
+    rising_fallback, rising_summary = fallback_profile([1.0, 2.0, 3.0, 4.0], 3)
+    falling_fallback, falling_summary = fallback_profile([4.0, 3.0, 2.0, 1.0], 3)
+    constant_fallback, constant_summary = fallback_profile([4.0, 4.0, 4.0, 4.0], 3)
+    assert rising_fallback == falling_fallback
+    assert rising_fallback[0] == 1.0
+    assert all(scale > 0 for scale in rising_fallback)
+    assert rising_summary["reason"] == "first_difference_rms_floor"
+    assert falling_summary["reason"] == "first_difference_rms_floor"
+    assert constant_fallback == [0.0, 0.0, 0.0]
+    assert constant_summary["reason"] == "first_difference_scale"
+
+    fallback, fallback_summary = fallback_profile([10.0, 12.0, 15.0, 19.0], 4)
+    assert fallback_summary["fallback"] is True
+    assert all(right > left for left, right in zip(fallback, fallback[1:]))
+    fallback_points = format_predictions([12.0, 13.0], fallback[:2], fallback_summary)
+    assert all(point["uncertainty_source"] == "fallback" for point in fallback_points)
+    assert all(isinstance(point.get("uncertainty_reason"), str) for point in fallback_points)
+    assert all(point["calibration_source"] == "training_history" for point in fallback_points)
+    assert all(point["interval_level"] == 0.95 for point in fallback_points)
+    assert all(point["interval_kind"] == "fallback_normal_approximation" for point in fallback_points)
+    assert math.isclose(fallback_points[0]["interval_lower"], 12.0 - NORMAL_95 * fallback[0])
+    assert math.isclose(fallback_points[0]["interval_upper"], 12.0 + NORMAL_95 * fallback[0])
+    assert all(point["upper_error_p99"] >= 0 for point in fallback_points)
+    assert all(point["calibration_mean_error"] is None for point in fallback_points)
+    assert all(point["calibration_count"] is None for point in fallback_points)
+
+    ses_values, ses_summary = ses_profile(2.0, 0.4, 4, [-2.0, -1.0, 1.0, 2.0])
+    assert ses_summary["fallback"] is False
+    assert ses_values[0] == 2.0 and ses_values[-1] > ses_values[0]
+    model_points = format_predictions([12.0], ses_values[:1], ses_summary)
+    assert model_points[0]["uncertainty_source"] == "empirical"
+    assert model_points[0]["calibration_source"] == "training_one_step_residuals"
+    assert model_points[0]["calibration_mean_error"] == 0.0
+    assert model_points[0]["calibration_count"] == 4
+    for predictions, profile, summary in (
+        ([float("nan")], [1.0], ses_summary),
+        ([12.0], [-1.0], ses_summary),
+        ([12.0], [1.0], {"source": "empirical", "horizon_start": 0}),
+    ):
+        try:
+            format_predictions(predictions, profile, summary)
+        except ValueError as exc:
+            assert str(exc).startswith("[MODEL]")
+        else:
+            raise AssertionError("invalid uncertainty output was formatted")
+
+    ma_values, ma_summary = moving_average_profile(
+        [10, 11, 13, 12, 15, 16, 18, 17, 20, 21, 23, 24],
+        3,
+        3,
+    )
+    assert len(ma_values) == 3
+    assert all(math.isfinite(value) and value >= 0 for value in ma_values)
+    assert ma_summary["method"] == "rolling_origin_horizon_residual_quantiles"
+    assert ma_summary["calibration_source"] == "training_rolling_origin"
+
+    mixed_ma_values, mixed_ma_summary = moving_average_profile(
+        [10, 11, 13, 12, 15, 16],
+        3,
+        3,
+    )
+    assert mixed_ma_summary["fallback_horizons"] == [3]
+    mixed_ma_points = format_predictions(
+        [20.0, 21.0, 22.0],
+        mixed_ma_values,
+        mixed_ma_summary,
+    )
+    assert [point["uncertainty_source"] for point in mixed_ma_points] == [
+        "empirical", "empirical", "fallback",
+    ]
+    assert mixed_ma_points[0]["calibration_source"] == "training_rolling_origin"
+    assert mixed_ma_points[2]["calibration_source"] == "training_history"
+    assert "uncertainty_reason" not in mixed_ma_points[0]
+    assert isinstance(mixed_ma_points[2]["uncertainty_reason"], str)
+    sliced_fallback_point = format_predictions(
+        [22.0],
+        mixed_ma_values[2:],
+        {**mixed_ma_summary, "horizon_start": 3},
+    )[0]
+    assert sliced_fallback_point["uncertainty_source"] == "fallback"
+
+    arima_points = arima._format_predictions([0.0], [[-3.0, 5.0]], 2.5, 4)
+    assert len(arima_points) == 1
+    assert arima_points[0]["prediction"] == 0.0
+    assert math.isclose(arima_points[0]["std_dev"], 8.0 / (2.0 * NORMAL_95))
+    assert arima_points[0]["uncertainty_source"] == "model"
+    assert arima_points[0]["calibration_source"] == "arima_forecast_distribution"
+    assert arima_points[0]["interval_lower"] == -3.0
+    assert arima_points[0]["interval_upper"] == 5.0
+    assert arima_points[0]["interval_level"] == 0.95
+    assert arima_points[0]["interval_kind"] == "model_prediction_interval"
+    assert arima_points[0]["upper_error_p99"] > 0
+    assert arima_points[0]["calibration_mean_error"] == 2.5
+    assert arima_points[0]["calibration_count"] == 4
+
+    _, biased_summary = ses_profile(0.0, 0.4, 1, [5.0, 5.0, 5.0, 5.0])
+    biased_point = format_predictions([100.0], [0.0], biased_summary)[0]
+    assert biased_point["interval_lower"] == 105.0
+    assert biased_point["interval_upper"] == 105.0
+    assert biased_point["upper_error_p99"] == 5.0
+    assert biased_point["std_dev"] == 0.0
+    assert biased_point["calibration_mean_error"] == 5.0
+    assert biased_point["calibration_count"] == 4
+
+    guarded, guarded_summary = ensemble_growth_profile(
+        {"member": [0.0, 2.0, 3.0]},
+        {"member": 1.0},
+        [1.0, -1.0, 0.5],
+        [10.0, 11.0, 13.0, 14.0],
+        3,
+    )
+    assert guarded_summary["fallback"] is True
+    assert all(math.isfinite(value) and value >= 0 for value in guarded)
+    assert max(guarded) < 100.0
+
+
+def assert_textbook_ensemble_estimators() -> None:
+    targets = np.asarray([10.0, 12.0, 11.0])
+    weights, diagnostics = weighted_avg._compute_inverse_residual_mse_weights(
+        targets,
+        {
+            "near": [10.0, 12.0, 11.0],
+            "far": [30.0, 30.0, 30.0],
+        },
+    )
+    assert math.isclose(sum(weights.values()), 1.0)
+    assert 0.5 < weights["near"] < 1.0
+    assert diagnostics["raw_weights"]["near"] > weights["near"]
+    assert math.isclose(diagnostics["reliability"], 3 / 6)
+
+    meta_model = stacking._fit_meta_model(
+        np.asarray([[1.0, 0.0], [0.0, 1.0], [1.0, 1.0], [2.0, 1.0]]),
+        np.asarray([2.0, 3.0, 5.0, 7.0]),
+        ["ma", "es"],
+    )
+    assert meta_model["kind"] == "nnls"
+    assert meta_model["strategy"] == "nonnegative_least_squares"
+    assert np.allclose(meta_model["coefficients"], [2.0, 3.0], atol=1e-9)
+    assert "weights" not in meta_model
+
+    gamma = boosting._nonnegative_line_search([1.0, 2.0], [2.0, 1.0])
+    assert math.isclose(gamma, 0.8)
+    assert boosting._nonnegative_line_search([1.0, 2.0], [-2.0, -1.0]) == 0.0
 
 
 def assert_source_artifact_configuration_resolution() -> None:
@@ -369,11 +751,58 @@ def assert_source_artifact_configuration_resolution() -> None:
         assert validated_files == source_files
         assert resolved_params["ma"]["window"] == 3
         assert math.isclose(resolved_params["es"]["alpha"], 0.2)
-        assert resolved_params["arima"] == {"d": 1, "max_p": 4, "max_q": 5}
-        assert resolved_params["lstm"]["look_back"] == 5
-        assert resolved_params["lstm"]["epochs"] == 7
+        assert resolved_params["arima"] == {"d": 1}
+        assert "look_back" not in resolved_params["lstm"]
+        assert "epochs" not in resolved_params["lstm"]
         assert resolved_params["lstm"]["normalization"] == "zscore"
         assert json.loads(resolved_params["lstm"]["lstm_features"]) == ["价格指数"]
+
+        target_only_lstm_file = temp_path / "lstm-target-only.pkl"
+        with target_only_lstm_file.open("wb") as handle:
+            pickle.dump(
+                {
+                    "model_type": "lstm",
+                    "target_key": "销售数量",
+                    "feature_keys": [],
+                    "feature_types": {"销售数量": "numeric"},
+                    "normalization": "minmax",
+                },
+                handle,
+            )
+        target_only_params, _ = resolve_base_model_artifact_configs(
+            parsed_data,
+            ["lstm"],
+            {"lstm": dict(fallback_params["lstm"])},
+            {"lstm": str(target_only_lstm_file)},
+            "Target-only regression ensemble",
+        )
+        assert json.loads(target_only_params["lstm"]["lstm_features"]) == []
+        assert target_only_params["lstm"]["feature_types"] == {"销售数量": "numeric"}
+
+        missing_feature_list_file = temp_path / "lstm-missing-feature-list.pkl"
+        with missing_feature_list_file.open("wb") as handle:
+            pickle.dump(
+                {
+                    "model_type": "lstm",
+                    "target_key": "销售数量",
+                    "feature_types": {"销售数量": "numeric"},
+                    "normalization": "minmax",
+                },
+                handle,
+            )
+        try:
+            resolve_base_model_artifact_configs(
+                parsed_data,
+                ["lstm"],
+                {"lstm": dict(fallback_params["lstm"])},
+                {"lstm": str(missing_feature_list_file)},
+                "Invalid LSTM regression ensemble",
+            )
+        except ValueError as exc:
+            assert "invalid training configuration" in str(exc)
+        else:
+            raise AssertionError("LSTM artifact without feature_keys was accepted")
+
         # Resolution returns a canonical copy rather than rewriting the CLI fallback.
         assert fallback_params["ma"]["window"] == 17
         assert fallback_params["es"]["alpha"] == 0.8
@@ -464,22 +893,22 @@ def assert_moving_average_teaching_window_boundary() -> None:
 
 
 def assert_residual_std_small_sample_fallbacks() -> None:
-    # Independent evaluation residuals win when their sample standard deviation
-    # is identifiable.
+    # The primary training-side calibration residuals win when their sample
+    # standard deviation is identifiable.
     assert math.isclose(
         estimate_residual_std([1.0, 5.0], [10.0, 20.0], [100.0, 200.0]),
         math.sqrt(8.0),
     )
 
-    # A one-point evaluation cannot identify dispersion, so ensembles use the
-    # chronological internal holdout instead of reporting a misleading zero.
+    # A one-point calibration segment cannot identify dispersion, so callers use
+    # a second chronological training-side residual series instead of zero.
     assert math.isclose(
         estimate_residual_std([2.0], [1.0, 3.0], [100.0, 200.0]),
         math.sqrt(2.0),
     )
 
-    # If both residual sources contain only one point, fall back to the training
-    # series spread, matching the base-model small-data convention.
+    # If both calibration sources contain only one point, fall back to the
+    # training-series spread, matching the base-model small-data convention.
     assert math.isclose(
         estimate_residual_std([2.0], [1.0], [10.0, 14.0]),
         math.sqrt(8.0),
@@ -488,7 +917,7 @@ def assert_residual_std_small_sample_fallbacks() -> None:
     try:
         estimate_residual_std([float("nan")], [1.0, 2.0], [3.0, 4.0])
     except ValueError as exc:
-        assert str(exc).startswith("[DATA] evaluation")
+        assert str(exc).startswith("[DATA] primary calibration")
     else:
         raise AssertionError("non-finite residuals were accepted")
 
@@ -681,7 +1110,10 @@ def assert_clipped_predictions_drive_python_metrics() -> None:
     assert y_true == [2.0, 4.0]
     assert y_pred == [0.0, 0.0]
     assert math.isclose(metrics["rmse"], math.sqrt(10.0))
-    assert math.isclose(std_dev, math.sqrt(2.0))
+    # SES uncertainty is calibrated from one-step training innovations, not the
+    # held-out targets.  Keep this regression focused on demand-domain clipping
+    # and require only a usable scale here; horizon growth is covered separately.
+    assert math.isfinite(std_dev) and std_dev > 0.0
 
 
 def assert_boosting_requests_signed_base_outputs() -> None:
@@ -689,10 +1121,10 @@ def assert_boosting_requests_signed_base_outputs() -> None:
 
     def fake_train(**kwargs: object) -> dict[str, object]:
         captured_params.update(kwargs["model_params"])  # type: ignore[arg-type]
-        return {"predictions": [{"prediction": -3.0}]}
+        return {"predictions": [{"prediction": -3.0, "std_dev": 1.0}]}
 
     with patch.object(boosting, "run_base_model_subprocess", side_effect=fake_train):
-        _model_file, predictions = boosting._train_stage_model(
+        _model_file, predictions, profile = boosting._train_stage_model(
             "ma",
             [{"销售数量": 1.0}, {"销售数量": -1.0}, {"销售数量": -2.0}],
             [],
@@ -703,6 +1135,7 @@ def assert_boosting_requests_signed_base_outputs() -> None:
         )
     assert captured_params["allow_negative_predictions"] is True
     assert predictions.tolist() == [-3.0]
+    assert profile == [1.0]
 
 
 def assert_boosting_keeps_signed_corrections_end_to_end() -> None:
@@ -714,12 +1147,12 @@ def assert_boosting_keeps_signed_corrections_end_to_end() -> None:
     ]
     parsed_data = load_data_from_json(json.dumps(records, ensure_ascii=False))
     training_calls = iter((
-        ("candidate-r0-ma.pkl", np.asarray([3.0, 3.0])),
-        ("candidate-r0-es.pkl", np.asarray([4.0, 4.0])),
-        ("candidate-r1-ma.pkl", np.asarray([-4.0, -4.0])),
-        ("candidate-r1-es.pkl", np.asarray([1.0, 1.0])),
-        ("final-r0-ma.pkl", np.asarray([3.0, 3.0])),
-        ("final-r1-ma.pkl", np.asarray([-4.0, -4.0])),
+        ("candidate-r0-ma.pkl", np.asarray([2.0, 1.0, 0.0]), [1.0, 1.1, 1.2]),
+        ("candidate-r0-es.pkl", np.asarray([10.0, -10.0, 10.0]), [1.0, 1.1, 1.2]),
+        ("candidate-r1-ma.pkl", np.asarray([-1.0, 1.0, 0.0]), [1.0, 1.1, 1.2]),
+        ("candidate-r1-es.pkl", np.asarray([10.0, -10.0, 10.0]), [1.0, 1.1, 1.2]),
+        ("final-r0-ma.pkl", np.asarray([2.0, 1.0]), [1.0, 1.1]),
+        ("final-r1-ma.pkl", np.asarray([-1.0, 1.0]), [1.0, 1.1]),
     ))
 
     def fake_train_stage(*_args: object, **_kwargs: object):
@@ -731,8 +1164,16 @@ def assert_boosting_keeps_signed_corrections_end_to_end() -> None:
         _parsed_data: object,
         train_range: range,
     ) -> np.ndarray:
-        value = -4.0 if "r1" in model_file else (4.0 if "es" in model_file else 3.0)
-        return np.full(len(train_range), value, dtype=float)
+        if "r1" in model_file:
+            pattern = [-1.0, 1.0, 0.0]
+        elif "es" in model_file:
+            pattern = [10.0, -10.0, 10.0]
+        else:
+            pattern = [2.0, 1.0, 0.0]
+        return np.asarray(
+            [pattern[index % len(pattern)] for index in range(len(train_range))],
+            dtype=float,
+        )
 
     with (
         patch.object(boosting, "_build_round_records", return_value=([], [])),
@@ -747,8 +1188,9 @@ def assert_boosting_keeps_signed_corrections_end_to_end() -> None:
             base_model_states,
             _y_true,
             y_pred,
-            std_dev,
+            uncertainty_profile,
             _search_summary,
+            training_details,
         ) = boosting.train_and_evaluate(
             parsed_data,
             range(0, 8),
@@ -759,9 +1201,10 @@ def assert_boosting_keeps_signed_corrections_end_to_end() -> None:
             max_rounds=2,
         )
 
-    assert model_chain == ["ma", "ma"]
-    assert stage_coefficients == [1.0, 0.5]
-    assert y_pred == [1.0, 1.0]
+    assert model_chain == ["es", "ma"]
+    assert np.allclose(stage_coefficients, [0.6, 0.3])
+    assert np.allclose(y_pred, [0.9, 0.9])
+    assert len(uncertainty_profile) == 2
 
     saved_state = {
         "model_type": boosting.MODEL_TYPE,
@@ -769,14 +1212,15 @@ def assert_boosting_keeps_signed_corrections_end_to_end() -> None:
         "model_chain": model_chain,
         "stage_coefficients": stage_coefficients,
         "base_model_states": base_model_states,
-        "std_dev_residuals": std_dev,
+        "uncertainty": training_details["uncertainty"],
+        "algorithm_revision": MODEL_ALGORITHM_REVISION,
     }
     prediction_calls: list[dict[str, object]] = []
 
     def fake_predict_stage(**kwargs: object) -> dict[str, object]:
         prediction_calls.append(kwargs)
         value = 3.0 if len(prediction_calls) == 1 else -4.0
-        return {"forecasts": [value]}
+        return {"predictions": [{"prediction": value, "std_dev": 1.0}]}
 
     with tempfile.TemporaryDirectory() as temp_dir:
         artifact_path = os.path.join(temp_dir, "boosting.pkl")
@@ -787,10 +1231,131 @@ def assert_boosting_keeps_signed_corrections_end_to_end() -> None:
             "run_base_model_predict_subprocess",
             side_effect=fake_predict_stage,
         ):
-            production_prediction, _ = boosting.predict(artifact_path, 1)
+            production_prediction, _profile, _summary = boosting.predict(artifact_path, 1)
 
-    assert production_prediction == [1.0]
+    assert np.allclose(production_prediction, [0.6])
     assert all(call["allow_negative_predictions"] is True for call in prediction_calls)
+
+
+def assert_boosting_trim_uses_retained_prefix_residuals() -> None:
+    records = [
+        {"月份": f"2026-{index + 1:02d}", "销售数量": 1.0}
+        for index in range(10)
+    ]
+    parsed_data = load_data_from_json(json.dumps(records, ensure_ascii=False))
+    expected_prefix_residuals = np.asarray([0.0, 1.0, 0.0])
+    full_selection_residuals = np.asarray([0.5, 0.5, 0.0])
+
+    def fake_fitted(
+        _model_name: str,
+        model_file: str,
+        _parsed_data: object,
+        train_range: range,
+    ) -> np.ndarray:
+        if "trim" in model_file:
+            pattern = [-1.0]
+        elif "r1" in model_file:
+            pattern = [-1.0, 1.0, 0.0]
+        elif "es" in model_file:
+            pattern = [10.0, -10.0, 10.0]
+        else:
+            pattern = [2.0, 1.0, 0.0]
+        return np.asarray(
+            [pattern[index % len(pattern)] for index in range(len(train_range))],
+            dtype=float,
+        )
+
+    regular_training_calls = iter((
+        ("candidate-r0-ma.pkl", np.asarray([2.0, 1.0, 0.0]), [1.0, 1.1, 1.2]),
+        ("candidate-r0-es.pkl", np.asarray([10.0, -10.0, 10.0]), [1.0, 1.1, 1.2]),
+        ("candidate-r1-ma.pkl", np.asarray([-1.0, 1.0, 0.0]), [1.0, 1.1, 1.2]),
+        ("candidate-r1-es.pkl", np.asarray([10.0, -10.0, 10.0]), [1.0, 1.1, 1.2]),
+        ("final-r0-ma.pkl", np.asarray([2.0, 1.0]), [1.0, 1.1]),
+        ("final-r1-trim.pkl", np.asarray([-1.0, 1.0]), [1.0, 1.1]),
+    ))
+
+    with (
+        patch.object(boosting, "_build_round_records", return_value=([], [])),
+        patch.object(
+            boosting,
+            "_train_stage_model",
+            side_effect=lambda *_args, **_kwargs: next(regular_training_calls),
+        ),
+        patch.object(boosting, "_compute_in_sample_fitted_predictions", side_effect=fake_fitted),
+        patch.object(boosting, "remove_member_model_artifact"),
+    ):
+        regular_result = boosting.train_and_evaluate(
+            parsed_data,
+            range(0, 8),
+            range(8, 10),
+            ["ma", "es"],
+            {"ma": {"window": 2}, "es": {"alpha": 0.3}},
+            learning_rate=0.5,
+            max_rounds=2,
+        )
+
+    assert regular_result[1] == ["es"]
+    regular_calibration = np.asarray(
+        regular_result[8]["uncertainty"]["calibration_residuals"]
+    )
+    assert np.allclose(regular_calibration, expected_prefix_residuals)
+    assert not np.allclose(regular_calibration, full_selection_residuals)
+    assert math.isclose(
+        regular_result[6][0],
+        float(np.std(expected_prefix_residuals, ddof=1)),
+    )
+
+    guided_training_calls = iter((
+        ("guided-final-r0.pkl", np.asarray([2.0, 1.0]), [1.0, 1.1]),
+        ("guided-final-r1-trim.pkl", np.asarray([-1.0, 1.0]), [1.0, 1.1]),
+    ))
+    with tempfile.TemporaryDirectory(prefix="guided-boosting-trim-") as artifact_dir:
+        guided_state = {
+            "parsed_data": parsed_data,
+            "train_range": {"start": 0, "stop": 8},
+            "eval_range": {"start": 8, "stop": 10},
+            "models": ["ma", "es"],
+            "model_params": {"ma": {"window": 2}, "es": {"alpha": 0.3}},
+            "base_model_files": {},
+            "model_chain": ["es", "ma"],
+            "stage_coefficients": [0.1, 0.5],
+            "residual_val": full_selection_residuals.copy(),
+            "validation_residual_snapshots": [
+                np.asarray([1.0, 1.0, 1.0]),
+                expected_prefix_residuals.copy(),
+                full_selection_residuals.copy(),
+            ],
+            "search_summary": {"stages": []},
+            "artifact_dir": artifact_dir,
+            "split_plan": {
+                "purpose": "boosting",
+                "prefix_size": 5,
+                "validation_size": 3,
+            },
+        }
+        with (
+            patch.object(boosting, "_build_round_records", return_value=([], [])),
+            patch.object(
+                boosting,
+                "_train_stage_model",
+                side_effect=lambda *_args, **_kwargs: next(guided_training_calls),
+            ),
+            patch.object(boosting, "_compute_in_sample_fitted_predictions", side_effect=fake_fitted),
+            patch.object(boosting, "remove_member_model_artifact"),
+        ):
+            guided_ensemble_model._run_boosting(
+                "retrain_chain", None, guided_state
+            )
+            guided_ensemble_model._run_boosting(
+                "combine_evaluate", None, guided_state
+            )
+
+    assert guided_state["model_chain"] == ["es"]
+    guided_calibration = np.asarray(
+        guided_state["uncertainty"]["calibration_residuals"]
+    )
+    assert np.allclose(guided_calibration, expected_prefix_residuals)
+    assert not np.allclose(guided_calibration, full_selection_residuals)
 
 
 def assert_subprocess_prediction_domains() -> None:
@@ -827,17 +1392,25 @@ def assert_loaded_ensemble_demand_semantics() -> None:
 
     def fake_runner(values: list[float]):
         iterator = iter(values)
-        return lambda **_: {"forecasts": [next(iterator)]}
+        return lambda **_: {
+            "predictions": [{"prediction": next(iterator), "std_dev": 1.0}]
+        }
+
+    uncertainty = {
+        "calibration_residuals": [1.0, 2.0],
+        "reference_series": [10.0, 11.0, 12.0],
+    }
 
     with patch.object(
         weighted_avg,
         "run_base_model_predict_subprocess",
         side_effect=fake_runner([-10.0, 4.0]),
     ):
-        predictions, _ = weighted_avg.predict("", 1, {
+        predictions, _profile, _summary = weighted_avg.predict("", 1, {
             "weights": {"ma": 0.5, "es": 0.5},
             "base_model_states": base_states,
             "models": ["ma", "es"],
+            "uncertainty": uncertainty,
         })
         assert predictions == [2.0]
 
@@ -846,10 +1419,15 @@ def assert_loaded_ensemble_demand_semantics() -> None:
         "run_base_model_predict_subprocess",
         side_effect=fake_runner([-10.0, 4.0]),
     ):
-        predictions, _ = stacking.predict("", 1, {
-            "meta_model": {"kind": "weighted_blend", "weights": [0.5, 0.5]},
+        predictions, _profile, _summary = stacking.predict("", 1, {
+            "meta_model": {
+                "kind": "nnls",
+                "model_names": ["ma", "es"],
+                "coefficients": [0.5, 0.5],
+            },
             "base_model_states": base_states,
             "models": ["ma", "es"],
+            "uncertainty": uncertainty,
         })
         assert predictions == [2.0]
 
@@ -860,13 +1438,14 @@ def assert_loaded_ensemble_demand_semantics() -> None:
             "ma": {"models": [{"model_file": "ma.pkl"}]},
             "es": {"models": [{"model_file": "es.pkl"}]},
         },
+        "uncertainty": uncertainty,
     }
     with patch.object(
         boosting,
         "run_base_model_predict_subprocess",
         side_effect=fake_runner([-10.0, 12.0]),
     ):
-        predictions, _ = boosting.predict("", 1, boosting_state)
+        predictions, _profile, _summary = boosting.predict("", 1, boosting_state)
         assert predictions == [6.0]
 
     with patch.object(
@@ -874,7 +1453,7 @@ def assert_loaded_ensemble_demand_semantics() -> None:
         "run_base_model_predict_subprocess",
         side_effect=fake_runner([1.0, -10.0]),
     ):
-        predictions, _ = boosting.predict("", 1, boosting_state)
+        predictions, _profile, _summary = boosting.predict("", 1, boosting_state)
         assert predictions == [0.0]
 
 
@@ -900,6 +1479,7 @@ def assert_corrupt_state_errors() -> None:
                 pickle.dump({
                     "model_type": model_type,
                     "prediction_domain": DEMAND_PREDICTION_DOMAIN,
+                    "algorithm_revision": MODEL_ALGORITHM_REVISION,
                 }, handle)
             args = argparse.Namespace(
                 data=records_json,
@@ -1028,7 +1608,7 @@ def assert_ensemble_source_config_conflicts_end_to_end() -> None:
     expected_params: dict[str, dict[str, float | int]] = {
         "ma": {"window": 3},
         "es": {"alpha": 0.2},
-        "arima": {"d": 1, "max_p": 1, "max_q": 1},
+        "arima": {"d": 1},
     }
 
     with tempfile.TemporaryDirectory() as temp_dir:
@@ -1197,6 +1777,11 @@ def main() -> None:
     assert_target_only_lstm_training()
     assert_internal_split_boundaries()
     assert_internal_holdout_configuration_boundaries()
+    assert_lstm_features_are_explicit_across_ensemble_planning()
+    assert_ensemble_entrypoints_require_lstm_features()
+    assert_dynamic_hidden_configuration()
+    assert_horizon_aware_uncertainty_profiles()
+    assert_textbook_ensemble_estimators()
     assert_source_artifact_configuration_resolution()
     assert_moving_average_teaching_window_boundary()
     assert_residual_std_small_sample_fallbacks()
@@ -1208,6 +1793,7 @@ def main() -> None:
     assert_clipped_predictions_drive_python_metrics()
     assert_boosting_requests_signed_base_outputs()
     assert_boosting_keeps_signed_corrections_end_to_end()
+    assert_boosting_trim_uses_retained_prefix_residuals()
     assert_subprocess_prediction_domains()
     assert_loaded_ensemble_demand_semantics()
     assert_same_path_artifact_replay()

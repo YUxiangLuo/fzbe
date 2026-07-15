@@ -19,7 +19,7 @@ BASE_MODEL_TRAIN_ARGS = {
     "arima": ("--d", "1", "--max-p", "2", "--max-q", "2"),
 }
 
-from model_metadata_assertions import assert_method_metadata
+from model_metadata_assertions import assert_method_metadata  # noqa: E402
 
 
 def load_csv_records(csv_path: Path) -> list[dict[str, str]]:
@@ -218,13 +218,16 @@ def main() -> None:
         assert train_output["search_summary"]["algorithm"] == "residual_boosting"
         assert len(train_output["model_chain"]) >= 1
         assert len(train_output["model_chain"]) == len(train_output["stage_coefficients"])
-        assert math.isclose(float(train_output["stage_coefficients"][0]), 1.0, rel_tol=1e-9, abs_tol=1e-9)
+        assert all(
+            math.isfinite(float(value)) and float(value) > 0.0
+            for value in train_output["stage_coefficients"]
+        )
         assert_series_close(actual_eval_predictions, expected_eval_predictions)
         assert_all_finite(actual_eval_std_devs, "train_std_devs")
 
         first_stage_idx, first_stage_model_name, first_stage_coefficient, first_stage_model_state = next(iter_stage_models(train_state))
         assert first_stage_idx == 0
-        assert math.isclose(first_stage_coefficient, 1.0, rel_tol=1e-9, abs_tol=1e-9)
+        assert math.isfinite(first_stage_coefficient) and first_stage_coefficient > 0.0
         assert Path(first_stage_model_state["model_file"]).exists()
         original_base_predictions = extract_predictions(
             invoke_model(

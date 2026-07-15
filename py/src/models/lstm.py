@@ -27,6 +27,13 @@ from log_safety import summarize_cli_args
 from metrics import mae, mape, r2, rmse
 from model_info import attach_method_metadata, ensure_state_metadata
 from serialization import dump_model, load_model
+from dynamic_config import derive_lstm_config
+from uncertainty import (
+    fallback_profile,
+    format_predictions,
+    profile_for_steps,
+    residual_profile_by_horizon,
+)
 
 MODEL_TYPE = "lstm"
 DIRECT_FORECAST_STRATEGY = "direct_multi_horizon"
@@ -35,11 +42,11 @@ DEFAULT_PRODUCTION_FORECAST_HORIZON = 6
 METHOD_NAME = "LSTM 多变量销量预测"
 DIRECT_IMPLEMENTATION_NOTES = [
     "教科书 LSTM 定义的是带遗忘门、输入门和输出门的循环神经网络单元。",
-    "本系统仅用训练区间拟合数值缩放器和类别 One-Hot 编码器，再采用两层 LSTM 加 Dense 输出层；隐藏单元数随编码后维度和训练样本量动态选择。",
+    "本系统仅用训练区间拟合数值缩放器和类别 One-Hot 编码器，再采用单层 LSTM 加线性 Dense 多步输出；look-back 在 2 到 12 之间，隐藏单元、批大小和训练预算由样本量、预测跨度及编码后维度共同确定。",
     "为了服务未来多期销量预测，新训练模型采用直接多步策略，一次输出完整预测 horizon，减少递归预测的误差累积；输入只包含预测起点之前最后 look_back 期的历史目标与历史特征，不读取未来特征值。",
-    "训练中的 EarlyStopping 监控训练损失而非验证损失（教学数据过小，不再切分验证集），其作用是训练损失进入平台期即停止，并非教科书意义的验证集早停。",
-    "Dense 输出层本身不带非负约束；本系统将逆缩放后的最终销量点预测按 max(0, y_hat) 截断，并以截断值计算残差、指标和 std_dev。该业务后处理不是 LSTM 单元定义的一部分。",
-    "预测值附带的 std_dev 通常是评估段残差的样本标准差；评估不足 2 点时退回训练目标序列波动。该值不随预测步长增长，与 ARIMA 随步长展宽的置信区间口径不同。",
+    "样本足够时使用带 horizon 隔离带的时间顺序验证集监控 val_loss；选择轮数的临时预处理器和网络容量都只依据验证起点之前可见的数据，随后在全部训练窗口重新推导最终容量并拟合预处理器和网络。小样本明确标记为教学演示并使用有限训练预算，不以训练 loss 冒充泛化早停。",
+    "Dense 输出层本身不带非负约束；本系统将逆缩放后的最终销量点预测按 max(0, y_hat) 截断，并以截断值计算评估残差和指标。该业务后处理不是 LSTM 单元定义的一部分。",
+    "std_dev 优先来自时间顺序验证窗口中逆缩放、未做非负截断的逐输出 horizon 残差；95% 区间和生产用 99% 上侧误差取各 horizon 的 actual-prediction 经验残差分位数，因而保留稳定偏差。教学演示模式使用明确标记的一阶差分 sqrt(h) 正态近似回退。",
 ]
 AUTOREGRESSIVE_IMPLEMENTATION_NOTES = [
     "教科书 LSTM 定义的是带遗忘门、输入门和输出门的循环神经网络单元。",
@@ -47,7 +54,7 @@ AUTOREGRESSIVE_IMPLEMENTATION_NOTES = [
     "该一步递归路径仅用于兼容旧模型产物：后续步骤把预测目标滚入窗口，其他特征保持为最后观测值；当前新训练流程不会自动回退到此策略。",
     "训练中的 EarlyStopping 监控训练损失而非验证损失（教学数据过小，不再切分验证集），其作用是训练损失进入平台期即停止，并非教科书意义的验证集早停。",
     "Dense 输出层本身不带非负约束；兼容旧产物时也只把最终逆缩放销量点预测按 max(0, y_hat) 截断。Boosting 的内部残差学习会显式关闭该截断，以保留有符号残差。",
-    "预测值附带的 std_dev 通常是评估段残差的样本标准差；评估不足 2 点时退回训练目标序列波动。该值不随预测步长增长，与 ARIMA 随步长展宽的置信区间口径不同。",
+    "兼容路径只读取产物中已经保存的不确定性信息；若无法覆盖请求跨度则使用明确标记的训练历史一阶差分 sqrt(h) 回退，不读取当前预测期真实值。",
 ]
 
 # Type alias for input flexibility
@@ -61,16 +68,24 @@ def _metadata_for_strategy(strategy: str) -> Tuple[str, List[str]]:
     return LEGACY_FORECAST_STRATEGY, AUTOREGRESSIVE_IMPLEMENTATION_NOTES
 
 
-def _format_predictions(preds: List[float], std_dev: float) -> List[Dict[str, float]]:
+def _format_predictions(
+    preds: List[float],
+    std_dev: Any,
+    metadata: Optional[Dict[str, Any]] = None,
+) -> List[Dict[str, Any]]:
     """
     Format predictions with standard deviation for JSON output.
     """
-    return [{"prediction": float(p), "std_dev": float(std_dev)} for p in preds]
+    profile = list(std_dev) if isinstance(std_dev, (list, tuple, np.ndarray)) else [float(std_dev)] * len(preds)
+    return format_predictions(preds, profile, metadata or {"source": "empirical", "fallback": False})
 
 
-def _parse_feature_key_list(raw_value: Optional[str]) -> Optional[List[str]]:
-    if raw_value is None or raw_value == "":
-        return None
+def _parse_feature_key_list(raw_value: Optional[str]) -> List[str]:
+    if raw_value is None or not str(raw_value).strip():
+        raise ValueError(
+            "[VALIDATION] LSTM requires an explicit feature list; "
+            "use [] for a target-only LSTM."
+        )
 
     try:
         parsed = json.loads(raw_value)
@@ -106,21 +121,24 @@ def _load_state(model_path: str) -> Dict[str, Any]:
     if not isinstance(state, dict) or state.get("model_type") != MODEL_TYPE:
         raise ValueError("[VALIDATION] Invalid LSTM model file.")
 
-    # Load the Keras model from the dedicated file
+    saved_strategy = str(state.get("forecast_strategy", LEGACY_FORECAST_STRATEGY))
+    forecast_strategy, notes = _metadata_for_strategy(saved_strategy)
+    ensure_state_metadata(state, METHOD_NAME, forecast_strategy, notes)
+    if saved_strategy != DIRECT_FORECAST_STRATEGY:
+        raise ValueError("[MODEL] Obsolete autoregressive LSTM artifacts must be retrained.")
+    if "normalization" not in state:
+        raise ValueError("[MODEL] Saved LSTM model is missing normalization metadata.")
+    raw_feature_keys = state.get("feature_keys")
+    if not isinstance(raw_feature_keys, list) or any(
+        not isinstance(feature_name, str) or not feature_name.strip()
+        for feature_name in raw_feature_keys
+    ):
+        raise ValueError("[MODEL] Saved LSTM model is missing an explicit feature list.")
+    state["feature_keys"] = [feature_name.strip() for feature_name in raw_feature_keys]
+
+    # Reject obsolete metadata before paying the cost of loading the sidecar.
     keras_model_path = state.get("keras_model_path")
     state["keras_model"] = _load_keras_artifact(keras_model_path)
-
-    # Ensure normalization is loaded for predict function
-    if "normalization" not in state:
-        state["normalization"] = 'minmax' # Default to minmax if not found (for older models)
-    if "forecast_strategy" not in state:
-        state["forecast_strategy"] = (
-            DIRECT_FORECAST_STRATEGY
-            if int(state.get("forecast_horizon", 0) or 0) > 0
-            else LEGACY_FORECAST_STRATEGY
-        )
-    forecast_strategy, notes = _metadata_for_strategy(str(state["forecast_strategy"]))
-    ensure_state_metadata(state, METHOD_NAME, forecast_strategy, notes)
 
     return state
 
@@ -163,19 +181,6 @@ def _create_direct_dataset(
         dataX.append(dataset[start_idx:end_history, :])
         dataY.append(dataset[end_history:end_target, 0])
     return np.array(dataX), np.array(dataY)
-
-
-def _estimate_std_dev(residuals: ArrayLike, reference_series: ArrayLike) -> float:
-    residuals_array = np.asarray(residuals, dtype=float)
-    if residuals_array.size > 1:
-        return float(np.std(residuals_array, ddof=1))
-
-    reference_array = np.asarray(reference_series, dtype=float)
-    if reference_array.size > 1:
-        return float(np.std(reference_array, ddof=1))
-
-    baseline = abs(float(np.mean(reference_array))) if reference_array.size else 0.0
-    return float(max(baseline * 0.05, 1.0))
 
 
 def _set_random_seed(seed: int = 42) -> None:
@@ -324,12 +329,11 @@ def _inverse_transform_target_values(preprocessor: Any, scaled_values: np.ndarra
     return target_scaler.inverse_transform(dummy_array)[:, 0]
 
 
-def _forecast_direct_from_state(state: Dict[str, Any], steps: int) -> Tuple[List[float], float]:
+def _forecast_direct_from_state(state: Dict[str, Any], steps: int) -> Tuple[List[float], List[float]]:
     keras_model = state["keras_model"]
     preprocessor = state["preprocessor"]
     look_back = state["look_back"]
     history_df = state["history_df"]
-    std_dev_residuals = float(state.get("std_dev_residuals", 0.0))
     forecast_horizon = int(state.get("forecast_horizon", 0))
 
     if forecast_horizon < 1:
@@ -360,15 +364,20 @@ def _forecast_direct_from_state(state: Dict[str, Any], steps: int) -> Tuple[List
     unscaled_predictions = _inverse_transform_target_values(preprocessor, predictions_scaled)
 
     log.info(f"Generated {len(unscaled_predictions)} predictions after inverse transform")
-    return unscaled_predictions[:steps].flatten().tolist(), std_dev_residuals
+    profile, _ = profile_for_steps(
+        state.get("uncertainty_profile"),
+        steps,
+        state.get("reference_series", []),
+        state.get("uncertainty_summary"),
+    )
+    return unscaled_predictions[:steps].flatten().tolist(), profile
 
 
-def _forecast_autoregressive_from_state(state: Dict[str, Any], steps: int) -> Tuple[List[float], float]:
+def _forecast_autoregressive_from_state(state: Dict[str, Any], steps: int) -> Tuple[List[float], List[float]]:
     keras_model = state["keras_model"]
     preprocessor = state["preprocessor"]
     look_back = state["look_back"]
     history_df = state["history_df"]
-    std_dev_residuals = float(state.get("std_dev_residuals", 0.0))
     normalization = state.get("normalization", 'minmax')
 
     log.info(f"Generating {steps}-step autoregressive forecast with look_back={look_back}, normalization='{normalization}'")
@@ -407,14 +416,20 @@ def _forecast_autoregressive_from_state(state: Dict[str, Any], steps: int) -> Tu
 
     log.info(f"Generated {len(unscaled_predictions)} predictions after inverse transform")
 
-    return unscaled_predictions.flatten().tolist(), std_dev_residuals
+    profile, _ = profile_for_steps(
+        state.get("uncertainty_profile"),
+        steps,
+        state.get("reference_series", []),
+        state.get("uncertainty_summary"),
+    )
+    return unscaled_predictions.flatten().tolist(), profile
 
 
 def _forecast_from_state(
     state: Dict[str, Any],
     steps: int,
     prediction_domain: Optional[str] = None,
-) -> Tuple[List[float], float]:
+) -> Tuple[List[float], List[float]]:
     strategy = state.get("forecast_strategy", LEGACY_FORECAST_STRATEGY)
     if strategy == DIRECT_FORECAST_STRATEGY:
         predictions, std_dev = _forecast_direct_from_state(state, steps)
@@ -430,7 +445,7 @@ def predict(
     steps: int,
     state: Optional[Dict[str, Any]] = None,
     allow_negative_predictions: bool = False,
-) -> Tuple[List[float], float]:
+) -> Tuple[List[float], List[float]]:
     """
     Forecast using a saved LSTM model.
     """
@@ -456,21 +471,21 @@ def _fit_direct_model(
     parsed_data: ParsedData,
     feature_types: Dict[str, str],
     train_range: range,
-    look_back: int,
-    epochs: int,
     normalization: str,
     forecast_horizon: int,
 ):
     from tensorflow.keras.layers import LSTM as KerasLSTM
     from tensorflow.keras.layers import Dense
     from tensorflow.keras.layers import Input
-    from tensorflow.keras.callbacks import EarlyStopping, LearningRateScheduler
+    from tensorflow.keras.callbacks import EarlyStopping
     from tensorflow.keras.models import Sequential
     from tensorflow.keras.optimizers import Adam
 
     df = parsed_data.df
     preprocessor, scaled_series = _build_preprocessor(parsed_data, feature_types, train_range, normalization)
     n_features_out = scaled_series.shape[1]
+    config = derive_lstm_config(len(train_range), forecast_horizon, n_features_out)
+    look_back = int(config["look_back"])
 
     train_data = scaled_series[train_range]
     log.info(
@@ -485,60 +500,149 @@ def _fit_direct_model(
         )
     log.info(f"Training dataset created: X shape={trainX.shape}, Y shape={trainY.shape}")
 
-    base_units = max(16, min(64, n_features_out * 4, max(16, len(trainX) * 4)))
-    secondary_units = max(8, base_units // 2)
-    dense_units = max(8, secondary_units)
     log.info(
-        "Building direct LSTM model: units=(%s,%s), dense=%s, horizon=%s, input_shape=(%s, %s)",
-        base_units,
-        secondary_units,
-        dense_units,
+        "Building direct LSTM model: regime=%s, units=%s, horizon=%s, input_shape=(%s, %s)",
+        config["regime"],
+        config["units"],
         forecast_horizon,
         look_back,
         n_features_out,
     )
 
-    model = Sequential([
-        Input(shape=(look_back, n_features_out)),
-        KerasLSTM(base_units, return_sequences=True),
-        KerasLSTM(secondary_units),
-        Dense(dense_units, activation="relu"),
-        Dense(forecast_horizon),
-    ])
+    def build_model(
+        input_feature_count: int = n_features_out,
+        units: int = int(config["units"]),
+    ):
+        network = Sequential([
+            Input(shape=(look_back, input_feature_count)),
+            KerasLSTM(units),
+            Dense(forecast_horizon),
+        ])
+        network.compile(
+            loss="mean_squared_error",
+            optimizer=Adam(learning_rate=0.001, clipnorm=1.0),
+        )
+        return network
 
-    initial_learning_rate = 0.001
-    decay_rate = 0.98
-    optimizer = Adam(learning_rate=initial_learning_rate, clipnorm=1.0)
-    model.compile(loss="mean_squared_error", optimizer=optimizer)
+    validation_residuals = None
+    epochs_ran = int(config["max_epochs"])
+    if config["regime"] == "standard":
+        validation_count = int(config["validation_windows"])
+        selection_count = int(config["selection_train_windows"])
+        validation_start = len(trainX) - validation_count
+        selection_fit_points = selection_count + look_back + forecast_horizon - 1
+        selection_fit_range = range(
+            train_range.start,
+            train_range.start + selection_fit_points,
+        )
+        validation_preprocessor, validation_scaled_series = _build_preprocessor(
+            parsed_data,
+            feature_types,
+            selection_fit_range,
+            normalization,
+        )
+        validation_train_data = validation_scaled_series[train_range]
+        validationX, validationY = _create_direct_dataset(
+            validation_train_data,
+            look_back,
+            forecast_horizon,
+        )
+        if len(validationX) != len(trainX):
+            raise ValueError("[MODEL] LSTM validation preprocessing changed the window count.")
+        selection_config = derive_lstm_config(
+            len(train_range),
+            forecast_horizon,
+            int(validationX.shape[2]),
+        )
+        schedule_keys = (
+            "look_back",
+            "windows",
+            "validation_windows",
+            "purge_windows",
+            "selection_train_windows",
+            "batch_size",
+            "max_epochs",
+            "patience",
+        )
+        if any(selection_config[key] != config[key] for key in schedule_keys):
+            raise ValueError("[MODEL] LSTM validation preprocessing changed the training schedule.")
+        config["validation_preprocessor_fit_points"] = selection_fit_points
+        config["validation_feature_count"] = int(validationX.shape[2])
+        config["selection_units"] = int(selection_config["units"])
+        config["selection_parameter_count"] = int(selection_config["parameter_count"])
+        selection_model = build_model(
+            int(validationX.shape[2]),
+            int(selection_config["units"]),
+        )
+        history = selection_model.fit(
+            validationX[:selection_count],
+            validationY[:selection_count],
+            validation_data=(validationX[validation_start:], validationY[validation_start:]),
+            epochs=int(selection_config["max_epochs"]),
+            batch_size=int(selection_config["batch_size"]),
+            verbose=0,
+            callbacks=[EarlyStopping(
+                monitor="val_loss",
+                patience=int(selection_config["patience"]),
+                restore_best_weights=True,
+            )],
+            shuffle=False,
+        )
+        validation_losses = history.history.get("val_loss", [])
+        if not validation_losses:
+            raise ValueError("[MODEL] LSTM validation training produced no val_loss history.")
+        epochs_ran = int(np.argmin(validation_losses)) + 1
+        validation_predictions_scaled = selection_model.predict(
+            validationX[validation_start:],
+            verbose=0,
+        )
+        validation_predictions = _inverse_transform_target_values(
+            validation_preprocessor,
+            validation_predictions_scaled,
+        ).reshape(validation_predictions_scaled.shape)
+        validation_actuals = _inverse_transform_target_values(
+            validation_preprocessor,
+            validationY[validation_start:],
+        ).reshape(validationY[validation_start:].shape)
+        validation_residuals = validation_actuals - validation_predictions
+        _set_random_seed(42)
 
-    def lr_schedule(epoch):
-        return initial_learning_rate * (decay_rate ** epoch)
-
-    lr_scheduler = LearningRateScheduler(lr_schedule, verbose=0)
-    early_stopping = EarlyStopping(
-        monitor="loss",
-        patience=max(2, min(6, epochs // 4 or 2)),
-        restore_best_weights=True,
-    )
-    batch_size = max(1, min(8, len(trainX)))
-
-    log.info(f"Training direct LSTM model for {epochs} epochs with batch_size={batch_size}...")
-    log.info(f"Initial learning rate: {initial_learning_rate}, decay rate: {decay_rate}")
+    model = build_model()
     model.fit(
         trainX,
         trainY,
-        epochs=epochs,
-        batch_size=batch_size,
+        epochs=epochs_ran,
+        batch_size=int(config["batch_size"]),
         verbose=0,
-        callbacks=[lr_scheduler, early_stopping],
         shuffle=False,
     )
+    config["epochs_ran"] = epochs_ran
     log.info("Model training completed")
 
     history_df_for_saving = df.iloc[train_range.stop - look_back : train_range.stop].copy()
     log.debug(f"Saved history for future predictions: {len(history_df_for_saving)} rows")
 
-    return model, preprocessor, history_df_for_saving
+    reference_series = df[parsed_data.target_key].values[train_range]
+    if validation_residuals is None:
+        uncertainty_profile, uncertainty_summary = fallback_profile(
+            reference_series,
+            forecast_horizon,
+        )
+    else:
+        uncertainty_profile, uncertainty_summary = residual_profile_by_horizon(
+            validation_residuals,
+            reference_series,
+            forecast_horizon,
+        )
+
+    return (
+        model,
+        preprocessor,
+        history_df_for_saving,
+        config,
+        uncertainty_profile,
+        uncertainty_summary,
+    )
 
 
 def _fit_autoregressive_model(
@@ -627,16 +731,17 @@ def train_and_evaluate(
     feature_types: Dict[str, str],
     train_range: range,
     eval_range: range,
-    look_back: int,
-    epochs: int,
     normalization: str = 'minmax',
     timestamps: Optional[List[str]] = None,
     prediction_domain: str = DEMAND_PREDICTION_DOMAIN,
-) -> Tuple[Dict[str, Any], Any, Any, List[float], List[float], float, pd.DataFrame]:
+) -> Tuple[
+    Dict[str, Any], Any, Any, List[float], List[float], float, pd.DataFrame,
+    Dict[str, Any], List[float], Dict[str, Any],
+]:
     """
     Trains and evaluates the LSTM model with typed features.
     """
-    log.info(f"Starting LSTM train_and_evaluate: look_back={look_back}, epochs={epochs}, normalization='{normalization}', train_range={train_range}, eval_range={eval_range}")
+    log.info(f"Starting LSTM train_and_evaluate: normalization='{normalization}', train_range={train_range}, eval_range={eval_range}")
 
     df = parsed_data.df
     target_key = parsed_data.target_key
@@ -649,22 +754,31 @@ def train_and_evaluate(
     log.debug(f"Training data range: [{train_range.start}, {train_range.stop-1}], count={train_range.stop - train_range.start}")
     log.debug(f"Evaluation data range: [{eval_range.start}, {eval_range.stop-1}], count={eval_range.stop - eval_range.start}")
 
-    model, preprocessor, history_df_for_saving = _fit_direct_model(
+    (
+        model,
+        preprocessor,
+        history_df_for_saving,
+        derived_config,
+        uncertainty_profile,
+        uncertainty_summary,
+    ) = _fit_direct_model(
         parsed_data,
         feature_types,
         train_range,
-        look_back,
-        epochs,
         normalization,
         forecast_horizon,
     )
+    look_back = int(derived_config["look_back"])
 
     # Make predictions for evaluation
     if not list(eval_range):
         log.warning("Empty evaluation range, returning empty metrics")
-        return {}, model, preprocessor, [], [], _estimate_std_dev([], train_target_values), history_df_for_saving
+        return (
+            {}, model, preprocessor, [], [], float(uncertainty_profile[0]), history_df_for_saving,
+            derived_config, uncertainty_profile, uncertainty_summary,
+        )
 
-    log.info(f"Generating predictions for evaluation range...")
+    log.info("Generating predictions for evaluation range...")
     state_for_eval = {
         "keras_model": model,
         "preprocessor": preprocessor,
@@ -674,6 +788,9 @@ def train_and_evaluate(
         "history_df": history_df_for_saving,
         "normalization": normalization,
         "prediction_domain": prediction_domain,
+        "uncertainty_profile": uncertainty_profile,
+        "uncertainty_summary": uncertainty_summary,
+        "reference_series": train_target_values.tolist(),
     }
     full_forecast, _ = _forecast_from_state(
         state_for_eval,
@@ -688,7 +805,7 @@ def train_and_evaluate(
     log.info(f"Generated {len(y_pred)} predictions after inverse transform")
 
     residuals = y_true - y_pred
-    std_dev_residuals = _estimate_std_dev(residuals, train_target_values)
+    std_dev_residuals = float(uncertainty_profile[0])
     log.info(f"Calculated residuals: mean={np.mean(residuals):.4f}, std_dev={std_dev_residuals:.4f}")
 
     metrics = {
@@ -696,9 +813,8 @@ def train_and_evaluate(
         "mae": mae(y_true, y_pred),
         "mape": mape(y_true, y_pred),
         "r2": r2(y_true, y_pred),
-        "look_back": look_back,
-        "epochs": epochs,
         "forecast_horizon": forecast_horizon,
+        "training_regime": derived_config["regime"],
         "evaluated_points": len(y_true),
         "evaluate_indices": list(eval_range),
         "evaluate_months": [timestamps[i] for i in eval_range] if timestamps else [],
@@ -706,7 +822,18 @@ def train_and_evaluate(
 
     log.info(f"Evaluation metrics computed: RMSE={metrics['rmse']:.4f}, MAE={metrics['mae']:.4f}, MAPE={metrics['mape']:.4f}, R²={metrics['r2']:.4f}")
 
-    return metrics, model, preprocessor, y_true.tolist(), list(y_pred), std_dev_residuals, history_df_for_saving
+    return (
+        metrics,
+        model,
+        preprocessor,
+        y_true.tolist(),
+        list(y_pred),
+        std_dev_residuals,
+        history_df_for_saving,
+        derived_config,
+        uncertainty_profile,
+        uncertainty_summary,
+    )
 
 
 # ---------- public entry ----------
@@ -746,42 +873,16 @@ def run(args) -> None:
         )
 
         ts, te = int(args.train_start), int(args.train_end)
-        look_back = int(state["look_back"])
-        epochs = int(state.get("epochs", 20))
         normalization = state.get("normalization", 'minmax')
-        forecast_strategy = state.get("forecast_strategy", LEGACY_FORECAST_STRATEGY)
-        train_size = te - ts + 1
         explicit_fit_forecast_steps = int(getattr(args, "fit_forecast_steps", 0) or 0)
         desired_forecast_horizon = (
-            (
-                explicit_fit_forecast_steps
-                if explicit_fit_forecast_steps > 0
-                else _resolve_production_forecast_horizon(state=state)
-            )
-            if forecast_strategy == DIRECT_FORECAST_STRATEGY
-            else 0
+            explicit_fit_forecast_steps
+            if explicit_fit_forecast_steps > 0
+            else _resolve_production_forecast_horizon(state=state)
         )
-        effective_forecast_strategy = forecast_strategy
         fit_forecast_horizon = desired_forecast_horizon
-        if (
-            forecast_strategy == DIRECT_FORECAST_STRATEGY
-            and desired_forecast_horizon > 0
-            and not _can_fit_direct_forecast(train_size, look_back, desired_forecast_horizon)
-        ):
-            raise ValueError(
-                "[VALIDATION] Training range is too short to preserve the evaluated direct LSTM strategy "
-                f"(train_size={train_size}, look_back={look_back}, required_horizon={desired_forecast_horizon}). "
-                "Please increase the data window instead of switching forecast strategy."
-            )
-
-        _validate_fit_args(
-            parsed_data,
-            ts,
-            te,
-            look_back,
-            fit_forecast_horizon,
-            effective_forecast_strategy,
-        )
+        if not (0 <= ts <= te < parsed_data.n_obs):
+            raise ValueError(f"[VALIDATION] Invalid train range: [{ts},{te}].")
 
         feature_types = state.get("feature_types") or infer_parsed_feature_types(
             parsed_data,
@@ -790,25 +891,20 @@ def run(args) -> None:
         )
         _validate_lstm_feature_types(parsed_data, feature_types)
         _validate_lstm_numeric_columns(parsed_data, feature_types)
-        if effective_forecast_strategy == DIRECT_FORECAST_STRATEGY and fit_forecast_horizon > 0:
-            model, preprocessor, history_df = _fit_direct_model(
-                parsed_data,
-                feature_types,
-                range(ts, te + 1),
-                look_back,
-                epochs,
-                normalization,
-                fit_forecast_horizon,
-            )
-        else:
-            model, preprocessor, history_df = _fit_autoregressive_model(
-                parsed_data,
-                feature_types,
-                range(ts, te + 1),
-                look_back,
-                epochs,
-                normalization,
-            )
+        (
+            model,
+            preprocessor,
+            history_df,
+            derived_config,
+            uncertainty_profile,
+            uncertainty_summary,
+        ) = _fit_direct_model(
+            parsed_data,
+            feature_types,
+            range(ts, te + 1),
+            normalization,
+            fit_forecast_horizon,
+        )
 
         keras_model_path = os.path.splitext(save_path)[0] + "_keras_model.h5"
         temp_keras_model_path = os.path.splitext(save_path)[0] + f"_keras_model.tmp-{os.getpid()}.h5"
@@ -822,16 +918,10 @@ def run(args) -> None:
                 except OSError:
                     pass
 
-        std_dev_residuals = float(
-            state.get(
-                "std_dev_residuals",
-                _estimate_std_dev([], parsed_data.df[parsed_data.target_key].values[ts : te + 1]),
-            )
-        )
+        std_dev_residuals = float(uncertainty_profile[0])
         next_state = {
             "model_type": MODEL_TYPE,
-            "look_back": look_back,
-            "epochs": epochs,
+            "look_back": int(derived_config["look_back"]),
             "normalization": normalization,
             "train_end_index": te,
             "preprocessor": preprocessor,
@@ -840,34 +930,49 @@ def run(args) -> None:
             "feature_keys": parsed_data.feature_keys,
             "feature_types": feature_types,
             "keras_model_path": keras_model_path,
-            "forecast_horizon": (
-                fit_forecast_horizon
-                if effective_forecast_strategy == DIRECT_FORECAST_STRATEGY and fit_forecast_horizon > 0
-                else 0
-            ),
-            "forecast_strategy": effective_forecast_strategy,
+            "forecast_horizon": fit_forecast_horizon,
+            "forecast_strategy": DIRECT_FORECAST_STRATEGY,
             "production_forecast_horizon": desired_forecast_horizon,
             "std_dev_residuals": std_dev_residuals,
+            "derived_config": derived_config,
+            "uncertainty_profile": uncertainty_profile,
+            "uncertainty_summary": uncertainty_summary,
+            "reference_series": parsed_data.df[parsed_data.target_key].values[ts : te + 1].tolist(),
             "prediction_domain": prediction_domain,
         }
-        output_strategy, output_notes = _metadata_for_strategy(effective_forecast_strategy)
+        output_strategy, output_notes = _metadata_for_strategy(DIRECT_FORECAST_STRATEGY)
         attach_method_metadata(next_state, METHOD_NAME, output_strategy, output_notes)
         dump_model(next_state, save_path)
 
         out: Dict[str, Any] = {
             "mode": "lstm_fit_only",
-            "look_back": look_back,
-            "epochs": epochs,
             "normalization": normalization,
             "train_end_index": te,
             "target_key": parsed_data.target_key,
             "feature_keys": parsed_data.feature_keys,
             "feature_types": feature_types,
             "saved_model": save_path,
+            "forecast_horizon": fit_forecast_horizon,
+            "training_regime": derived_config["regime"],
+            "uncertainty_summary": uncertainty_summary,
         }
+        fit_predict_steps = int(getattr(args, "fit_predict_steps", 0) or 0)
+        if fit_predict_steps > 0:
+            preds, resolved_profile = predict(
+                save_path,
+                fit_predict_steps,
+                state=next_state,
+                allow_negative_predictions=bool(getattr(args, "allow_negative_predictions", False)),
+            )
+            _, resolved_summary = profile_for_steps(
+                next_state["uncertainty_profile"],
+                fit_predict_steps,
+                next_state["reference_series"],
+                next_state["uncertainty_summary"],
+            )
+            out["forecast_steps"] = fit_predict_steps
+            out["predictions"] = _format_predictions(preds, resolved_profile, resolved_summary)
         attach_method_metadata(out, METHOD_NAME, output_strategy, output_notes)
-        if fit_forecast_horizon > 0:
-            out["forecast_horizon"] = fit_forecast_horizon
         out["logs"] = get_log_contents()
         print(json.dumps(out, ensure_ascii=False, indent=2 if pretty else None))
         return
@@ -881,22 +986,36 @@ def run(args) -> None:
             raise ValueError("[VALIDATION] --forecast_steps must be > 0.")
 
         log.info(f"Starting prediction with {steps} forecast steps")
-        preds, std_dev = predict(
-            load_path,
-            steps,
-            state=state,
-            allow_negative_predictions=bool(getattr(args, "allow_negative_predictions", False)),
-        )
-        predictions_with_std = _format_predictions(preds, std_dev)
+        prepared = state.get("prepared_predictions")
+        if (
+            not bool(getattr(args, "allow_negative_predictions", False))
+            and isinstance(prepared, list)
+            and len(prepared) >= steps
+        ):
+            predictions_with_std = [dict(point) for point in prepared[:steps]]
+        else:
+            preds, profile = predict(
+                load_path,
+                steps,
+                state=state,
+                allow_negative_predictions=bool(getattr(args, "allow_negative_predictions", False)),
+            )
+            _, resolved_uncertainty_summary = profile_for_steps(
+                state.get("uncertainty_profile"),
+                steps,
+                state.get("reference_series") or [],
+                state.get("uncertainty_summary") or {},
+            )
+            predictions_with_std = _format_predictions(preds, profile, resolved_uncertainty_summary)
 
         out: Dict[str, Any] = {
             "mode": "lstm_loaded_predict",
-            "look_back": state["look_back"],
             "train_end_index": state["train_end_index"],
             "target_key": state.get("target_key"),
             "feature_keys": state.get("feature_keys"),
             "forecast_steps": steps,
             "predictions": predictions_with_std,
+            "uncertainty_summary": state.get("uncertainty_summary"),
         }
         output_strategy, output_notes = _metadata_for_strategy(str(state.get("forecast_strategy", LEGACY_FORECAST_STRATEGY)))
         attach_method_metadata(out, METHOD_NAME, output_strategy, output_notes)
@@ -951,62 +1070,62 @@ def run(args) -> None:
         ts, te = int(args.train_start), int(args.train_end)
         es, ee = int(args.eval_start), int(args.eval_end)
 
-        look_back_arg = getattr(args, "look_back", None)
-        epochs_arg = getattr(args, "epochs", None)
-
-        # Auto-select look_back and epochs based on training data size (for educational small datasets)
-        train_size = te - ts + 1
-        if look_back_arg is not None:
-            look_back = int(look_back_arg)
-        else:
-            look_back = max(3, min(12, train_size // 4))
-            log.info(f"Auto-selected look_back={look_back} based on train_size={train_size}")
-
-        if epochs_arg is not None:
-            epochs = int(epochs_arg)
-        else:
-            epochs = 20  # Default as per client requirements
-            log.info(f"Using default epochs={epochs}")
-
         normalization_arg = getattr(args, "normalization", None)
         normalization = normalization_arg if normalization_arg is not None else 'minmax'
-        log.debug(f"Training params: look_back={look_back}, epochs={epochs}, normalization='{normalization}'")
+        log.debug(f"Training params: normalization='{normalization}'")
 
-        _validate_training_args(parsed_data, ts, te, es, ee, look_back)
+        _validate_training_args(parsed_data, ts, te, es, ee)
         prediction_domain = resolve_prediction_domain(
             allow_negative_predictions=bool(getattr(args, "allow_negative_predictions", False)),
         )
 
         log.info("Starting model training and evaluation...")
-        metrics, model, preprocessor, y_true, y_pred, std_dev_residuals, history_df = train_and_evaluate(
+        (
+            metrics,
+            model,
+            preprocessor,
+            y_true,
+            y_pred,
+            std_dev_residuals,
+            history_df,
+            derived_config,
+            uncertainty_profile,
+            uncertainty_summary,
+        ) = train_and_evaluate(
             parsed_data,
             feature_types,
             range(ts, te + 1),
             range(es, ee + 1),
-            look_back,
-            epochs,
             normalization,
             months,
             prediction_domain,
         )
         log.info(f"Training finished. Metrics: {metrics}")
 
-        predictions_with_std = _format_predictions(y_pred, std_dev_residuals)
+        forecast_offset = es - te - 1
+        evaluation_profile = uncertainty_profile[
+            forecast_offset : forecast_offset + len(y_pred)
+        ]
+        predictions_with_std = _format_predictions(
+            y_pred,
+            evaluation_profile,
+            {**uncertainty_summary, "horizon_start": forecast_offset + 1},
+        )
 
         out: Dict[str, Any] = {
             "mode": "lstm_train_eval",
             "data_points": parsed_data.n_obs,
             "target_key": parsed_data.target_key,
             "feature_types": feature_types,
-            "look_back": look_back,
-            "epochs": epochs,
             "normalization": normalization,
             "forecast_horizon": metrics.get("forecast_horizon"),
+            "training_regime": derived_config["regime"],
             "train_range": {"start_index": ts, "end_index": te},
             "evaluate_range": {"start_index": es, "end_index": ee},
             "metrics": metrics,
             "eval_y_true": y_true,
             "predictions": predictions_with_std,
+            "uncertainty_summary": uncertainty_summary,
         }
         attach_method_metadata(out, METHOD_NAME, DIRECT_FORECAST_STRATEGY, DIRECT_IMPLEMENTATION_NOTES)
 
@@ -1027,8 +1146,7 @@ def run(args) -> None:
 
             state = {
                 "model_type": MODEL_TYPE,
-                "look_back": look_back,
-                "epochs": epochs,
+                "look_back": int(derived_config["look_back"]),
                 "normalization": normalization,
                 "train_end_index": te,
                 "preprocessor": preprocessor,
@@ -1043,6 +1161,10 @@ def run(args) -> None:
                     eval_forecast_horizon=int(metrics.get("forecast_horizon", 0) or 0)
                 ),
                 "std_dev_residuals": std_dev_residuals,
+                "derived_config": derived_config,
+                "uncertainty_profile": uncertainty_profile,
+                "uncertainty_summary": uncertainty_summary,
+                "reference_series": parsed_data.df[parsed_data.target_key].values[ts : te + 1].tolist(),
                 "prediction_domain": prediction_domain,
             }
             attach_method_metadata(state, METHOD_NAME, DIRECT_FORECAST_STRATEGY, DIRECT_IMPLEMENTATION_NOTES)
@@ -1071,28 +1193,22 @@ def _validate_fit_args(
     forecast_horizon: int = 0,
     forecast_strategy: str = DIRECT_FORECAST_STRATEGY,
 ) -> None:
+    """Validate only public fit boundaries; hidden look-back is re-derived later."""
     n = parsed_data.n_obs
 
     if not (0 <= ts <= te < n):
         raise ValueError(f"[VALIDATION] Invalid train range: [{ts},{te}], must be within [0, {n-1}]")
-    if look_back < 1:
-        raise ValueError("[VALIDATION] look_back must be >= 1.")
-    if te - ts + 1 <= look_back:
-        raise ValueError("[VALIDATION] Training range must be larger than look_back.")
-    if forecast_strategy == DIRECT_FORECAST_STRATEGY and forecast_horizon > 0:
-        if te - ts + 1 < look_back + forecast_horizon:
-            raise ValueError(
-                "[VALIDATION] Training range is too short for the saved LSTM direct forecast horizon."
-            )
+    if forecast_strategy == DIRECT_FORECAST_STRATEGY and forecast_horizon < 1:
+        raise ValueError("[VALIDATION] LSTM direct forecast horizon must be at least 1.")
 
 
 def _validate_training_args(
-    parsed_data: ParsedData, ts: int, te: int, es: int, ee: int, look_back: int
+    parsed_data: ParsedData, ts: int, te: int, es: int, ee: int
 ) -> None:
     """
     Validate training and evaluation parameters for LSTM.
     """
-    log.debug(f"Validating training arguments: ts={ts}, te={te}, es={es}, ee={ee}, look_back={look_back}")
+    log.debug(f"Validating training arguments: ts={ts}, te={te}, es={es}, ee={ee}")
     n = parsed_data.n_obs
     log.debug(f"Total data points: {n}")
 
@@ -1105,31 +1221,14 @@ def _validate_training_args(
     if es <= te:
         log.error(f"Evaluation start {es} must be after training end {te}")
         raise ValueError(f"[VALIDATION] Evaluation start ({es}) must be after training end ({te}).")
-    if look_back < 1:
-        log.error(f"look_back {look_back} must be >= 1")
-        raise ValueError("[VALIDATION] look_back must be >= 1.")
-    if te - ts + 1 <= look_back:
-        log.error(f"Training range size {te - ts + 1} must be larger than look_back {look_back}")
-        raise ValueError("[VALIDATION] Training range must be larger than look_back.")
     forecast_horizon = ee - te
-    if te - ts + 1 < look_back + forecast_horizon:
-        log.error(
-            "Training range size %s is too short for look_back=%s and forecast_horizon=%s",
-            te - ts + 1,
-            look_back,
-            forecast_horizon,
-        )
-        raise ValueError(
-            "[VALIDATION] Training range must contain at least look_back + forecast horizon points."
-        )
 
     # Additional helpful validations
     train_size = te - ts + 1
     eval_size = ee - es + 1
     log.info(
-        "Validation passed: train_size=%s, eval_size=%s, look_back=%s, forecast_horizon=%s",
+        "Validation passed: train_size=%s, eval_size=%s, forecast_horizon=%s",
         train_size,
         eval_size,
-        look_back,
         forecast_horizon,
     )

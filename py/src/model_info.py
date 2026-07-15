@@ -3,12 +3,16 @@
 from typing import Any, Dict, Iterable, List
 
 
+MODEL_ALGORITHM_REVISION = 3
+
+
 def method_metadata(
     method_name: str,
     forecast_strategy: str,
     implementation_notes: Iterable[str],
 ) -> Dict[str, Any]:
     return {
+        "algorithm_revision": MODEL_ALGORITHM_REVISION,
         "method_name": method_name,
         "forecast_strategy": forecast_strategy,
         "implementation_notes": list(implementation_notes),
@@ -31,6 +35,11 @@ def ensure_state_metadata(
     forecast_strategy: str,
     implementation_notes: Iterable[str],
 ) -> Dict[str, Any]:
+    if state.get("algorithm_revision") != MODEL_ALGORITHM_REVISION:
+        raise ValueError(
+            "[MODEL] Model artifact was created by an obsolete algorithm revision; "
+            "retrain the model before reuse."
+        )
     state.setdefault("method_name", method_name)
     state.setdefault("forecast_strategy", forecast_strategy)
     notes: List[str] = list(implementation_notes)

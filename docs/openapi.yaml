@@ -352,7 +352,6 @@ components:
             - type: string
               minLength: 1
             - type: array
-              minItems: 1
               items:
                 type: string
                 minLength: 1
@@ -407,7 +406,6 @@ components:
                 - type: string
                   minLength: 1
                 - type: array
-                  minItems: 1
                   items:
                     type: string
                     minLength: 1
@@ -418,7 +416,7 @@ components:
               type: string
               enum: [minmax, zscore]
 
-    EnsembleTrainRequest:
+    EnsembleWithoutLstmTrainRequest:
       allOf:
         - $ref: '#/components/schemas/ModelTrainRequestBase'
         - type: object
@@ -427,6 +425,44 @@ components:
             models:
               type: string
               minLength: 1
+              maxLength: 64
+              description: 以逗号分隔的至少两个、不重复的基础模型；此分支不得包含 LSTM。
+              not:
+                pattern: '(^|,)\s*lstm\s*(,|$)'
+
+    EnsembleWithLstmTrainRequest:
+      allOf:
+        - $ref: '#/components/schemas/ModelTrainRequestBase'
+        - type: object
+          required: [models, lstmFeatures, lstmTargetFeature, lstmNormalization]
+          properties:
+            models:
+              type: string
+              minLength: 1
+              maxLength: 64
+              description: 以逗号分隔的至少两个、不重复的基础模型，且包含 LSTM。
+              pattern: '(^|,)\s*lstm\s*(,|$)'
+            lstmFeatures:
+              description: 显式选择的 LSTM 外生特征；空数组表示仅使用目标序列，不会自动选择全部特征。
+              oneOf:
+                - type: string
+                  minLength: 1
+                - type: array
+                  items:
+                    type: string
+                    minLength: 1
+            lstmTargetFeature:
+              type: string
+              minLength: 1
+              maxLength: 255
+            lstmNormalization:
+              type: string
+              enum: [minmax, zscore]
+
+    EnsembleTrainRequest:
+      oneOf:
+        - $ref: '#/components/schemas/EnsembleWithoutLstmTrainRequest'
+        - $ref: '#/components/schemas/EnsembleWithLstmTrainRequest'
 
     ModelTrainRequest:
       description: 请求体要求取决于路径参数 `model_type`。
@@ -464,7 +500,73 @@ components:
           minimum: 1
           maximum: 12
 
-    ModelOperationResponse:
+    ProductionPredictionPoint:
+      type: object
+      required:
+        - prediction
+        - std_dev
+        - upper_error_p99
+        - uncertainty_source
+        - calibration_mean_error
+        - calibration_count
+      properties:
+        prediction:
+          type: number
+          minimum: 0
+        std_dev:
+          type: number
+          minimum: 0
+          description: 客户安全库存公式使用的中心化误差标准差。
+        upper_error_p99:
+          type: number
+          minimum: 0
+          description: 生产容量场景使用的单侧 P99 误差偏移。
+        uncertainty_source:
+          type: string
+          enum: [model, empirical, fallback]
+        uncertainty_reason:
+          type: string
+        calibration_source:
+          type: string
+          minLength: 1
+        calibration_mean_error:
+          type: number
+          nullable: true
+          description: 与 calibration_count 同时为 null，或同时提供有效校准诊断。
+        calibration_count:
+          type: integer
+          minimum: 1
+          nullable: true
+          description: 与 calibration_mean_error 同时为 null，或同时提供有效校准诊断。
+        interval_lower:
+          type: number
+        interval_upper:
+          type: number
+        interval_level:
+          type: number
+          enum: [0.95]
+        interval_kind:
+          type: string
+          minLength: 1
+
+    ProductionPredictionResults:
+      type: object
+      required: [predictions]
+      properties:
+        predictions:
+          type: array
+          minItems: 1
+          maxItems: 12
+          items:
+            $ref: '#/components/schemas/ProductionPredictionPoint'
+        method_name:
+          type: string
+        forecast_strategy:
+          type: string
+        implementation_notes:
+          type: string
+
+    ModelPredictionResponsePayload:
       type: object
       required: [status, results]
       properties:
@@ -472,8 +574,15 @@ components:
           type: string
           enum: [success]
         results:
-          type: object
-          additionalProperties: true
+          $ref: '#/components/schemas/ProductionPredictionResults'
+
+    ModelPredictionResponse:
+      type: object
+      description: 全局成功响应中间件会把模型预测 payload 包装在 data 字段内。
+      required: [data]
+      properties:
+        data:
+          $ref: '#/components/schemas/ModelPredictionResponsePayload'
 
     GuidedTrainingSession:
       type: object
@@ -524,6 +633,65 @@ components:
     GuidedTrainingSessionResponse:
       allOf:
         - $ref: '#/components/schemas/GuidedTrainingSession'
+
+    ProductionPreparationStep:
+      type: object
+      required: [id, label]
+      properties:
+        id:
+          type: string
+          minLength: 1
+        label:
+          type: string
+          minLength: 1
+
+    ProductionPreparationSessionResponse:
+      type: object
+      required: [status, results]
+      properties:
+        status:
+          type: string
+          enum: [success]
+        results:
+          type: object
+          required:
+            - session_id
+            - session_status
+            - completed_step_ids
+            - total_steps
+            - next_step
+            - error_message
+          properties:
+            session_id:
+              type: string
+              format: uuid
+            session_status:
+              type: string
+              enum: [ready, running, failed, completed, superseded]
+            completed_step_ids:
+              type: array
+              items:
+                type: string
+            total_steps:
+              type: integer
+              minimum: 2
+            next_step:
+              type: object
+              allOf:
+                - $ref: '#/components/schemas/ProductionPreparationStep'
+              nullable: true
+            error_message:
+              type: string
+              nullable: true
+            preparation_token:
+              type: string
+              format: uuid
+            prepared_forecast_steps:
+              type: integer
+              minimum: 1
+              maximum: 12
+            reused_existing:
+              type: boolean
 
     AcademicTerm:
       type: object
@@ -2398,11 +2566,12 @@ paths:
               schema:
                 $ref: '#/components/schemas/ErrorResponse'
 
-  /api/v1/models/{model_type}/prepare-production:
+  /api/v1/models/{model_type}/production-preparation/sessions:
     post:
       tags: [Models]
-      summary: 准备生产预测模型
-      operationId: prepareModelForProduction
+      summary: 创建或恢复生产准备会话
+      operationId: createOrResumeProductionPreparationSession
+      description: 创建可恢复的生产模型准备会话。融合模型会在初始化后按成员或 boosting 阶段展开工作项；此接口本身不启动模型子进程。
       security:
         - bearerAuth: []
       parameters:
@@ -2415,11 +2584,11 @@ paths:
               $ref: '#/components/schemas/ModelPrepareProductionRequest'
       responses:
         '200':
-          description: 准备成功
+          description: 会话创建或恢复成功
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/ModelOperationResponse'
+                $ref: '#/components/schemas/ProductionPreparationSessionResponse'
         '400':
           description: 参数错误或模型尚未满足生产准备条件
           content:
@@ -2439,7 +2608,87 @@ paths:
               schema:
                 $ref: '#/components/schemas/ErrorResponse'
         '409':
-          description: 同一实验下该模型已有训练/预测任务在执行
+          description: 训练版本或已有会话已失效
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '504':
+          description: 会话创建超过服务端时限
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /api/v1/models/{model_type}/production-preparation/sessions/{session_id}:
+    get:
+      tags: [Models]
+      summary: 获取生产准备会话
+      operationId: getProductionPreparationSession
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/modelType'
+        - $ref: '#/components/parameters/sessionId'
+      responses:
+        '200':
+          description: 成功
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ProductionPreparationSessionResponse'
+        '403':
+          description: 权限不足
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '404':
+          description: 会话不存在
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /api/v1/models/{model_type}/production-preparation/sessions/{session_id}/steps/{step_id}/run:
+    post:
+      tags: [Models]
+      summary: 执行一个生产准备步骤
+      operationId: runProductionPreparationStep
+      description: 每个请求最多运行一个基础模型成员或一个 boosting 阶段，并在成功后提交可恢复 checkpoint。
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/modelType'
+        - $ref: '#/components/parameters/sessionId'
+        - $ref: '#/components/parameters/stepId'
+      responses:
+        '200':
+          description: 步骤完成，返回更新后的会话
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ProductionPreparationSessionResponse'
+        '400':
+          description: 参数、checkpoint receipt 或 Python 输入无效
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '403':
+          description: 权限不足
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '404':
+          description: 会话不存在
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '409':
+          description: 步骤乱序、来源版本变化或同一模型正在执行其他操作
           content:
             application/json:
               schema:
@@ -2457,7 +2706,7 @@ paths:
               schema:
                 $ref: '#/components/schemas/ErrorResponse'
         '504':
-          description: 准备超时
+          description: 当前步骤执行超时；可重试同一步骤
           content:
             application/json:
               schema:
@@ -2484,7 +2733,7 @@ paths:
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/ModelOperationResponse'
+                $ref: '#/components/schemas/ModelPredictionResponse'
         '400':
           description: 参数错误
           content:

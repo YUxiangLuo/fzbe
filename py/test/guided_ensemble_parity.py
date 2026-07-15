@@ -17,8 +17,10 @@ sys.path.insert(0, str(TEST_ROOT))
 from guided_standalone_parity import (  # noqa: E402
     LSTM_FEATURES,
     LSTM_FIXTURE,
+    assert_calibration_diagnostics,
     load_fixture,
     maximum_delta,
+    maximum_optional_delta,
     run_json,
 )
 
@@ -98,13 +100,18 @@ def train_base_models(data: str, temp_path: Path) -> dict[str, str]:
     return base_files
 
 
-def ensemble_args(data: str, save_model: Path, base_files: dict[str, str]) -> list[str]:
+def ensemble_args(
+    data: str,
+    save_model: Path,
+    base_files: dict[str, str],
+    evaluation_range: tuple[int, int] = EVAL_RANGE,
+) -> list[str]:
     return [
         "--data", data,
         "--train-start", str(TRAIN_RANGE[0]),
         "--train-end", str(TRAIN_RANGE[1]),
-        "--eval-start", str(EVAL_RANGE[0]),
-        "--eval-end", str(EVAL_RANGE[1]),
+        "--eval-start", str(evaluation_range[0]),
+        "--eval-end", str(evaluation_range[1]),
         "--models", ",".join(MODELS),
         "--base-model-files", json.dumps(base_files),
         "--window", "4",
@@ -121,6 +128,14 @@ def ensemble_args(data: str, save_model: Path, base_files: dict[str, str]) -> li
         "--max-rounds", "1",
         "--save-model", str(save_model),
     ]
+
+
+def shift_evaluation_truth(data: str) -> str:
+    """Change only independent evaluation labels, leaving all training inputs intact."""
+    records = json.loads(data)
+    for index in range(EVAL_RANGE[0], EVAL_RANGE[1] + 1):
+        records[index]["销售数量"] = float(records[index]["销售数量"]) + 10_000.0
+    return json.dumps(records, ensure_ascii=False)
 
 
 def train_guided(
@@ -173,6 +188,8 @@ def compare_results(
     for key in ("mode", "models", "method_name", "forecast_strategy", "implementation_notes", "eval_y_true"):
         if regular.get(key) != guided.get(key):
             raise AssertionError(f"{model_type}.{key} differs")
+    assert_calibration_diagnostics(regular.get("predictions"), f"regular {model_type}")
+    assert_calibration_diagnostics(guided.get("predictions"), f"guided {model_type}")
 
     deltas = {
         "metrics": maximum_delta(
@@ -190,7 +207,56 @@ def compare_results(
             [point["std_dev"] for point in guided["predictions"]],
             f"{model_type}.std_dev",
         ),
+        "interval_lower": maximum_delta(
+            [point["interval_lower"] for point in regular["predictions"]],
+            [point["interval_lower"] for point in guided["predictions"]],
+            f"{model_type}.interval_lower",
+        ),
+        "interval_upper": maximum_delta(
+            [point["interval_upper"] for point in regular["predictions"]],
+            [point["interval_upper"] for point in guided["predictions"]],
+            f"{model_type}.interval_upper",
+        ),
+        "upper_error_p99": maximum_delta(
+            [point["upper_error_p99"] for point in regular["predictions"]],
+            [point["upper_error_p99"] for point in guided["predictions"]],
+            f"{model_type}.upper_error_p99",
+        ),
+        "calibration_mean_error": maximum_optional_delta(
+            [point.get("calibration_mean_error") for point in regular["predictions"]],
+            [point.get("calibration_mean_error") for point in guided["predictions"]],
+            f"{model_type}.calibration_mean_error",
+        ),
+        "calibration_count": maximum_optional_delta(
+            [point.get("calibration_count") for point in regular["predictions"]],
+            [point.get("calibration_count") for point in guided["predictions"]],
+            f"{model_type}.calibration_count",
+        ),
     }
+
+    expected_calibration_source = (
+        "level1_holdout" if model_type == "stacking" else "internal_validation"
+    )
+    for label, result in (("regular", regular), ("guided", guided)):
+        for index, point in enumerate(result["predictions"]):
+            if point.get("calibration_source") != expected_calibration_source:
+                raise AssertionError(
+                    f"{label} {model_type}.predictions[{index}] uses "
+                    f"{point.get('calibration_source')!r} rather than "
+                    f"{expected_calibration_source!r}"
+                )
+            if point.get("interval_level") != 0.95:
+                raise AssertionError(
+                    f"{label} {model_type}.predictions[{index}] has an invalid interval level"
+                )
+            if point.get("interval_kind") != "empirical_residual_quantile":
+                raise AssertionError(
+                    f"{label} {model_type}.predictions[{index}] has an invalid interval kind"
+                )
+            if point["interval_lower"] > point["interval_upper"]:
+                raise AssertionError(
+                    f"{label} {model_type}.predictions[{index}] has reversed interval bounds"
+                )
 
     if model_type == "weighted_avg":
         deltas["weights"] = maximum_delta(
@@ -201,10 +267,10 @@ def compare_results(
     elif model_type == "stacking":
         if regular["meta_model"]["strategy"] != guided["meta_model"]["strategy"]:
             raise AssertionError("stacking.meta_model.strategy differs")
-        deltas["weights"] = maximum_delta(
-            regular["meta_model"]["weights"],
-            guided["meta_model"]["weights"],
-            "stacking.meta_model.weights",
+        deltas["coefficients"] = maximum_delta(
+            regular["meta_model"]["coefficients"],
+            guided["meta_model"]["coefficients"],
+            "stacking.meta_model.coefficients",
         )
     else:
         for key in ("model_chain", "stage_coefficients"):
@@ -230,12 +296,14 @@ def compare_loaded_predictions(model_type: str, regular_model: Path, guided_mode
             ],
             f"{label} {model_type} loaded prediction",
         )
+        assert_calibration_diagnostics(result.get("predictions"), f"loaded {label} {model_type}")
         predictions.append([point["prediction"] for point in result["predictions"]])
     return maximum_delta(predictions[0], predictions[1], f"loaded {model_type}.predictions")
 
 
 def main() -> None:
     data = load_fixture(LSTM_FIXTURE)
+    shifted_eval_data = shift_evaluation_truth(data)
     summary: dict[str, Any] = {}
     with tempfile.TemporaryDirectory(prefix="fangzhen-guided-ensemble-parity-") as temp_dir:
         temp_path = Path(temp_dir)
@@ -250,6 +318,68 @@ def main() -> None:
                 [sys.executable, str(RUN_MODEL), model_type, *regular_args],
                 f"regular {model_type}",
             )
+            contiguous_eval_range = (TRAIN_RANGE[1] + 1, EVAL_RANGE[1])
+            contiguous_model = temp_path / f"contiguous-eval-{model_type}.pkl"
+            contiguous_eval = run_json(
+                [
+                    sys.executable,
+                    str(RUN_MODEL),
+                    model_type,
+                    *ensemble_args(
+                        data,
+                        contiguous_model,
+                        base_files,
+                        contiguous_eval_range,
+                    ),
+                ],
+                f"contiguous-eval {model_type}",
+            )
+            overlap_offset = EVAL_RANGE[0] - contiguous_eval_range[0]
+            contiguous_overlap = contiguous_eval["predictions"][overlap_offset:]
+            evaluation_slice_invariance = {
+                key: maximum_delta(
+                    [point[key] for point in regular["predictions"]],
+                    [point[key] for point in contiguous_overlap],
+                    f"{model_type}.evaluation_slice_invariant_{key}",
+                )
+                for key in ("prediction", "std_dev", "interval_lower", "interval_upper")
+            }
+            for label, delta in evaluation_slice_invariance.items():
+                if delta > TOLERANCE:
+                    raise AssertionError(
+                        f"{model_type}.{label} changed by {delta} when only the "
+                        "evaluation slice start changed"
+                    )
+            shifted_eval_model = temp_path / f"shifted-eval-{model_type}.pkl"
+            shifted_eval = run_json(
+                [
+                    sys.executable,
+                    str(RUN_MODEL),
+                    model_type,
+                    *ensemble_args(shifted_eval_data, shifted_eval_model, base_files),
+                ],
+                f"shifted-eval {model_type}",
+            )
+            if regular["eval_y_true"] == shifted_eval["eval_y_true"]:
+                raise AssertionError(f"{model_type} evaluation-truth fixture was not shifted")
+            eval_truth_independence = {
+                "predictions": maximum_delta(
+                    [point["prediction"] for point in regular["predictions"]],
+                    [point["prediction"] for point in shifted_eval["predictions"]],
+                    f"{model_type}.eval_truth_independent_predictions",
+                ),
+                "std_dev": maximum_delta(
+                    [point["std_dev"] for point in regular["predictions"]],
+                    [point["std_dev"] for point in shifted_eval["predictions"]],
+                    f"{model_type}.eval_truth_independent_std_dev",
+                ),
+            }
+            for label, delta in eval_truth_independence.items():
+                if delta > TOLERANCE:
+                    raise AssertionError(
+                        f"{model_type}.{label} changed by {delta} when only independent "
+                        "evaluation labels changed"
+                    )
             guided = train_guided(model_type, guided_args, temp_path)
             deltas = compare_results(model_type, regular, guided)
             loaded_delta = compare_loaded_predictions(model_type, regular_model, guided_model)
@@ -260,6 +390,8 @@ def main() -> None:
             summary[model_type] = {
                 "training": deltas,
                 "loaded_predictions": loaded_delta,
+                "evaluation_truth_independence": eval_truth_independence,
+                "evaluation_slice_invariance": evaluation_slice_invariance,
             }
 
     print(json.dumps({"ensembles": summary, "status": "ok"}, ensure_ascii=False, indent=2))

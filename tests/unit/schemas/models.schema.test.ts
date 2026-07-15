@@ -166,6 +166,35 @@ describe("Models Schemas", () => {
         models: "ma,es",
       }).success).toBe(true);
     });
+
+    test("should require explicit LSTM configuration for every ensemble and preserve target-only selection", () => {
+      for (const modelType of ["weighted_avg", "stacking", "boosting"] as const) {
+        const missing = getTrainSchemaForModel(modelType).safeParse({
+          experiment_id: 12,
+          models: "ma,lstm",
+        });
+        expect(missing.success).toBe(false);
+        if (!missing.success) {
+          expect(missing.error.issues.map((issue) => issue.path[0])).toEqual([
+            "lstmFeatures",
+            "lstmTargetFeature",
+            "lstmNormalization",
+          ]);
+        }
+
+        const targetOnly = getTrainSchemaForModel(modelType).safeParse({
+          experiment_id: 12,
+          models: "ma,lstm",
+          lstmFeatures: [],
+          lstmTargetFeature: "销售数量",
+          lstmNormalization: "minmax",
+        });
+        expect(targetOnly.success).toBe(true);
+        if (targetOnly.success) {
+          expect(targetOnly.data.lstmFeatures).toBe("[]");
+        }
+      }
+    });
   });
 
   describe("predictSchema", () => {

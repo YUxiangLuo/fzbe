@@ -25,6 +25,12 @@ from subprocess_utils import (
     run_base_model_fit_subprocess,
     run_base_model_predict_subprocess,
 )
+from uncertainty import format_predictions as format_uncertainty_predictions
+from dynamic_config import (
+    derive_arima_search_limit,
+    derive_lstm_config,
+    plan_internal_holdout,
+)
 
 SUPPORTED_BASE_MODEL_TYPES = frozenset({"ma", "es", "arima", "lstm"})
 
@@ -79,6 +85,26 @@ def parse_feature_name_list(raw_value: Any) -> List[str]:
     return []
 
 
+def require_explicit_lstm_feature_names(
+    raw_value: Any,
+    context: str = "LSTM",
+) -> List[str]:
+    """Parse an explicit LSTM feature selection without inventing defaults.
+
+    An empty JSON/list value is meaningful: it selects a target-only LSTM.  A
+    missing or blank value is ambiguous and must never be interpreted as every
+    dataset column.
+    """
+    if raw_value is None or (
+        isinstance(raw_value, str) and not raw_value.strip()
+    ):
+        raise ValueError(
+            f"[VALIDATION] {context} requires an explicit LSTM feature list; "
+            "use [] for a target-only LSTM."
+        )
+    return parse_feature_name_list(raw_value)
+
+
 def load_lstm_source_state(model_file: str, context: str) -> Dict[str, Any]:
     source_model_state = load_model(model_file)
     if not isinstance(source_model_state, dict) or source_model_state.get("model_type") != "lstm":
@@ -96,10 +122,16 @@ def build_lstm_params_from_source_state(
         or fallback_params.get("lstm_target_feature")
         or parsed_data.target_key
     )
+    raw_feature_keys = source_model_state.get("feature_keys")
+    if not isinstance(raw_feature_keys, list) or any(
+        not isinstance(feature_name, str) or not feature_name.strip()
+        for feature_name in raw_feature_keys
+    ):
+        raise ValueError("Saved LSTM artifact is missing an explicit feature list.")
     feature_keys = [
-        feature_name
-        for feature_name in source_model_state.get("feature_keys", []) or []
-        if feature_name and feature_name != target_feature
+        feature_name.strip()
+        for feature_name in raw_feature_keys
+        if feature_name.strip() != target_feature
     ]
     raw_feature_types = source_model_state.get("feature_types")
     if isinstance(raw_feature_types, dict) and raw_feature_types:
@@ -117,17 +149,14 @@ def build_lstm_params_from_source_state(
     feature_types[target_feature] = "numeric"
 
     params = {
-        "look_back": int(source_model_state["look_back"]),
-        "epochs": int(source_model_state.get("epochs", fallback_params.get("epochs", 20))),
         "feature_types": feature_types,
         "normalization": source_model_state.get(
             "normalization",
             fallback_params.get("normalization", "minmax"),
         ),
         "lstm_target_feature": target_feature,
+        "lstm_features": json.dumps(feature_keys, ensure_ascii=False),
     }
-    if feature_keys:
-        params["lstm_features"] = json.dumps(feature_keys, ensure_ascii=False)
     return params
 
 
@@ -190,69 +219,122 @@ def prepare_lstm_source_model_for_requested_steps(
     return adjusted_source_model_file, adjusted_source_model_file
 
 
-def format_predictions(preds: List[float], std_dev: float = 0.0) -> List[Dict[str, float]]:
-    return [{"prediction": float(prediction), "std_dev": float(std_dev)} for prediction in preds]
+def format_predictions(
+    preds: List[float],
+    std_dev: Any = 0.0,
+    metadata: Optional[Dict[str, Any]] = None,
+) -> List[Dict[str, Any]]:
+    profile = (
+        [float(value) for value in std_dev]
+        if isinstance(std_dev, (list, tuple, np.ndarray))
+        else [float(std_dev)] * len(preds)
+    )
+    return format_uncertainty_predictions(
+        preds,
+        profile,
+        metadata or {"source": "empirical", "fallback": False},
+    )
 
 
-def compute_phase1_train_size(train_size: int) -> int:
-    """Return the chronological internal training size used by all ensembles."""
-    if train_size <= 15:
-        return max(train_size - 3, int(train_size * 0.85))
-    return max(3, int(train_size * 0.8))
+def estimate_lstm_encoded_feature_count(
+    parsed_data: ParsedData,
+    params: Dict[str, Any],
+    train_start: int,
+    prefix_size: int,
+) -> int:
+    target = str(params.get("lstm_target_feature") or parsed_data.target_key)
+    raw_features = require_explicit_lstm_feature_names(
+        params.get("lstm_features") if "lstm_features" in params else None,
+        "LSTM holdout planning",
+    )
+    feature_types = params.get("feature_types") or {}
+    prefix = parsed_data.df.iloc[train_start : train_start + prefix_size]
+    count = 1
+    for feature in raw_features:
+        if feature == target or feature not in prefix.columns:
+            continue
+        if feature_types.get(feature) == "categorical":
+            count += max(1, int(prefix[feature].nunique(dropna=False)))
+        else:
+            count += 1
+    return count
+
+
+def plan_ensemble_internal_holdout(
+    parsed_data: ParsedData,
+    train_range: range,
+    models_to_use: List[str],
+    model_params: Dict[str, Dict[str, Any]],
+    purpose: str,
+) -> Dict[str, Any]:
+    models = validate_base_model_names(models_to_use, purpose.title())
+    for model_name in models:
+        if model_name != "lstm":
+            continue
+        params = model_params.get(model_name, {})
+        require_explicit_lstm_feature_names(
+            params.get("lstm_features") if "lstm_features" in params else None,
+            f"{purpose.title()} holdout planning",
+        )
+
+    def is_feasible(prefix_size: int, validation_size: int) -> bool:
+        try:
+            for model_name in models:
+                params = model_params.get(model_name, {})
+                if model_name == "ma" and prefix_size < int(params.get("window", 0)):
+                    return False
+                if model_name == "es" and prefix_size < 2:
+                    return False
+                if model_name == "arima":
+                    derive_arima_search_limit(prefix_size, int(params.get("d", 0)))
+                if model_name == "lstm":
+                    feature_count = estimate_lstm_encoded_feature_count(
+                        parsed_data,
+                        params,
+                        train_range.start,
+                        prefix_size,
+                    )
+                    derive_lstm_config(prefix_size, validation_size, feature_count)
+            return True
+        except (TypeError, ValueError):
+            return False
+
+    return plan_internal_holdout(
+        purpose,
+        len(train_range),
+        len(models),
+        is_feasible,
+    )
 
 
 def can_refit_source_artifact_for_internal_holdout(model_name: str) -> bool:
     """Whether fit-only can safely refit directly from the source artifact.
 
     MA and ES artifacts contain fixed user parameters, while LSTM fit-only mode
-    carries over the user-facing feature/training configuration and rebuilds its
-    dynamic structure on the shorter prefix.  An ARIMA artifact additionally
+    carries over only user-facing feature/normalization choices and rebuilds all
+    hidden configuration on the shorter prefix. An ARIMA artifact additionally
     contains p and q selected using the complete training range; reusing those
     orders would let the internal holdout influence its own prediction.  ARIMA
-    therefore reruns the same fixed-d AIC/BIC search on the prefix.
+    therefore reruns the same fixed-d AICc search on the prefix.
     """
     return model_name in {"ma", "es", "lstm"}
 
 
-def validate_internal_split_base_params(
-    models_to_use: List[str],
-    model_params: Dict[str, Dict[str, Any]],
-    train_size: int,
-    context: str,
-) -> int:
-    phase1_size = compute_phase1_train_size(train_size)
-    if "ma" in models_to_use:
-        window = int(model_params.get("ma", {}).get("window", 0))
-        if window > phase1_size:
-            raise ValueError(
-                f"[VALIDATION] MA window ({window}) exceeds the {context} internal "
-                f"training split ({phase1_size} points)."
-            )
-    if "arima" in models_to_use:
-        d = int(model_params.get("arima", {}).get("d", 0))
-        if phase1_size < d + 2:
-            raise ValueError(
-                f"[VALIDATION] {context} internal training split ({phase1_size} points) "
-                f"must contain at least d + 2 points for ARIMA (d={d})."
-            )
-    return phase1_size
-
-
 def estimate_residual_std(
-    primary_residuals: Any,
-    fallback_residuals: Any = None,
+    calibration_residuals: Any,
+    fallback_calibration_residuals: Any = None,
     reference_series: Any = None,
 ) -> float:
-    """Estimate a finite sample residual standard deviation for small holdouts.
+    """Estimate a finite sample scale from training-side calibration residuals.
 
-    The independent evaluation residuals are preferred.  A one-point evaluation
-    cannot identify a sample standard deviation, so ensemble models can fall back
-    to their chronological internal validation residuals.  The reference-series
-    branch is a final small-data fallback consistent with the base models.
+    A one-point calibration segment cannot identify a sample standard deviation,
+    so callers may provide a second chronological training-side residual series.
+    The reference-series branch is the final small-data fallback. Independent
+    evaluation labels must never be supplied to this helper.
     """
     for label, values in (
-        ("evaluation", primary_residuals),
-        ("internal validation", fallback_residuals),
+        ("primary calibration", calibration_residuals),
+        ("fallback calibration", fallback_calibration_residuals),
         ("reference", reference_series),
     ):
         if values is None:
@@ -324,8 +406,8 @@ def resolve_base_model_artifact_configs(
     so invalid paths and states are rejected here.
 
     ARIMA is deliberately special: only the user-fixed differencing order ``d``
-    comes from the artifact.  ``p`` and ``q`` remain search bounds and are selected
-    again on the internal prefix, avoiding holdout leakage from the full-data fit.
+    comes from the artifact. Search bounds and p/q are derived again on each
+    internal prefix, avoiding holdout leakage from the full-data fit.
     """
     selected_models = set(models_to_use)
     canonical_params = {
@@ -392,9 +474,9 @@ def resolve_base_model_artifact_configs(
                 raise ValueError(
                     f"[VALIDATION] {context} ARIMA source artifact is missing d."
                 )
-            fallback_params["d"] = _artifact_integer(
-                artifact_d, f"{context} ARIMA d"
-            )
+            canonical_params[model_name] = {
+                "d": _artifact_integer(artifact_d, f"{context} ARIMA d")
+            }
         else:
             try:
                 canonical_params[model_name] = build_lstm_params_from_source_state(
@@ -420,8 +502,11 @@ def build_ensemble_subprocess_data(
     numeric_data_dicts, _ = build_numeric_subprocess_records(parsed_data)
     lstm_data_dicts = numeric_data_dicts
     if "lstm" in models_to_use:
-        lstm_feature_types = model_params.get("lstm", {}).get("feature_types", {})
-        lstm_feature_keys = [k for k in lstm_feature_types.keys() if k != parsed_data.target_key]
+        lstm_params = model_params.get("lstm", {})
+        lstm_feature_keys = require_explicit_lstm_feature_names(
+            lstm_params.get("lstm_features") if "lstm_features" in lstm_params else None,
+            "Ensemble LSTM member",
+        )
         lstm_data_dicts, _ = build_subprocess_records(parsed_data, feature_keys=lstm_feature_keys)
 
     return numeric_data_dicts, lstm_data_dicts
@@ -486,7 +571,7 @@ def fit_and_predict_from_source_model(
     )
 
     try:
-        run_base_model_fit_subprocess(
+        fit_result = run_base_model_fit_subprocess(
             model_type=model_name,
             data=data,
             train_start=train_start,
@@ -494,15 +579,9 @@ def fit_and_predict_from_source_model(
             source_model_file=source_model_file,
             save_model_file=temp_model_file,
             fit_forecast_steps=forecast_steps if model_name == "lstm" else None,
+            predict_steps=forecast_steps,
             timeout=timeout,
         )
-
-        prediction_result = run_base_model_predict_subprocess(
-            model_type=model_name,
-            model_file=temp_model_file,
-            forecast_steps=forecast_steps,
-            timeout=timeout,
-        )
-        return extract_predictions_from_result(prediction_result)
+        return extract_predictions_from_result(fit_result)
     finally:
         remove_member_model_artifact(model_name, temp_model_file)

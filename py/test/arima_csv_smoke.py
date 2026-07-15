@@ -14,7 +14,7 @@ PY_ROOT = Path(__file__).resolve().parents[1]
 RUN_MODEL = PY_ROOT / "run_model.py"
 CSV_FIXTURE = Path(__file__).resolve().parent / "fixtures" / "core_models_smoke.csv"
 
-from model_metadata_assertions import assert_method_metadata
+from model_metadata_assertions import assert_method_metadata  # noqa: E402
 
 
 def load_csv_records(csv_path: Path) -> list[dict[str, str]]:
@@ -48,7 +48,7 @@ def run_arima(data_json: str, *extra_args: str) -> subprocess.CompletedProcess[s
 
 
 def select_reference_model(series: list[float], d: int, max_p: int, max_q: int):
-    aic_model = pm.auto_arima(
+    return pm.auto_arima(
         series,
         d=d,
         start_p=0,
@@ -59,71 +59,18 @@ def select_reference_model(series: list[float], d: int, max_p: int, max_q: int):
         stepwise=True,
         suppress_warnings=True,
         error_action="ignore",
-        information_criterion="aic",
-        trace=False,
-    )
-    bic_model = pm.auto_arima(
-        series,
-        d=d,
-        start_p=0,
-        start_q=0,
-        max_p=max_p,
-        max_q=max_q,
-        seasonal=False,
-        stepwise=True,
-        suppress_warnings=True,
-        error_action="ignore",
-        information_criterion="bic",
+        information_criterion="aicc",
+        with_intercept="auto",
+        maxiter=50,
         trace=False,
     )
 
-    aic_aic = float(aic_model.aic())
-    aic_bic = float(aic_model.bic())
-    bic_aic = float(bic_model.aic())
-    bic_bic = float(bic_model.bic())
-    train_size = len(series)
 
-    selection_criterion = "aic_optimized"
-    best_model = aic_model
-    selected_model = "aic_optimized"
-    if train_size < 30:
-        if bic_bic < aic_bic:
-            best_model = bic_model
-            selected_model = "bic_optimized"
-            selection_criterion = "bic_preferred_small_sample"
-        elif bic_bic == aic_bic and bic_aic <= aic_aic:
-            best_model = bic_model
-            selected_model = "bic_optimized"
-            selection_criterion = "bic_tie_better_or_equal_aic"
-    else:
-        if bic_aic < aic_aic:
-            best_model = bic_model
-            selected_model = "bic_optimized"
-            selection_criterion = "bic_optimized_better_aic"
-        elif bic_aic == aic_aic and bic_bic < aic_bic:
-            best_model = bic_model
-            selected_model = "bic_optimized"
-            selection_criterion = "bic_tie_aic_better_bic"
-
-    search_summary = {
-        "aic_optimized_model": {
-            "order": {"p": aic_model.order[0], "d": aic_model.order[1], "q": aic_model.order[2]},
-            "aic": aic_aic,
-            "bic": aic_bic,
-        },
-        "bic_optimized_model": {
-            "order": {"p": bic_model.order[0], "d": bic_model.order[1], "q": bic_model.order[2]},
-            "aic": bic_aic,
-            "bic": bic_bic,
-        },
-        "selected_model": selected_model,
-        "selection_criterion": selection_criterion,
-    }
-    return best_model, search_summary
+NORMAL_95 = 1.959963984540054
 
 
 def to_std_devs(conf_intervals: list[list[float]]) -> list[float]:
-    return [float((interval[1] - interval[0]) / 3.92) for interval in conf_intervals]
+    return [float((interval[1] - interval[0]) / (2.0 * NORMAL_95)) for interval in conf_intervals]
 
 
 def assert_series_close(actual: list[float], expected: list[float], tol: float = 1e-6) -> None:
@@ -182,7 +129,7 @@ def main() -> None:
             "--pretty",
         )
 
-        best_model, expected_search_summary = select_reference_model(sales[0:20], d, max_p, max_q)
+        best_model = select_reference_model(sales[0:20], d, max_p, max_q)
         expected_eval_predictions, expected_conf_int = best_model.predict(n_periods=4, return_conf_int=True)
         expected_eval_std = to_std_devs(expected_conf_int.tolist())
 
@@ -199,9 +146,24 @@ def main() -> None:
         assert train_output["best_order"] == expected_best_order
         assert train_output["metrics"]["evaluate_months"] == timestamps[20:24]
         assert train_output["eval_y_true"] == sales[20:24]
-        assert train_output["search_summary"] == expected_search_summary
+        search_summary = train_output["search_summary"]
+        assert search_summary["selection_criterion"] == "aicc"
+        assert search_summary["selected_order"] == expected_best_order
+        assert search_summary["effective_train_size"] == 19
+        assert search_summary["max_p"] == max_p
+        assert search_summary["max_q"] == max_q
+        assert isinstance(search_summary["diagnostics"], dict)
         assert_series_close(actual_eval_predictions, expected_eval_predictions.tolist())
         assert_series_close(actual_eval_std, expected_eval_std)
+        expected_mean_error = sum(
+            actual - predicted
+            for actual, predicted in zip(sales[20:24], actual_eval_predictions)
+        ) / 4
+        assert all(
+            math.isclose(float(point["calibration_mean_error"]), expected_mean_error)
+            and point["calibration_count"] == 4
+            for point in train_output["predictions"]
+        )
 
         gap_output = invoke_arima(
             data_json,
@@ -221,7 +183,7 @@ def main() -> None:
             str(max_q),
             "--pretty",
         )
-        gap_reference, _ = select_reference_model(sales[0:20], d, max_p, max_q)
+        gap_reference = select_reference_model(sales[0:20], d, max_p, max_q)
         gap_predictions, gap_conf_int = gap_reference.predict(
             n_periods=4,
             return_conf_int=True,
@@ -283,6 +245,11 @@ def main() -> None:
         assert predict_output["forecast_steps"] == 3
         assert_series_close(actual_future_predictions, expected_future_predictions.tolist())
         assert_series_close(actual_future_std, expected_future_std)
+        assert all(
+            math.isclose(float(point["calibration_mean_error"]), expected_mean_error)
+            and point["calibration_count"] == 4
+            for point in predict_output["predictions"]
+        )
 
         short_train_result = run_arima(
             data_json,
@@ -300,7 +267,7 @@ def main() -> None:
         )
         assert_error(
             short_train_result,
-            "[VALIDATION] Training range must contain at least d + 2 points for ARIMA fitting (got train_size=2, d=1).",
+            "[VALIDATION] ARIMA requires at least 6 effective training points after differencing (got train_size=2, d=1, effective=1).",
         )
 
         short_fit_result = run_arima(
@@ -318,7 +285,7 @@ def main() -> None:
         )
         assert_error(
             short_fit_result,
-            "[VALIDATION] ARIMA fit-only training range must contain at least d + 2 points for ARIMA fitting (got train_size=2, d=1).",
+            "[VALIDATION] ARIMA requires at least 6 effective training points after differencing (got train_size=2, d=1, effective=1). Context: ARIMA fit-only training range.",
         )
 
     print(

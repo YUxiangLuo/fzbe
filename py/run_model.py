@@ -41,6 +41,11 @@ def main():
         help="Required direct forecast horizon when refitting an artifact",
     )
     parser.add_argument(
+        "--fit-predict-steps",
+        type=int,
+        help="Fit an artifact and return this many forecasts in the same subprocess",
+    )
+    parser.add_argument(
         "--allow-negative-predictions",
         action="store_true",
         help=argparse.SUPPRESS,
@@ -54,11 +59,11 @@ def main():
     parser.add_argument("--alpha", type=float, help="Exponential smoothing alpha value")
     # ARIMA
     parser.add_argument("--d", type=int, help="ARIMA differencing order")
-    parser.add_argument("--max-p", type=int, help="ARIMA max p order for auto_arima")
-    parser.add_argument("--max-q", type=int, help="ARIMA max q order for auto_arima")
+    parser.add_argument("--max-p", type=int, help="Deprecated compatibility flag; the ARIMA p limit is data-derived")
+    parser.add_argument("--max-q", type=int, help="Deprecated compatibility flag; the ARIMA q limit is data-derived")
     # LSTM
-    parser.add_argument("--look-back", type=int, help="LSTM look back window")
-    parser.add_argument("--epochs", type=int, help="LSTM training epochs")
+    parser.add_argument("--look-back", type=int, help="Deprecated compatibility flag; LSTM look-back is data-derived")
+    parser.add_argument("--epochs", type=int, help="Deprecated compatibility flag; LSTM epochs are data-derived")
     parser.add_argument("--feature-types", type=str, help="LSTM feature types as JSON string")
     parser.add_argument("--lstm-features", type=str, help="LSTM feature list as JSON array or legacy comma-separated string")
     parser.add_argument("--lstm-features-json", type=str, help="LSTM feature list as JSON array")
@@ -68,11 +73,12 @@ def main():
     parser.add_argument("--models", type=str, help="Comma-separated list of base models for stacking/weighted_avg/boosting")
     parser.add_argument("--base-model-files", type=str, help="JSON object mapping base model names to saved model artifact paths")
     # Boosting-specific
-    parser.add_argument("--learning-rate", type=float, help="Boosting learning rate (shrinkage parameter)")
-    parser.add_argument("--max-rounds", type=int, help="Boosting maximum number of rounds")
+    parser.add_argument("--learning-rate", type=float, help="Deprecated compatibility flag; Boosting uses line search")
+    parser.add_argument("--max-rounds", type=int, help="Deprecated compatibility flag; Boosting rounds are data-derived")
 
-    # Every supported model argument is declared above. Reject misspelled or stale
-    # flags so a requested teaching parameter can never be silently ignored.
+    # Recognize deprecated hidden-parameter flags so older callers fail safely:
+    # model code deliberately ignores them and derives those values from data.
+    # Truly unknown or misspelled flags are still rejected by argparse.
     args = parser.parse_args()
 
     if args.data_file:

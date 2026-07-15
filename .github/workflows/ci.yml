@@ -43,6 +43,9 @@ jobs:
       - name: Typecheck
         run: bun run typecheck
 
+      - name: Validate OpenAPI contract
+        run: bun run lint:openapi
+
       - name: Run unit tests
         run: bun run test:unit
 
@@ -50,7 +53,7 @@ jobs:
         run: bun audit
 
   python-smoke:
-    name: Four-model lifecycle and parity
+    name: Seven-model lifecycle and parity
     runs-on: ubuntu-latest
     timeout-minutes: 40
     env:
@@ -83,6 +86,9 @@ jobs:
       - name: Verify dataset numeric contract
         run: py/venv/bin/python py/test/data_contract_smoke.py
 
+      - name: Run model review regression tests
+        run: py/venv/bin/python py/test/review_regressions.py
+
       - name: Run moving-average smoke test
         run: py/venv/bin/python py/test/ma_csv_smoke.py
 
@@ -95,5 +101,29 @@ jobs:
       - name: Run LSTM smoke test
         run: py/venv/bin/python py/test/lstm_csv_smoke.py
 
+      - name: Run weighted-average smoke test
+        run: py/venv/bin/python py/test/weighted_avg_csv_smoke.py
+
+      - name: Run stacking smoke test
+        run: py/venv/bin/python py/test/stacking_csv_smoke.py
+
+      - name: Run boosting smoke test
+        run: py/venv/bin/python py/test/boosting_csv_smoke.py
+
+      - name: Run weighted-average with LSTM smoke test
+        run: py/venv/bin/python py/test/weighted_avg_lstm_csv_smoke.py
+
+      - name: Run stacking with LSTM smoke test
+        run: py/venv/bin/python py/test/stacking_lstm_csv_smoke.py
+
+      - name: Run boosting with LSTM smoke test
+        run: py/venv/bin/python py/test/boosting_lstm_csv_smoke.py
+
+      - name: Verify resumable production preparation including LSTM
+        run: py/venv/bin/python py/test/production_preparation_smoke.py
+
       - name: Verify guided and standalone lifecycle parity
         run: py/venv/bin/python py/test/guided_standalone_parity.py
+
+      - name: Verify guided and regular ensemble lifecycle parity
+        run: py/venv/bin/python py/test/guided_ensemble_parity.py

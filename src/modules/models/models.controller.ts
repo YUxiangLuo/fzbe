@@ -9,10 +9,12 @@ import {
 } from "./models.validation";
 import {
   createOrResumeGuidedTrainingSession,
+  createOrResumeProductionPreparationSession,
   discardGuidedTrainingSession,
   getGuidedTrainingSession,
+  getProductionPreparationSession,
   runGuidedTrainingStep,
-  prepareExperimentModelForProduction,
+  runProductionPreparationStep,
   predictExperimentModel,
   ModelValidationError,
   ModelNotFoundError,
@@ -277,7 +279,7 @@ modelsController.post(
 );
 
 modelsController.post(
-  "/api/v1/models/:model_type/prepare-production",
+  "/api/v1/models/:model_type/production-preparation/sessions",
   jwtAuth,
   requireStudent,
   async (c) => {
@@ -303,12 +305,11 @@ modelsController.post(
     const body = validation.data;
 
     try {
-      const result = await prepareExperimentModelForProduction(
+      const result = await createOrResumeProductionPreparationSession(
         modelType,
         payload.sub,
         body.experiment_id,
         body.forecast_steps,
-        false,
       );
       return c.json(result);
     } catch (error: unknown) {
@@ -347,6 +348,83 @@ modelsController.post(
       const err = error as Error;
       const message = err.message || `${modelType.toUpperCase()} 生产模型准备失败`;
       return handleUnexpectedError(c, error, message);
+    }
+  },
+);
+
+modelsController.get(
+  "/api/v1/models/:model_type/production-preparation/sessions/:session_id",
+  jwtAuth,
+  requireStudent,
+  async (c) => {
+    const modelTypeParam = c.req.param("model_type");
+    if (!isModelType(modelTypeParam)) {
+      return c.json({ error: "指定的模型类型无效" }, 400);
+    }
+    const sessionId = c.req.param("session_id");
+    if (!sessionId) return c.json({ error: "生产准备会话 ID 无效" }, 400);
+    const payload = c.get("jwtPayload") as JwtPayload;
+    try {
+      return c.json(await getProductionPreparationSession(modelTypeParam, payload.sub, sessionId));
+    } catch (error: unknown) {
+      if (error instanceof ModelAccessError) return c.json({ error: error.message }, error.status);
+      if (error instanceof ModelNotFoundError) return c.json({ error: error.message }, 404);
+      if (error instanceof ModelValidationError) return c.json({ error: error.message, ...error.details }, 400);
+      return handleUnexpectedError(c, error, "获取生产准备会话失败");
+    }
+  },
+);
+
+modelsController.post(
+  "/api/v1/models/:model_type/production-preparation/sessions/:session_id/steps/:step_id/run",
+  jwtAuth,
+  requireStudent,
+  async (c) => {
+    const modelTypeParam = c.req.param("model_type");
+    if (!isModelType(modelTypeParam)) {
+      return c.json({ error: "指定的模型类型无效" }, 400);
+    }
+    const sessionId = c.req.param("session_id");
+    const stepId = c.req.param("step_id");
+    if (!sessionId || !stepId) {
+      return c.json({ error: "生产准备会话或步骤 ID 无效" }, 400);
+    }
+    const payload = c.get("jwtPayload") as JwtPayload;
+    try {
+      return c.json(await runProductionPreparationStep(
+        modelTypeParam,
+        payload.sub,
+        sessionId,
+        stepId,
+      ));
+    } catch (error: unknown) {
+      if (error instanceof ModelCapacityBusyError) {
+        c.header("Retry-After", String(error.retryAfterSeconds));
+        return c.json({ error: error.message, code: error.code, retryable: error.retryable }, 429);
+      }
+      if (error instanceof ModelOperationDeadlineError) {
+        return c.json(buildOperationDeadlinePayload(error, "生产准备步骤超过服务端时限，请重试当前步骤"), 504);
+      }
+      if (error instanceof ModelAccessError) return c.json({ error: error.message }, error.status);
+      if (error instanceof ModelNotFoundError) return c.json({ error: error.message }, 404);
+      if (error instanceof ModelValidationError) return c.json({ error: error.message, ...error.details }, 400);
+      if (error instanceof ModelConflictError) {
+        return c.json({ error: error.message, code: error.code, ...error.details }, 409);
+      }
+      if (error instanceof ModelServiceUnavailableError) {
+        return c.json({ error: error.message, code: error.code }, 503);
+      }
+      if (error instanceof ModelTimeoutError) {
+        return c.json(
+          buildModelTimeoutPayload(error, "production_preparation", "生产准备步骤超时，请重试当前步骤"),
+          504,
+        );
+      }
+      const pythonError = parsePythonServiceError(error);
+      if (pythonError !== null) {
+        return c.json({ error: pythonError || "Python 模型输入无效" }, 400);
+      }
+      return handleUnexpectedError(c, error, `${modelTypeParam.toUpperCase()} 生产准备步骤失败`);
     }
   },
 );

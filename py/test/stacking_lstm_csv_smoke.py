@@ -169,7 +169,7 @@ def train_base_model_artifacts(
 
 def combine_stacking_predictions(state: dict, forecast_steps: int) -> tuple[list[float], dict[str, list[float]], np.ndarray]:
     meta_model = state["meta_model"]
-    weights = np.asarray(meta_model["weights"], dtype=float)
+    weights = np.asarray(meta_model["coefficients"], dtype=float)
     member_predictions: dict[str, list[float]] = {}
     prediction_matrix = []
 
@@ -281,13 +281,12 @@ def main() -> None:
         assert train_output["models"] == BASE_MODELS
         assert train_output["metrics"]["evaluate_months"] == timestamps[28:31]
         assert train_output["eval_y_true"] == sales[28:31]
-        assert train_state["meta_model"]["kind"] == "weighted_blend"
+        assert train_state["meta_model"]["kind"] == "nnls"
+        assert train_state["meta_model"]["strategy"] == "nonnegative_least_squares"
         assert set(train_state["meta_model"]["model_names"]) == set(BASE_MODELS)
-        assert_series_close([float(np.sum(backtest_weights))], [1.0])
         assert np.all(backtest_weights >= 0)
         assert_series_close(actual_eval_predictions, expected_eval_predictions)
         assert_all_finite(actual_eval_std_devs, "train_std_devs")
-        assert_predictions_within_member_envelope(BASE_MODELS, backtest_member_predictions, actual_eval_predictions)
 
         saved_lstm_member = Path(train_state["base_model_states"]["lstm"]["model_file"])
         if not saved_lstm_member.exists():
@@ -323,7 +322,6 @@ def main() -> None:
             production_state,
             forecast_steps=future_steps,
         )
-        assert_series_close([float(np.sum(production_weights))], [1.0])
         assert np.all(production_weights >= 0)
 
         production_lstm_member = Path(production_state["base_model_states"]["lstm"]["model_file"])
@@ -366,7 +364,6 @@ def main() -> None:
         assert_series_close(future_predictions_one, future_predictions_two)
         assert_series_close(future_std_devs_one, future_std_devs_two)
         assert_all_finite(future_std_devs_one, "future_std_devs")
-        assert_predictions_within_member_envelope(BASE_MODELS, production_member_predictions, future_predictions_one)
 
         missing_feature_result = run_command(
             "stacking",
@@ -397,17 +394,17 @@ def main() -> None:
             "[VALIDATION] LSTM feature columns not found in dataset: ['不存在字段']",
         )
 
-        oversized_look_back_result = run_command(
+        hidden_params_ignored_output = invoke_model(
             "stacking",
             data_json,
             "--train-start",
             "0",
             "--train-end",
-            "11",
-            "--eval-start",
             "12",
+            "--eval-start",
+            "13",
             "--eval-end",
-            "15",
+            "16",
             "--models",
             "ma,lstm",
             "--window",
@@ -421,10 +418,8 @@ def main() -> None:
             "--lstm-features",
             "价格指数,促销投入,库存水平,搜索热度",
         )
-        assert_error(
-            oversized_look_back_result,
-            "[VALIDATION] LSTM look_back (9) is too large for the stacking internal training split (10 points) and level1 horizon (2 points).",
-        )
+        assert hidden_params_ignored_output["mode"] == "stacking_train_eval"
+        assert hidden_params_ignored_output["meta_model"]["strategy"] == "nonnegative_least_squares"
 
         short_fit_result = run_command(
             "stacking",
@@ -432,7 +427,7 @@ def main() -> None:
             "--train-start",
             "0",
             "--train-end",
-            "3",
+            "6",
             "--load-model",
             str(stacking_model_backtest),
             "--save-model",
@@ -442,7 +437,7 @@ def main() -> None:
         )
         assert_error(
             short_fit_result,
-            "[VALIDATION] Stacking fit-only member lstm cannot be refit: Training range must be larger than look_back.",
+            "Training range is too short for a direct LSTM forecast",
         )
 
         missing_saved_feature_fit_result = run_command(
@@ -471,11 +466,11 @@ def main() -> None:
             "--train-start",
             "0",
             "--train-end",
-            "11",
+            "27",
             "--eval-start",
-            "12",
+            "28",
             "--eval-end",
-            "15",
+            "30",
             "--look-back",
             "4",
             "--epochs",
@@ -498,11 +493,11 @@ def main() -> None:
             "--train-start",
             "0",
             "--train-end",
-            "11",
+            "27",
             "--eval-start",
-            "12",
+            "28",
             "--eval-end",
-            "15",
+            "30",
             "--models",
             "ma,lstm",
             "--window",
@@ -523,12 +518,13 @@ def main() -> None:
         )
         assert reuse_param_mismatch_output["mode"] == "stacking_train_eval"
         assert reuse_param_mismatch_output["models"] == ["ma", "lstm"]
-        assert len(reuse_param_mismatch_output["predictions"]) == 4
+        assert len(reuse_param_mismatch_output["predictions"]) == 3
         reuse_param_mismatch_state = load_pickled_state(reuse_param_mismatch_model)
         reused_saved_lstm_member = Path(reuse_param_mismatch_state["base_model_states"]["lstm"]["model_file"])
         if not reused_saved_lstm_member.exists():
             raise AssertionError(f"reused stacking LSTM member artifact missing: {reused_saved_lstm_member}")
-        assert reuse_param_mismatch_state["base_model_states"]["lstm"]["params"]["look_back"] == 4
+        assert "look_back" not in reuse_param_mismatch_state["base_model_states"]["lstm"]["params"]
+        assert "epochs" not in reuse_param_mismatch_state["base_model_states"]["lstm"]["params"]
         assert parse_stored_feature_names(
             reuse_param_mismatch_state["base_model_states"]["lstm"]["params"]["lstm_features"]
         ) == LSTM_FEATURE_KEYS
@@ -611,7 +607,7 @@ def main() -> None:
                 "reused_base_models": BASE_MODELS,
                 "edge_cases": [
                     "missing_lstm_feature",
-                    "oversized_look_back",
+                    "hidden_lstm_params_ignored",
                     "fit_only_short_window",
                     "fit_only_missing_saved_feature",
                     "reused_lstm_source_param_mismatch",

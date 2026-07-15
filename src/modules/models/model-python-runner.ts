@@ -11,14 +11,28 @@ const TRAINING_TIMEOUT = TIMEOUTS.MODEL_TRAINING;
 const MODEL_DEADLINE_ENV_NAME = "FZ_MODEL_DEADLINE_EPOCH_MS";
 const PROCESS_TERMINATION_WAIT_MS = TIMEOUTS.MODEL_PROCESS_TERMINATION_GRACE;
 const GUIDED_ENSEMBLE_MODEL_TYPES = new Set(["weighted_avg", "boosting", "stacking"]);
+const PRODUCTION_PREPARATION_SCRIPT = "production_prepare_model.py";
 
-const resolvePythonProcessTimeoutMs = (timeoutMs?: number): number => {
+const resolvePythonProcessTimeoutMs = (
+  timeoutMs?: number,
+  hardCapMs: number = TIMEOUTS.MODEL_EXECUTION_HARD_CAP,
+): number => {
   const requestedTimeoutMs = timeoutMs ?? TRAINING_TIMEOUT;
   if (!Number.isFinite(requestedTimeoutMs) || requestedTimeoutMs <= 0) {
     throw new RangeError(`Python 模型超时必须是正数，收到: ${requestedTimeoutMs}`);
   }
-  return Math.min(requestedTimeoutMs, TIMEOUTS.MODEL_EXECUTION_HARD_CAP);
+  return Math.min(requestedTimeoutMs, hardCapMs);
 };
+
+export const resolvePythonProcessHardCapMs = (
+  modelType: string,
+  scriptName?: string,
+) => (
+  GUIDED_ENSEMBLE_MODEL_TYPES.has(modelType)
+  || scriptName === PRODUCTION_PREPARATION_SCRIPT
+    ? TIMEOUTS.MODEL_ORCHESTRATION_HARD_CAP
+    : TIMEOUTS.MODEL_EXECUTION_HARD_CAP
+);
 
 export function buildPythonModelProcessEnv(): Record<string, string> {
   const modelThreads = String(PYTHON_RUNTIME_CONFIG.MODEL_PROCESS_THREADS);
@@ -47,6 +61,7 @@ export const allPossiblePythonParams: Record<string, string> = {
   evalEnd: "eval-end",
   saveModel: "save-model",
   loadModel: "load-model",
+  sourceModel: "source-model",
   forecastSteps: "forecast-steps",
   fitForecastSteps: "fit-forecast-steps",
   fitOnly: "fit-only",
@@ -229,7 +244,10 @@ export async function runPythonModel(
   terminationSignal?: AbortSignal,
 ): Promise<unknown> {
   if (terminationSignal?.aborted) throw getAbortError(terminationSignal);
-  const executionTimeoutMs = resolvePythonProcessTimeoutMs(timeoutMs);
+  const executionTimeoutMs = resolvePythonProcessTimeoutMs(
+    timeoutMs,
+    resolvePythonProcessHardCapMs(modelType),
+  );
   const deadlineEpochMs = Date.now() + executionTimeoutMs;
   const pythonExec = resolvePythonExecutable();
 
@@ -394,7 +412,7 @@ export async function runPythonModel(
 }
 
 export interface GuidedPythonStepResult {
-  protocol_version: 2;
+  protocol_version: 3;
   attempt_id: string;
   step_id: string;
   output?: unknown;
@@ -403,6 +421,10 @@ export interface GuidedPythonStepResult {
   input_state_sha256?: string | null;
   candidate_state_path: string;
   candidate_state_sha256: string;
+}
+
+export interface ProductionPreparationPythonStepResult extends Omit<GuidedPythonStepResult, "protocol_version"> {
+  protocol_version: 1;
 }
 
 export async function runPythonGuidedTrainingStep(
@@ -416,12 +438,19 @@ export async function runPythonGuidedTrainingStep(
   artifactDir: string,
   timeoutMs: number = TRAINING_TIMEOUT,
   terminationSignal?: AbortSignal,
+  scriptName?: string,
 ): Promise<GuidedPythonStepResult> {
   if (terminationSignal?.aborted) throw getAbortError(terminationSignal);
-  const executionTimeoutMs = resolvePythonProcessTimeoutMs(timeoutMs);
+  const executionTimeoutMs = resolvePythonProcessTimeoutMs(
+    timeoutMs,
+    resolvePythonProcessHardCapMs(modelType, scriptName),
+  );
   const deadlineEpochMs = Date.now() + executionTimeoutMs;
   const pythonExec = resolvePythonExecutable();
-  const scriptPath = path.join(PY_DIR, GUIDED_ENSEMBLE_MODEL_TYPES.has(modelType) ? "guided_ensemble_model.py" : "guided_model.py");
+  const scriptPath = path.join(
+    PY_DIR,
+    scriptName ?? (GUIDED_ENSEMBLE_MODEL_TYPES.has(modelType) ? "guided_ensemble_model.py" : "guided_model.py"),
+  );
   if (!fs.existsSync(scriptPath)) {
     throw new Error(`未找到 Python guided 训练入口脚本: ${scriptPath}`);
   }
@@ -554,4 +583,31 @@ export async function runPythonGuidedTrainingStep(
       terminationSignal.removeEventListener("abort", abortHandler);
     }
   }
+}
+
+export async function runPythonProductionPreparationStep(
+  modelType: string,
+  stepId: string,
+  params: Record<string, unknown>,
+  attemptId: string,
+  inputStateFilePath: string | null,
+  candidateStateFilePath: string,
+  receiptFilePath: string,
+  artifactDir: string,
+  timeoutMs: number = TRAINING_TIMEOUT,
+  terminationSignal?: AbortSignal,
+): Promise<ProductionPreparationPythonStepResult> {
+  return await runPythonGuidedTrainingStep(
+    modelType,
+    stepId,
+    params,
+    attemptId,
+    inputStateFilePath,
+    candidateStateFilePath,
+    receiptFilePath,
+    artifactDir,
+    timeoutMs,
+    terminationSignal,
+    PRODUCTION_PREPARATION_SCRIPT,
+  ) as unknown as ProductionPreparationPythonStepResult;
 }

@@ -20,25 +20,31 @@ from log_safety import summarize_cli_args
 from metrics import mae, mape, r2, rmse
 from model_info import attach_method_metadata, ensure_state_metadata
 from serialization import dump_model, load_model
+from uncertainty import format_predictions, profile_for_steps, ses_profile
 
 MODEL_TYPE = "es"
 METHOD_NAME = "一次指数平滑"
 FORECAST_STRATEGY = "flat_simple_exponential_smoothing"
 IMPLEMENTATION_NOTES = [
     "本系统实现教科书中的一次指数平滑，平滑系数 alpha 满足 0 < alpha <= 1。",
-    "为使递推定义明确且适合小样本，初始水平固定为训练区间的第一个观测值；alpha 由用户指定，不在训练中自动优化。",
+    "alpha 由用户指定且不会被优化；初始水平 l0 在固定 alpha 下通过最小化训练期一步预测 SSE 自动估计。",
     "一次指数平滑的多步未来销量预测为水平外推；趋势和季节性需要 Holt 或 Holt-Winters 扩展，本系统未在该模型中启用。",
     "在非负销量输入下，一次指数平滑的凸递推通常自然非负；本系统仍将最终销量点预测按 max(0, y_hat) 截断，并用截断后的值计算残差与指标。该后处理不属于教科书 SES 递推式。",
-    "预测值附带的 std_dev 通常是评估段残差的样本标准差；评估不足 2 点时退回训练序列波动。该值不随预测步长增长，与 ARIMA 随步长展宽的置信区间口径不同。",
+    "std_dev 使用 ETS(A,N,N) 的逐步预测方差 sigma²[1+alpha²(h-1)]；sigma 来自训练期一步预测残差。95% 区间和生产用 99% 上侧误差则由带相同步长增长因子的 actual-prediction 经验残差分位数给出，样本不足时明确标记正态近似回退。",
 ]
 
 # Type alias for input flexibility
 ArrayLike = Union[List[float], np.ndarray]
 
 
-def _format_predictions(preds: List[float], std_dev: float) -> List[Dict[str, float]]:
-    """Format predictions with standard deviation for JSON output."""
-    return [{"prediction": p, "std_dev": std_dev} for p in preds]
+def _format_predictions(
+    preds: List[float],
+    std_dev: Any,
+    metadata: Optional[Dict[str, Any]] = None,
+) -> List[Dict[str, Any]]:
+    """Format predictions with a horizon-aware uncertainty profile."""
+    profile = list(std_dev) if isinstance(std_dev, (list, tuple, np.ndarray)) else [float(std_dev)] * len(preds)
+    return format_predictions(preds, profile, metadata or {"source": "empirical", "fallback": False})
 
 
 def _load_state(model_path: str) -> Dict[str, Any]:
@@ -54,12 +60,11 @@ def predict(
     steps: int,
     state: Optional[Dict[str, Any]] = None,
     allow_negative_predictions: bool = False,
-) -> Tuple[List[float], float]:
+) -> Tuple[List[float], List[float]]:
     """Forecast future values using a saved ES model."""
     log.debug(f"ES predict called with steps={steps}, model_path={model_path}")
     state = state or _load_state(model_path)
     model = state["model"]
-    std_dev_residuals = float(state.get("std_dev_residuals", 0.0))
     alpha = float(state.get("alpha", 0.5))
 
     log.info(f"Generating {steps}-step forecast with alpha={alpha}")
@@ -68,16 +73,19 @@ def predict(
         allow_negative_predictions=allow_negative_predictions,
     )
     predictions = apply_prediction_domain(model.forecast(steps), prediction_domain)
+    uncertainty_profile, _ = profile_for_steps(
+        state.get("uncertainty_profile"),
+        steps,
+        state.get("reference_series", []),
+        state.get("uncertainty_summary"),
+    )
     log.info(f"Generated {len(predictions)} predictions")
 
-    return predictions.tolist(), std_dev_residuals
+    return predictions.tolist(), uncertainty_profile
 
 
-def _estimate_std_dev(residuals: ArrayLike, reference_series: ArrayLike) -> float:
-    residuals_array = np.asarray(residuals, dtype=float)
-    if residuals_array.size > 1:
-        return float(np.std(residuals_array, ddof=1))
-
+def _reference_scale(reference_series: ArrayLike) -> float:
+    """Return a training-history fallback scale when residuals are unavailable."""
     reference_array = np.asarray(reference_series, dtype=float)
     if reference_array.size > 1:
         return float(np.std(reference_array, ddof=1))
@@ -87,25 +95,33 @@ def _estimate_std_dev(residuals: ArrayLike, reference_series: ArrayLike) -> floa
 
 
 def _fit_textbook_ses(y_train: ArrayLike, alpha: float) -> Any:
-    """Fit SES with the common textbook first-observation initialization.
-
-    ``initialization_method="estimated"`` can choose a heuristic initial level
-    for longer series even when alpha optimization is disabled.  Keeping the
-    first-value convention explicit makes the classroom formula and executable
-    model identical across statsmodels versions.
-    """
+    """Estimate the initial level by SSE while keeping user-selected alpha fixed."""
     train_array = np.asarray(y_train, dtype=float)
     if train_array.size == 0:
         raise ValueError("[VALIDATION] ES training range is empty.")
 
     return SimpleExpSmoothing(
         train_array,
-        initialization_method="known",
-        initial_level=float(train_array[0]),
+        initialization_method="estimated",
     ).fit(
         smoothing_level=alpha,
-        optimized=False,
+        optimized=True,
     )
+
+
+def _training_residuals(model: Any, y_train: ArrayLike) -> np.ndarray:
+    values = np.asarray(y_train, dtype=float)
+    fitted = np.asarray(model.fittedvalues, dtype=float)
+    residuals = values - fitted
+    return residuals[np.isfinite(residuals)]
+
+
+def _training_residual_scale(model: Any, y_train: ArrayLike) -> float:
+    values = np.asarray(y_train, dtype=float)
+    finite = _training_residuals(model, values)
+    if finite.size > 1:
+        return float(np.std(finite, ddof=1))
+    return _reference_scale(values)
 
 
 def train_and_evaluate(
@@ -129,7 +145,7 @@ def train_and_evaluate(
 
     log.info(f"Fitting SimpleExpSmoothing with alpha={alpha}")
     model = _fit_textbook_ses(y_train, alpha)
-    log.debug(f"Model fitted successfully")
+    log.debug("Model fitted successfully")
 
     forecast_steps = eval_range.stop - train_range.stop
     forecast_offset = eval_range.start - train_range.stop
@@ -149,7 +165,7 @@ def train_and_evaluate(
     y_true = y_eval.tolist()
 
     residuals = np.array(y_true) - np.array(y_pred)
-    std_dev_residuals = _estimate_std_dev(residuals, y_train)
+    std_dev_residuals = _training_residual_scale(model, y_train)
 
     log.info(f"Calculated residuals: mean={np.mean(residuals):.4f}, std_dev={std_dev_residuals:.4f}")
 
@@ -232,7 +248,13 @@ def run(args) -> None:
 
         y_fit = np.asarray(y)[range(ts, te + 1)]
         model = _fit_textbook_ses(y_fit, alpha)
-        std_dev_residuals = float(state.get("std_dev_residuals", _estimate_std_dev([], y_fit)))
+        std_dev_residuals = _training_residual_scale(model, y_fit)
+        profile, uncertainty_summary = ses_profile(
+            std_dev_residuals,
+            alpha,
+            12,
+            _training_residuals(model, y_fit),
+        )
 
         next_state = {
             "model_type": MODEL_TYPE,
@@ -240,6 +262,10 @@ def run(args) -> None:
             "train_end_index": te,
             "model": model,
             "std_dev_residuals": std_dev_residuals,
+            "initial_level": float(model.params["initial_level"]),
+            "uncertainty_profile": profile,
+            "uncertainty_summary": uncertainty_summary,
+            "reference_series": y_fit.tolist(),
             "prediction_domain": prediction_domain,
         }
         attach_method_metadata(next_state, METHOD_NAME, FORECAST_STRATEGY, IMPLEMENTATION_NOTES)
@@ -251,6 +277,22 @@ def run(args) -> None:
             "train_end_index": te,
             "saved_model": save_path,
         }
+        fit_predict_steps = int(getattr(args, "fit_predict_steps", 0) or 0)
+        if fit_predict_steps > 0:
+            preds, resolved_profile = predict(
+                save_path,
+                fit_predict_steps,
+                state=next_state,
+                allow_negative_predictions=bool(getattr(args, "allow_negative_predictions", False)),
+            )
+            _, resolved_summary = profile_for_steps(
+                next_state["uncertainty_profile"],
+                fit_predict_steps,
+                next_state["reference_series"],
+                next_state["uncertainty_summary"],
+            )
+            out["forecast_steps"] = fit_predict_steps
+            out["predictions"] = _format_predictions(preds, resolved_profile, resolved_summary)
         attach_method_metadata(out, METHOD_NAME, FORECAST_STRATEGY, IMPLEMENTATION_NOTES)
         out["logs"] = get_log_contents()
         print(json.dumps(out, ensure_ascii=False, indent=2 if pretty else None))
@@ -265,13 +307,27 @@ def run(args) -> None:
                 raise ValueError("[VALIDATION] --forecast_steps must be > 0.")
 
             log.info(f"Starting prediction with {steps} forecast steps")
-            preds, std_dev = predict(
-                load_path,
-                steps,
-                state=state,
-                allow_negative_predictions=bool(getattr(args, "allow_negative_predictions", False)),
-            )
-            predictions_with_std = _format_predictions(preds, std_dev)
+            prepared = state.get("prepared_predictions")
+            if (
+                not bool(getattr(args, "allow_negative_predictions", False))
+                and isinstance(prepared, list)
+                and len(prepared) >= steps
+            ):
+                predictions_with_std = [dict(point) for point in prepared[:steps]]
+            else:
+                preds, profile = predict(
+                    load_path,
+                    steps,
+                    state=state,
+                    allow_negative_predictions=bool(getattr(args, "allow_negative_predictions", False)),
+                )
+                _, resolved_uncertainty_summary = profile_for_steps(
+                    state.get("uncertainty_profile"),
+                    steps,
+                    state.get("reference_series") or [],
+                    state.get("uncertainty_summary") or {},
+                )
+                predictions_with_std = _format_predictions(preds, profile, resolved_uncertainty_summary)
 
             out: Dict[str, Any] = {
                 "mode": "es_loaded_predict",
@@ -324,7 +380,19 @@ def run(args) -> None:
         )
         log.info(f"Training finished. Metrics: {metrics}")
 
-        predictions_with_std = _format_predictions(y_pred, std_dev_residuals)
+        full_profile, uncertainty_summary = ses_profile(
+            std_dev_residuals,
+            alpha,
+            max(12, ee - te),
+            _training_residuals(model, np.asarray(y)[range(ts, te + 1)]),
+        )
+        forecast_offset = es - te - 1
+        evaluation_profile = full_profile[forecast_offset : forecast_offset + len(y_pred)]
+        predictions_with_std = _format_predictions(
+            y_pred,
+            evaluation_profile,
+            {**uncertainty_summary, "horizon_start": forecast_offset + 1},
+        )
 
         out: Dict[str, Any] = {
             "mode": "fixed_alpha_only",
@@ -335,6 +403,8 @@ def run(args) -> None:
             "metrics": metrics,
             "eval_y_true": y_true,
             "predictions": predictions_with_std,
+            "initial_level": float(model.params["initial_level"]),
+            "uncertainty_summary": uncertainty_summary,
         }
         attach_method_metadata(out, METHOD_NAME, FORECAST_STRATEGY, IMPLEMENTATION_NOTES)
 
@@ -343,6 +413,10 @@ def run(args) -> None:
             state = {
                 "model_type": MODEL_TYPE, "alpha": alpha, "train_end_index": te,
                 "model": model, "std_dev_residuals": std_dev_residuals,
+                "initial_level": float(model.params["initial_level"]),
+                "uncertainty_profile": full_profile[:12],
+                "uncertainty_summary": uncertainty_summary,
+                "reference_series": np.asarray(y)[range(ts, te + 1)].tolist(),
                 "prediction_domain": prediction_domain,
             }
             attach_method_metadata(state, METHOD_NAME, FORECAST_STRATEGY, IMPLEMENTATION_NOTES)

@@ -62,8 +62,8 @@ export const GUIDED_TRAINING_STEPS: Record<GuidedModelType, GuidedTrainingStepDe
     {
       id: "estimate_residuals",
       label: "估计预测波动",
-      description: "比较评估区间真实值和已经非负截断的销量预测值，估计残差波动，用于给预测结果附上不确定性范围。",
-      actionLabel: "估计残差",
+      description: "只用训练段执行 rolling-origin 多步回测，逐 horizon 估计预测波动；样本不足的 horizon 使用明确标记的 fallback，评估区间真实值不参与校准。",
+      actionLabel: "估计波动",
     },
     {
       id: "evaluate_metrics",
@@ -74,7 +74,7 @@ export const GUIDED_TRAINING_STEPS: Record<GuidedModelType, GuidedTrainingStepDe
     {
       id: "save_artifact",
       label: "保存模型产物",
-      description: "保存移动平均窗口、最近历史值和残差波动，供后续预测和报告复用。",
+      description: "保存移动平均窗口、最近历史值和训练段 rolling-origin 预测波动，供后续预测和报告复用。",
       actionLabel: "保存结果",
     },
   ],
@@ -88,7 +88,7 @@ export const GUIDED_TRAINING_STEPS: Record<GuidedModelType, GuidedTrainingStepDe
     {
       id: "fit_model",
       label: "拟合平滑水平",
-      description: "按教科书递推式，以第一个训练观测作为初始水平 S₁=Y₁，再使用固定 α 逐期更新水平项。",
+      description: "在固定用户 α 的前提下，用训练数据估计 ETS(A,N,N) 的初始水平，再逐期更新水平项；α 本身不会被自动改变。",
       actionLabel: "拟合模型",
     },
     {
@@ -100,13 +100,13 @@ export const GUIDED_TRAINING_STEPS: Record<GuidedModelType, GuidedTrainingStepDe
     {
       id: "estimate_residuals",
       label: "估计残差波动",
-      description: "比较已经非负截断的销量预测值和真实值，估计指数平滑模型在评估区间的误差离散程度。",
+      description: "用训练期一步预测残差估计创新尺度，并按 ETS(A,N,N) 解析公式让多步预测标准差随 horizon 展宽。",
       actionLabel: "估计残差",
     },
     {
       id: "evaluate_metrics",
       label: "计算误差指标",
-      description: "计算 RMSE、MAE、MAPE、R²，判断固定 α 的预测效果是否稳定。",
+      description: "计算 RMSE、MAE、MAPE、R²，描述固定 α 在当前评估区间的预测误差。",
       actionLabel: "计算指标",
     },
     {
@@ -125,26 +125,26 @@ export const GUIDED_TRAINING_STEPS: Record<GuidedModelType, GuidedTrainingStepDe
     },
     {
       id: "aic_search",
-      label: "执行 AIC 搜索",
-      description: "在固定 d 和样本量自适应的 p/q 边界内，运行一次以 AIC 为目标的 stepwise 搜索；它会逐步探索候选，而不是穷举每个组合。",
-      actionLabel: "运行 AIC",
+      label: "执行 AICc 搜索",
+      description: "在固定 d 和样本量自适应的 p/q 边界内运行一次 AICc stepwise 搜索，并检查优胜模型是否收敛；必要时用更高迭代上限重试。",
+      actionLabel: "运行 AICc",
     },
     {
       id: "bic_search",
-      label: "执行 BIC 搜索",
-      description: "在相同边界内再运行一次以 BIC 为目标的 stepwise 搜索，利用更强的复杂度惩罚得到第二个候选优胜者。",
-      actionLabel: "运行 BIC",
+      label: "检查残差诊断",
+      description: "对 AICc 优胜模型执行带模型自由度修正的 Ljung–Box 白噪声检验，记录诊断结果而不再用第二套准则重复搜索。",
+      actionLabel: "检查残差",
     },
     {
       id: "select_model",
-      label: "选择最终阶数",
-      description: "只比较两次 stepwise 搜索各自的优胜模型：训练点少于30时按 BIC 优先，至少30点时按 AIC 优先，并用另一准则处理并列。",
-      actionLabel: "选择模型",
+      label: "确认最终阶数",
+      description: "确认一次 AICc 搜索得到的非季节 ARIMA(p,d,q)、截距/漂移设定和收敛信息；残差诊断作为教学解释而非事后换模依据。",
+      actionLabel: "确认模型",
     },
     {
       id: "forecast",
       label: "预测评估区间",
-      description: "使用选定的非季节 ARIMA(p,d,q) 直接生成多步预测；点预测按 max(0, ŷ) 截断。95%区间仍来自未截断的 ARIMA 分布，其宽度除以3.92得到近似标准差。",
+      description: "使用选定的非季节 ARIMA(p,d,q) 直接生成多步预测；点预测按 max(0, ŷ) 截断。95%区间仍来自未截断的 ARIMA 分布，并按精确的 95% 正态临界值 1.9599639845 由区间宽度反推标准差。",
       actionLabel: "生成预测",
     },
     {
@@ -176,25 +176,25 @@ export const GUIDED_TRAINING_STEPS: Record<GuidedModelType, GuidedTrainingStepDe
     {
       id: "build_model",
       label: "确定网络结构",
-      description: "构建两层 LSTM、ReLU Dense 隐藏层和长度等于预测跨度的线性 Dense 输出层；隐藏单元与批大小按特征维度和样本量动态确定。",
+      description: "构建单层 LSTM 和长度等于预测跨度的线性 Dense 输出层；look-back 在2到12之间动态确定，若无法保留至少两个历史步和四个监督窗口则拒绝训练；隐藏单元和批大小按样本窗数、特征维度及参数预算确定。",
       actionLabel: "构建网络",
     },
     {
       id: "train_model",
       label: "训练神经网络",
-      description: "用 MSE、Adam、逐轮学习率衰减和不打乱的批训练拟合网络；为保留小样本，EarlyStopping 监控训练 loss 而非验证 loss，并恢复最佳训练损失权重。",
+      description: "标准数据量下按时间顺序划分并隔离相邻窗口，用验证 loss 早停选择轮数，再以该轮数在全部窗口重拟合；样本太少时进入明确标注的教学演示模式。",
       actionLabel: "训练模型",
     },
     {
       id: "forecast",
       label: "生成评估预测",
-      description: "仅使用训练截止点之前最后 look_back 行历史特征，一次直接输出完整评估跨度并还原销量尺度，再按 max(0, ŷ) 截断销量点预测；本实现不读取未来特征轨迹。",
+      description: "仅使用训练截止点前由当前数据规模动态确定的最近历史窗口，一次直接输出完整评估跨度并还原销量尺度，再按 max(0, ŷ) 截断；不读取未来特征轨迹。",
       actionLabel: "生成预测",
     },
     {
       id: "evaluate_metrics",
       label: "计算误差指标",
-      description: "比较非负截断后的 LSTM 销量点预测和真实值，计算 RMSE、MAE、MAPE、R²，并用同一预测口径估计残差波动。",
+      description: "比较非负截断后的预测和真实值并计算指标；标准模式按验证窗口逐 horizon 估计波动，教学演示模式明确使用 fallback。",
       actionLabel: "计算指标",
     },
     {
@@ -214,19 +214,19 @@ export const GUIDED_TRAINING_STEPS: Record<GuidedModelType, GuidedTrainingStepDe
     {
       id: "split_validation",
       label: "划分权重验证段",
-      description: "按时间顺序从训练区间末尾留出验证段：8–15个训练点时通常留2–3点，更长序列约留20%，专门估计成员误差。",
+      description: "按模型数和样本量确定期望验证段，再在保证所有成员均可训练的前提下动态留出时间末段。",
       actionLabel: "划分数据",
     },
     {
       id: "validation_predictions",
       label: "生成验证段预测",
-      description: "只用验证段之前的数据重新拟合：MA窗口、ES的α及LSTM单模型配置沿用已完成产物，LSTM动态结构按当前数据段重算；ARIMA固定d并在前段重新搜索p、q，避免完整训练段的定阶结果进入留出预测。",
+      description: "只继承用户选择的 MA 窗口、ES α、ARIMA d 与 LSTM 特征/归一化；ARIMA 阶数和 LSTM 隐藏参数都在留出段之前重新推导。",
       actionLabel: "训练并预测",
     },
     {
       id: "compute_weights",
       label: "计算融合权重",
-      description: "按 1/(MSE+10⁻⁹) 归一化为非负且和为1的权重；该小样本折中不估计成员误差之间的协方差，权重可能随短验证段波动。",
+      description: "先按带尺度 epsilon 的 1/MSE 得到候选权重，再依据验证样本数向等权组合收缩，减轻短验证段极端权重。",
       actionLabel: "计算权重",
     },
     {
@@ -238,7 +238,7 @@ export const GUIDED_TRAINING_STEPS: Record<GuidedModelType, GuidedTrainingStepDe
     {
       id: "blend_evaluate",
       label: "加权组合并评估",
-      description: "先把各成员销量预测截断到不小于0，再按固定权重组合；组合结果也做非负兜底，然后计算指标和残差波动。评估点不足2个时使用内部验证残差。",
+      description: "按收缩权重组合非负成员预测并计算独立评估指标；不确定性仅由内部权重验证段组合残差校准，信息不足会标记 fallback。",
       actionLabel: "组合评估",
     },
     {
@@ -264,13 +264,13 @@ export const GUIDED_TRAINING_STEPS: Record<GuidedModelType, GuidedTrainingStepDe
     {
       id: "level1_predictions",
       label: "生成元模型训练特征",
-      description: "基础模型只在 Level-0 重新拟合后预测 Level-1：MA、ES及LSTM沿用单模型配置，LSTM动态结构按当前数据段重算；ARIMA固定d并在Level-0重新搜索p、q，预测矩阵作为元模型输入。",
+      description: "基础模型只在 Level-0 重新拟合后预测 Level-1；只继承用户参数，ARIMA 阶数与 LSTM 隐藏配置都按 Level-0 重算。",
       actionLabel: "生成二层特征",
     },
     {
       id: "fit_meta_model",
       label: "拟合元模型",
-      description: "先拟合无截距非负线性回归，再把系数归一化为和为1的权重；这是稳定、可解释的凸组合近似，并非一般 Stacking 对元学习器的唯一规定。",
+      description: "对 Level-1 预测矩阵拟合无截距非负最小二乘（NNLS）；保留原始非负系数，不强制归一化。",
       actionLabel: "拟合元模型",
     },
     {
@@ -282,7 +282,7 @@ export const GUIDED_TRAINING_STEPS: Record<GuidedModelType, GuidedTrainingStepDe
     {
       id: "meta_evaluate",
       label: "元模型组合并评估",
-      description: "把截断到不小于0的成员销量预测交给元模型，最终组合结果也做非负兜底后再评估；Level-1样本不多于模型数+1或矩阵病态时改用 inverse-MAE。",
+      description: "把非负成员预测交给 NNLS 元模型并对最终销量做非负兜底；不确定性仅由 Level-1 组合残差校准，独立评估真实值不参与校准。",
       actionLabel: "组合评估",
     },
     {
@@ -296,25 +296,25 @@ export const GUIDED_TRAINING_STEPS: Record<GuidedModelType, GuidedTrainingStepDe
     {
       id: "prepare_data",
       label: "确认 Boosting 材料",
-      description: "读取实验数据，校验训练区间、评估区间、基础模型候选库、学习率和最大迭代轮数。",
+      description: "读取实验数据，校验训练区间、评估区间和基础模型候选库；轮数与阶段系数均由数据动态决定。",
       actionLabel: "校验数据",
     },
     {
       id: "split_residual_sets",
       label: "初始化残差训练集",
-      description: "按与其他融合模型相同的小样本时间留出规则拆分训练/验证段，并把原始销量作为第一轮要拟合的残差目标。",
+      description: "动态拆分时间顺序训练/验证段，把原始销量作为第一轮目标，并由模型数与验证点数确定最多轮数。",
       actionLabel: "初始化残差",
     },
     {
       id: "retrain_chain",
       label: "重训已选模型链",
-      description: "按已选模型链重训：沿用成员核心配置，但第一阶段拟合原始销量并截断为非负，系数为1；后续阶段改训有符号残差且不截断，系数为学习率0.3。",
+      description: "在完整训练段逐级重训已选链，并对每级重新执行非负平方损失线搜索；若某级系数变为零，则裁剪该级及后续候选链。",
       actionLabel: "重训模型链",
     },
     {
       id: "combine_evaluate",
       label: "累加阶段预测并评估",
-      description: "按各阶段系数累加预测，最后仅把物理销量结果截断到不小于0，再计算误差指标和残差波动。",
+      description: "按各阶段系数累加预测，最后仅把物理销量结果截断到不小于0，再计算独立评估指标；不确定性由内部时间验证残差校准。",
       actionLabel: "组合评估",
     },
     {

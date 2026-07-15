@@ -8,10 +8,22 @@ interface TrainingMetricsPayload extends Record<string, unknown> {
 interface PredictionPoint extends Record<string, unknown> {
   prediction?: unknown;
   std_dev?: unknown;
+  uncertainty_source?: unknown;
+  uncertainty_reason?: unknown;
+  calibration_source?: unknown;
+  interval_lower?: unknown;
+  interval_upper?: unknown;
+  interval_level?: unknown;
+  interval_kind?: unknown;
+  upper_error_p99?: unknown;
+  calibration_mean_error?: unknown;
+  calibration_count?: unknown;
 }
 
 interface DemandPredictionNormalizationOptions {
   requireStdDev?: boolean;
+  requireUpperErrorP99?: boolean;
+  requireCalibrationDiagnostics?: boolean;
 }
 
 const METRIC_EPSILON = 1e-12;
@@ -49,6 +61,85 @@ export const normalizeDemandPredictionPoints = (
       && (typeof point.std_dev !== "number" || !Number.isFinite(point.std_dev) || point.std_dev < 0)
     ) {
       throw new Error(`[PYTHON_DATA] Prediction point ${index} std_dev must be a nonnegative finite number`);
+    }
+    if (
+      options.requireStdDev
+      && !["model", "empirical", "fallback"].includes(String(point.uncertainty_source))
+    ) {
+      throw new Error(`[PYTHON_DATA] Prediction point ${index} uncertainty_source is invalid`);
+    }
+    if (
+      options.requireStdDev
+      && point.uncertainty_reason !== undefined
+      && typeof point.uncertainty_reason !== "string"
+    ) {
+      throw new Error(`[PYTHON_DATA] Prediction point ${index} uncertainty_reason must be a string`);
+    }
+    if (
+      (options.requireUpperErrorP99 || point.upper_error_p99 !== undefined)
+      && (
+        typeof point.upper_error_p99 !== "number"
+        || !Number.isFinite(point.upper_error_p99)
+        || point.upper_error_p99 < 0
+      )
+    ) {
+      throw new Error(`[PYTHON_DATA] Prediction point ${index} upper_error_p99 must be a nonnegative finite number`);
+    }
+    if (
+      point.calibration_source !== undefined
+      && (typeof point.calibration_source !== "string" || point.calibration_source.length === 0)
+    ) {
+      throw new Error(`[PYTHON_DATA] Prediction point ${index} calibration_source must be a non-empty string`);
+    }
+    const hasCalibrationMeanError = point.calibration_mean_error !== undefined;
+    const hasCalibrationCount = point.calibration_count !== undefined;
+    if (
+      options.requireCalibrationDiagnostics
+      && (!hasCalibrationMeanError || !hasCalibrationCount)
+    ) {
+      throw new Error(`[PYTHON_DATA] Prediction point ${index} calibration diagnostics are required`);
+    }
+    if (hasCalibrationMeanError || hasCalibrationCount) {
+      const bothNull = point.calibration_mean_error === null && point.calibration_count === null;
+      const bothValid = (
+        typeof point.calibration_mean_error === "number"
+        && Number.isFinite(point.calibration_mean_error)
+        && typeof point.calibration_count === "number"
+        && Number.isInteger(point.calibration_count)
+        && point.calibration_count > 0
+      );
+      if (!bothNull && !bothValid) {
+        throw new Error(
+          `[PYTHON_DATA] Prediction point ${index} calibration diagnostics must be a finite mean and positive count, or both null`,
+        );
+      }
+    }
+    const hasIntervalField = [
+      point.interval_lower,
+      point.interval_upper,
+      point.interval_level,
+      point.interval_kind,
+    ].some((value) => value !== undefined);
+    if (hasIntervalField) {
+      if (
+        typeof point.interval_lower !== "number"
+        || !Number.isFinite(point.interval_lower)
+        || typeof point.interval_upper !== "number"
+        || !Number.isFinite(point.interval_upper)
+        || point.interval_lower > point.interval_upper
+      ) {
+        throw new Error(`[PYTHON_DATA] Prediction point ${index} interval bounds are invalid`);
+      }
+      if (
+        typeof point.interval_level !== "number"
+        || !Number.isFinite(point.interval_level)
+        || Math.abs(point.interval_level - 0.95) > 1e-9
+      ) {
+        throw new Error(`[PYTHON_DATA] Prediction point ${index} interval_level must equal 0.95`);
+      }
+      if (typeof point.interval_kind !== "string" || point.interval_kind.length === 0) {
+        throw new Error(`[PYTHON_DATA] Prediction point ${index} interval_kind must be a non-empty string`);
+      }
     }
     return {
       ...point,
@@ -136,24 +227,35 @@ const resultTransformers: Record<ModelType, (result: Record<string, unknown>) =>
       ? { ...(result.diagnostics as object), y_pred_eval: (result.predictions as { prediction: number }[] | undefined)?.map((p) => p.prediction) || [] }
       : undefined,
   }),
-  es: () => ({}),
+  es: (result) => ({
+    initial_level: result.initial_level,
+    uncertainty_summary: result.uncertainty_summary,
+  }),
   ma: () => ({}),
   lstm: (result) => ({
     feature_types: result.feature_types,
-    look_back: result.look_back,
-    epochs: result.epochs,
     forecast_horizon: result.forecast_horizon,
+    training_regime: result.training_regime,
+    uncertainty_summary: result.uncertainty_summary,
     diagnostics: result.diagnostics
       ? { ...(result.diagnostics as object), y_pred_eval: (result.predictions as { prediction: number }[] | undefined)?.map((p) => p.prediction) || [] }
       : undefined,
   }),
-  stacking: (result) => ({ model_names: result.models, meta_model: result.meta_model }),
+  stacking: (result) => ({
+    model_names: result.models,
+    meta_model: result.meta_model,
+    split_plan: result.split_plan,
+  }),
   weighted_avg: (result) => ({
     model_names: result.models,
     weights: (result.models as string[] | undefined)?.map((name) => (result.weights as Record<string, number>)?.[name]),
+    weight_diagnostics: result.weight_diagnostics,
+    split_plan: result.split_plan,
   }),
   boosting: (result) => ({
     model_names: result.model_chain,
+    stage_coefficients: result.stage_coefficients,
+    split_plan: result.split_plan,
     search_summary: result.search_summary,
   }),
 };
@@ -167,7 +269,11 @@ export function transformTrainingResult(
     result.metrics && typeof result.metrics === "object"
       ? (result.metrics as TrainingMetricsPayload)
       : undefined;
-  const predictions = normalizeDemandPredictionPoints(result.predictions, expectedEvaluationLength);
+  const predictions = normalizeDemandPredictionPoints(
+    result.predictions,
+    expectedEvaluationLength,
+    { requireStdDev: true },
+  );
   const actual = normalizeEvaluationActuals(result.eval_y_true, predictions.length);
   const metrics = recomputeCanonicalMetrics(originalMetrics, actual, predictions);
   const normalizedResult = {
@@ -181,6 +287,7 @@ export function transformTrainingResult(
     metrics,
     eval_y_true: actual,
     eval_predictions: predictions.map((point) => point.prediction),
+    prediction_points: predictions,
     evaluate_indices: normalizeNumericArray(metrics?.evaluate_indices),
     evaluate_months: normalizeStringArray(metrics?.evaluate_months),
     method_name: result.method_name,
