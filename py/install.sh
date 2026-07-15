@@ -7,6 +7,14 @@ cd "$(dirname "$0")"
 
 PYTHON_VERSION="3.13"
 VENV_DIR="venv"
+INSTALL_TESTS=false
+
+for arg in "$@"; do
+  case "$arg" in
+    --test) INSTALL_TESTS=true ;;
+    *) echo "Error: unknown argument: $arg" >&2; exit 2 ;;
+  esac
+done
 
 # 检查 uv 是否可用
 if ! command -v uv &>/dev/null; then
@@ -41,6 +49,10 @@ uv pip install \
   --python "$VENV_DIR/bin/python3" \
   -r requirements.txt
 
+if [ "$INSTALL_TESTS" = true ]; then
+  echo "Deep tests use only the Python standard library; no additional test dependencies are required."
+fi
+
 # 清理 bytecode 缓存
 find . -type d -name __pycache__ -not -path "./$VENV_DIR/*" -exec rm -rf {} + 2>/dev/null || true
 
@@ -48,3 +60,6 @@ echo "------------------------------------------------------------"
 echo "Python env ready: $PWD/$VENV_DIR"
 echo "Activate:  source $VENV_DIR/bin/activate"
 echo "Verify:    python -m src.adf --help"
+if [ "$INSTALL_TESTS" = true ]; then
+  echo "Deep test: $PWD/$VENV_DIR/bin/python deep_tests/run.py --profile fast"
+fi

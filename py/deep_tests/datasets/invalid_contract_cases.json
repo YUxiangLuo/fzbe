@@ -1,0 +1,1 @@
+[{"expected_tag":"[DATA]","name":"empty"},{"expected_tag":"[DATA]","name":"not_list"},{"expected_tag":"[DATA]","name":"missing_target"},{"expected_tag":"[DATA]","name":"non_numeric_target"},{"expected_tag":"[DATA]","name":"nan"},{"expected_tag":"[DATA]","name":"infinity"},{"expected_tag":"[DATA]","name":"missing_feature"}]
