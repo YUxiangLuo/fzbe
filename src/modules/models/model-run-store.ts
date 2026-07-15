@@ -1,6 +1,7 @@
 import crypto from "crypto";
 import type { PoolConnection, RowDataPacket } from "mysql2/promise";
 import { pool } from "../../config";
+import { acquireConnectionWithTimeout, queryWithTimeout } from "./model-db-guard";
 import type { ModelType, TrainInput } from "./models.schema";
 import type { BaseModelType, EnsembleModelType, GuidedModelType } from "./model-types";
 import { ModelValidationError } from "./model-errors";
@@ -540,7 +541,7 @@ export const loadCurrentExperimentStatePatch = async (
   experimentId: number,
   studentId: number,
 ) => {
-  const [rows] = await pool.query<RowDataPacket[]>(
+  const [rows] = await queryWithTimeout<RowDataPacket[]>(pool, 
     `SELECT *
        FROM experiment_status
       WHERE experiment_id = ?
@@ -743,7 +744,7 @@ const assertTrainingRequestStillCurrent = async (
 export async function commitModelTrainingRun(
   input: CommitModelTrainingRunInput,
 ): Promise<CommitModelTrainingRunResult> {
-  const connection = await pool.getConnection();
+  const connection = await acquireConnectionWithTimeout(pool);
   try {
     await connection.beginTransaction();
     const [experimentRows] = await connection.query<RowDataPacket[]>(
@@ -981,7 +982,7 @@ export async function getActiveModelTrainingRun(
   studentId: number,
   modelType: ModelType,
 ): Promise<ModelTrainingRunRow | null> {
-  const [rows] = await pool.query<ModelTrainingRunRow[]>(
+  const [rows] = await queryWithTimeout<ModelTrainingRunRow[]>(pool, 
     `SELECT *
        FROM model_training_runs
       WHERE experiment_id = ?
@@ -1002,7 +1003,7 @@ export async function setProductionArtifactForRun(
   productionRevision: string,
   productionArtifactSha256: string | null = null,
 ) {
-  const [result] = await pool.query(
+  const [result] = await queryWithTimeout(pool, 
     `UPDATE model_training_runs
         SET production_artifact_path = ?,
             production_artifact_sha256 = ?,
@@ -1016,7 +1017,7 @@ export async function setProductionArtifactForRun(
 }
 
 export async function backfillArtifactSha256ForRun(runId: string, artifactSha256: string) {
-  const [result] = await pool.query(
+  const [result] = await queryWithTimeout(pool, 
     `UPDATE model_training_runs
         SET artifact_sha256 = ?
       WHERE run_id = ?
@@ -1032,7 +1033,7 @@ export async function backfillProductionArtifactSha256ForRun(
   productionRevision: string,
   productionArtifactSha256: string,
 ) {
-  const [result] = await pool.query(
+  const [result] = await queryWithTimeout(pool, 
     `UPDATE model_training_runs
         SET production_artifact_sha256 = ?
       WHERE run_id = ?
@@ -1048,7 +1049,7 @@ export async function clearProductionArtifactForRun(
   runId: string,
   productionRevision: string,
 ) {
-  const [result] = await pool.query(
+  const [result] = await queryWithTimeout(pool, 
     `UPDATE model_training_runs
         SET production_artifact_path = NULL,
             production_artifact_sha256 = NULL,

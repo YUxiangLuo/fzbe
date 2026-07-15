@@ -5,6 +5,7 @@ import os from "node:os";
 import type { Stats } from "node:fs";
 import type { PoolConnection, RowDataPacket } from "mysql2/promise";
 import { pool } from "../../config";
+import { acquireConnectionWithTimeout, queryWithTimeout } from "./model-db-guard";
 import logger from "../../utils/logger";
 import type { ModelType, TrainInput } from "./models.schema";
 import { TIMEOUTS, CLEANUP_RETENTION } from "../../utils/constants";
@@ -189,7 +190,7 @@ interface StaleModelExperimentEligibilityRow extends RowDataPacket {
 }
 
 async function assertExperimentModelAccess(experimentId: number, studentId: number) {
-  const [rows] = await pool.query<ExperimentModelContextRow[]>(
+  const [rows] = await queryWithTimeout<ExperimentModelContextRow[]>(pool, 
     `SELECT student_id,
             status,
             selected_industry,
@@ -1219,7 +1220,7 @@ const deleteGuidedTrainingSession = async (
     return false;
   }
 
-  await pool.query(
+  await queryWithTimeout(pool, 
     `DELETE FROM model_guided_training_sessions
       WHERE session_id = ?`,
     [row.session_id],
@@ -1258,7 +1259,7 @@ const cleanupOrphanGuidedTrainingArtifactDirs = async (
       continue;
     }
 
-    const [rows] = await pool.query<RowDataPacket[]>(
+    const [rows] = await queryWithTimeout<RowDataPacket[]>(pool, 
       `SELECT session_id
          FROM model_guided_training_sessions
         WHERE artifact_dir = ?
@@ -1298,7 +1299,7 @@ export async function cleanupExpiredGuidedTrainingSessions(
 
   const expirationCutoffExpression = options.now ? "?" : "NOW()";
   const expirationCutoffParams = options.now ? [options.now] : [];
-  const [rows] = await pool.query<GuidedTrainingCleanupRow[]>(
+  const [rows] = await queryWithTimeout<GuidedTrainingCleanupRow[]>(pool, 
     `SELECT session_id,
             artifact_dir
        FROM model_guided_training_sessions
@@ -1331,7 +1332,7 @@ export async function cleanupExpiredGuidedTrainingSessions(
 
   if (sessionIdsToDelete.length > 0) {
     const placeholders = sessionIdsToDelete.map(() => "?").join(", ");
-    await pool.query(
+    await queryWithTimeout(pool, 
       `DELETE FROM model_guided_training_sessions
         WHERE session_id IN (${placeholders})`,
       sessionIdsToDelete,
@@ -2221,7 +2222,7 @@ const markGuidedTrainingSessionSuperseded = async (
   row: Pick<GuidedTrainingSessionRow, "session_id">,
   reason: string,
 ) => {
-  await pool.query(
+  await queryWithTimeout(pool, 
     `UPDATE model_guided_training_sessions
         SET status = 'superseded',
             current_step_id = NULL,
@@ -2320,7 +2321,7 @@ const assertCompletedGuidedTrainingRunCurrent = async (
     if (isEnsembleModelType(row.model_type)) {
       const body = parseJsonColumn<TrainInput>(row.request_payload, {} as TrainInput);
       const requestedModels = parseRequestedBaseModels(body.models ?? "");
-      const [dependencyRows] = await pool.query<ModelTrainingDependencyRow[]>(
+      const [dependencyRows] = await queryWithTimeout<ModelTrainingDependencyRow[]>(pool, 
         `SELECT base_model_type, base_run_id
            FROM model_training_run_dependencies
           WHERE run_id = ?`,
@@ -2362,7 +2363,7 @@ const assertCompletedGuidedTrainingRunCurrent = async (
 const fetchGuidedTrainingSessionRow = async (
   sessionId: string,
 ): Promise<GuidedTrainingSessionRow | null> => {
-  const [rows] = await pool.query<GuidedTrainingSessionRow[]>(
+  const [rows] = await queryWithTimeout<GuidedTrainingSessionRow[]>(pool, 
     `SELECT session_id,
             experiment_id,
             student_id,
@@ -2488,7 +2489,7 @@ const beginGuidedStepAttempt = async (
   stepId: string,
   timeoutMs: number,
 ) => {
-  const connection = await pool.getConnection();
+  const connection = await acquireConnectionWithTimeout(pool);
   try {
     await connection.beginTransaction();
     const [sessionRows] = await connection.query<GuidedTrainingSessionRow[]>(
@@ -2603,7 +2604,7 @@ const commitGuidedIntermediateStep = async (input: {
   stepPlan: GuidedTrainingStepDefinition[];
   receipt: Record<string, unknown>;
 }) => {
-  const connection = await pool.getConnection();
+  const connection = await acquireConnectionWithTimeout(pool);
   try {
     await connection.beginTransaction();
     const [sessionRows] = await connection.query<RowDataPacket[]>(
@@ -2676,7 +2677,7 @@ const recordGuidedAttemptPythonCompleted = async (
   attempt: GuidedTrainingStepAttemptRow,
   receipt: Record<string, unknown>,
 ) => {
-  await pool.query(
+  await queryWithTimeout(pool, 
     `UPDATE model_guided_training_step_attempts
         SET status = 'python_completed',
             candidate_state_sha256 = ?,
@@ -2854,7 +2855,7 @@ const createOrResumeGuidedTrainingSessionInternal = async (
     experimentRevision,
     baseRunFingerprint,
   });
-  const [existingRows] = await pool.query<GuidedTrainingSessionRow[]>(
+  const [existingRows] = await queryWithTimeout<GuidedTrainingSessionRow[]>(pool, 
     `SELECT session_id,
             experiment_id,
             student_id,
@@ -2981,7 +2982,7 @@ const createOrResumeGuidedTrainingSessionInternal = async (
     await writeGuidedDatasetSnapshot(artifactDir, datasetJson);
     operationContext.throwIfTerminated();
     insertAttempted = true;
-    await pool.query(
+    await queryWithTimeout(pool, 
       `INSERT INTO model_guided_training_sessions
        (session_id,
         experiment_id,
@@ -3030,7 +3031,7 @@ const createOrResumeGuidedTrainingSessionInternal = async (
     }
     fs.rmSync(artifactDir, { recursive: true, force: true });
     operationContext.throwIfTerminated();
-    const [racedRows] = await pool.query<GuidedTrainingSessionRow[]>(
+    const [racedRows] = await queryWithTimeout<GuidedTrainingSessionRow[]>(pool, 
       `SELECT *
          FROM model_guided_training_sessions
         WHERE experiment_id = ?
@@ -3155,7 +3156,7 @@ export async function discardGuidedTrainingSession(
       { mode: "execution_only", experimentId: row.experiment_id, modelType },
       async (lease) => {
         await lease.verifyOwned();
-        const [result] = await pool.query(
+        const [result] = await queryWithTimeout(pool, 
           `DELETE FROM model_guided_training_sessions
             WHERE session_id = ?
               AND student_id = ?
@@ -3726,7 +3727,7 @@ const shouldDeleteStaleModelArtifactGroup = async (
   group: ModelArtifactGroup,
   maxAgeSeconds: number,
 ) => {
-  const [rows] = await pool.query<StaleModelExperimentEligibilityRow[]>(
+  const [rows] = await queryWithTimeout<StaleModelExperimentEligibilityRow[]>(pool, 
     `SELECT CASE
               WHEN status = 'Completed' THEN 1
               WHEN TIMESTAMPDIFF(

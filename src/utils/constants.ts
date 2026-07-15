@@ -63,6 +63,15 @@ const MODEL_LOCK_CONNECTION_ACQUIRE_TIMEOUT_MS =
   parsePositiveIntegerEnv("MODEL_LOCK_CONNECTION_ACQUIRE_TIMEOUT_MS") ?? 2_000;
 const MODEL_LOCK_QUERY_TIMEOUT_MS =
   parsePositiveIntegerEnv("MODEL_LOCK_QUERY_TIMEOUT_MS") ?? 2_000;
+// Business (non-lock) DB work runs while an admission permit + advisory locks are
+// held. mysql2 has no default per-query or acquire timeout, so a hung query or a
+// starved pool would keep the permit occupied far past the operation deadline.
+// These bound both so the permit is always released promptly. Generous relative
+// to the healthy sub-second query time, but far below the operation deadline.
+const MODEL_DB_QUERY_TIMEOUT_MS =
+  parsePositiveIntegerEnv("MODEL_DB_QUERY_TIMEOUT_MS") ?? 30_000;
+const MODEL_DB_CONNECTION_ACQUIRE_TIMEOUT_MS =
+  parsePositiveIntegerEnv("MODEL_DB_CONNECTION_ACQUIRE_TIMEOUT_MS") ?? 10_000;
 const MODEL_PROCESS_TERMINATION_GRACE_MS =
   parsePositiveIntegerEnv("MODEL_PROCESS_TERMINATION_GRACE_MS") ?? 5_000;
 const ADF_OPERATION_CLEANUP_BUDGET_MS =
@@ -168,6 +177,10 @@ export const TIMEOUTS = {
   MODEL_LOCK_CONNECTION_ACQUIRE: MODEL_LOCK_CONNECTION_ACQUIRE_TIMEOUT_MS,
   /** advisory-lock 获取、校验和释放 SQL 的最长执行时间。 */
   MODEL_LOCK_QUERY: MODEL_LOCK_QUERY_TIMEOUT_MS,
+  /** 持有并发额度期间业务查询的最长执行时间（超时即释放 lease）。 */
+  MODEL_DB_QUERY: MODEL_DB_QUERY_TIMEOUT_MS,
+  /** 持有并发额度期间从连接池获取业务连接的最长等待时间。 */
+  MODEL_DB_CONNECTION_ACQUIRE: MODEL_DB_CONNECTION_ACQUIRE_TIMEOUT_MS,
   /** Python 收到 SIGTERM 后允许优雅退出的时间。 */
   MODEL_PROCESS_TERMINATION_GRACE: MODEL_PROCESS_TERMINATION_GRACE_MS,
   /** ADF 从接收请求到进入清理前的总时限。 */
