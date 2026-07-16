@@ -50,16 +50,12 @@ class SevenModelLifecycleTests(unittest.TestCase):
                         ))
                     if model in {"weighted_avg", "stacking", "boosting"}:
                         split_plan = state["split_plan"]
+                        self.assertGreaterEqual(split_plan["prefix_size"], 2)
+                        self.assertGreaterEqual(split_plan["validation_size"], 2)
+                        self.assertNotIn("scheme", split_plan)
+                        self.assertNotIn("folds", split_plan)
                         self.assertEqual(
-                            "expanding_window_rolling_origin",
-                            split_plan["scheme"],
-                        )
-                        self.assertEqual(
-                            split_plan["fold_count"] * split_plan["validation_size"],
-                            split_plan["calibration_size"],
-                        )
-                        self.assertEqual(
-                            "rolling_origin_oof",
+                            "level1_holdout" if model == "stacking" else "internal_validation",
                             state["uncertainty"]["calibration_source"],
                         )
 

@@ -213,20 +213,20 @@ export const GUIDED_TRAINING_STEPS: Record<GuidedModelType, GuidedTrainingStepDe
     },
     {
       id: "split_validation",
-      label: "规划滚动起点验证",
-      description: "按模型数、样本量和成员可训练条件规划最多三折扩展窗口滚动起点验证；各验证块互不重叠，数据不足时显式退化为单折。",
+      label: "划分权重验证段",
+      description: "按模型数和样本量确定期望验证段，再在保证所有成员均可训练的前提下动态留出时间末段。",
       actionLabel: "划分数据",
     },
     {
       id: "validation_predictions",
       label: "生成验证段预测",
-      description: "逐折只继承用户选择的 MA 窗口、ES α、ARIMA d 与 LSTM 历史特征/归一化；ARIMA 阶数和 LSTM 隐藏参数都在每个预测起点之前重新推导。",
+      description: "只继承用户选择的 MA 窗口、ES α、ARIMA d 与 LSTM 特征/归一化；ARIMA 阶数和 LSTM 隐藏参数都在留出段之前重新推导。",
       actionLabel: "训练并预测",
     },
     {
       id: "compute_weights",
       label: "计算融合权重",
-      description: "汇总各折 OOF 残差，先按带尺度 epsilon 的 1/MSE 得到候选权重，再依据 OOF 样本数向等权组合收缩。",
+      description: "先按带尺度 epsilon 的 1/MSE 得到候选权重，再依据验证样本数向等权组合收缩，减轻短验证段极端权重。",
       actionLabel: "计算权重",
     },
     {
@@ -238,7 +238,7 @@ export const GUIDED_TRAINING_STEPS: Record<GuidedModelType, GuidedTrainingStepDe
     {
       id: "blend_evaluate",
       label: "加权组合并评估",
-      description: "按收缩权重组合非负成员预测并计算独立评估指标；不确定性仅由滚动起点 OOF 组合残差校准，信息不足会标记 fallback。",
+      description: "按收缩权重组合非负成员预测并计算独立评估指标；不确定性仅由内部权重验证段组合残差校准，信息不足会标记 fallback。",
       actionLabel: "组合评估",
     },
     {
@@ -257,20 +257,20 @@ export const GUIDED_TRAINING_STEPS: Record<GuidedModelType, GuidedTrainingStepDe
     },
     {
       id: "split_levels",
-      label: "规划 Level-0/OOF 折",
-      description: "规划最多三折扩展窗口滚动起点验证：每折 Level-0 只使用历史前缀，后续互不重叠块产生 OOF 元学习样本。",
+      label: "划分 Level-0/Level-1",
+      description: "按时间顺序把训练区间拆成基础模型训练段和元模型训练段，保持预测的时间因果顺序并降低信息泄漏风险。",
       actionLabel: "划分层级",
     },
     {
       id: "level1_predictions",
       label: "生成元模型训练特征",
-      description: "基础模型在每折 Level-0 历史前缀重新拟合后生成 OOF 预测；只继承用户参数，ARIMA 阶数与 LSTM 隐藏配置逐折重算。",
+      description: "基础模型只在 Level-0 重新拟合后预测 Level-1；只继承用户参数，ARIMA 阶数与 LSTM 隐藏配置都按 Level-0 重算。",
       actionLabel: "生成二层特征",
     },
     {
       id: "fit_meta_model",
       label: "拟合元模型",
-      description: "对汇总的滚动起点 OOF 预测矩阵拟合无截距非负最小二乘（NNLS）；保留原始非负系数，不强制归一化。",
+      description: "对 Level-1 预测矩阵拟合无截距非负最小二乘（NNLS）；保留原始非负系数，不强制归一化。",
       actionLabel: "拟合元模型",
     },
     {
@@ -282,7 +282,7 @@ export const GUIDED_TRAINING_STEPS: Record<GuidedModelType, GuidedTrainingStepDe
     {
       id: "meta_evaluate",
       label: "元模型组合并评估",
-      description: "把非负成员预测交给 NNLS 元模型并对最终销量做非负兜底；不确定性仅由滚动起点 OOF 组合残差校准，独立评估真实值不参与校准。",
+      description: "把非负成员预测交给 NNLS 元模型并对最终销量做非负兜底；不确定性仅由 Level-1 组合残差校准，独立评估真实值不参与校准。",
       actionLabel: "组合评估",
     },
     {
@@ -302,19 +302,19 @@ export const GUIDED_TRAINING_STEPS: Record<GuidedModelType, GuidedTrainingStepDe
     {
       id: "split_residual_sets",
       label: "初始化残差训练集",
-      description: "初始化最多三折扩展窗口滚动起点残差状态，把原始销量作为第一轮目标，并由模型数与 OOF 校准点数确定最多轮数。",
+      description: "动态拆分时间顺序训练/验证段，把原始销量作为第一轮目标，并由模型数与验证点数确定最多轮数。",
       actionLabel: "初始化残差",
     },
     {
       id: "retrain_chain",
       label: "重训已选模型链",
-      description: "在完整训练段逐级重训已选链，同时保留滚动起点 OOF 学到的非负阶段系数；全量样本内拟合只用于构造下一阶段残差，不重新调系数。",
+      description: "在完整训练段逐级重训已选链，同时保留时间留出验证学到的非负阶段系数；全量样本内拟合只用于构造下一阶段残差，不重新调系数。",
       actionLabel: "重训模型链",
     },
     {
       id: "combine_evaluate",
       label: "累加阶段预测并评估",
-      description: "按 OOF 阶段系数累加预测，最后仅把物理销量结果截断到不小于0，再计算独立评估指标；不确定性由滚动起点 OOF 残差校准。",
+      description: "按验证阶段系数累加预测，最后仅把物理销量结果截断到不小于0，再计算独立评估指标；不确定性由内部时间验证残差校准。",
       actionLabel: "组合评估",
     },
     {

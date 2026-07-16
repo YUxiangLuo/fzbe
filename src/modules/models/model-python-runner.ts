@@ -416,7 +416,7 @@ export async function runPythonModel(
 }
 
 export interface GuidedPythonStepResult {
-  protocol_version: 4;
+  protocol_version: 3;
   attempt_id: string;
   step_id: string;
   output?: unknown;

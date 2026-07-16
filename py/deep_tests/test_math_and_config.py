@@ -20,7 +20,6 @@ from py.src.data_utils import ParsedData
 from py.src.ensemble_utils import (
     controlled_ensemble_map,
     plan_ensemble_internal_holdout,
-    rolling_origin_ranges,
 )
 from py.src.metrics import mae, mape, r2, rmse
 from py.src.model_info import attach_method_metadata, ensure_state_metadata
@@ -66,63 +65,6 @@ class MathematicalGoldenTests(unittest.TestCase):
             self.assertAlmostEqual(nonnegative_line_search(residual, prediction), boosting._nonnegative_line_search(residual, prediction), places=12)
         np.testing.assert_equal(boosting._apply_stage_output_semantics(0, [-2, 3]), [0, 3])
         np.testing.assert_equal(boosting._apply_stage_output_semantics(1, [-2, 3]), [-2, 3])
-
-    @profile("fast")
-    def test_checkpointed_boosting_folds_match_the_pooled_candidate_core(self):
-        fold_states = [
-            {
-                "fold_index": 0,
-                "prefix_range": range(0, 3),
-                "validation_range": range(3, 5),
-                "residual_val": np.asarray([4.0, 2.0]),
-            },
-            {
-                "fold_index": 1,
-                "prefix_range": range(0, 5),
-                "validation_range": range(5, 7),
-                "residual_val": np.asarray([3.0, 1.0]),
-            },
-        ]
-        evaluated = {
-            0: {
-                "fold_predictions": np.asarray([2.0, 1.0]),
-                "fold_fitted_train_predictions": np.asarray([0.0, 1.0, 1.5]),
-            },
-            1: {
-                "fold_predictions": np.asarray([1.0, 2.0]),
-                "fold_fitted_train_predictions": np.asarray([0.0, 1.0, 1.5, 2.0, 2.5]),
-            },
-        }
-        checkpointed = boosting.finalize_rolling_origin_candidate(
-            fold_states,
-            "ma",
-            [evaluated[0], evaluated[1]],
-        )
-        expected_gamma = nonnegative_line_search(
-            [4.0, 2.0, 3.0, 1.0],
-            [2.0, 1.0, 1.0, 2.0],
-        )
-        self.assertAlmostEqual(expected_gamma, checkpointed["coefficient"], places=12)
-
-        def fake_fold(_parsed, fold, _model, _params, _round):
-            return evaluated[fold["fold_index"]]
-
-        with patch.object(
-            boosting,
-            "evaluate_rolling_origin_fold_candidate",
-            side_effect=fake_fold,
-        ):
-            monolithic = boosting.evaluate_rolling_origin_candidate(
-                object(), fold_states, "ma", {}, 0
-            )
-        self.assertAlmostEqual(
-            checkpointed["coefficient"], monolithic["coefficient"], places=12
-        )
-        self.assertAlmostEqual(checkpointed["rmse"], monolithic["rmse"], places=12)
-        for left, right in zip(
-            checkpointed["next_residuals"], monolithic["next_residuals"]
-        ):
-            np.testing.assert_allclose(left, right, rtol=0, atol=0)
 
     @profile("fast")
     def test_lstm_direct_windows_do_not_include_future_inputs(self):
@@ -243,7 +185,7 @@ class DynamicConfigurationTests(unittest.TestCase):
         self.assertEqual([1, 3, 4], [derive_boosting_max_rounds(2, value) for value in (2, 4, 10)])
 
     @profile("fast")
-    def test_ensemble_holdout_expands_into_nonoverlapping_rolling_origins(self):
+    def test_ensemble_holdout_uses_the_latest_chronological_block(self):
         parsed = ParsedData(
             df=pd.DataFrame({"time": range(36), "y": range(36)}),
             target_key="y",
@@ -259,20 +201,14 @@ class DynamicConfigurationTests(unittest.TestCase):
             params,
             "weighted",
         )
-        self.assertEqual("expanding_window_rolling_origin", plan["scheme"])
-        self.assertEqual(3, plan["fold_count"])
-        self.assertEqual(24, plan["calibration_size"])
-        self.assertIs(False, plan["single_fold_fallback"])
-        ranges = rolling_origin_ranges(range(36), plan)
-        self.assertEqual(
-            [(0, 12, 12, 20), (0, 20, 20, 28), (0, 28, 28, 36)],
-            [
-                (prefix.start, prefix.stop, validation.start, validation.stop)
-                for prefix, validation in ranges
-            ],
-        )
-        validation_points = [point for _prefix, validation in ranges for point in validation]
-        self.assertEqual(len(validation_points), len(set(validation_points)))
+        self.assertEqual(28, plan["prefix_size"])
+        self.assertEqual(8, plan["validation_size"])
+        self.assertNotIn("scheme", plan)
+        self.assertNotIn("folds", plan)
+        prefix_range = range(36)[:plan["prefix_size"]]
+        validation_range = range(36)[plan["prefix_size"]:]
+        self.assertEqual((0, 28), (prefix_range.start, prefix_range.stop))
+        self.assertEqual((28, 36), (validation_range.start, validation_range.stop))
 
         small = ParsedData(
             df=pd.DataFrame({"time": range(8), "y": range(8)}),
@@ -288,8 +224,8 @@ class DynamicConfigurationTests(unittest.TestCase):
             params,
             "weighted",
         )
-        self.assertEqual(1, fallback["fold_count"])
-        self.assertIs(True, fallback["single_fold_fallback"])
+        self.assertEqual(5, fallback["prefix_size"])
+        self.assertEqual(3, fallback["validation_size"])
 
 
 if __name__ == "__main__":

@@ -88,7 +88,7 @@ class CheckpointModeParityTests(unittest.TestCase):
                                 production_state["uncertainty"]["calibration_residuals"],
                             )
                             self.assertEqual(
-                                "rolling_origin_oof",
+                                "internal_validation",
                                 production_state["uncertainty"]["calibration_source"],
                             )
                     else:

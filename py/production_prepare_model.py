@@ -333,9 +333,9 @@ def _fit_boosting_stage(step_id: str, state: Dict[str, Any]) -> Dict[str, Any]:
         train_range,
     )
     fitted = boosting._apply_stage_output_semantics(stage_idx, fitted)
-    # Preserve the leakage-safe coefficient learned from rolling-origin OOF
-    # predictions. Full-range in-sample fitted values are used only to construct
-    # the next residual target, never to retune deployment coefficients.
+    # Preserve the coefficient learned on the chronological validation holdout.
+    # Full-range in-sample fitted values only construct the next residual target;
+    # they never retune deployment coefficients.
     coefficient = float(stage["coefficient"])
     state["residual_train"] = residual_train - coefficient * fitted
     state["future_prediction"] = np.asarray(state["future_prediction"], dtype=float) + coefficient * stage_predictions
@@ -412,7 +412,7 @@ def _finalize(state: Dict[str, Any]) -> Dict[str, Any]:
 
     calibration_source = str(
         uncertainty.get("calibration_source")
-        or "rolling_origin_oof"
+        or ("level1_holdout" if model_type == "stacking" else "internal_validation")
     )
     profile, summary = ensemble_growth_profile(
         state["member_profiles"],

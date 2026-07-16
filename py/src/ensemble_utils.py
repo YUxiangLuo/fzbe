@@ -36,7 +36,6 @@ from dynamic_config import (
 )
 
 SUPPORTED_BASE_MODEL_TYPES = frozenset({"ma", "es", "arima", "lstm"})
-MAX_ROLLING_ORIGIN_FOLDS = 3
 _T = TypeVar("_T")
 
 
@@ -337,88 +336,12 @@ def plan_ensemble_internal_holdout(
         except (TypeError, ValueError):
             return False
 
-    holdout_plan = plan_internal_holdout(
+    return plan_internal_holdout(
         purpose,
         len(train_range),
         len(models),
         is_feasible,
     )
-    validation_size = int(holdout_plan["validation_size"])
-    final_prefix_size = int(holdout_plan["prefix_size"])
-
-    # Build non-overlapping, expanding-window folds backwards from the end of
-    # train_range.  The most recent fold is exactly the old chronological
-    # holdout, preserving its feasibility guarantees. Earlier folds add genuine
-    # out-of-fold observations without allowing future rows into a prefix fit.
-    prefix_sizes = [final_prefix_size]
-    candidate_prefix = final_prefix_size - validation_size
-    while (
-        len(prefix_sizes) < MAX_ROLLING_ORIGIN_FOLDS
-        and candidate_prefix >= 2
-        and is_feasible(candidate_prefix, validation_size)
-    ):
-        prefix_sizes.append(candidate_prefix)
-        candidate_prefix -= validation_size
-    prefix_sizes.reverse()
-
-    folds: List[Dict[str, int]] = []
-    for fold_index, prefix_size in enumerate(prefix_sizes):
-        validation_start = prefix_size
-        validation_stop = prefix_size + validation_size
-        folds.append({
-            "fold_index": fold_index,
-            "prefix_size": prefix_size,
-            "validation_start_offset": validation_start,
-            "validation_stop_offset": validation_stop,
-            "validation_size": validation_size,
-        })
-
-    return {
-        **holdout_plan,
-        "scheme": "expanding_window_rolling_origin",
-        "max_fold_count": MAX_ROLLING_ORIGIN_FOLDS,
-        "fold_count": len(folds),
-        "folds": folds,
-        "calibration_size": len(folds) * validation_size,
-        "single_fold_fallback": len(folds) == 1,
-    }
-
-
-def rolling_origin_ranges(
-    train_range: range,
-    split_plan: Dict[str, Any],
-) -> List[Tuple[range, range]]:
-    folds = split_plan.get("folds")
-    if not isinstance(folds, list) or not folds:
-        # Backward compatibility for revision-3 guided checkpoints/artifacts.
-        prefix_size = int(split_plan["prefix_size"])
-        folds = [{
-            "prefix_size": prefix_size,
-            "validation_start_offset": prefix_size,
-            "validation_stop_offset": len(train_range),
-        }]
-
-    ranges: List[Tuple[range, range]] = []
-    for fold in folds:
-        if not isinstance(fold, dict):
-            raise ValueError("[VALIDATION] Invalid rolling-origin fold plan.")
-        prefix_size = int(fold["prefix_size"])
-        validation_start = int(fold["validation_start_offset"])
-        validation_stop = int(fold["validation_stop_offset"])
-        prefix = range(train_range.start, train_range.start + prefix_size)
-        validation = range(
-            train_range.start + validation_start,
-            train_range.start + validation_stop,
-        )
-        if (
-            len(prefix) < 2
-            or len(validation) < 2
-            or prefix.stop != validation.start
-            or validation.stop > train_range.stop
-        ):
-            raise ValueError("[VALIDATION] Invalid rolling-origin fold boundaries.")
-        ranges.append((prefix, validation))
-    return ranges
 
 
 def can_refit_source_artifact_for_internal_holdout(model_name: str) -> bool:
@@ -665,121 +588,6 @@ def build_ensemble_subprocess_data(
         lstm_data_dicts, _ = build_subprocess_records(parsed_data, feature_keys=lstm_feature_keys)
 
     return numeric_data_dicts, lstm_data_dicts
-
-
-def generate_rolling_origin_member_predictions(
-    parsed_data: ParsedData,
-    train_range: range,
-    models_to_use: List[str],
-    model_params: Dict[str, Dict[str, Any]],
-    base_model_files: Optional[Dict[str, str]],
-    split_plan: Dict[str, Any],
-    context: str,
-) -> Tuple[np.ndarray, Dict[str, np.ndarray], List[Dict[str, Any]]]:
-    """Generate leakage-safe, concatenated member predictions for every fold."""
-    numeric_records, lstm_records = build_ensemble_subprocess_data(
-        parsed_data,
-        models_to_use,
-        model_params,
-    )
-    predictions: Dict[str, List[float]] = {
-        model_name: [] for model_name in models_to_use
-    }
-    targets: List[float] = []
-    fold_details: List[Dict[str, Any]] = []
-
-    for fold_index, (prefix_range, validation_range) in enumerate(
-        rolling_origin_ranges(train_range, split_plan)
-    ):
-        fold_targets = np.asarray(parsed_data.y[validation_range], dtype=float)
-        targets.extend(fold_targets.tolist())
-        fold_detail: Dict[str, Any] = {
-            "fold_index": fold_index,
-            "train_start": prefix_range.start,
-            "train_end": prefix_range.stop - 1,
-            "validation_start": validation_range.start,
-            "validation_end": validation_range.stop - 1,
-            "validation_size": len(validation_range),
-            "member_rmse": {},
-        }
-
-        def predict_member(model_name: str) -> Tuple[str, np.ndarray]:
-            params = model_params[model_name]
-            source_model_file = (base_model_files or {}).get(model_name)
-            timeout = 600 if model_name == "lstm" else 120
-            data = lstm_records if model_name == "lstm" else numeric_records
-
-            if (
-                source_model_file
-                and can_refit_source_artifact_for_internal_holdout(model_name)
-            ):
-                adjusted_source_model_file = source_model_file
-                temporary_source_file: Optional[str] = None
-                try:
-                    if model_name == "lstm":
-                        source_state = load_lstm_source_state(
-                            source_model_file,
-                            f"{context} LSTM source model",
-                        )
-                        adjusted_source_model_file, temporary_source_file = (
-                            prepare_lstm_source_model_for_requested_steps(
-                                source_model_file,
-                                source_state,
-                                requested_steps=len(validation_range),
-                            )
-                        )
-                    fold_predictions = fit_and_predict_from_source_model(
-                        model_name=model_name,
-                        source_model_file=adjusted_source_model_file,
-                        data=data,
-                        train_start=prefix_range.start,
-                        train_end=prefix_range.stop - 1,
-                        forecast_steps=len(validation_range),
-                        timeout=timeout,
-                    )
-                finally:
-                    if temporary_source_file and os.path.exists(temporary_source_file):
-                        os.remove(temporary_source_file)
-            else:
-                result = run_base_model_subprocess(
-                    model_type=model_name,
-                    data=data,
-                    train_start=prefix_range.start,
-                    train_end=prefix_range.stop - 1,
-                    eval_start=validation_range.start,
-                    eval_end=validation_range.stop - 1,
-                    model_params=dict(params),
-                    timeout=timeout,
-                )
-                fold_predictions = extract_predictions_from_result(result)
-
-            normalized = normalize_demand_forecast(fold_predictions)
-            if len(normalized) != len(validation_range) or not np.isfinite(normalized).all():
-                raise ValueError(
-                    f"[MODEL] {context} member {model_name} returned an invalid "
-                    f"rolling-origin prediction vector for fold {fold_index + 1}."
-                )
-            return model_name, normalized
-
-        member_results = controlled_ensemble_map(
-            [lambda name=name: predict_member(name) for name in models_to_use],
-            contains_lstm="lstm" in models_to_use,
-        )
-        for model_name, normalized in member_results:
-            predictions[model_name].extend(normalized.tolist())
-            fold_detail["member_rmse"][model_name] = float(
-                np.sqrt(np.mean(np.square(fold_targets - normalized)))
-            )
-        fold_details.append(fold_detail)
-
-    target_array = np.asarray(targets, dtype=float)
-    prediction_arrays = {
-        model_name: np.asarray(values, dtype=float)
-        for model_name, values in predictions.items()
-    }
-    if target_array.size != int(split_plan.get("calibration_size", target_array.size)):
-        raise ValueError("[VALIDATION] Rolling-origin calibration size mismatch.")
-    return target_array, prediction_arrays, fold_details
 
 
 def get_member_model_path(save_path: str, model_name: str, round_idx: int | None = None) -> str:

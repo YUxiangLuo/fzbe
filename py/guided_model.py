@@ -1136,7 +1136,7 @@ def main() -> None:
 
     _save_state(args.output_state_file, state)
     payload = {
-        "protocol_version": 4,
+        "protocol_version": 3,
         "attempt_id": args.attempt_id,
         "step_id": args.step_id,
         "output": _jsonable(output),

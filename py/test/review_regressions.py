@@ -1162,8 +1162,6 @@ def assert_boosting_requests_signed_base_outputs() -> None:
 
 
 def assert_boosting_keeps_signed_corrections_end_to_end() -> None:
-    import threading
-
     from data_utils import load_data_from_json
 
     records = [
@@ -1171,42 +1169,17 @@ def assert_boosting_keeps_signed_corrections_end_to_end() -> None:
         for index in range(10)
     ]
     parsed_data = load_data_from_json(json.dumps(records, ensure_ascii=False))
-    call_counts = {"ma": 0, "es": 0}
-    call_lock = threading.Lock()
+    training_calls = iter((
+        ("candidate-r0-ma.pkl", np.asarray([2.0, 1.0, 0.0]), [1.0, 1.1, 1.2]),
+        ("candidate-r0-es.pkl", np.asarray([100.0, 0.0, 0.0]), [1.0, 1.1, 1.2]),
+        ("candidate-r1-ma.pkl", np.asarray([-1.0, 1.0, 0.0]), [1.0, 1.1, 1.2]),
+        ("candidate-r1-es.pkl", np.asarray([100.0, -100.0, 0.0]), [1.0, 1.1, 1.2]),
+        ("final-r0-ma.pkl", np.asarray([2.0, 1.0]), [1.0, 1.1]),
+        ("final-r1-ma.pkl", np.asarray([-1.0, 1.0]), [1.0, 1.1]),
+    ))
 
-    def fake_train_stage(*args: object, **_kwargs: object):
-        model_name = str(args[0])
-        with call_lock:
-            call_index = call_counts[model_name]
-            call_counts[model_name] += 1
-        if model_name == "es":
-            return (
-                f"candidate-es-{call_index}.pkl",
-                (
-                    np.asarray([100.0, 0.0, 0.0])
-                    if call_index < 2
-                    else np.asarray([100.0, -100.0, 0.0])
-                ),
-                [1.0, 1.1, 1.2],
-            )
-        if call_index < 2:
-            return (
-                f"candidate-r0-ma-{call_index}.pkl",
-                np.asarray([2.0, 1.0, 0.0]),
-                [1.0, 1.1, 1.2],
-            )
-        if call_index < 4:
-            return (
-                f"candidate-r1-ma-{call_index}.pkl",
-                np.asarray([-1.0, 1.0, 0.0]),
-                [1.0, 1.1, 1.2],
-            )
-        stage = call_index - 4
-        return (
-            f"final-r{stage}-ma.pkl",
-            np.asarray([2.0, 1.0]) if stage == 0 else np.asarray([-1.0, 1.0]),
-            [1.0, 1.1],
-        )
+    def fake_train_stage(*_args: object, **_kwargs: object):
+        return next(training_calls)
 
     def fake_fitted(
         _model_name: str,
@@ -1230,7 +1203,6 @@ def assert_boosting_keeps_signed_corrections_end_to_end() -> None:
         patch.object(boosting, "_train_stage_model", side_effect=fake_train_stage),
         patch.object(boosting, "_compute_in_sample_fitted_predictions", side_effect=fake_fitted),
         patch.object(boosting, "remove_member_model_artifact"),
-        patch.object(boosting, "derive_boosting_max_rounds", return_value=2),
     ):
         (
             _metrics,
@@ -1293,14 +1265,14 @@ def assert_boosting_keeps_signed_corrections_end_to_end() -> None:
     assert all(call["allow_negative_predictions"] is True for call in prediction_calls)
 
 
-def assert_boosting_refit_preserves_oof_coefficients_and_calibration() -> None:
+def assert_boosting_refit_preserves_validation_coefficients_and_calibration() -> None:
     records = [
         {"月份": f"2026-{index + 1:02d}", "销售数量": 1.0}
         for index in range(10)
     ]
     parsed_data = load_data_from_json(json.dumps(records, ensure_ascii=False))
     selected_coefficients = [0.6, 0.3]
-    expected_oof_residuals = np.asarray([0.1, -0.1, 0.2, 0.1, -0.1, 0.2])
+    expected_validation_residuals = np.asarray([0.1, -0.1, 0.2])
 
     def fake_fitted(
         _model_name: str,
@@ -1310,7 +1282,7 @@ def assert_boosting_refit_preserves_oof_coefficients_and_calibration() -> None:
     ) -> np.ndarray:
         # The second full-range fitted learner is deliberately anti-correlated
         # with its residual target. A full in-sample line search would trim it;
-        # the deployment refit must retain the leakage-safe OOF coefficient.
+        # the deployment refit must retain the leakage-safe validation coefficient.
         value = -1.0 if "r1" in model_file else 1.0
         return np.full(len(train_range), value, dtype=float)
 
@@ -1318,7 +1290,7 @@ def assert_boosting_refit_preserves_oof_coefficients_and_calibration() -> None:
         ("guided-final-r0.pkl", np.asarray([1.0, 1.0]), [1.0, 1.1]),
         ("guided-final-r1.pkl", np.asarray([-1.0, -1.0]), [1.0, 1.1]),
     ))
-    with tempfile.TemporaryDirectory(prefix="guided-boosting-oof-") as artifact_dir:
+    with tempfile.TemporaryDirectory(prefix="guided-boosting-validation-") as artifact_dir:
         guided_state = {
             "parsed_data": parsed_data,
             "train_range": {"start": 0, "stop": 8},
@@ -1329,19 +1301,16 @@ def assert_boosting_refit_preserves_oof_coefficients_and_calibration() -> None:
             "model_chain": ["ma", "ma"],
             "stage_coefficients": selected_coefficients.copy(),
             "validation_residual_snapshots": [
-                np.ones(6),
-                np.full(6, 0.4),
-                expected_oof_residuals.copy(),
+                np.ones(3),
+                np.full(3, 0.4),
+                expected_validation_residuals.copy(),
             ],
             "search_summary": {"stages": []},
             "artifact_dir": artifact_dir,
             "split_plan": {
                 "purpose": "boosting",
-                "scheme": "expanding_window_rolling_origin",
                 "prefix_size": 5,
                 "validation_size": 3,
-                "fold_count": 2,
-                "calibration_size": 6,
             },
         }
         with (
@@ -1367,8 +1336,8 @@ def assert_boosting_refit_preserves_oof_coefficients_and_calibration() -> None:
     guided_calibration = np.asarray(
         guided_state["uncertainty"]["calibration_residuals"]
     )
-    assert np.allclose(guided_calibration, expected_oof_residuals)
-    assert guided_state["uncertainty"]["calibration_source"] == "rolling_origin_oof"
+    assert np.allclose(guided_calibration, expected_validation_residuals)
+    assert guided_state["uncertainty"]["calibration_source"] == "internal_validation"
 
 
 def assert_subprocess_prediction_domains() -> None:
@@ -1812,7 +1781,7 @@ def main() -> None:
     assert_clipped_predictions_drive_python_metrics()
     assert_boosting_requests_signed_base_outputs()
     assert_boosting_keeps_signed_corrections_end_to_end()
-    assert_boosting_refit_preserves_oof_coefficients_and_calibration()
+    assert_boosting_refit_preserves_validation_coefficients_and_calibration()
     assert_subprocess_prediction_domains()
     assert_loaded_ensemble_demand_semantics()
     assert_same_path_artifact_replay()

@@ -26,7 +26,8 @@ from data_utils import infer_feature_types, load_data_from_json
 from error_protocol import format_known_error
 from ensemble_utils import (
     build_ensemble_subprocess_data,
-    generate_rolling_origin_member_predictions,
+    can_refit_source_artifact_for_internal_holdout,
+    fit_and_predict_from_source_model,
     get_member_model_path,
     normalize_demand_forecast,
     parse_base_model_files_arg,
@@ -36,7 +37,6 @@ from ensemble_utils import (
     remove_member_model_artifact,
     require_explicit_lstm_feature_names,
     resolve_base_model_artifact_configs,
-    rolling_origin_ranges,
 )
 from dynamic_config import derive_boosting_max_rounds
 from logger import get_log_contents
@@ -280,10 +280,10 @@ def _initialize_state(model_type: str, args, state: Dict[str, Any]) -> Dict[str,
 
     if model_type == "boosting":
         state["max_rounds"] = derive_boosting_max_rounds(
-            len(models_to_use), int(split_plan["calibration_size"])
+            len(models_to_use), int(split_plan["validation_size"])
         )
         state["minimum_relative_improvement"] = (
-            0.05 if int(split_plan["calibration_size"]) < 5 else 0.01
+            0.05 if int(split_plan["validation_size"]) < 5 else 0.01
         )
 
     return {
@@ -301,186 +301,68 @@ def _base_timeout(models_to_use: List[str], model_params: Dict[str, Dict[str, An
     return 600
 
 
-def _rolling_oof_predictions(
+def _holdout_predictions(
+    module,
     parsed_data,
     models_to_use: List[str],
     model_params: Dict[str, Dict[str, Any]],
     base_model_files: Dict[str, str],
     train_range: range,
-    split_plan: Dict[str, Any],
+    holdout_range: range,
     source_context: str,
-) -> Tuple[Dict[str, List[float]], List[float], List[Dict[str, Any]]]:
-    targets, predictions, fold_diagnostics = (
-        generate_rolling_origin_member_predictions(
-            parsed_data,
-            train_range,
-            models_to_use,
-            model_params,
-            base_model_files,
-            split_plan,
-            source_context,
-        )
-    )
-    return (
-        {name: values.tolist() for name, values in predictions.items()},
-        targets.tolist(),
-        fold_diagnostics,
-    )
+) -> Dict[str, List[float]]:
+    numeric_data_dicts, lstm_data_dicts = build_ensemble_subprocess_data(parsed_data, models_to_use, model_params)
+    predictions: Dict[str, List[float]] = {}
+    timeout = _base_timeout(models_to_use, model_params)
 
-
-def _rolling_oof_fold_prediction(
-    parsed_data,
-    model_name: str,
-    model_params: Dict[str, Dict[str, Any]],
-    base_model_files: Dict[str, str],
-    train_range: range,
-    split_plan: Dict[str, Any],
-    fold_index: int,
-    source_context: str,
-) -> Tuple[List[float], List[float], Dict[str, Any]] | None:
-    """Run one member on one rolling-origin fold for a bounded checkpoint."""
-    fold_ranges = rolling_origin_ranges(train_range, split_plan)
-    if fold_index < 0:
-        raise ValueError("[VALIDATION] Rolling-origin fold index must be positive.")
-    if fold_index >= len(fold_ranges):
-        return None
-
-    prefix_range, validation_range = fold_ranges[fold_index]
-    single_fold_plan = {
-        **split_plan,
-        "fold_count": 1,
-        "calibration_size": len(validation_range),
-        "folds": [{
-            "fold_index": fold_index,
-            "prefix_size": len(prefix_range),
-            "validation_start_offset": validation_range.start - train_range.start,
-            "validation_stop_offset": validation_range.stop - train_range.start,
-            "validation_size": len(validation_range),
-        }],
-    }
-    predictions, targets, fold_diagnostics = _rolling_oof_predictions(
-        parsed_data,
-        [model_name],
-        model_params,
-        base_model_files,
-        train_range,
-        single_fold_plan,
-        source_context,
-    )
-    detail = dict(fold_diagnostics[0])
-    detail["fold_index"] = fold_index
-    return predictions[model_name], targets, detail
-
-
-def _record_rolling_oof_fold(
-    state: Dict[str, Any],
-    storage_key: str,
-    model_name: str,
-    fold_index: int,
-    prediction: List[float],
-    targets: List[float],
-    diagnostic: Dict[str, Any],
-) -> None:
-    model_folds = state.setdefault(storage_key, {}).setdefault(model_name, {})
-    if fold_index in model_folds:
-        raise ValueError("[VALIDATION] Rolling-origin member fold was already evaluated.")
-    model_folds[fold_index] = prediction
-
-    target_folds = state.setdefault("oof_target_folds", {})
-    existing_targets = target_folds.get(fold_index)
-    if existing_targets is not None and not np.array_equal(
-        np.asarray(existing_targets, dtype=float),
-        np.asarray(targets, dtype=float),
-    ):
-        raise ValueError("[VALIDATION] Rolling-origin target fold is inconsistent across members.")
-    target_folds[fold_index] = targets
-    _merge_fold_diagnostics(state, [diagnostic])
-
-
-def _assemble_rolling_oof_folds(
-    state: Dict[str, Any],
-    storage_key: str,
-    models_to_use: List[str],
-) -> Tuple[Dict[str, List[float]], List[float]]:
-    fold_count = len(state["split_plan"].get("folds") or []) or 1
-    expected_folds = list(range(fold_count))
-    stored_predictions = state.get(storage_key)
-    target_folds = state.get("oof_target_folds")
-    if not isinstance(stored_predictions, dict) or not isinstance(target_folds, dict):
-        raise ValueError("[VALIDATION] Rolling-origin fold checkpoints are missing.")
-
-    missing_targets = [index + 1 for index in expected_folds if index not in target_folds]
-    if missing_targets:
-        raise ValueError(
-            "[VALIDATION] Rolling-origin target folds are incomplete: "
-            + ", ".join(map(str, missing_targets))
-        )
-
-    assembled: Dict[str, List[float]] = {}
     for model_name in models_to_use:
-        model_folds = stored_predictions.get(model_name)
-        if not isinstance(model_folds, dict):
-            raise ValueError(
-                f"[VALIDATION] Rolling-origin predictions are missing for {model_name}."
-            )
-        missing = [index + 1 for index in expected_folds if index not in model_folds]
-        if missing:
-            raise ValueError(
-                f"[VALIDATION] Rolling-origin folds are incomplete for {model_name}: "
-                + ", ".join(map(str, missing))
-            )
-        assembled[model_name] = [
-            value
-            for index in expected_folds
-            for value in model_folds[index]
-        ]
+        params = model_params[model_name]
+        source_model_file = base_model_files.get(model_name)
+        if (
+            source_model_file
+            and can_refit_source_artifact_for_internal_holdout(model_name)
+        ):
+            adjusted_source_model_file = source_model_file
+            temp_source_model_file = None
+            try:
+                if model_name == "lstm":
+                    source_model_state = module._load_lstm_source_state(source_model_file, source_context)
+                    adjusted_source_model_file, temp_source_model_file = (
+                        module._prepare_lstm_source_model_for_requested_steps(
+                            source_model_file,
+                            source_model_state,
+                            requested_steps=len(holdout_range),
+                        )
+                    )
+                predictions[model_name] = normalize_demand_forecast(fit_and_predict_from_source_model(
+                    model_name=model_name,
+                    source_model_file=adjusted_source_model_file,
+                    data=lstm_data_dicts if model_name == "lstm" else numeric_data_dicts,
+                    train_start=train_range.start,
+                    train_end=train_range.stop - 1,
+                    forecast_steps=len(holdout_range),
+                    timeout=timeout,
+                )).tolist()
+            finally:
+                if temp_source_model_file and os.path.exists(temp_source_model_file):
+                    os.remove(temp_source_model_file)
+            continue
 
-    targets = [
-        value
-        for index in expected_folds
-        for value in target_folds[index]
-    ]
-    return assembled, targets
-
-
-def _merge_fold_diagnostics(
-    state: Dict[str, Any],
-    fold_diagnostics: List[Dict[str, Any]],
-) -> None:
-    existing = state.setdefault("fold_diagnostics", [])
-    by_index = {
-        int(item["fold_index"]): item
-        for item in existing
-        if isinstance(item, dict) and "fold_index" in item
-    }
-    for detail in fold_diagnostics:
-        fold_index = int(detail["fold_index"])
-        if fold_index not in by_index:
-            by_index[fold_index] = {
-                **detail,
-                "member_rmse": dict(detail.get("member_rmse") or {}),
-            }
-        else:
-            by_index[fold_index].setdefault("member_rmse", {}).update(
-                detail.get("member_rmse") or {}
-            )
-    merged = [by_index[index] for index in sorted(by_index)]
-    state["fold_diagnostics"] = merged
-    state["split_plan"]["fold_diagnostics"] = merged
-
-
-def _rolling_oof_targets(
-    parsed_data,
-    train_range: range,
-    split_plan: Dict[str, Any],
-) -> np.ndarray:
-    return np.concatenate([
-        np.asarray(parsed_data.y[validation_range], dtype=float)
-        for _prefix_range, validation_range in rolling_origin_ranges(
-            train_range,
-            split_plan,
+        result = run_base_model_subprocess(
+            model_type=model_name,
+            data=lstm_data_dicts if model_name == "lstm" else numeric_data_dicts,
+            train_start=train_range.start,
+            train_end=train_range.stop - 1,
+            eval_start=holdout_range.start,
+            eval_end=holdout_range.stop - 1,
+            model_params=params.copy(),
+            timeout=timeout,
         )
-    ])
+        predictions[model_name] = normalize_demand_forecast(
+            extract_predictions_from_result(result)
+        ).tolist()
+
+    return predictions
 
 
 def _eval_member_predictions(
@@ -641,50 +523,6 @@ def _run_weighted(step_id: str, args, state: Dict[str, Any]) -> Dict[str, Any]:
     model_params = state["model_params"]
     base_model_files = state["base_model_files"]
 
-    fold_member_match = re.fullmatch(
-        r"validation_prediction_fold_(\d+)_(ma|es|arima|lstm)",
-        step_id,
-    )
-    if fold_member_match:
-        fold_index = int(fold_member_match.group(1)) - 1
-        model_name = fold_member_match.group(2)
-        if model_name not in models_to_use:
-            raise ValueError("[VALIDATION] Weighted member step is not part of this session.")
-        fold_count = len(rolling_origin_ranges(train_range, state["split_plan"]))
-        result = _rolling_oof_fold_prediction(
-            parsed_data,
-            model_name,
-            model_params,
-            base_model_files,
-            train_range,
-            state["split_plan"],
-            fold_index,
-            "Saved Weighted Average LSTM base model",
-        )
-        if result is None:
-            return {
-                "model": model_name,
-                "fold": fold_index + 1,
-                "fold_count": fold_count,
-                "skipped": True,
-            }
-        prediction, targets, diagnostic = result
-        _record_rolling_oof_fold(
-            state,
-            "weight_val_prediction_folds",
-            model_name,
-            fold_index,
-            prediction,
-            targets,
-            diagnostic,
-        )
-        return {
-            "model": model_name,
-            "fold": fold_index + 1,
-            "fold_count": fold_count,
-            "predicted_points": len(prediction),
-        }
-
     member_match = re.fullmatch(
         r"(validation_prediction|eval_prediction)_(ma|es|arima|lstm)",
         step_id,
@@ -694,19 +532,17 @@ def _run_weighted(step_id: str, args, state: Dict[str, Any]) -> Dict[str, Any]:
         if model_name not in models_to_use:
             raise ValueError("[VALIDATION] Weighted member step is not part of this session.")
         if action == "validation_prediction":
-            predictions, targets, fold_diagnostics = _rolling_oof_predictions(
+            prediction = _holdout_predictions(
+                weighted_avg,
                 parsed_data,
                 [model_name],
                 model_params,
                 base_model_files,
-                train_range,
-                state["split_plan"],
+                _state_range(state, "weight_train_range"),
+                _state_range(state, "weight_val_range"),
                 "Saved Weighted Average LSTM base model",
-            )
-            prediction = predictions[model_name]
+            )[model_name]
             state.setdefault("weight_val_predictions", {})[model_name] = prediction
-            state["oof_targets"] = targets
-            _merge_fold_diagnostics(state, fold_diagnostics)
             return {"model": model_name, "predicted_points": len(prediction)}
 
         predictions, profiles, model_states = _eval_member_predictions(
@@ -745,38 +581,26 @@ def _run_weighted(step_id: str, args, state: Dict[str, Any]) -> Dict[str, Any]:
         }
 
     if step_id == "validation_predictions":
-        predictions, targets, fold_diagnostics = _rolling_oof_predictions(
+        predictions = _holdout_predictions(
+            weighted_avg,
             parsed_data,
             models_to_use,
             model_params,
             base_model_files,
-            train_range,
-            state["split_plan"],
+            _state_range(state, "weight_train_range"),
+            _state_range(state, "weight_val_range"),
             "Saved Weighted Average LSTM base model",
         )
         state["weight_val_predictions"] = predictions
-        state["oof_targets"] = targets
-        _merge_fold_diagnostics(state, fold_diagnostics)
         return {
             "predicted_points": {name: len(values) for name, values in predictions.items()},
             "models": models_to_use,
         }
 
     if step_id == "compute_weights":
-        if "weight_val_prediction_folds" in state:
-            predictions, targets = _assemble_rolling_oof_folds(
-                state,
-                "weight_val_prediction_folds",
-                models_to_use,
-            )
-            state["weight_val_predictions"] = predictions
-            state["oof_targets"] = targets
+        weight_val_range = _state_range(state, "weight_val_range")
         predictions = state["weight_val_predictions"]
-        y_true_val = np.asarray(
-            state.get("oof_targets")
-            or _rolling_oof_targets(parsed_data, train_range, state["split_plan"]),
-            dtype=float,
-        )
+        y_true_val = parsed_data.y[weight_val_range]
         weights, diagnostics = weighted_avg._compute_inverse_residual_mse_weights(
             y_true_val, predictions
         )
@@ -816,16 +640,12 @@ def _run_weighted(step_id: str, args, state: Dict[str, Any]) -> Dict[str, Any]:
         y_pred_final = np.sum(x_eval * model_weights, axis=1)
         y_pred_final = normalize_demand_forecast(y_pred_final)
         y_true = parsed_data.y[eval_range]
+        weight_val_range = _state_range(state, "weight_val_range")
         weight_val_predictions = state["weight_val_predictions"]
         x_weight_val = np.array([weight_val_predictions[name] for name in models_to_use]).T
         weight_val_blend = np.sum(x_weight_val * model_weights, axis=1)
         weight_val_blend = normalize_demand_forecast(weight_val_blend)
-        oof_targets = np.asarray(
-            state.get("oof_targets")
-            or _rolling_oof_targets(parsed_data, train_range, state["split_plan"]),
-            dtype=float,
-        )
-        weight_val_residuals = oof_targets - weight_val_blend
+        weight_val_residuals = parsed_data.y[weight_val_range] - weight_val_blend
         eval_forecast_steps = eval_range.stop - train_range.stop
         eval_forecast_offset = eval_range.start - train_range.stop
         full_uncertainty_profile, uncertainty_summary = ensemble_growth_profile(
@@ -834,12 +654,11 @@ def _run_weighted(step_id: str, args, state: Dict[str, Any]) -> Dict[str, Any]:
             weight_val_residuals,
             parsed_data.y[train_range],
             eval_forecast_steps,
-            calibration_source="rolling_origin_oof",
         )
         uncertainty_profile = full_uncertainty_profile[
             eval_forecast_offset: eval_forecast_offset + len(eval_range)
         ]
-        uncertainty_summary.setdefault("calibration_source", "rolling_origin_oof")
+        uncertainty_summary.setdefault("calibration_source", "internal_validation")
         timestamps = parsed_data.timestamps
         metrics = {
             "rmse": rmse(y_true, y_pred_final),
@@ -869,7 +688,7 @@ def _run_weighted(step_id: str, args, state: Dict[str, Any]) -> Dict[str, Any]:
         state["y_pred"] = y_pred_final.tolist()
         state["uncertainty"] = {
             "calibration_residuals": weight_val_residuals.tolist(),
-            "calibration_source": "rolling_origin_oof",
+            "calibration_source": "internal_validation",
             "reference_series": parsed_data.y[train_range].tolist(),
             "profile": full_uncertainty_profile,
             "summary": uncertainty_summary,
@@ -905,50 +724,6 @@ def _run_stacking(step_id: str, args, state: Dict[str, Any]) -> Dict[str, Any]:
     model_params = state["model_params"]
     base_model_files = state["base_model_files"]
 
-    fold_member_match = re.fullmatch(
-        r"level1_prediction_fold_(\d+)_(ma|es|arima|lstm)",
-        step_id,
-    )
-    if fold_member_match:
-        fold_index = int(fold_member_match.group(1)) - 1
-        model_name = fold_member_match.group(2)
-        if model_name not in models_to_use:
-            raise ValueError("[VALIDATION] Stacking member step is not part of this session.")
-        fold_count = len(rolling_origin_ranges(train_range, state["split_plan"]))
-        result = _rolling_oof_fold_prediction(
-            parsed_data,
-            model_name,
-            model_params,
-            base_model_files,
-            train_range,
-            state["split_plan"],
-            fold_index,
-            "Saved Stacking LSTM base model",
-        )
-        if result is None:
-            return {
-                "model": model_name,
-                "fold": fold_index + 1,
-                "fold_count": fold_count,
-                "skipped": True,
-            }
-        prediction, targets, diagnostic = result
-        _record_rolling_oof_fold(
-            state,
-            "level1_prediction_folds",
-            model_name,
-            fold_index,
-            prediction,
-            targets,
-            diagnostic,
-        )
-        return {
-            "model": model_name,
-            "fold": fold_index + 1,
-            "fold_count": fold_count,
-            "predicted_points": len(prediction),
-        }
-
     member_match = re.fullmatch(
         r"(level1_prediction|eval_prediction)_(ma|es|arima|lstm)",
         step_id,
@@ -958,19 +733,17 @@ def _run_stacking(step_id: str, args, state: Dict[str, Any]) -> Dict[str, Any]:
         if model_name not in models_to_use:
             raise ValueError("[VALIDATION] Stacking member step is not part of this session.")
         if action == "level1_prediction":
-            predictions, targets, fold_diagnostics = _rolling_oof_predictions(
+            prediction = _holdout_predictions(
+                stacking,
                 parsed_data,
                 [model_name],
                 model_params,
                 base_model_files,
-                train_range,
-                state["split_plan"],
+                _state_range(state, "level0_range"),
+                _state_range(state, "level1_range"),
                 "Saved Stacking LSTM base model",
-            )
-            prediction = predictions[model_name]
+            )[model_name]
             state.setdefault("level1_prediction_map", {})[model_name] = prediction
-            state["oof_targets"] = targets
-            _merge_fold_diagnostics(state, fold_diagnostics)
             return {"model": model_name, "predicted_points": len(prediction)}
 
         predictions, profiles, model_states = _eval_member_predictions(
@@ -1009,42 +782,30 @@ def _run_stacking(step_id: str, args, state: Dict[str, Any]) -> Dict[str, Any]:
         }
 
     if step_id == "level1_predictions":
-        prediction_map, targets, fold_diagnostics = _rolling_oof_predictions(
+        prediction_map = _holdout_predictions(
+            stacking,
             parsed_data,
             models_to_use,
             model_params,
             base_model_files,
-            train_range,
-            state["split_plan"],
+            _state_range(state, "level0_range"),
+            _state_range(state, "level1_range"),
             "Saved Stacking LSTM base model",
         )
         state["level1_predictions"] = [prediction_map[name] for name in models_to_use]
-        state["oof_targets"] = targets
-        _merge_fold_diagnostics(state, fold_diagnostics)
         return {
             "predicted_points": {name: len(values) for name, values in prediction_map.items()},
             "models": models_to_use,
         }
 
     if step_id == "fit_meta_model":
-        if "level1_prediction_folds" in state:
-            prediction_map, targets = _assemble_rolling_oof_folds(
-                state,
-                "level1_prediction_folds",
-                models_to_use,
-            )
-            state["level1_prediction_map"] = prediction_map
-            state["oof_targets"] = targets
+        level1_range = _state_range(state, "level1_range")
         if "level1_prediction_map" in state:
             state["level1_predictions"] = [
                 state["level1_prediction_map"][name] for name in models_to_use
             ]
         x_meta_train = np.column_stack(state["level1_predictions"])
-        y_meta_train = np.asarray(
-            state.get("oof_targets")
-            or _rolling_oof_targets(parsed_data, train_range, state["split_plan"]),
-            dtype=float,
-        )
+        y_meta_train = parsed_data.y[level1_range]
         meta_model = stacking._fit_meta_model(x_meta_train, y_meta_train, models_to_use)
         state["meta_model"] = meta_model
         return {
@@ -1085,16 +846,12 @@ def _run_stacking(step_id: str, args, state: Dict[str, Any]) -> Dict[str, Any]:
         y_pred_final = stacking._predict_with_meta_model(state["meta_model"], x_meta_eval)
         y_pred_final = normalize_demand_forecast(y_pred_final)
         y_true = parsed_data.y[eval_range]
+        level1_range = _state_range(state, "level1_range")
         x_meta_train = np.column_stack(state["level1_predictions"])
         level1_blend = normalize_demand_forecast(
             stacking._predict_with_meta_model(state["meta_model"], x_meta_train)
         )
-        oof_targets = np.asarray(
-            state.get("oof_targets")
-            or _rolling_oof_targets(parsed_data, train_range, state["split_plan"]),
-            dtype=float,
-        )
-        level1_residuals = oof_targets - level1_blend
+        level1_residuals = parsed_data.y[level1_range] - level1_blend
         coefficients = dict(zip(
             state["meta_model"]["model_names"],
             state["meta_model"]["coefficients"],
@@ -1107,12 +864,12 @@ def _run_stacking(step_id: str, args, state: Dict[str, Any]) -> Dict[str, Any]:
             level1_residuals,
             parsed_data.y[train_range],
             eval_forecast_steps,
-            calibration_source="rolling_origin_oof",
+            calibration_source="level1_holdout",
         )
         uncertainty_profile = full_uncertainty_profile[
             eval_forecast_offset: eval_forecast_offset + len(eval_range)
         ]
-        uncertainty_summary.setdefault("calibration_source", "rolling_origin_oof")
+        uncertainty_summary.setdefault("calibration_source", "level1_holdout")
         timestamps = parsed_data.timestamps
         metrics = {
             "rmse": rmse(y_true, y_pred_final),
@@ -1141,7 +898,7 @@ def _run_stacking(step_id: str, args, state: Dict[str, Any]) -> Dict[str, Any]:
         state["y_pred"] = y_pred_final.tolist()
         state["uncertainty"] = {
             "calibration_residuals": level1_residuals.tolist(),
-            "calibration_source": "rolling_origin_oof",
+            "calibration_source": "level1_holdout",
             "reference_series": parsed_data.y[train_range].tolist(),
             "profile": full_uncertainty_profile,
             "summary": uncertainty_summary,
@@ -1166,85 +923,6 @@ def _boosting_round_match(step_id: str) -> Tuple[int, str] | None:
     return int(match.group(1)) - 1, match.group(2)
 
 
-def _pooled_guided_boosting_residuals(state: Dict[str, Any]) -> np.ndarray:
-    folds = state.get("boosting_fold_states")
-    if not isinstance(folds, list) or not folds:
-        raise ValueError("[VALIDATION] Boosting rolling-origin fold state is missing.")
-    return np.concatenate([
-        np.asarray(fold["residual_val"], dtype=float)
-        for fold in folds
-    ])
-
-
-def _evaluate_guided_boosting_candidate(
-    parsed_data,
-    state: Dict[str, Any],
-    model_name: str,
-    params: Dict[str, Any],
-    round_idx: int,
-) -> Dict[str, Any]:
-    normalized_folds = [
-        {
-            **fold,
-            "prefix_range": _state_range(fold, "prefix_range"),
-            "validation_range": _state_range(fold, "validation_range"),
-        }
-        for fold in state["boosting_fold_states"]
-    ]
-    return boosting.evaluate_rolling_origin_candidate(
-        parsed_data,
-        normalized_folds,
-        model_name,
-        params,
-        round_idx,
-    )
-
-
-def _normalized_guided_boosting_folds(state: Dict[str, Any]) -> List[Dict[str, Any]]:
-    return [
-        {
-            **fold,
-            "prefix_range": _state_range(fold, "prefix_range"),
-            "validation_range": _state_range(fold, "validation_range"),
-        }
-        for fold in state["boosting_fold_states"]
-    ]
-
-
-def _finalize_guided_boosting_fold_candidates(
-    state: Dict[str, Any],
-    models_to_use: List[str],
-) -> List[Dict[str, Any]]:
-    normalized_folds = _normalized_guided_boosting_folds(state)
-    stored_results = state.get("pending_candidate_fold_results")
-    if not isinstance(stored_results, dict):
-        raise ValueError("[VALIDATION] Boosting candidate fold checkpoints are missing.")
-
-    stage_results = []
-    for model_name in models_to_use:
-        model_results = stored_results.get(model_name)
-        if not isinstance(model_results, dict):
-            raise ValueError(
-                f"[VALIDATION] Boosting candidate folds are missing for {model_name}."
-            )
-        missing = [
-            fold_index + 1
-            for fold_index in range(len(normalized_folds))
-            if fold_index not in model_results
-        ]
-        if missing:
-            raise ValueError(
-                f"[VALIDATION] Boosting candidate folds are incomplete for {model_name}: "
-                + ", ".join(map(str, missing))
-            )
-        stage_results.append(boosting.finalize_rolling_origin_candidate(
-            normalized_folds,
-            model_name,
-            [model_results[index] for index in range(len(normalized_folds))],
-        ))
-    return stage_results
-
-
 def _run_boosting(step_id: str, args, state: Dict[str, Any]) -> Dict[str, Any]:
     if step_id == "prepare_data":
         return _initialize_state("boosting", args, state)
@@ -1255,60 +933,6 @@ def _run_boosting(step_id: str, args, state: Dict[str, Any]) -> Dict[str, Any]:
     models_to_use = state["models"]
     model_params = state["model_params"]
     base_model_files = state["base_model_files"]
-
-    fold_candidate_match = re.fullmatch(
-        r"round_(\d+)_evaluate_fold_(\d+)_(ma|es|arima|lstm)",
-        step_id,
-    )
-    if fold_candidate_match:
-        round_idx = int(fold_candidate_match.group(1)) - 1
-        fold_index = int(fold_candidate_match.group(2)) - 1
-        model_name = fold_candidate_match.group(3)
-        if model_name not in models_to_use:
-            raise ValueError("[VALIDATION] Boosting candidate is not part of this session.")
-        if round_idx != int(state.get("next_round_index", 0)):
-            raise ValueError("[VALIDATION] Boosting candidate step is out of order.")
-
-        normalized_folds = _normalized_guided_boosting_folds(state)
-        residual_val = _pooled_guided_boosting_residuals(state)
-        if state.get("pending_round_index") != round_idx:
-            state["pending_round_index"] = round_idx
-            state["pending_current_rmse"] = rmse(
-                np.zeros_like(residual_val), residual_val
-            )
-            state["pending_candidate_fold_results"] = {}
-            state.pop("pending_stage_results", None)
-
-        if fold_index < 0:
-            raise ValueError("[VALIDATION] Boosting fold index must be positive.")
-        if fold_index >= len(normalized_folds):
-            return {
-                "round": round_idx + 1,
-                "model": model_name,
-                "fold": fold_index + 1,
-                "fold_count": len(normalized_folds),
-                "skipped": True,
-            }
-
-        model_results = state.setdefault(
-            "pending_candidate_fold_results", {}
-        ).setdefault(model_name, {})
-        if fold_index in model_results:
-            raise ValueError("[VALIDATION] Boosting candidate fold was already evaluated.")
-        model_results[fold_index] = boosting.evaluate_rolling_origin_fold_candidate(
-            parsed_data,
-            normalized_folds[fold_index],
-            model_name,
-            model_params[model_name],
-            round_idx,
-        )
-        return {
-            "round": round_idx + 1,
-            "model": model_name,
-            "fold": fold_index + 1,
-            "fold_count": len(normalized_folds),
-            "predicted_points": len(normalized_folds[fold_index]["validation_range"]),
-        }
 
     candidate_match = re.fullmatch(
         r"round_(\d+)_evaluate_(ma|es|arima|lstm)",
@@ -1321,57 +945,81 @@ def _run_boosting(step_id: str, args, state: Dict[str, Any]) -> Dict[str, Any]:
             raise ValueError("[VALIDATION] Boosting candidate is not part of this session.")
         if round_idx != int(state.get("next_round_index", 0)):
             raise ValueError("[VALIDATION] Boosting candidate step is out of order.")
-        residual_val = _pooled_guided_boosting_residuals(state)
+        boost_train_range = _state_range(state, "boost_train_range")
+        boost_val_range = _state_range(state, "boost_val_range")
+        residual_train = np.asarray(state["residual_train"], dtype=float)
+        residual_val = np.asarray(state["residual_val"], dtype=float)
         if state.get("pending_round_index") != round_idx:
             state["pending_round_index"] = round_idx
             state["pending_current_rmse"] = rmse(np.zeros_like(residual_val), residual_val)
             state["pending_stage_results"] = []
-            state.pop("pending_candidate_fold_results", None)
         if any(
             result["model_name"] == model_name
             for result in state["pending_stage_results"]
         ):
             raise ValueError("[VALIDATION] Boosting candidate was already evaluated.")
 
-        candidate_result = _evaluate_guided_boosting_candidate(
+        params = model_params[model_name]
+        timeout = boosting._get_model_timeout(model_name, params)
+        round_parsed_data = boosting._build_residual_parsed_data(
             parsed_data,
-            state,
-            model_name,
-            model_params[model_name],
-            round_idx,
+            boost_train_range,
+            residual_train,
         )
-        state["pending_stage_results"].append(candidate_result)
+        round_numeric_records, round_lstm_records = boosting._build_round_records(
+            round_parsed_data,
+            model_name,
+            params,
+        )
+        temp_model_file, stage_predictions, _stage_profile = boosting._train_stage_model(
+            model_name,
+            round_numeric_records,
+            round_lstm_records,
+            boost_train_range,
+            boost_val_range,
+            params,
+            timeout,
+        )
+        fitted_train_predictions = boosting._compute_in_sample_fitted_predictions(
+            model_name,
+            temp_model_file,
+            round_parsed_data,
+            boost_train_range,
+        )
+        stage_predictions = boosting._apply_stage_output_semantics(round_idx, stage_predictions)
+        fitted_train_predictions = boosting._apply_stage_output_semantics(
+            round_idx,
+            fitted_train_predictions,
+        )
+        coefficient = boosting._nonnegative_line_search(residual_val, stage_predictions)
+        next_residual_val = residual_val - coefficient * stage_predictions
+        next_rmse = rmse(np.zeros_like(next_residual_val), next_residual_val)
+        remove_member_model_artifact(model_name, temp_model_file)
+        state["pending_stage_results"].append({
+            "model_name": model_name,
+            "coefficient": coefficient,
+            "rmse": next_rmse,
+            "fitted_train_predictions": fitted_train_predictions,
+            "next_residual_val": next_residual_val,
+        })
         return {
             "round": round_idx + 1,
             "model": model_name,
             "previous_rmse": state["pending_current_rmse"],
-            "rmse": candidate_result["rmse"],
-            "coefficient": candidate_result["coefficient"],
-            "fold_rmse": candidate_result["fold_rmse"],
+            "rmse": next_rmse,
+            "coefficient": coefficient,
         }
 
     if step_id == "split_residual_sets":
-        planned_ranges = rolling_origin_ranges(train_range, state["split_plan"])
-        boosting_fold_states = []
-        for fold_index, (prefix_range, validation_range) in enumerate(planned_ranges):
-            boosting_fold_states.append({
-                "fold_index": fold_index,
-                "prefix_range": _range_to_state(prefix_range),
-                "validation_range": _range_to_state(validation_range),
-                "residual_train": np.asarray(parsed_data.y[prefix_range], dtype=float),
-                "residual_val": np.asarray(parsed_data.y[validation_range], dtype=float),
-            })
-        # Keep the legacy aliases for checkpoint inspection/UI compatibility;
-        # all selection math below uses the complete fold collection.
-        boost_train_range, boost_val_range = planned_ranges[-1]
+        split = int(state["split_plan"]["prefix_size"])
+        boost_train_range = range(train_range.start, train_range.start + split)
+        boost_val_range = range(train_range.start + split, train_range.stop)
+        y_true_val = np.asarray(parsed_data.y[boost_val_range], dtype=float)
         state["boost_train_range"] = _range_to_state(boost_train_range)
         state["boost_val_range"] = _range_to_state(boost_val_range)
-        state["boosting_fold_states"] = boosting_fold_states
-        state["residual_train"] = boosting_fold_states[-1]["residual_train"]
-        state["residual_val"] = boosting_fold_states[-1]["residual_val"]
-        state["validation_residual_snapshots"] = [
-            _pooled_guided_boosting_residuals(state).copy()
-        ]
+        state["residual_train"] = np.asarray(parsed_data.y[boost_train_range], dtype=float)
+        state["residual_val"] = y_true_val
+        state["validation_residual_snapshots"] = [y_true_val.copy()]
         state["model_chain"] = []
         state["stage_coefficients"] = []
         state["next_round_index"] = 0
@@ -1386,8 +1034,6 @@ def _run_boosting(step_id: str, args, state: Dict[str, Any]) -> Dict[str, Any]:
         return {
             "boost_train_size": len(boost_train_range),
             "boost_val_size": len(boost_val_range),
-            "fold_count": len(planned_ranges),
-            "calibration_size": int(state["split_plan"]["calibration_size"]),
             "max_rounds": state["max_rounds"],
             "split_plan": state["split_plan"],
         }
@@ -1398,24 +1044,62 @@ def _run_boosting(step_id: str, args, state: Dict[str, Any]) -> Dict[str, Any]:
         if round_idx != int(state.get("next_round_index", 0)):
             raise ValueError("[VALIDATION] Boosting round step is out of order.")
 
-        residual_val = _pooled_guided_boosting_residuals(state)
+        boost_train_range = _state_range(state, "boost_train_range")
+        boost_val_range = _state_range(state, "boost_val_range")
+        residual_train = np.asarray(state["residual_train"], dtype=float)
+        residual_val = np.asarray(state["residual_val"], dtype=float)
         if action == "evaluate_candidates":
             current_rmse = rmse(np.zeros_like(residual_val), residual_val)
-            stage_results = [
-                _evaluate_guided_boosting_candidate(
-                    parsed_data,
-                    state,
+            round_parsed_data = boosting._build_residual_parsed_data(parsed_data, boost_train_range, residual_train)
+            stage_results: List[Dict[str, Any]] = []
+            for model_name in models_to_use:
+                params = model_params[model_name]
+                timeout = boosting._get_model_timeout(model_name, params)
+                round_numeric_records, round_lstm_records = boosting._build_round_records(
+                    round_parsed_data,
                     model_name,
-                    model_params[model_name],
-                    round_idx,
+                    params,
                 )
-                for model_name in models_to_use
-            ]
+                temp_model_file, stage_predictions, _stage_profile = boosting._train_stage_model(
+                    model_name,
+                    round_numeric_records,
+                    round_lstm_records,
+                    boost_train_range,
+                    boost_val_range,
+                    params,
+                    timeout,
+                )
+                fitted_train_predictions = boosting._compute_in_sample_fitted_predictions(
+                    model_name,
+                    temp_model_file,
+                    round_parsed_data,
+                    boost_train_range,
+                )
+                stage_predictions = boosting._apply_stage_output_semantics(
+                    round_idx,
+                    stage_predictions,
+                )
+                fitted_train_predictions = boosting._apply_stage_output_semantics(
+                    round_idx,
+                    fitted_train_predictions,
+                )
+                coefficient = boosting._nonnegative_line_search(
+                    residual_val, stage_predictions
+                )
+                next_residual_val = residual_val - coefficient * stage_predictions
+                next_rmse = rmse(np.zeros_like(next_residual_val), next_residual_val)
+                remove_member_model_artifact(model_name, temp_model_file)
+                stage_results.append({
+                    "model_name": model_name,
+                    "coefficient": coefficient,
+                    "rmse": next_rmse,
+                    "fitted_train_predictions": fitted_train_predictions,
+                    "next_residual_val": next_residual_val,
+                })
 
             state["pending_round_index"] = round_idx
             state["pending_current_rmse"] = current_rmse
             state["pending_stage_results"] = stage_results
-            state.pop("pending_candidate_fold_results", None)
             return {
                 "round": round_idx + 1,
                 "previous_rmse": current_rmse,
@@ -1423,7 +1107,6 @@ def _run_boosting(step_id: str, args, state: Dict[str, Any]) -> Dict[str, Any]:
                     result["model_name"]: {
                         "rmse": result["rmse"],
                         "coefficient": result["coefficient"],
-                        "fold_rmse": result["fold_rmse"],
                     }
                     for result in stage_results
                 },
@@ -1433,11 +1116,6 @@ def _run_boosting(step_id: str, args, state: Dict[str, Any]) -> Dict[str, Any]:
         if pending_round != round_idx:
             raise ValueError("[VALIDATION] Boosting candidate results are missing for this round.")
 
-        if "pending_candidate_fold_results" in state:
-            state["pending_stage_results"] = _finalize_guided_boosting_fold_candidates(
-                state,
-                models_to_use,
-            )
         stage_results = state["pending_stage_results"]
         evaluated_models = {result["model_name"] for result in stage_results}
         if evaluated_models != set(models_to_use):
@@ -1459,7 +1137,6 @@ def _run_boosting(step_id: str, args, state: Dict[str, Any]) -> Dict[str, Any]:
                 result["model_name"]: {
                     "rmse": result["rmse"],
                     "coefficient": result["coefficient"],
-                    "fold_rmse": result["fold_rmse"],
                 }
                 for result in stage_results
             },
@@ -1472,17 +1149,10 @@ def _run_boosting(step_id: str, args, state: Dict[str, Any]) -> Dict[str, Any]:
         if relative_improvement >= float(state["minimum_relative_improvement"]):
             state["model_chain"].append(best_result["model_name"])
             state["stage_coefficients"].append(best_result["coefficient"])
-            for fold_index, fold in enumerate(state["boosting_fold_states"]):
-                fold["residual_train"] = (
-                    np.asarray(fold["residual_train"], dtype=float)
-                    - best_result["coefficient"]
-                    * best_result["fold_fitted_train_predictions"][fold_index]
-                )
-                fold["residual_val"] = best_result["next_residuals"][fold_index]
-            state["residual_train"] = state["boosting_fold_states"][-1]["residual_train"]
-            state["residual_val"] = state["boosting_fold_states"][-1]["residual_val"]
+            state["residual_train"] = residual_train - best_result["coefficient"] * best_result["fitted_train_predictions"]
+            state["residual_val"] = best_result["next_residual_val"]
             state["validation_residual_snapshots"].append(
-                _pooled_guided_boosting_residuals(state).copy()
+                np.asarray(state["residual_val"], dtype=float).copy()
             )
             state["next_round_index"] = round_idx + 1
             stage_summary["action"] = "selected"
@@ -1496,7 +1166,6 @@ def _run_boosting(step_id: str, args, state: Dict[str, Any]) -> Dict[str, Any]:
         state.pop("pending_round_index", None)
         state.pop("pending_current_rmse", None)
         state.pop("pending_stage_results", None)
-        state.pop("pending_candidate_fold_results", None)
 
         return {
             **stage_summary,
@@ -1644,6 +1313,9 @@ def _run_boosting(step_id: str, args, state: Dict[str, Any]) -> Dict[str, Any]:
             stage_idx,
             fitted_train_predictions,
         )
+        # Preserve the coefficient selected on the chronological holdout. The
+        # full-range fitted values only advance the residual target for the next
+        # stage; they must not retune deployment behavior in-sample.
         coefficient = float(state["selection_coefficients"][stage_idx])
 
         final_eval_preds = final_eval_preds + coefficient * stage_eval_predictions
@@ -1857,12 +1529,11 @@ def _run_boosting(step_id: str, args, state: Dict[str, Any]) -> Dict[str, Any]:
             calibration_residuals,
             parsed_data.y[train_range],
             eval_forecast_steps,
-            calibration_source="rolling_origin_oof",
         )
         uncertainty_profile = full_uncertainty_profile[
             eval_forecast_offset: eval_forecast_offset + len(eval_range)
         ]
-        uncertainty_summary.setdefault("calibration_source", "rolling_origin_oof")
+        uncertainty_summary.setdefault("calibration_source", "internal_validation")
         timestamps = parsed_data.timestamps
         metrics = {
             "rmse": rmse(y_true_eval, final_eval_preds),
@@ -1894,7 +1565,7 @@ def _run_boosting(step_id: str, args, state: Dict[str, Any]) -> Dict[str, Any]:
         state["search_summary"]["refit_coefficients"] = state["stage_coefficients"]
         state["uncertainty"] = {
             "calibration_residuals": calibration_residuals.tolist(),
-            "calibration_source": "rolling_origin_oof",
+            "calibration_source": "internal_validation",
             "reference_series": parsed_data.y[train_range].tolist(),
             "profile": full_uncertainty_profile,
             "summary": uncertainty_summary,
@@ -2003,7 +1674,7 @@ def main() -> None:
 
     _save_state(args.output_state_file, state)
     payload = {
-        "protocol_version": 4,
+        "protocol_version": 3,
         "attempt_id": args.attempt_id,
         "step_id": args.step_id,
         "output": _jsonable(output),

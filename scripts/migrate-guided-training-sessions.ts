@@ -126,7 +126,7 @@ try {
        SET status = 'superseded',
            current_step_id = NULL,
            superseded_reason = 'Guided training checkpoint protocol was upgraded; create a new session.'
-     WHERE protocol_version < 4
+     WHERE protocol_version < 3
        AND status IN ('ready', 'running', 'failed')
   `);
 
@@ -136,7 +136,7 @@ try {
   `);
   await connection.query(`
     ALTER TABLE model_guided_training_sessions
-      MODIFY protocol_version SMALLINT UNSIGNED NOT NULL DEFAULT 4
+      MODIFY protocol_version SMALLINT UNSIGNED NOT NULL DEFAULT 3
   `);
 
   await connection.query(`

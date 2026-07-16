@@ -25,8 +25,9 @@ from data_utils import (
 )
 from ensemble_utils import (
     build_ensemble_subprocess_data,
+    can_refit_source_artifact_for_internal_holdout,
+    fit_and_predict_from_source_model,
     format_predictions,
-    generate_rolling_origin_member_predictions,
     get_lstm_source_forecast_strategy,
     get_member_model_path,
     load_lstm_source_state,
@@ -54,15 +55,15 @@ from subprocess_utils import (
 from uncertainty import ensemble_growth_profile
 
 MODEL_TYPE = "weighted_avg"
-METHOD_NAME = "滚动起点 OOF 残差MSE倒数加权平均融合"
-FORECAST_STRATEGY = "rolling_origin_oof_residual_mse_weighted_average"
+METHOD_NAME = "验证残差MSE倒数加权平均融合"
+FORECAST_STRATEGY = "validation_residual_mse_weighted_average"
 IMPLEMENTATION_NOTES = [
     "教科书组合预测常用逆方差或误差方差-协方差思想分配权重；当预测误差近似无偏时，MSE 与方差口径一致。",
-    "本系统在训练区间末部执行最多三折、互不重叠的扩展窗口滚动起点验证；每折只使用该预测起点之前的数据拟合成员，样本不足时显式退化为单折。候选权重先按汇总 OOF 残差的 1/(MSE+epsilon) 归一化，再按校准样本可靠度向等权组合收缩。",
+    "本系统按时间顺序留出末段，并根据模型数、样本数及所有成员的最小可训练条件动态缩减留出段；候选权重先按 1/(MSE+epsilon) 归一化，再按验证样本可靠度向等权组合收缩。",
     "该规则会同时惩罚系统性偏差和残差波动，但没有估计模型误差之间的协方差；可靠度收缩避免很短验证段产生近乎全押单一模型的权重。",
     "内部验证只沿用用户选择的 MA 窗口、ES alpha、ARIMA d 与 LSTM 特征/归一化；ARIMA 阶数和 LSTM look-back、容量、批大小、轮数均按当前子训练段重新推导，避免完整训练段信息泄漏。",
     "基础模型随后使用完整训练区间的既有匹配产物或重新拟合产物生成评估预测；所有表示实体销量的成员预测会先截断到不小于 0，再按固定权重组合，组合结果也做同样的非负兜底。",
-    "std_dev、95% 区间和生产用 99% 上侧误差仅用滚动起点 OOF 的 actual-prediction 组合残差校准，并继承成员不确定性的逐 horizon 增长形状；经验分位数会保留稳定偏差，独立评估真实值不参与校准，信息不足时明确标记为 fallback。",
+    "std_dev、95% 区间和生产用 99% 上侧误差仅用内部时间验证段的 actual-prediction 组合残差校准，并继承成员不确定性的逐 horizon 增长形状；经验分位数会保留稳定偏差，独立评估真实值不参与校准，信息不足时明确标记为 fallback。",
 ]
 
 
@@ -323,11 +324,11 @@ def predict(
         uncertainty_state.get("reference_series") or [],
         steps,
         calibration_source=str(
-            uncertainty_state.get("calibration_source") or "rolling_origin_oof"
+            uncertainty_state.get("calibration_source") or "internal_validation"
         ),
     )
     summary.setdefault("calibration_source", str(
-        uncertainty_state.get("calibration_source") or "rolling_origin_oof"
+        uncertainty_state.get("calibration_source") or "internal_validation"
     ))
     return final_predictions.tolist(), profile, summary
 
@@ -347,9 +348,9 @@ def train_and_evaluate(
     """Trains and evaluates the Weighted Average model using inverse residual-MSE weighting.
 
     Time-ordered error-weighted flow:
-    1. Plan expanding-window rolling-origin folds inside train_range
-    2. Train base models on each prefix and concatenate out-of-fold predictions
-    3. Calculate inverse-MSE candidates on pooled OOF residuals and shrink them toward equal weights
+    1. Dynamically split train_range into chronological weight_train and weight_val
+    2. Train base models on weight_train, predict on weight_val
+    3. Calculate inverse-MSE candidates and shrink them toward equal weights
     4. Retrain base models on full train_range
     5. Evaluate weighted combination on independent eval_range
 
@@ -362,7 +363,8 @@ def train_and_evaluate(
     - final_prediction = sum(weight_i * prediction_i)
     """
 
-    # === Step 1: Plan expanding-window rolling-origin folds ===
+    # === Step 1: Split train_range into weight_train and weight_val ===
+    # This prevents data leakage: weights are calculated on "unseen" weight_val predictions
     train_len = len(train_range)
     if train_len < 8:
         raise ValueError("[VALIDATION] train_range too small for weighted average (需要至少8个点，推荐≥12点)")
@@ -370,12 +372,14 @@ def train_and_evaluate(
     split_plan = plan_ensemble_internal_holdout(
         parsed_data, train_range, models_to_use, model_params, "weighted"
     )
+    weight_split = int(split_plan["prefix_size"])
+
+    weight_train_range = range(train_range.start, train_range.start + weight_split)
+    weight_val_range = range(train_range.start + weight_split, train_range.stop)
+
     print("[Weighted Average] 数据划分:", file=sys.stderr)
-    print(
-        f"  滚动起点折数: {split_plan['fold_count']}，"
-        f"OOF校准点数: {split_plan['calibration_size']}",
-        file=sys.stderr,
-    )
+    print(f"  权重训练集: {weight_train_range} ({len(weight_train_range)} points)", file=sys.stderr)
+    print(f"  权重验证集 (计算权重): {weight_val_range} ({len(weight_val_range)} points)", file=sys.stderr)
     print(f"  评估集: {eval_range} ({len(eval_range)} points)", file=sys.stderr)
 
     # Non-LSTM base models keep numeric-only rows; LSTM can use categorical features.
@@ -385,27 +389,67 @@ def train_and_evaluate(
         model_params,
     )
 
-    # Calculate dynamic timeout for full-range member fits below.
+    # === Step 2: Phase 1 - Train on weight_train, predict on weight_val ===
+    print("\n[Weighted Average Phase 1] 训练基础模型并生成权重验证集预测", file=sys.stderr)
+    weight_val_predictions = {}
+
+    # Calculate dynamic timeout for LSTM models
     base_timeout = 600 if "lstm" in models_to_use else 120
 
-    # === Step 2: Generate pooled OOF member predictions ===
-    print("\n[Weighted Average Phase 1] 生成滚动起点 OOF 成员预测", file=sys.stderr)
-    y_true_val, weight_val_predictions, fold_diagnostics = (
-        generate_rolling_origin_member_predictions(
-            parsed_data,
-            train_range,
-            models_to_use,
-            model_params,
-            base_model_files,
-            split_plan,
-            "Weighted Average",
-        )
-    )
-    split_plan["fold_diagnostics"] = fold_diagnostics
+    for model_name in models_to_use:
+        params = model_params[model_name]
+        source_model_file = (base_model_files or {}).get(model_name)
+
+        print(f"  训练 {model_name} 在 weight_train，预测 weight_val...", file=sys.stderr)
+        if (
+            source_model_file
+            and can_refit_source_artifact_for_internal_holdout(model_name)
+        ):
+            adjusted_source_model_file = source_model_file
+            temp_source_model_file = None
+            try:
+                if model_name == "lstm":
+                    source_model_state = _load_lstm_source_state(
+                        source_model_file,
+                        "Saved Weighted Average LSTM base model",
+                    )
+                    adjusted_source_model_file, temp_source_model_file = _prepare_lstm_source_model_for_requested_steps(
+                        source_model_file,
+                        source_model_state,
+                        requested_steps=len(weight_val_range),
+                    )
+                y_pred_val = fit_and_predict_from_source_model(
+                    model_name=model_name,
+                    source_model_file=adjusted_source_model_file,
+                    data=lstm_data_dicts if model_name == "lstm" else numeric_data_dicts,
+                    train_start=weight_train_range.start,
+                    train_end=weight_train_range.stop - 1,
+                    forecast_steps=len(weight_val_range),
+                    timeout=base_timeout,
+                )
+            finally:
+                if temp_source_model_file and os.path.exists(temp_source_model_file):
+                    os.remove(temp_source_model_file)
+        else:
+            result = run_base_model_subprocess(
+                model_type=model_name,
+                data=lstm_data_dicts if model_name == "lstm" else numeric_data_dicts,
+                train_start=weight_train_range.start,
+                train_end=weight_train_range.stop - 1,
+                eval_start=weight_val_range.start,
+                eval_end=weight_val_range.stop - 1,
+                model_params=params.copy(),
+                timeout=base_timeout,
+            )
+
+            y_pred_val = extract_predictions_from_result(result)
+        weight_val_predictions[model_name] = normalize_demand_forecast(y_pred_val).tolist()
+        print(f"    ✓ 生成 {len(y_pred_val)} 个weight_val预测", file=sys.stderr)
 
     # === Step 3: Calculate weights using validation residual MSE ===
     print("\n[Weighted Average Phase 2] 计算权重（验证集残差MSE倒数加权）", file=sys.stderr)
-    print("  误差计算 (基于滚动起点 OOF 残差MSE):", file=sys.stderr)
+    y_true_val = parsed_data.y[weight_val_range]  # ✅ weight_val的真实值
+    print("  误差计算 (基于weight_val残差MSE):", file=sys.stderr)
     weights, weight_diagnostics = _compute_inverse_residual_mse_weights(
         y_true_val, weight_val_predictions
     )
@@ -573,12 +617,11 @@ def train_and_evaluate(
         weight_val_residuals,
         parsed_data.y[train_range],
         eval_forecast_steps,
-        calibration_source="rolling_origin_oof",
     )
     uncertainty_profile = full_uncertainty_profile[
         eval_forecast_offset: eval_forecast_offset + len(eval_range)
     ]
-    uncertainty_summary.setdefault("calibration_source", "rolling_origin_oof")
+    uncertainty_summary.setdefault("calibration_source", "internal_validation")
 
     # ✅ 在独立的eval_range上计算指标
     timestamps = parsed_data.timestamps
@@ -595,7 +638,7 @@ def train_and_evaluate(
 
     uncertainty_state = {
         "calibration_residuals": weight_val_residuals.tolist(),
-        "calibration_source": "rolling_origin_oof",
+        "calibration_source": "internal_validation",
         "reference_series": parsed_data.y[train_range].tolist(),
         "profile": full_uncertainty_profile,
         "summary": uncertainty_summary,
