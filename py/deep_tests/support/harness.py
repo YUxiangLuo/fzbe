@@ -135,7 +135,15 @@ def assert_prediction_contract(payload: dict[str, Any], expected: int) -> None:
             raise AssertionError(f"prediction {index} violates demand/uncertainty domain")
         if float(point["interval_lower"]) > float(point["interval_upper"]):
             raise AssertionError(f"prediction {index} interval is inverted")
-    for key in ("method_name", "forecast_strategy", "implementation_notes", "algorithm_revision"):
+    for key in (
+        "method_name",
+        "forecast_strategy",
+        "implementation_notes",
+        "algorithm_revision",
+        "artifact_schema_revision",
+        "artifact_format",
+        "runtime_compatibility",
+    ):
         if not payload.get(key):
             raise AssertionError(f"missing method metadata: {key}")
 

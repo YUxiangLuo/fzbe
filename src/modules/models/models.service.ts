@@ -83,7 +83,7 @@ export type { GuidedTrainingSessionPayload, GuidedTrainingStepDefinition } from 
 
 const TRAINING_TIMEOUT = TIMEOUTS.MODEL_TRAINING;
 const MODEL_ORCHESTRATION_HARD_CAP = TIMEOUTS.MODEL_ORCHESTRATION_HARD_CAP;
-const GUIDED_TRAINING_PROTOCOL_VERSION = 3;
+const GUIDED_TRAINING_PROTOCOL_VERSION = 4;
 const PRODUCTION_PREPARATION_PROTOCOL_VERSION = 1;
 const DEFAULT_PRODUCTION_FORECAST_STEPS = 6;
 const MIN_TRAINING_POINTS = 8;
@@ -1810,7 +1810,7 @@ export const resolveGuidedStepTimeoutMs = (
       Math.max(TRAINING_TIMEOUT, BASE_MODEL_TIMEOUT_SECONDS[member] * 1000 + 30_000),
     );
   }
-  // Protocol-v2 sessions are superseded before execution; this only keeps the
+  // Older aggregate-step sessions are superseded before execution; this keeps the
   // old aggregate id safely bounded during a rolling deployment.
   if (stepId === "retrain_chain") return MODEL_ORCHESTRATION_HARD_CAP;
   return TRAINING_TIMEOUT;
@@ -2139,6 +2139,8 @@ const BASE_MODEL_LABELS: Record<BaseModelType, string> = {
   lstm: "LSTM",
 };
 
+const MAX_ROLLING_ORIGIN_FOLDS = 3;
+
 const buildMemberStepDefinitions = (
   models: BaseModelType[],
   idPrefix: string,
@@ -2151,6 +2153,21 @@ const buildMemberStepDefinitions = (
   actionLabel: `执行 ${BASE_MODEL_LABELS[model]}`,
 }));
 
+const buildRollingFoldMemberStepDefinitions = (
+  models: BaseModelType[],
+  idPrefix: string,
+  labelPrefix: string,
+  description: (model: BaseModelType, fold: number) => string,
+): GuidedTrainingStepDefinition[] => Array.from(
+  { length: MAX_ROLLING_ORIGIN_FOLDS },
+  (_, foldIndex) => buildMemberStepDefinitions(
+    models,
+    `${idPrefix}_fold_${foldIndex + 1}`,
+    `${labelPrefix}（第 ${foldIndex + 1} 折）`,
+    (model) => description(model, foldIndex + 1),
+  ),
+).flat();
+
 const buildBoostingRoundStepDefinitions = (
   maxRounds: number,
   models: BaseModelType[],
@@ -2158,13 +2175,13 @@ const buildBoostingRoundStepDefinitions = (
   const steps: GuidedTrainingStepDefinition[] = [];
   for (let round = 1; round <= maxRounds; round += 1) {
     steps.push(
-      ...buildMemberStepDefinitions(
+      ...buildRollingFoldMemberStepDefinitions(
         models,
         `round_${round}_evaluate`,
         `第 ${round} 轮评估候选`,
-        (model) => round === 1
-          ? `用原始销量训练 ${BASE_MODEL_LABELS[model]}，通过非负平方损失线搜索求阶段系数并记录验证残差 RMSE。`
-          : `用当前有正有负的残差训练 ${BASE_MODEL_LABELS[model]}，动态求非负阶段系数并记录第 ${round} 轮验证残差 RMSE。`,
+        (model, fold) => round === 1
+          ? `在第 ${fold} 个滚动起点折上用原始销量训练 ${BASE_MODEL_LABELS[model]}；所有有效折完成后统一执行非负平方损失线搜索。`
+          : `在第 ${fold} 个滚动起点折上用当前有正有负的残差训练 ${BASE_MODEL_LABELS[model]}；所有有效折完成后统一计算第 ${round} 轮阶段系数。`,
       ),
       {
         id: `round_${round}_select_winner`,
@@ -2177,7 +2194,7 @@ const buildBoostingRoundStepDefinitions = (
   return steps;
 };
 
-const buildGuidedTrainingStepPlan = (
+export const buildGuidedTrainingStepPlan = (
   modelType: GuidedModelType,
   body: TrainInput,
 ): GuidedTrainingStepDefinition[] => {
@@ -2189,11 +2206,11 @@ const buildGuidedTrainingStepPlan = (
   if (modelType === "weighted_avg") {
     return GUIDED_TRAINING_STEPS.weighted_avg.flatMap((step) => {
       if (step.id === "validation_predictions") {
-        return buildMemberStepDefinitions(
+        return buildRollingFoldMemberStepDefinitions(
           requestedModels,
           "validation_prediction",
           "生成权重验证预测",
-          (model) => `只在权重训练段拟合 ${BASE_MODEL_LABELS[model]}，并为时间留出的权重验证段生成预测。`,
+          (model, fold) => `只在第 ${fold} 折的历史前缀拟合 ${BASE_MODEL_LABELS[model]}，并为该折时间留出段生成预测；不存在的预留折会直接跳过。`,
         );
       }
       if (step.id === "eval_predictions") {
@@ -2210,11 +2227,11 @@ const buildGuidedTrainingStepPlan = (
   if (modelType === "stacking") {
     return GUIDED_TRAINING_STEPS.stacking.flatMap((step) => {
       if (step.id === "level1_predictions") {
-        return buildMemberStepDefinitions(
+        return buildRollingFoldMemberStepDefinitions(
           requestedModels,
           "level1_prediction",
           "生成 Level-1 特征",
-          (model) => `只在 Level-0 拟合 ${BASE_MODEL_LABELS[model]}，生成 Level-1 时间留出预测。`,
+          (model, fold) => `只在第 ${fold} 折的 Level-0 历史前缀拟合 ${BASE_MODEL_LABELS[model]}，生成该折 Level-1 时间留出预测；不存在的预留折会直接跳过。`,
         );
       }
       if (step.id === "eval_predictions") {

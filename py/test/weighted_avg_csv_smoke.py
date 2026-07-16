@@ -124,7 +124,6 @@ def main() -> None:
     train_end = 19
     eval_start = 20
     eval_end = 23
-    weight_train_end = 15
     future_steps = 3
 
     with tempfile.TemporaryDirectory(prefix="fangzhen-weighted-avg-csv-") as temp_dir:
@@ -191,48 +190,68 @@ def main() -> None:
             "--pretty",
         )
 
-        weight_val_predictions: dict[str, list[float]] = {}
+        weight_val_predictions: dict[str, list[float]] = {
+            model_name: [] for model_name in BASE_MODELS
+        }
         eval_predictions: dict[str, list[float]] = {}
-        for model_name in BASE_MODELS:
-            refit_model_path = temp_path / f"{model_name}-weight-refit.pkl"
-            invoke_model(
-                model_name,
-                data_json,
-                "--train-start",
-                str(train_start),
-                "--train-end",
-                str(weight_train_end),
-                "--load-model",
-                str(base_model_paths[model_name]),
-                "--save-model",
-                str(refit_model_path),
-                "--fit-only",
-                "--pretty",
-            )
-            weight_val_predictions[model_name] = extract_predictions(
-                invoke_model(
-                    model_name,
-                    None,
-                    "--load-model",
-                    str(refit_model_path),
-                    "--forecast-steps",
-                    "4",
-                    "--pretty",
+        # Independent oracle for the implementation's three expanding-window
+        # rolling-origin folds: 0..7→8..11, 0..11→12..15, 0..15→16..19.
+        for fold_index, (prefix_end, validation_start, validation_end) in enumerate((
+            (7, 8, 11),
+            (11, 12, 15),
+            (15, 16, 19),
+        )):
+            for model_name in BASE_MODELS:
+                if model_name == "arima":
+                    fold_output = invoke_model(
+                        "arima",
+                        data_json,
+                        "--train-start", str(train_start),
+                        "--train-end", str(prefix_end),
+                        "--eval-start", str(validation_start),
+                        "--eval-end", str(validation_end),
+                        "--d", "1",
+                        "--pretty",
+                    )
+                else:
+                    refit_model_path = temp_path / f"{model_name}-weight-fold-{fold_index}.pkl"
+                    invoke_model(
+                        model_name,
+                        data_json,
+                        "--train-start", str(train_start),
+                        "--train-end", str(prefix_end),
+                        "--load-model", str(base_model_paths[model_name]),
+                        "--save-model", str(refit_model_path),
+                        "--fit-only",
+                        "--pretty",
+                    )
+                    fold_output = invoke_model(
+                        model_name,
+                        None,
+                        "--load-model", str(refit_model_path),
+                        "--forecast-steps", "4",
+                        "--pretty",
+                    )
+                weight_val_predictions[model_name].extend(
+                    extract_predictions(fold_output)
                 )
-            )
+
+        for model_name in BASE_MODELS:
             eval_predictions[model_name] = extract_predictions(
                 invoke_model(
                     model_name,
                     None,
-                    "--load-model",
-                    str(base_model_paths[model_name]),
+                    "--load-model", str(base_model_paths[model_name]),
                     "--forecast-steps",
                     "4",
                     "--pretty",
                 )
             )
 
-        expected_weights = normalized_inverse_residual_mse_weights(weight_val_predictions, sales[16:20])
+        expected_weights = normalized_inverse_residual_mse_weights(
+            weight_val_predictions,
+            sales[8:20],
+        )
         expected_eval_predictions = weighted_sum(eval_predictions, expected_weights)
 
         weighted_model_backtest = temp_path / "weighted-avg-backtest.pkl"

@@ -296,6 +296,7 @@ const {
   createOrResumeGuidedTrainingSession,
   getGuidedTrainingSession,
   runGuidedTrainingStep,
+  buildGuidedTrainingStepPlan,
   resolveGuidedStepTimeoutMs,
   createOrResumeProductionPreparationSession,
   getProductionPreparationSession,
@@ -353,7 +354,7 @@ const buildGuidedSessionRow = (overrides: Record<string, unknown> = {}) => ({
   request_hash: "request-hash",
   dataset_revision: "dataset-revision",
   runtime_revision: getModelRuntimeRevision(),
-  protocol_version: 3,
+  protocol_version: 4,
   request_payload: JSON.stringify({
     experiment_id: 990002,
     selected_industry: "制造业",
@@ -570,6 +571,39 @@ describe("models service", () => {
     }
   });
 
+  test("rejects duplicate, reversed, and missing monthly periods before model training", async () => {
+    const cases = [
+      {
+        csv: "月份,销售数量\n2024-01,100\n2024-01,110\n",
+        code: "DATASET_TIME_DUPLICATE",
+      },
+      {
+        csv: "月份,销售数量\n2024-02,100\n2024-01,110\n",
+        code: "DATASET_TIME_ORDER",
+      },
+      {
+        csv: "月份,销售数量\n2024-01,100\n2024-03,110\n",
+        code: "DATASET_TIME_GAP",
+      },
+    ];
+
+    for (const testCase of cases) {
+      await writeFile(datasetCsvPath, testCase.csv);
+      poolQuery.mockReset();
+      poolQuery.mockResolvedValueOnce([[{ file_path: datasetCsvPath }]]);
+
+      await expect(
+        loadDatasetFromDb("制造业", "样本企业", "样本产品"),
+      ).rejects.toMatchObject({
+        details: {
+          row: 2,
+          field: "年份/月份",
+          code: testCase.code,
+        },
+      });
+    }
+  });
+
   test("gives each guided ensemble subtask its own bounded timeout", () => {
     const ensembleBody = {
       models: "ma,es,arima,lstm",
@@ -577,15 +611,43 @@ describe("models service", () => {
 
     expect(resolveGuidedStepTimeoutMs("ma", "fit", {} as never)).toBe(300_000);
     expect(
-      resolveGuidedStepTimeoutMs("weighted_avg", "validation_prediction_lstm", ensembleBody),
+      resolveGuidedStepTimeoutMs("weighted_avg", "validation_prediction_fold_3_lstm", ensembleBody),
     ).toBe(630_000);
     expect(
-      resolveGuidedStepTimeoutMs("stacking", "level1_prediction_lstm", ensembleBody),
+      resolveGuidedStepTimeoutMs("stacking", "level1_prediction_fold_3_lstm", ensembleBody),
+    ).toBe(630_000);
+    expect(
+      resolveGuidedStepTimeoutMs("boosting", "round_1_evaluate_fold_3_lstm", ensembleBody),
     ).toBe(630_000);
     expect(
       resolveGuidedStepTimeoutMs("boosting", "retrain_chain", ensembleBody),
     ).toBe(630_000);
 
+  });
+
+  test("checkpoints every guided rolling-origin fold as a separately budgeted step", () => {
+    const body = { models: "ma,lstm" } as never;
+    const weightedIds = buildGuidedTrainingStepPlan("weighted_avg", body).map(
+      (step: { id: string }) => step.id,
+    );
+    const stackingIds = buildGuidedTrainingStepPlan("stacking", body).map(
+      (step: { id: string }) => step.id,
+    );
+    const boostingIds = buildGuidedTrainingStepPlan("boosting", body).map(
+      (step: { id: string }) => step.id,
+    );
+
+    for (let fold = 1; fold <= 3; fold += 1) {
+      expect(weightedIds).toContain(`validation_prediction_fold_${fold}_ma`);
+      expect(weightedIds).toContain(`validation_prediction_fold_${fold}_lstm`);
+      expect(stackingIds).toContain(`level1_prediction_fold_${fold}_ma`);
+      expect(stackingIds).toContain(`level1_prediction_fold_${fold}_lstm`);
+      expect(boostingIds).toContain(`round_1_evaluate_fold_${fold}_ma`);
+      expect(boostingIds).toContain(`round_1_evaluate_fold_${fold}_lstm`);
+    }
+    expect(weightedIds).not.toContain("validation_prediction_lstm");
+    expect(stackingIds).not.toContain("level1_prediction_lstm");
+    expect(boostingIds).not.toContain("round_1_evaluate_lstm");
   });
 
   test("classifies auxiliary Python process deadlines as typed model timeouts", async () => {
@@ -1276,7 +1338,7 @@ describe("models service", () => {
             request_hash: params[4],
             dataset_revision: params[5],
             runtime_revision: params[6],
-            protocol_version: 3,
+            protocol_version: 4,
             request_payload: params[7],
             status: "ready",
             current_step_id: params[8],
@@ -2070,7 +2132,7 @@ describe("models service", () => {
         .update("candidate-checkpoint")
         .digest("hex");
       await writeFile(receiptPath, JSON.stringify({
-        protocol_version: 3,
+        protocol_version: 4,
         attempt_id: attemptId,
         step_id: "prepare_data",
         candidate_state_path: candidatePath,
@@ -2190,7 +2252,7 @@ describe("models service", () => {
         .digest("hex");
       const receiptOutput = { prepared_rows: 18 };
       await writeFile(receiptPath, JSON.stringify({
-        protocol_version: 3,
+        protocol_version: 4,
         attempt_id: attemptId,
         step_id: "prepare_data",
         candidate_state_path: candidatePath,
@@ -3114,7 +3176,7 @@ describe("models service", () => {
           request_hash: "request-hash",
           dataset_revision: "dataset-revision",
           runtime_revision: getModelRuntimeRevision(),
-          protocol_version: 3,
+          protocol_version: 4,
           request_payload: "{}",
           status: "ready",
           current_step_id: "prepare_data",
@@ -3326,7 +3388,7 @@ describe("models service", () => {
           request_hash: "request-hash",
           dataset_revision: "dataset-revision",
           runtime_revision: getModelRuntimeRevision(),
-          protocol_version: 3,
+          protocol_version: 4,
           request_payload: "{}",
           status: "ready",
           current_step_id: "prepare_data",

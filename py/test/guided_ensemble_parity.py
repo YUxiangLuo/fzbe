@@ -234,9 +234,7 @@ def compare_results(
         ),
     }
 
-    expected_calibration_source = (
-        "level1_holdout" if model_type == "stacking" else "internal_validation"
-    )
+    expected_calibration_source = "rolling_origin_oof"
     for label, result in (("regular", regular), ("guided", guided)):
         for index, point in enumerate(result["predictions"]):
             if point.get("calibration_source") != expected_calibration_source:

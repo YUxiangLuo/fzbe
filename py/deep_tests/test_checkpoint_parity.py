@@ -76,6 +76,21 @@ class CheckpointModeParityTests(unittest.TestCase):
                         # weights/meta-model while refitting members on the longer range.
                         # Recombine those independently loaded members with a local oracle.
                         expected = production_ensemble_oracle(model, production_artifact)
+                        standalone_state = load_model(str(standalone_artifact))
+                        production_state = load_model(str(production_artifact))
+                        if model == "boosting":
+                            self.assertEqual(
+                                standalone_state["stage_coefficients"],
+                                production_state["stage_coefficients"],
+                            )
+                            self.assertEqual(
+                                standalone_state["uncertainty"]["calibration_residuals"],
+                                production_state["uncertainty"]["calibration_residuals"],
+                            )
+                            self.assertEqual(
+                                "rolling_origin_oof",
+                                production_state["uncertainty"]["calibration_source"],
+                            )
                     else:
                         # Base-model production is a longer-range refit, so compare it
                         # with an independent monolithic fit over that same range.

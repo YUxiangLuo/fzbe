@@ -79,10 +79,10 @@ def assert_all_finite(values: list[float], label: str) -> None:
 
 def compute_expected_stacking_weights(
     model_names: list[str],
-    level1_predictions: dict[str, list[float]],
+    oof_predictions: dict[str, list[float]],
     meta_target: np.ndarray,
 ) -> np.ndarray:
-    meta_train = np.column_stack([level1_predictions[name] for name in model_names])
+    meta_train = np.column_stack([oof_predictions[name] for name in model_names])
     coefficients, _ = nnls(meta_train, meta_target)
     return coefficients
 
@@ -167,7 +167,6 @@ def main() -> None:
     train_end = 19
     eval_start = 20
     eval_end = 23
-    level0_train_end = 14
     future_steps = 3
 
     with tempfile.TemporaryDirectory(prefix="fangzhen-stacking-csv-") as temp_dir:
@@ -187,35 +186,55 @@ def main() -> None:
             eval_end,
         )
 
-        level1_predictions: dict[str, list[float]] = {}
+        oof_predictions: dict[str, list[float]] = {
+            model_name: [] for model_name in BASE_MODELS
+        }
         eval_predictions: dict[str, list[float]] = {}
-        for model_name in BASE_MODELS:
-            refit_model_path = temp_path / f"{model_name}-level1-refit.pkl"
-            invoke_model(
-                model_name,
-                data_json,
-                "--train-start",
-                str(train_start),
-                "--train-end",
-                str(level0_train_end),
-                "--load-model",
-                str(base_model_paths[model_name]),
-                "--save-model",
-                str(refit_model_path),
-                "--fit-only",
-                "--pretty",
-            )
-            level1_predictions[model_name] = extract_predictions(
-                invoke_model(
-                    model_name,
-                    None,
-                    "--load-model",
-                    str(refit_model_path),
-                    "--forecast-steps",
-                    "5",
-                    "--pretty",
+        # Independent oracle for the two feasible expanding-window folds:
+        # 0..9→10..14 and 0..14→15..19.  The earlier 5-point prefix is
+        # intentionally omitted because ARIMA(d=1) needs 6 effective points.
+        for fold_index, (prefix_end, validation_start, validation_end) in enumerate((
+            (9, 10, 14),
+            (14, 15, 19),
+        )):
+            for model_name in BASE_MODELS:
+                if model_name == "arima":
+                    fold_output = invoke_model(
+                        "arima",
+                        data_json,
+                        "--train-start", str(train_start),
+                        "--train-end", str(prefix_end),
+                        "--eval-start", str(validation_start),
+                        "--eval-end", str(validation_end),
+                        "--d", "1",
+                        "--max-p", "2",
+                        "--max-q", "2",
+                        "--pretty",
+                    )
+                else:
+                    refit_model_path = temp_path / f"{model_name}-oof-fold-{fold_index}.pkl"
+                    invoke_model(
+                        model_name,
+                        data_json,
+                        "--train-start", str(train_start),
+                        "--train-end", str(prefix_end),
+                        "--load-model", str(base_model_paths[model_name]),
+                        "--save-model", str(refit_model_path),
+                        "--fit-only",
+                        "--pretty",
+                    )
+                    fold_output = invoke_model(
+                        model_name,
+                        None,
+                        "--load-model", str(refit_model_path),
+                        "--forecast-steps", "5",
+                        "--pretty",
+                    )
+                oof_predictions[model_name].extend(
+                    extract_predictions(fold_output)
                 )
-            )
+
+        for model_name in BASE_MODELS:
             eval_predictions[model_name] = extract_predictions(
                 invoke_model(
                     model_name,
@@ -228,10 +247,10 @@ def main() -> None:
                 )
             )
 
-        meta_target = np.array(sales[15:20], dtype=float)
+        meta_target = np.array(sales[10:20], dtype=float)
         expected_weights = compute_expected_stacking_weights(
             BASE_MODELS,
-            level1_predictions,
+            oof_predictions,
             meta_target,
         )
         expected_eval_predictions = blend_predictions(BASE_MODELS, eval_predictions, expected_weights)
@@ -274,6 +293,9 @@ def main() -> None:
         assert train_output["models"] == BASE_MODELS
         assert train_output["metrics"]["evaluate_months"] == timestamps[20:24]
         assert train_output["eval_y_true"] == sales[20:24]
+        assert train_output["split_plan"]["scheme"] == "expanding_window_rolling_origin"
+        assert train_output["split_plan"]["fold_count"] == 2
+        assert train_output["split_plan"]["calibration_size"] == 10
         assert train_output["meta_model"]["strategy"] == "nonnegative_least_squares"
         assert_series_close(train_output["meta_model"]["coefficients"], expected_weights.tolist())
         assert_series_close(actual_eval_predictions, expected_eval_predictions)

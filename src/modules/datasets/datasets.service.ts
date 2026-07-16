@@ -7,7 +7,13 @@ import { validateFile, generateUniqueFilename, FileValidationError } from "../..
 import { logWarning } from "../../utils/error-handler";
 import { FILE_SIZE_LIMITS } from "../../utils/constants";
 import type { UpdateDatasetInput } from "./datasets.schema";
-import { normalizeSalesValue, normalizeYearMonth } from "./dataset-values";
+import {
+  formatYearMonth,
+  isConsecutiveYearMonth,
+  normalizeSalesValue,
+  normalizeYearMonth,
+  type NormalizedYearMonth,
+} from "./dataset-values";
 
 interface DatasetRow extends RowDataPacket {
   dataset_id: number;
@@ -92,7 +98,7 @@ export async function uploadDataset(file: File, dataName: string, description?: 
 
     for (const [, segment] of segmentsMap.entries()) {
       const timePoints = new Set<string>();
-      let previousTime = "";
+      let previousTime: NormalizedYearMonth | null = null;
       const firstRow = segment.rows[0];
       if (!firstRow) return { error: "数据格式错误", status: 400 as const, details: { message: `产品 "${segment.productName}" 无有效数据` } };
 
@@ -102,7 +108,7 @@ export async function uploadDataset(file: File, dataName: string, description?: 
         const yearRaw = row["年份"]?.trim();
         const monthRaw = row["月份"]?.trim();
 
-        if (!yearRaw || !/^\d{4}$/.test(yearRaw)) {
+        if (!yearRaw || !/^[1-9]\d{3}$/.test(yearRaw)) {
           return { error: "数据格式错误", status: 400 as const, details: { message: `产品 "${segment.productName}" 第 ${i + 1} 行年份格式错误` } };
         }
         if (!monthRaw || !/^(0?[1-9]|1[0-2])$/.test(monthRaw)) {
@@ -110,17 +116,20 @@ export async function uploadDataset(file: File, dataName: string, description?: 
         }
 
         const normalizedTime = normalizeYearMonth(yearRaw, monthRaw)!;
-        const currentTime = `${normalizedTime.year}-${normalizedTime.month}`;
+        const currentTime = formatYearMonth(normalizedTime);
 
         if (timePoints.has(currentTime)) {
           return { error: "数据重复", status: 400 as const, details: { message: `产品 "${segment.productName}" 存在重复的时间点: ${currentTime}` } };
         }
         timePoints.add(currentTime);
 
-        if (previousTime && currentTime < previousTime) {
+        if (previousTime && currentTime < formatYearMonth(previousTime)) {
           return { error: "时间顺序错误", status: 400 as const, details: { message: `产品 "${segment.productName}" 时间顺序颠倒` } };
         }
-        previousTime = currentTime;
+        if (previousTime && !isConsecutiveYearMonth(previousTime, normalizedTime)) {
+          return { error: "时间不连续", status: 400 as const, details: { message: `产品 "${segment.productName}" 在 ${formatYearMonth(previousTime)} 与 ${currentTime} 之间存在缺失月份` } };
+        }
+        previousTime = normalizedTime;
 
         const sales = normalizeSalesValue(row["销售数量"]);
         if (!sales) {

@@ -39,6 +39,10 @@ export function buildPythonModelProcessEnv(): Record<string, string> {
   const tfInterOpThreads = String(PYTHON_RUNTIME_CONFIG.TF_INTER_OP_THREADS);
 
   return {
+    // The API's global admission controller accounts for this parent Python
+    // process, not for children spawned by ensemble members.  Keep service-run
+    // ensembles single-worker so every admitted job has a bounded footprint.
+    FZ_ENSEMBLE_MAX_WORKERS: "1",
     OMP_NUM_THREADS: process.env.OMP_NUM_THREADS ?? modelThreads,
     OPENBLAS_NUM_THREADS: process.env.OPENBLAS_NUM_THREADS ?? modelThreads,
     MKL_NUM_THREADS: process.env.MKL_NUM_THREADS ?? modelThreads,
@@ -412,7 +416,7 @@ export async function runPythonModel(
 }
 
 export interface GuidedPythonStepResult {
-  protocol_version: 3;
+  protocol_version: 4;
   attempt_id: string;
   step_id: string;
   output?: unknown;

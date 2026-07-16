@@ -155,13 +155,9 @@ def main() -> None:
         assert isinstance(search_summary["diagnostics"], dict)
         assert_series_close(actual_eval_predictions, expected_eval_predictions.tolist())
         assert_series_close(actual_eval_std, expected_eval_std)
-        expected_mean_error = sum(
-            actual - predicted
-            for actual, predicted in zip(sales[20:24], actual_eval_predictions)
-        ) / 4
         assert all(
-            math.isclose(float(point["calibration_mean_error"]), expected_mean_error)
-            and point["calibration_count"] == 4
+            point["calibration_mean_error"] is None
+            and point["calibration_count"] is None
             for point in train_output["predictions"]
         )
 
@@ -246,8 +242,8 @@ def main() -> None:
         assert_series_close(actual_future_predictions, expected_future_predictions.tolist())
         assert_series_close(actual_future_std, expected_future_std)
         assert all(
-            math.isclose(float(point["calibration_mean_error"]), expected_mean_error)
-            and point["calibration_count"] == 4
+            point["calibration_mean_error"] is None
+            and point["calibration_count"] is None
             for point in predict_output["predictions"]
         )
 

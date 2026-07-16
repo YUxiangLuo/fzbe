@@ -39,7 +39,9 @@ MODEL_TYPE = "lstm"
 DIRECT_FORECAST_STRATEGY = "direct_multi_horizon"
 LEGACY_FORECAST_STRATEGY = "autoregressive"
 DEFAULT_PRODUCTION_FORECAST_HORIZON = 6
-METHOD_NAME = "LSTM 多变量销量预测"
+FEATURE_TIMING = "historical_only"
+KNOWN_FUTURE_FEATURES = False
+METHOD_NAME = "历史协变量直接多步 LSTM 销量预测"
 DIRECT_IMPLEMENTATION_NOTES = [
     "教科书 LSTM 定义的是带遗忘门、输入门和输出门的循环神经网络单元。",
     "本系统仅用训练区间拟合数值缩放器和类别 One-Hot 编码器，再采用单层 LSTM 加线性 Dense 多步输出；look-back 在 2 到 12 之间，隐藏单元、批大小和训练预算由样本量、预测跨度及编码后维度共同确定。",
@@ -66,6 +68,22 @@ def _metadata_for_strategy(strategy: str) -> Tuple[str, List[str]]:
     if strategy == DIRECT_FORECAST_STRATEGY:
         return DIRECT_FORECAST_STRATEGY, DIRECT_IMPLEMENTATION_NOTES
     return LEGACY_FORECAST_STRATEGY, AUTOREGRESSIVE_IMPLEMENTATION_NOTES
+
+
+def attach_lstm_metadata(
+    payload: Dict[str, Any],
+    forecast_strategy: str = DIRECT_FORECAST_STRATEGY,
+    implementation_notes: Optional[List[str]] = None,
+) -> Dict[str, Any]:
+    if forecast_strategy != DIRECT_FORECAST_STRATEGY:
+        raise ValueError(
+            "[MODEL] Only direct historical-window LSTM artifacts are supported."
+        )
+    notes = implementation_notes or _metadata_for_strategy(forecast_strategy)[1]
+    attach_method_metadata(payload, METHOD_NAME, forecast_strategy, notes)
+    payload["feature_timing"] = FEATURE_TIMING
+    payload["known_future_features"] = KNOWN_FUTURE_FEATURES
+    return payload
 
 
 def _format_predictions(
@@ -126,6 +144,13 @@ def _load_state(model_path: str) -> Dict[str, Any]:
     ensure_state_metadata(state, METHOD_NAME, forecast_strategy, notes)
     if saved_strategy != DIRECT_FORECAST_STRATEGY:
         raise ValueError("[MODEL] Obsolete autoregressive LSTM artifacts must be retrained.")
+    if (
+        state.get("feature_timing") != FEATURE_TIMING
+        or state.get("known_future_features") is not KNOWN_FUTURE_FEATURES
+    ):
+        raise ValueError(
+            "[MODEL] Saved LSTM model does not declare the required historical-only feature timing."
+        )
     if "normalization" not in state:
         raise ValueError("[MODEL] Saved LSTM model is missing normalization metadata.")
     raw_feature_keys = state.get("feature_keys")
@@ -431,10 +456,11 @@ def _forecast_from_state(
     prediction_domain: Optional[str] = None,
 ) -> Tuple[List[float], List[float]]:
     strategy = state.get("forecast_strategy", LEGACY_FORECAST_STRATEGY)
-    if strategy == DIRECT_FORECAST_STRATEGY:
-        predictions, std_dev = _forecast_direct_from_state(state, steps)
-    else:
-        predictions, std_dev = _forecast_autoregressive_from_state(state, steps)
+    if strategy != DIRECT_FORECAST_STRATEGY:
+        raise ValueError(
+            "[MODEL] Obsolete autoregressive LSTM state cannot be used for forecasting."
+        )
+    predictions, std_dev = _forecast_direct_from_state(state, steps)
     output_domain = prediction_domain or resolve_prediction_domain(state)
     return apply_prediction_domain(predictions, output_domain).tolist(), std_dev
 
@@ -941,7 +967,7 @@ def run(args) -> None:
             "prediction_domain": prediction_domain,
         }
         output_strategy, output_notes = _metadata_for_strategy(DIRECT_FORECAST_STRATEGY)
-        attach_method_metadata(next_state, METHOD_NAME, output_strategy, output_notes)
+        attach_lstm_metadata(next_state, output_strategy, output_notes)
         dump_model(next_state, save_path)
 
         out: Dict[str, Any] = {
@@ -972,7 +998,7 @@ def run(args) -> None:
             )
             out["forecast_steps"] = fit_predict_steps
             out["predictions"] = _format_predictions(preds, resolved_profile, resolved_summary)
-        attach_method_metadata(out, METHOD_NAME, output_strategy, output_notes)
+        attach_lstm_metadata(out, output_strategy, output_notes)
         out["logs"] = get_log_contents()
         print(json.dumps(out, ensure_ascii=False, indent=2 if pretty else None))
         return
@@ -1018,7 +1044,7 @@ def run(args) -> None:
             "uncertainty_summary": state.get("uncertainty_summary"),
         }
         output_strategy, output_notes = _metadata_for_strategy(str(state.get("forecast_strategy", LEGACY_FORECAST_STRATEGY)))
-        attach_method_metadata(out, METHOD_NAME, output_strategy, output_notes)
+        attach_lstm_metadata(out, output_strategy, output_notes)
         log.info("Prediction finished successfully")
 
         # Add captured logs to the final output
@@ -1127,7 +1153,7 @@ def run(args) -> None:
             "predictions": predictions_with_std,
             "uncertainty_summary": uncertainty_summary,
         }
-        attach_method_metadata(out, METHOD_NAME, DIRECT_FORECAST_STRATEGY, DIRECT_IMPLEMENTATION_NOTES)
+        attach_lstm_metadata(out, DIRECT_FORECAST_STRATEGY, DIRECT_IMPLEMENTATION_NOTES)
 
         if save_path:
             log.info(f"Saving model to {save_path}")
@@ -1167,7 +1193,7 @@ def run(args) -> None:
                 "reference_series": parsed_data.df[parsed_data.target_key].values[ts : te + 1].tolist(),
                 "prediction_domain": prediction_domain,
             }
-            attach_method_metadata(state, METHOD_NAME, DIRECT_FORECAST_STRATEGY, DIRECT_IMPLEMENTATION_NOTES)
+            attach_lstm_metadata(state, DIRECT_FORECAST_STRATEGY, DIRECT_IMPLEMENTATION_NOTES)
             dump_model(state, save_path)
             log.info(f"Model saved successfully to {save_path} (Keras: {keras_model_path})")
             out["saved_model"] = save_path

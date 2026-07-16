@@ -1,20 +1,13 @@
 # -*- coding: utf-8 -*-
 """
-Model serialization compatibility layer.
+Trusted model serialization layer.
 
-This module provides a consistent API for model serialization across all
-time series models. Uses pickle exclusively to ensure 100% cross-environment
-compatibility, regardless of whether joblib is installed.
-
-Design Decision:
-    We use pickle (instead of joblib) because:
-    - Guaranteed compatibility across all environments
-    - No dependency conflicts
-    - Simpler to debug and maintain
-    - joblib's optimizations are not critical for our model sizes
-
-    While joblib can be more efficient for large numpy arrays, our models
-    are small enough that the performance difference is negligible.
+Pickle is required because fitted statsmodels/scikit-learn/Keras-adjacent state
+contains Python objects that do not have a shared portable wire format. Pickle
+is neither safe for untrusted bytes nor cross-environment compatible. The
+application therefore restricts artifact paths, verifies artifact digests before
+loading, and embeds exact algorithm/schema/runtime metadata in every model state.
+Artifacts must be retrained after incompatible code or dependency changes.
 """
 import pickle
 import os
@@ -95,13 +88,16 @@ def load_model(path: str) -> Any:
         >>> print(state["model_type"])
         'ma'
     """
-    # Validate file exists
+    # This function must only receive application-owned, integrity-checked
+    # artifacts. Never expose it as a generic untrusted pickle loader.
     file_path = Path(path)
     if not file_path.exists():
         raise FileNotFoundError(
             f"[MODEL] Model file not found: {path}\n"
             f"Please ensure the model has been trained and saved first."
         )
+    if not file_path.is_file():
+        raise SerializationError(f"[MODEL] Model path is not a regular file: {path}")
 
     # Load the object. Any failure here means the artifact cannot be
     # reconstructed: corrupt/truncated bytes (UnpicklingError/EOFError/ValueError),

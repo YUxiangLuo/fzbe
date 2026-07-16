@@ -1,7 +1,10 @@
 import { describe, expect, test } from "bun:test";
 import {
+  formatYearMonth,
+  isConsecutiveYearMonth,
   normalizeSalesValue,
   normalizeYearMonth,
+  yearMonthOrdinal,
 } from "../../../src/modules/datasets/dataset-values";
 
 describe("dataset value normalization", () => {
@@ -31,7 +34,22 @@ describe("dataset value normalization", () => {
   test("normalizes strict year and month values", () => {
     expect(normalizeYearMonth("2024", "1")).toEqual({ year: "2024", month: "01" });
     expect(normalizeYearMonth("2024", "12")).toEqual({ year: "2024", month: "12" });
+    expect(normalizeYearMonth("1000", "01")).toEqual({ year: "1000", month: "01" });
+    expect(normalizeYearMonth("9999", "12")).toEqual({ year: "9999", month: "12" });
+    expect(normalizeYearMonth("0999", "1")).toBeNull();
+    expect(normalizeYearMonth("0000", "1")).toBeNull();
     expect(normalizeYearMonth("24", "1")).toBeNull();
     expect(normalizeYearMonth("2024", "13")).toBeNull();
+  });
+
+  test("compares monthly periods across year boundaries", () => {
+    const november = normalizeYearMonth("2024", "11")!;
+    const december = normalizeYearMonth("2024", "12")!;
+    const january = normalizeYearMonth("2025", "1")!;
+
+    expect(formatYearMonth(january)).toBe("2025-01");
+    expect(yearMonthOrdinal(december)).toBe(yearMonthOrdinal(november) + 1);
+    expect(isConsecutiveYearMonth(december, january)).toBeTrue();
+    expect(isConsecutiveYearMonth(november, january)).toBeFalse();
   });
 });

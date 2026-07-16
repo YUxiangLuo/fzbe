@@ -1,18 +1,30 @@
 from __future__ import annotations
 
 import math
+import os
 import tempfile
+import threading
 import unittest
+from copy import deepcopy
 from pathlib import Path
+from unittest.mock import patch
 
 import numpy as np
+import pandas as pd
 
 from py.deep_tests.support.harness import DATASETS, assert_prediction_contract, prediction_values, run_command
 from py.deep_tests.support.oracles import metrics, nonnegative_line_search, recursive_ma, shrunk_inverse_mse_weights
 from py.deep_tests.support.profiles import profile
 from py.src.dynamic_config import derive_arima_search_limit, derive_boosting_max_rounds, derive_lstm_config, plan_internal_holdout
+from py.src.data_utils import ParsedData
+from py.src.ensemble_utils import (
+    controlled_ensemble_map,
+    plan_ensemble_internal_holdout,
+    rolling_origin_ranges,
+)
 from py.src.metrics import mae, mape, r2, rmse
-from py.src.models import boosting, lstm, ma, stacking, weighted_avg
+from py.src.model_info import attach_method_metadata, ensure_state_metadata
+from py.src.models import arima, boosting, lstm, ma, stacking, weighted_avg
 
 
 class MathematicalGoldenTests(unittest.TestCase):
@@ -56,6 +68,63 @@ class MathematicalGoldenTests(unittest.TestCase):
         np.testing.assert_equal(boosting._apply_stage_output_semantics(1, [-2, 3]), [-2, 3])
 
     @profile("fast")
+    def test_checkpointed_boosting_folds_match_the_pooled_candidate_core(self):
+        fold_states = [
+            {
+                "fold_index": 0,
+                "prefix_range": range(0, 3),
+                "validation_range": range(3, 5),
+                "residual_val": np.asarray([4.0, 2.0]),
+            },
+            {
+                "fold_index": 1,
+                "prefix_range": range(0, 5),
+                "validation_range": range(5, 7),
+                "residual_val": np.asarray([3.0, 1.0]),
+            },
+        ]
+        evaluated = {
+            0: {
+                "fold_predictions": np.asarray([2.0, 1.0]),
+                "fold_fitted_train_predictions": np.asarray([0.0, 1.0, 1.5]),
+            },
+            1: {
+                "fold_predictions": np.asarray([1.0, 2.0]),
+                "fold_fitted_train_predictions": np.asarray([0.0, 1.0, 1.5, 2.0, 2.5]),
+            },
+        }
+        checkpointed = boosting.finalize_rolling_origin_candidate(
+            fold_states,
+            "ma",
+            [evaluated[0], evaluated[1]],
+        )
+        expected_gamma = nonnegative_line_search(
+            [4.0, 2.0, 3.0, 1.0],
+            [2.0, 1.0, 1.0, 2.0],
+        )
+        self.assertAlmostEqual(expected_gamma, checkpointed["coefficient"], places=12)
+
+        def fake_fold(_parsed, fold, _model, _params, _round):
+            return evaluated[fold["fold_index"]]
+
+        with patch.object(
+            boosting,
+            "evaluate_rolling_origin_fold_candidate",
+            side_effect=fake_fold,
+        ):
+            monolithic = boosting.evaluate_rolling_origin_candidate(
+                object(), fold_states, "ma", {}, 0
+            )
+        self.assertAlmostEqual(
+            checkpointed["coefficient"], monolithic["coefficient"], places=12
+        )
+        self.assertAlmostEqual(checkpointed["rmse"], monolithic["rmse"], places=12)
+        for left, right in zip(
+            checkpointed["next_residuals"], monolithic["next_residuals"]
+        ):
+            np.testing.assert_allclose(left, right, rtol=0, atol=0)
+
+    @profile("fast")
     def test_lstm_direct_windows_do_not_include_future_inputs(self):
         dataset = np.arange(24, dtype=float).reshape(12, 2)
         x, y = lstm._create_direct_dataset(dataset, look_back=3, forecast_horizon=2)
@@ -65,8 +134,81 @@ class MathematicalGoldenTests(unittest.TestCase):
             np.testing.assert_equal(x[index], dataset[index:index + 3])
             np.testing.assert_equal(y[index], dataset[index + 3:index + 5, 0])
 
+        metadata = lstm.attach_lstm_metadata({})
+        self.assertEqual("historical_only", metadata["feature_timing"])
+        self.assertIs(False, metadata["known_future_features"])
+        with self.assertRaisesRegex(ValueError, "Only direct historical-window"):
+            lstm.attach_lstm_metadata({}, lstm.LEGACY_FORECAST_STRATEGY)
+        with self.assertRaisesRegex(ValueError, "Obsolete autoregressive"):
+            lstm._forecast_from_state(
+                {"forecast_strategy": lstm.LEGACY_FORECAST_STRATEGY},
+                1,
+            )
+
+    @profile("fast")
+    def test_arima_deployment_intervals_do_not_claim_eval_bias_calibration(self):
+        point = arima._format_predictions([10.0], [[8.0, 12.0]])[0]
+        self.assertEqual("arima_forecast_distribution", point["calibration_source"])
+        self.assertIsNone(point["calibration_mean_error"])
+        self.assertIsNone(point["calibration_count"])
+
+    @profile("fast")
+    def test_artifact_runtime_manifest_is_required_exactly(self):
+        state = attach_method_metadata({}, "test", "test_strategy", ["test note"])
+        self.assertIn("python", state["runtime_compatibility"])
+        self.assertIn("packages", state["runtime_compatibility"])
+        self.assertEqual(
+            state,
+            ensure_state_metadata(state, "test", "test_strategy", ["test note"]),
+        )
+
+        incompatible = deepcopy(state)
+        incompatible["runtime_compatibility"]["python"] = "0.0"
+        with self.assertRaisesRegex(ValueError, "runtime dependencies"):
+            ensure_state_metadata(
+                incompatible,
+                "test",
+                "test_strategy",
+                ["test note"],
+            )
+
+        wrong_strategy = deepcopy(state)
+        wrong_strategy["forecast_strategy"] = "different_strategy"
+        with self.assertRaisesRegex(ValueError, "method metadata"):
+            ensure_state_metadata(
+                wrong_strategy,
+                "test",
+                "test_strategy",
+                ["test note"],
+            )
+
 
 class DynamicConfigurationTests(unittest.TestCase):
+    @profile("fast")
+    def test_controlled_ensemble_parallelism_is_bounded_and_ordered(self):
+        rendezvous = threading.Barrier(2)
+
+        def task(value: int):
+            def run() -> int:
+                rendezvous.wait(timeout=10)
+                return value
+            return run
+
+        with patch.dict(os.environ, {"FZ_ENSEMBLE_MAX_WORKERS": "8"}):
+            self.assertEqual(
+                [0, 1],
+                controlled_ensemble_map(
+                    [task(0), task(1)],
+                    contains_lstm=True,
+                ),
+            )
+        for invalid in ("0", "not-an-integer"):
+            with self.subTest(invalid=invalid), patch.dict(
+                os.environ,
+                {"FZ_ENSEMBLE_MAX_WORKERS": invalid},
+            ), self.assertRaisesRegex(ValueError, "positive integer"):
+                controlled_ensemble_map([lambda: 1])
+
     @profile("fast")
     def test_arima_search_boundaries(self):
         with self.assertRaisesRegex(ValueError, "\\[VALIDATION\\]"):
@@ -99,6 +241,55 @@ class DynamicConfigurationTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "No chronological"):
             plan_internal_holdout("boosting", 20, 2, lambda p, v: False)
         self.assertEqual([1, 3, 4], [derive_boosting_max_rounds(2, value) for value in (2, 4, 10)])
+
+    @profile("fast")
+    def test_ensemble_holdout_expands_into_nonoverlapping_rolling_origins(self):
+        parsed = ParsedData(
+            df=pd.DataFrame({"time": range(36), "y": range(36)}),
+            target_key="y",
+            time_key="time",
+            feature_keys=[],
+            time_frequency="numeric_step:1",
+        )
+        params = {"ma": {"window": 3}, "es": {"alpha": 0.2}}
+        plan = plan_ensemble_internal_holdout(
+            parsed,
+            range(36),
+            ["ma", "es"],
+            params,
+            "weighted",
+        )
+        self.assertEqual("expanding_window_rolling_origin", plan["scheme"])
+        self.assertEqual(3, plan["fold_count"])
+        self.assertEqual(24, plan["calibration_size"])
+        self.assertIs(False, plan["single_fold_fallback"])
+        ranges = rolling_origin_ranges(range(36), plan)
+        self.assertEqual(
+            [(0, 12, 12, 20), (0, 20, 20, 28), (0, 28, 28, 36)],
+            [
+                (prefix.start, prefix.stop, validation.start, validation.stop)
+                for prefix, validation in ranges
+            ],
+        )
+        validation_points = [point for _prefix, validation in ranges for point in validation]
+        self.assertEqual(len(validation_points), len(set(validation_points)))
+
+        small = ParsedData(
+            df=pd.DataFrame({"time": range(8), "y": range(8)}),
+            target_key="y",
+            time_key="time",
+            feature_keys=[],
+            time_frequency="numeric_step:1",
+        )
+        fallback = plan_ensemble_internal_holdout(
+            small,
+            range(8),
+            ["ma", "es"],
+            params,
+            "weighted",
+        )
+        self.assertEqual(1, fallback["fold_count"])
+        self.assertIs(True, fallback["single_fold_fallback"])
 
 
 if __name__ == "__main__":

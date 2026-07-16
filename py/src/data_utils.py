@@ -45,11 +45,13 @@ class ParsedData:
         target_key: str,
         time_key: Optional[str] = None,
         feature_keys: Optional[List[str]] = None,
+        time_frequency: Optional[str] = None,
     ):
         self.df = df
         self.target_key = target_key
         self.time_key = time_key
         self.feature_keys = feature_keys or []
+        self.time_frequency = time_frequency
 
     @property
     def n_obs(self) -> int:
@@ -378,6 +380,123 @@ def _data_error(message: str) -> ValueError:
     return ValueError(f"[DATA] {message}")
 
 
+_YEAR_MONTH_SHAPE_PATTERN = re.compile(r"^\s*(\d{4})[-/](0?[1-9]|1[0-2])\s*$")
+_YEAR_MONTH_PATTERN = re.compile(r"^\s*([1-9]\d{3})[-/](0?[1-9]|1[0-2])\s*$")
+
+
+def _raise_time_axis_error(time_key: str, message: str) -> None:
+    raise _data_error(f"Time column '{time_key}' {message}")
+
+
+def _validate_order_and_spacing(
+    values: np.ndarray,
+    *,
+    time_key: str,
+    expected_step: Optional[float] = None,
+) -> float:
+    """Validate a numeric representation of a time axis without reordering rows."""
+    if values.size <= 1:
+        return float(expected_step if expected_step is not None else 0.0)
+
+    differences = np.diff(values.astype(float))
+    if np.any(np.isclose(differences, 0.0, rtol=0.0, atol=1e-12)):
+        _raise_time_axis_error(time_key, "contains duplicate time points.")
+    if np.any(differences < 0):
+        _raise_time_axis_error(time_key, "must be strictly increasing in input row order.")
+
+    step = float(expected_step if expected_step is not None else differences[0])
+    if step <= 0 or not np.allclose(differences, step, rtol=1e-9, atol=1e-12):
+        _raise_time_axis_error(
+            time_key,
+            "must use one fixed frequency with no missing periods.",
+        )
+    return step
+
+
+def _validate_time_axis(df: pd.DataFrame, time_key: str) -> str:
+    """
+    Validate the canonical row order used by every model.
+
+    Calendar months must be consecutive. Numeric indices and timestamp series
+    must use one positive fixed step. The function intentionally never sorts:
+    silently sorting would change the train/evaluation ranges selected by users.
+    """
+    if time_key not in df.columns:
+        _raise_time_axis_error(time_key, "does not exist.")
+
+    series = df[time_key]
+    if series.isnull().any() or series.map(
+        lambda value: isinstance(value, str) and not value.strip()
+    ).any():
+        _raise_time_axis_error(time_key, "contains empty values.")
+
+    string_values = series.astype(str)
+    month_matches = string_values.map(_YEAR_MONTH_PATTERN.fullmatch)
+    month_shape_matches = string_values.map(_YEAR_MONTH_SHAPE_PATTERN.fullmatch)
+    if (month_shape_matches.notna() & month_matches.isna()).any():
+        _raise_time_axis_error(
+            time_key,
+            "contains YYYY-MM values with years outside 1000-9999.",
+        )
+    if month_matches.notna().all():
+        month_ordinals = np.asarray(
+            [
+                int(match.group(1)) * 12 + int(match.group(2)) - 1
+                for match in month_matches
+            ],
+            dtype=np.int64,
+        )
+        _validate_order_and_spacing(
+            month_ordinals,
+            time_key=time_key,
+            expected_step=1.0,
+        )
+        return "monthly"
+
+    numeric = _coerce_numeric_series(series)
+    if numeric.notna().all():
+        if _non_finite_mask(numeric).any():
+            _raise_time_axis_error(time_key, "contains non-finite values.")
+        step = _validate_order_and_spacing(
+            numeric.to_numpy(dtype=float),
+            time_key=time_key,
+        )
+        return "numeric" if len(numeric) <= 1 else f"numeric_step:{step:g}"
+
+    # Only accept date-like strings if every value parses.  Partial coercion is
+    # dangerous because it makes an invalid time label look like missing data.
+    try:
+        timestamps = pd.to_datetime(series, errors="coerce", format="mixed")
+    except TypeError:  # pandas < 2.0 compatibility
+        timestamps = pd.to_datetime(series, errors="coerce")
+    if timestamps.isnull().any():
+        _raise_time_axis_error(
+            time_key,
+            "must contain numeric indices, YYYY-MM values, or parseable dates.",
+        )
+
+    timestamp_ns = timestamps.astype("int64").to_numpy(dtype=np.int64)
+    if timestamp_ns.size > 1:
+        differences = np.diff(timestamp_ns)
+        if np.any(differences == 0):
+            _raise_time_axis_error(time_key, "contains duplicate time points.")
+        if np.any(differences < 0):
+            _raise_time_axis_error(time_key, "must be strictly increasing in input row order.")
+
+        # Consecutive calendar months are fixed-frequency even though their
+        # durations vary between 28 and 31 days.
+        month_ordinals = np.asarray(
+            [stamp.year * 12 + stamp.month - 1 for stamp in timestamps],
+            dtype=np.int64,
+        )
+        if np.all(np.diff(month_ordinals) == 1):
+            return "monthly"
+
+        _validate_order_and_spacing(timestamp_ns, time_key=time_key)
+
+    return "datetime_fixed"
+
+
 def load_data_from_json(
     json_string: str,
     target_key: Optional[str] = None,
@@ -416,33 +535,48 @@ def load_data_from_json(
         log.error(f"Target key '{target_key}' not found. Available columns: {df.columns.tolist()}")
         raise _data_error(f"Cannot determine target key. Please specify one. Available columns: {df.columns.tolist()}")
 
-    # Auto-detect time_key and create composite timestamp if possible
+    # Auto-detect time_key and create a strict composite timestamp when possible.
     if time_key is None:
         if "年份" in df.columns and "月份" in df.columns:
-            log.info("Found '年份' and '月份' columns, attempting to create composite timestamp.")
-            try:
-                # Ensure year and month are clean strings before combining
-                year_str = df["年份"].astype(str)
-                month_str = pd.to_numeric(df["月份"], errors='coerce').apply(lambda x: f"{int(x):02d}")
+            combined_month_matches = df["月份"].astype(str).map(_YEAR_MONTH_PATTERN.fullmatch)
+            if combined_month_matches.notna().all():
+                # Legacy database rows may retain a redundant 年份 header while
+                # 月份 already carries the authoritative YYYY-MM value.
+                time_key = "月份"
+                log.info("Using combined legacy '月份' values as the monthly time axis.")
+            else:
+                log.info("Found separate '年份' and '月份' columns, creating a composite monthly timestamp.")
+                years = _coerce_numeric_series(df["年份"])
+                months = _coerce_numeric_series(df["月份"])
+                valid_years = (
+                    years.notna()
+                    & np.isfinite(years)
+                    & years.eq(years.round())
+                    & (years >= 1000)
+                    & (years <= 9999)
+                )
+                valid_months = (
+                    months.notna()
+                    & np.isfinite(months)
+                    & months.eq(months.round())
+                    & (months >= 1)
+                    & (months <= 12)
+                )
+                if not bool(valid_years.all() and valid_months.all()):
+                    raise _data_error(
+                        "Columns '年份' and '月份' must contain a valid four-digit year and month 1-12."
+                    )
 
-                if month_str.isnull().any():
-                    log.warning("Could not create composite timestamp due to non-numeric '月份' values. Falling back.")
-                    raise ValueError("Non-numeric month values")
-
-                df["timestamp"] = year_str + "-" + month_str
+                year_values = years.astype(int)
+                month_values = months.astype(int)
+                df["timestamp"] = [
+                    f"{year:04d}-{month:02d}"
+                    for year, month in zip(year_values, month_values)
+                ]
                 time_key = "timestamp"
+                df["年份"] = year_values
+                df["月份"] = month_values
                 log.info(f"Created composite time_key: '{time_key}'")
-
-                # Convert 年份 and 月份 to numeric for use as features
-                df["年份"] = pd.to_numeric(df["年份"], errors='coerce')
-                df["月份"] = pd.to_numeric(df["月份"], errors='coerce')
-                log.info("Converted '年份' and '月份' to numeric types for use as features")
-            except Exception as e:
-                log.warning(f"Could not create composite timestamp: {e}. Falling back to simpler time key.")
-                if "月份" in df.columns:
-                    time_key = "月份"
-                elif "年份" in df.columns:
-                    time_key = "年份"
 
         elif "month" in df.columns:
             time_key = "month"
@@ -486,6 +620,10 @@ def load_data_from_json(
         else:
             log.debug(f"Keeping feature column '{col}' as categorical (dtype: {df[col].dtype})")
 
+    time_frequency = _validate_time_axis(df, time_key) if time_key else None
+    if time_key:
+        log.info("Validated time axis '%s' with frequency '%s'", time_key, time_frequency)
+
     # --- CRITICAL: Filter the DataFrame to only the used columns ---
     columns_to_keep = [target_key]
     if time_key:
@@ -509,4 +647,5 @@ def load_data_from_json(
         target_key=target_key,
         time_key=time_key,
         feature_keys=feature_keys,
+        time_frequency=time_frequency,
     )

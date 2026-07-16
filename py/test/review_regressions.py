@@ -42,7 +42,7 @@ from dynamic_config import (  # noqa: E402
     derive_lstm_config,
     plan_internal_holdout,
 )
-from model_info import MODEL_ALGORITHM_REVISION  # noqa: E402
+from model_info import attach_method_metadata  # noqa: E402
 from uncertainty import (  # noqa: E402
     NORMAL_95,
     ensemble_growth_profile,
@@ -332,15 +332,16 @@ def assert_target_only_lstm_training() -> None:
     with tempfile.TemporaryDirectory() as temp_dir:
         missing_features_artifact = Path(temp_dir) / "lstm-missing-features.pkl"
         with missing_features_artifact.open("wb") as handle:
-            pickle.dump(
-                {
-                    "model_type": "lstm",
-                    "algorithm_revision": MODEL_ALGORITHM_REVISION,
-                    "forecast_strategy": "direct_multi_horizon",
-                    "normalization": "minmax",
-                },
-                handle,
+            missing_feature_state = {
+                "model_type": "lstm",
+                "normalization": "minmax",
+            }
+            lstm.attach_lstm_metadata(
+                missing_feature_state,
+                lstm.DIRECT_FORECAST_STRATEGY,
+                lstm.DIRECT_IMPLEMENTATION_NOTES,
             )
+            pickle.dump(missing_feature_state, handle)
         try:
             lstm._load_state(str(missing_features_artifact))
         except ValueError as exc:
@@ -638,7 +639,7 @@ def assert_horizon_aware_uncertainty_profiles() -> None:
     )[0]
     assert sliced_fallback_point["uncertainty_source"] == "fallback"
 
-    arima_points = arima._format_predictions([0.0], [[-3.0, 5.0]], 2.5, 4)
+    arima_points = arima._format_predictions([0.0], [[-3.0, 5.0]])
     assert len(arima_points) == 1
     assert arima_points[0]["prediction"] == 0.0
     assert math.isclose(arima_points[0]["std_dev"], 8.0 / (2.0 * NORMAL_95))
@@ -649,8 +650,8 @@ def assert_horizon_aware_uncertainty_profiles() -> None:
     assert arima_points[0]["interval_level"] == 0.95
     assert arima_points[0]["interval_kind"] == "model_prediction_interval"
     assert arima_points[0]["upper_error_p99"] > 0
-    assert arima_points[0]["calibration_mean_error"] == 2.5
-    assert arima_points[0]["calibration_count"] == 4
+    assert arima_points[0]["calibration_mean_error"] is None
+    assert arima_points[0]["calibration_count"] is None
 
     _, biased_summary = ses_profile(0.0, 0.4, 1, [5.0, 5.0, 5.0, 5.0])
     biased_point = format_predictions([100.0], [0.0], biased_summary)[0]
@@ -734,6 +735,22 @@ def assert_source_artifact_configuration_resolution() -> None:
                 "normalization": "zscore",
             },
         }
+        source_modules = {"ma": ma, "es": es, "arima": arima}
+        for model_name, source_state in source_states.items():
+            if model_name == "lstm":
+                lstm.attach_lstm_metadata(
+                    source_state,
+                    lstm.DIRECT_FORECAST_STRATEGY,
+                    lstm.DIRECT_IMPLEMENTATION_NOTES,
+                )
+            else:
+                source_module = source_modules[model_name]
+                attach_method_metadata(
+                    source_state,
+                    source_module.METHOD_NAME,
+                    source_module.FORECAST_STRATEGY,
+                    source_module.IMPLEMENTATION_NOTES,
+                )
         source_files: dict[str, str] = {}
         for model_name, source_state in source_states.items():
             source_file = temp_path / f"{model_name}.pkl"
@@ -758,17 +775,20 @@ def assert_source_artifact_configuration_resolution() -> None:
         assert json.loads(resolved_params["lstm"]["lstm_features"]) == ["价格指数"]
 
         target_only_lstm_file = temp_path / "lstm-target-only.pkl"
+        target_only_state = {
+            "model_type": "lstm",
+            "target_key": "销售数量",
+            "feature_keys": [],
+            "feature_types": {"销售数量": "numeric"},
+            "normalization": "minmax",
+        }
+        lstm.attach_lstm_metadata(
+            target_only_state,
+            lstm.DIRECT_FORECAST_STRATEGY,
+            lstm.DIRECT_IMPLEMENTATION_NOTES,
+        )
         with target_only_lstm_file.open("wb") as handle:
-            pickle.dump(
-                {
-                    "model_type": "lstm",
-                    "target_key": "销售数量",
-                    "feature_keys": [],
-                    "feature_types": {"销售数量": "numeric"},
-                    "normalization": "minmax",
-                },
-                handle,
-            )
+            pickle.dump(target_only_state, handle)
         target_only_params, _ = resolve_base_model_artifact_configs(
             parsed_data,
             ["lstm"],
@@ -780,16 +800,19 @@ def assert_source_artifact_configuration_resolution() -> None:
         assert target_only_params["lstm"]["feature_types"] == {"销售数量": "numeric"}
 
         missing_feature_list_file = temp_path / "lstm-missing-feature-list.pkl"
+        missing_feature_list_state = {
+            "model_type": "lstm",
+            "target_key": "销售数量",
+            "feature_types": {"销售数量": "numeric"},
+            "normalization": "minmax",
+        }
+        lstm.attach_lstm_metadata(
+            missing_feature_list_state,
+            lstm.DIRECT_FORECAST_STRATEGY,
+            lstm.DIRECT_IMPLEMENTATION_NOTES,
+        )
         with missing_feature_list_file.open("wb") as handle:
-            pickle.dump(
-                {
-                    "model_type": "lstm",
-                    "target_key": "销售数量",
-                    "feature_types": {"销售数量": "numeric"},
-                    "normalization": "minmax",
-                },
-                handle,
-            )
+            pickle.dump(missing_feature_list_state, handle)
         try:
             resolve_base_model_artifact_configs(
                 parsed_data,
@@ -1139,6 +1162,8 @@ def assert_boosting_requests_signed_base_outputs() -> None:
 
 
 def assert_boosting_keeps_signed_corrections_end_to_end() -> None:
+    import threading
+
     from data_utils import load_data_from_json
 
     records = [
@@ -1146,17 +1171,42 @@ def assert_boosting_keeps_signed_corrections_end_to_end() -> None:
         for index in range(10)
     ]
     parsed_data = load_data_from_json(json.dumps(records, ensure_ascii=False))
-    training_calls = iter((
-        ("candidate-r0-ma.pkl", np.asarray([2.0, 1.0, 0.0]), [1.0, 1.1, 1.2]),
-        ("candidate-r0-es.pkl", np.asarray([10.0, -10.0, 10.0]), [1.0, 1.1, 1.2]),
-        ("candidate-r1-ma.pkl", np.asarray([-1.0, 1.0, 0.0]), [1.0, 1.1, 1.2]),
-        ("candidate-r1-es.pkl", np.asarray([10.0, -10.0, 10.0]), [1.0, 1.1, 1.2]),
-        ("final-r0-ma.pkl", np.asarray([2.0, 1.0]), [1.0, 1.1]),
-        ("final-r1-ma.pkl", np.asarray([-1.0, 1.0]), [1.0, 1.1]),
-    ))
+    call_counts = {"ma": 0, "es": 0}
+    call_lock = threading.Lock()
 
-    def fake_train_stage(*_args: object, **_kwargs: object):
-        return next(training_calls)
+    def fake_train_stage(*args: object, **_kwargs: object):
+        model_name = str(args[0])
+        with call_lock:
+            call_index = call_counts[model_name]
+            call_counts[model_name] += 1
+        if model_name == "es":
+            return (
+                f"candidate-es-{call_index}.pkl",
+                (
+                    np.asarray([100.0, 0.0, 0.0])
+                    if call_index < 2
+                    else np.asarray([100.0, -100.0, 0.0])
+                ),
+                [1.0, 1.1, 1.2],
+            )
+        if call_index < 2:
+            return (
+                f"candidate-r0-ma-{call_index}.pkl",
+                np.asarray([2.0, 1.0, 0.0]),
+                [1.0, 1.1, 1.2],
+            )
+        if call_index < 4:
+            return (
+                f"candidate-r1-ma-{call_index}.pkl",
+                np.asarray([-1.0, 1.0, 0.0]),
+                [1.0, 1.1, 1.2],
+            )
+        stage = call_index - 4
+        return (
+            f"final-r{stage}-ma.pkl",
+            np.asarray([2.0, 1.0]) if stage == 0 else np.asarray([-1.0, 1.0]),
+            [1.0, 1.1],
+        )
 
     def fake_fitted(
         _model_name: str,
@@ -1180,6 +1230,7 @@ def assert_boosting_keeps_signed_corrections_end_to_end() -> None:
         patch.object(boosting, "_train_stage_model", side_effect=fake_train_stage),
         patch.object(boosting, "_compute_in_sample_fitted_predictions", side_effect=fake_fitted),
         patch.object(boosting, "remove_member_model_artifact"),
+        patch.object(boosting, "derive_boosting_max_rounds", return_value=2),
     ):
         (
             _metrics,
@@ -1201,7 +1252,7 @@ def assert_boosting_keeps_signed_corrections_end_to_end() -> None:
             max_rounds=2,
         )
 
-    assert model_chain == ["es", "ma"]
+    assert model_chain == ["ma", "ma"]
     assert np.allclose(stage_coefficients, [0.6, 0.3])
     assert np.allclose(y_pred, [0.9, 0.9])
     assert len(uncertainty_profile) == 2
@@ -1213,8 +1264,13 @@ def assert_boosting_keeps_signed_corrections_end_to_end() -> None:
         "stage_coefficients": stage_coefficients,
         "base_model_states": base_model_states,
         "uncertainty": training_details["uncertainty"],
-        "algorithm_revision": MODEL_ALGORITHM_REVISION,
     }
+    attach_method_metadata(
+        saved_state,
+        boosting.METHOD_NAME,
+        boosting.FORECAST_STRATEGY,
+        boosting.IMPLEMENTATION_NOTES,
+    )
     prediction_calls: list[dict[str, object]] = []
 
     def fake_predict_stage(**kwargs: object) -> dict[str, object]:
@@ -1237,14 +1293,14 @@ def assert_boosting_keeps_signed_corrections_end_to_end() -> None:
     assert all(call["allow_negative_predictions"] is True for call in prediction_calls)
 
 
-def assert_boosting_trim_uses_retained_prefix_residuals() -> None:
+def assert_boosting_refit_preserves_oof_coefficients_and_calibration() -> None:
     records = [
         {"月份": f"2026-{index + 1:02d}", "销售数量": 1.0}
         for index in range(10)
     ]
     parsed_data = load_data_from_json(json.dumps(records, ensure_ascii=False))
-    expected_prefix_residuals = np.asarray([0.0, 1.0, 0.0])
-    full_selection_residuals = np.asarray([0.5, 0.5, 0.0])
+    selected_coefficients = [0.6, 0.3]
+    expected_oof_residuals = np.asarray([0.1, -0.1, 0.2, 0.1, -0.1, 0.2])
 
     def fake_fitted(
         _model_name: str,
@@ -1252,64 +1308,17 @@ def assert_boosting_trim_uses_retained_prefix_residuals() -> None:
         _parsed_data: object,
         train_range: range,
     ) -> np.ndarray:
-        if "trim" in model_file:
-            pattern = [-1.0]
-        elif "r1" in model_file:
-            pattern = [-1.0, 1.0, 0.0]
-        elif "es" in model_file:
-            pattern = [10.0, -10.0, 10.0]
-        else:
-            pattern = [2.0, 1.0, 0.0]
-        return np.asarray(
-            [pattern[index % len(pattern)] for index in range(len(train_range))],
-            dtype=float,
-        )
-
-    regular_training_calls = iter((
-        ("candidate-r0-ma.pkl", np.asarray([2.0, 1.0, 0.0]), [1.0, 1.1, 1.2]),
-        ("candidate-r0-es.pkl", np.asarray([10.0, -10.0, 10.0]), [1.0, 1.1, 1.2]),
-        ("candidate-r1-ma.pkl", np.asarray([-1.0, 1.0, 0.0]), [1.0, 1.1, 1.2]),
-        ("candidate-r1-es.pkl", np.asarray([10.0, -10.0, 10.0]), [1.0, 1.1, 1.2]),
-        ("final-r0-ma.pkl", np.asarray([2.0, 1.0]), [1.0, 1.1]),
-        ("final-r1-trim.pkl", np.asarray([-1.0, 1.0]), [1.0, 1.1]),
-    ))
-
-    with (
-        patch.object(boosting, "_build_round_records", return_value=([], [])),
-        patch.object(
-            boosting,
-            "_train_stage_model",
-            side_effect=lambda *_args, **_kwargs: next(regular_training_calls),
-        ),
-        patch.object(boosting, "_compute_in_sample_fitted_predictions", side_effect=fake_fitted),
-        patch.object(boosting, "remove_member_model_artifact"),
-    ):
-        regular_result = boosting.train_and_evaluate(
-            parsed_data,
-            range(0, 8),
-            range(8, 10),
-            ["ma", "es"],
-            {"ma": {"window": 2}, "es": {"alpha": 0.3}},
-            learning_rate=0.5,
-            max_rounds=2,
-        )
-
-    assert regular_result[1] == ["es"]
-    regular_calibration = np.asarray(
-        regular_result[8]["uncertainty"]["calibration_residuals"]
-    )
-    assert np.allclose(regular_calibration, expected_prefix_residuals)
-    assert not np.allclose(regular_calibration, full_selection_residuals)
-    assert math.isclose(
-        regular_result[6][0],
-        float(np.std(expected_prefix_residuals, ddof=1)),
-    )
+        # The second full-range fitted learner is deliberately anti-correlated
+        # with its residual target. A full in-sample line search would trim it;
+        # the deployment refit must retain the leakage-safe OOF coefficient.
+        value = -1.0 if "r1" in model_file else 1.0
+        return np.full(len(train_range), value, dtype=float)
 
     guided_training_calls = iter((
-        ("guided-final-r0.pkl", np.asarray([2.0, 1.0]), [1.0, 1.1]),
-        ("guided-final-r1-trim.pkl", np.asarray([-1.0, 1.0]), [1.0, 1.1]),
+        ("guided-final-r0.pkl", np.asarray([1.0, 1.0]), [1.0, 1.1]),
+        ("guided-final-r1.pkl", np.asarray([-1.0, -1.0]), [1.0, 1.1]),
     ))
-    with tempfile.TemporaryDirectory(prefix="guided-boosting-trim-") as artifact_dir:
+    with tempfile.TemporaryDirectory(prefix="guided-boosting-oof-") as artifact_dir:
         guided_state = {
             "parsed_data": parsed_data,
             "train_range": {"start": 0, "stop": 8},
@@ -1317,20 +1326,22 @@ def assert_boosting_trim_uses_retained_prefix_residuals() -> None:
             "models": ["ma", "es"],
             "model_params": {"ma": {"window": 2}, "es": {"alpha": 0.3}},
             "base_model_files": {},
-            "model_chain": ["es", "ma"],
-            "stage_coefficients": [0.1, 0.5],
-            "residual_val": full_selection_residuals.copy(),
+            "model_chain": ["ma", "ma"],
+            "stage_coefficients": selected_coefficients.copy(),
             "validation_residual_snapshots": [
-                np.asarray([1.0, 1.0, 1.0]),
-                expected_prefix_residuals.copy(),
-                full_selection_residuals.copy(),
+                np.ones(6),
+                np.full(6, 0.4),
+                expected_oof_residuals.copy(),
             ],
             "search_summary": {"stages": []},
             "artifact_dir": artifact_dir,
             "split_plan": {
                 "purpose": "boosting",
+                "scheme": "expanding_window_rolling_origin",
                 "prefix_size": 5,
                 "validation_size": 3,
+                "fold_count": 2,
+                "calibration_size": 6,
             },
         }
         with (
@@ -1350,12 +1361,14 @@ def assert_boosting_trim_uses_retained_prefix_residuals() -> None:
                 "combine_evaluate", None, guided_state
             )
 
-    assert guided_state["model_chain"] == ["es"]
+    assert guided_state["model_chain"] == ["ma", "ma"]
+    assert guided_state["stage_coefficients"] == selected_coefficients
+    assert guided_state["selection_coefficients"] == selected_coefficients
     guided_calibration = np.asarray(
         guided_state["uncertainty"]["calibration_residuals"]
     )
-    assert np.allclose(guided_calibration, expected_prefix_residuals)
-    assert not np.allclose(guided_calibration, full_selection_residuals)
+    assert np.allclose(guided_calibration, expected_oof_residuals)
+    assert guided_state["uncertainty"]["calibration_source"] == "rolling_origin_oof"
 
 
 def assert_subprocess_prediction_domains() -> None:
@@ -1475,12 +1488,18 @@ def assert_corrupt_state_errors() -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             source = os.path.join(temp_dir, "source.pkl")
             target = os.path.join(temp_dir, "target.pkl")
-            with open(source, "wb") as handle:
-                pickle.dump({
+            source_state = {
                     "model_type": model_type,
                     "prediction_domain": DEMAND_PREDICTION_DOMAIN,
-                    "algorithm_revision": MODEL_ALGORITHM_REVISION,
-                }, handle)
+            }
+            attach_method_metadata(
+                source_state,
+                module.METHOD_NAME,
+                module.FORECAST_STRATEGY,
+                module.IMPLEMENTATION_NOTES,
+            )
+            with open(source, "wb") as handle:
+                pickle.dump(source_state, handle)
             args = argparse.Namespace(
                 data=records_json,
                 train_start=0,
@@ -1793,7 +1812,7 @@ def main() -> None:
     assert_clipped_predictions_drive_python_metrics()
     assert_boosting_requests_signed_base_outputs()
     assert_boosting_keeps_signed_corrections_end_to_end()
-    assert_boosting_trim_uses_retained_prefix_residuals()
+    assert_boosting_refit_preserves_oof_coefficients_and_calibration()
     assert_subprocess_prediction_domains()
     assert_loaded_ensemble_demand_semantics()
     assert_same_path_artifact_replay()

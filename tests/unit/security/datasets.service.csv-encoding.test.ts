@@ -27,7 +27,12 @@ mock.module(configModulePath, () => ({
   },
 }));
 
-const { getProductFields, getProductSales, toCsvString } = await import(freshDatasetsServiceModulePath);
+const {
+  getProductFields,
+  getProductSales,
+  toCsvString,
+  uploadDataset,
+} = await import(freshDatasetsServiceModulePath);
 const { getCsvHeaders, readCsvRows } = await import("../../../src/utils/csv-processor");
 
 const gbkDatasetCsv = Buffer.from([
@@ -135,6 +140,23 @@ describe("datasets service CSV encoding", () => {
         field: "销售数量",
         message: "第 1 行销售数量无效",
       },
+    });
+  });
+
+  test("rejects a four-digit year below the Python training lower bound", async () => {
+    const csv = [
+      "行业名称,公司名称,产品名称,年份,月份,销售数量,数量单位",
+      "制造业,样本企业,样本产品,0999,1,100,件",
+    ].join("\n");
+    const result = await uploadDataset(
+      new File([csv], "low-year.csv", { type: "text/csv" }),
+      "低年份测试",
+    );
+
+    expect(result).toEqual({
+      error: "数据格式错误",
+      status: 400,
+      details: { message: '产品 "样本产品" 第 1 行年份格式错误' },
     });
   });
 });

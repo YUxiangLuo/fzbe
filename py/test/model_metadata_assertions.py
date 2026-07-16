@@ -15,28 +15,23 @@ EXPECTED_METHOD_METADATA = {
         "note_fragments": ("ARIMA", "stepwise"),
     },
     "lstm_direct": {
-        "method_name": "LSTM 多变量销量预测",
+        "method_name": "历史协变量直接多步 LSTM 销量预测",
         "forecast_strategy": "direct_multi_horizon",
         "note_fragments": ("直接多步", "递归"),
     },
-    "lstm_autoregressive": {
-        "method_name": "LSTM 多变量销量预测",
-        "forecast_strategy": "autoregressive",
-        "note_fragments": ("递归", "回退"),
-    },
     "weighted_avg": {
-        "method_name": "验证残差MSE倒数加权平均融合",
-        "forecast_strategy": "validation_residual_mse_weighted_average",
+        "method_name": "滚动起点 OOF 残差MSE倒数加权平均融合",
+        "forecast_strategy": "rolling_origin_oof_residual_mse_weighted_average",
         "note_fragments": ("残差", "权重"),
     },
     "stacking": {
-        "method_name": "时间顺序留出 Stacking 融合",
-        "forecast_strategy": "holdout_nonnegative_least_squares",
-        "note_fragments": ("时间顺序", "无截距"),
+        "method_name": "滚动起点 OOF Stacking 融合",
+        "forecast_strategy": "rolling_origin_oof_nonnegative_least_squares",
+        "note_fragments": ("滚动起点", "无截距"),
     },
     "boosting": {
-        "method_name": "残差提升融合",
-        "forecast_strategy": "greedy_residual_additive_ensemble",
+        "method_name": "滚动起点 OOF 残差提升融合",
+        "forecast_strategy": "rolling_origin_greedy_residual_additive_ensemble",
         "note_fragments": ("残差", "贪心"),
     },
 }

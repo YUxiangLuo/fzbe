@@ -4,7 +4,7 @@
 Residual Boosting Ensemble for Heterogeneous Time Series Models.
 
 Stage 0 fits the original target. Subsequent stages fit the residuals left by the
-current ensemble. Stage selection is performed on a held-out validation window,
+current ensemble. Stage selection is performed on rolling-origin validation folds,
 while each selected stage is retrained on the full train_range for final eval and
 artifact persistence.
 
@@ -22,6 +22,7 @@ from scipy.sparse import csr_matrix
 from data_utils import ParsedData, infer_feature_types, load_data_from_json
 from ensemble_utils import (
     build_ensemble_subprocess_data,
+    controlled_ensemble_map,
     format_predictions,
     get_lstm_source_forecast_strategy,
     get_member_model_path,
@@ -36,6 +37,7 @@ from ensemble_utils import (
     remove_member_model_artifact,
     require_explicit_lstm_feature_names,
     resolve_base_model_artifact_configs,
+    rolling_origin_ranges,
     validate_base_model_names,
 )
 from dynamic_config import derive_boosting_max_rounds
@@ -53,17 +55,17 @@ from uncertainty import ensemble_growth_profile
 
 MODEL_TYPE = "boosting"
 SUPPORTED_BASE_MODELS = ["ma", "es", "arima", "lstm"]
-METHOD_NAME = "残差提升融合"
-FORECAST_STRATEGY = "greedy_residual_additive_ensemble"
+METHOD_NAME = "滚动起点 OOF 残差提升融合"
+FORECAST_STRATEGY = "rolling_origin_greedy_residual_additive_ensemble"
 IMPLEMENTATION_NOTES = [
     "Boosting 的教科书核心是将多个弱学习器串行加到一个强学习器中，后续学习器重点修正前序误差。",
     "梯度提升在平方误差损失下等价于逐步拟合残差；本系统借鉴这一思想，但候选学习器是 MA、ES、ARIMA、LSTM 等时间序列模型。",
     "AdaBoost 通过样本权重实现错误关注；本系统的时间序列基础模型不支持样本权重，因此采用残差学习的加法模型。",
-    "系统按时间顺序动态留出末段；每轮贪心地从全部候选中选择，同一类型可重复入选，最大轮数由 min(2×模型数, 验证点数-1) 决定。",
+    "系统在训练区间末部执行最多三折、互不重叠的扩展窗口滚动起点验证；每轮按合并 OOF 残差贪心地从全部候选中选择，同一类型可重复入选，样本不足时显式退化为单折。",
     "候选只沿用用户选择的 MA 窗口、ES alpha、ARIMA d 及 LSTM 特征/归一化。ARIMA 阶数和 LSTM 隐藏参数针对每轮当前数据段与目标重新推导。",
     "更新训练段残差时，若某阶段在序列开头还没有可定义的样本内拟合值（如 MA 尚未凑满完整窗口、LSTM 尚未凑满 look_back），该前缀按零修正处理，即保持原残差；系统不会改用较短窗口伪造拟合值。",
-    "每个候选阶段以平方损失的一维非负线搜索求系数 gamma=max(0,<r,h>/<h,h>)；短验证段要求至少 5% 相对改善，其余要求 1%，无足够改善即提前停止。选出的模型链在完整训练区间逐级重训并重新估计 gamma；若某级最优系数为零，则裁剪该级及其后的验证候选链。",
-    "只有原始销量阶段和最终销量预测会截断到不小于 0，中间残差保持有符号。std_dev、95% 区间和生产用 99% 上侧误差仅用与最终保留模型链对应的 actual-prediction 组合残差校准各阶段逐 horizon 的增长形状；经验分位数会保留稳定偏差，独立评估真实值不参与校准，信息不足时明确标记 fallback。",
+    "每个候选阶段以合并 OOF 平方损失的一维非负线搜索求系数 gamma=max(0,<r,h>/<h,h>)；短校准段要求至少 5% 相对改善，其余要求 1%，无足够改善即提前停止。选出的模型链在完整训练区间逐级重训，但保留 OOF 选出的 gamma，避免用乐观的全量样本内拟合重新改写部署系数。",
+    "只有原始销量阶段和最终销量预测会截断到不小于 0，中间残差保持有符号。std_dev、95% 区间和生产用 99% 上侧误差仅用与最终模型链对应的滚动起点 OOF 组合残差校准各阶段逐 horizon 的增长形状；经验分位数会保留稳定偏差，独立评估真实值不参与校准，信息不足时明确标记 fallback。",
 ]
 
 
@@ -160,6 +162,7 @@ def _build_residual_parsed_data(
         target_key=parsed_data.target_key,
         time_key=parsed_data.time_key,
         feature_keys=parsed_data.feature_keys,
+        time_frequency=parsed_data.time_frequency,
     )
 
 
@@ -353,6 +356,145 @@ def _train_stage_model(
     )
 
 
+def evaluate_rolling_origin_fold_candidate(
+    parsed_data: ParsedData,
+    fold_state: Dict[str, Any],
+    model_name: str,
+    params: Dict[str, Any],
+    round_idx: int,
+) -> Dict[str, Any]:
+    """Fit one residual learner on one rolling-origin fold."""
+    prefix_range = fold_state["prefix_range"]
+    validation_range = fold_state["validation_range"]
+    if not isinstance(prefix_range, range) or not isinstance(validation_range, range):
+        raise ValueError("[VALIDATION] Boosting fold ranges are invalid.")
+
+    timeout = _get_model_timeout(model_name, params)
+    round_parsed_data = _build_residual_parsed_data(
+        parsed_data,
+        prefix_range,
+        np.asarray(fold_state["residual_train"], dtype=float),
+    )
+    numeric_records, lstm_records = _build_round_records(
+        round_parsed_data,
+        model_name,
+        params,
+    )
+    temp_model_file: Optional[str] = None
+    try:
+        temp_model_file, stage_predictions, _profile = _train_stage_model(
+            model_name,
+            numeric_records,
+            lstm_records,
+            prefix_range,
+            validation_range,
+            params,
+            timeout,
+        )
+        fitted_predictions = _compute_in_sample_fitted_predictions(
+            model_name,
+            temp_model_file,
+            round_parsed_data,
+            prefix_range,
+        )
+        return {
+            "fold_predictions": _apply_stage_output_semantics(
+                round_idx, stage_predictions
+            ),
+            "fold_fitted_train_predictions": _apply_stage_output_semantics(
+                round_idx, fitted_predictions
+            ),
+        }
+    finally:
+        if temp_model_file:
+            remove_member_model_artifact(model_name, temp_model_file)
+
+
+def finalize_rolling_origin_candidate(
+    fold_states: List[Dict[str, Any]],
+    model_name: str,
+    evaluated_folds: List[Dict[str, Any]],
+) -> Dict[str, Any]:
+    """Pool checkpointed folds and perform the shared stage line search."""
+    if not fold_states or len(evaluated_folds) != len(fold_states):
+        raise ValueError("[VALIDATION] Boosting candidate fold results are incomplete.")
+
+    fold_predictions = [
+        np.asarray(result["fold_predictions"], dtype=float)
+        for result in evaluated_folds
+    ]
+    fold_fitted_predictions = [
+        np.asarray(result["fold_fitted_train_predictions"], dtype=float)
+        for result in evaluated_folds
+    ]
+    for fold, predictions, fitted in zip(
+        fold_states, fold_predictions, fold_fitted_predictions
+    ):
+        if len(predictions) != len(fold["validation_range"]):
+            raise ValueError("[VALIDATION] Boosting candidate fold prediction length is invalid.")
+        if len(fitted) != len(fold["prefix_range"]):
+            raise ValueError("[VALIDATION] Boosting candidate fitted-value length is invalid.")
+
+    pooled_residual = np.concatenate([
+        np.asarray(fold["residual_val"], dtype=float)
+        for fold in fold_states
+    ])
+    pooled_predictions = np.concatenate(fold_predictions)
+    coefficient = _nonnegative_line_search(pooled_residual, pooled_predictions)
+    next_residuals = [
+        np.asarray(fold["residual_val"], dtype=float) - coefficient * predictions
+        for fold, predictions in zip(fold_states, fold_predictions)
+    ]
+    pooled_next = np.concatenate(next_residuals)
+    return {
+        "model_name": model_name,
+        "coefficient": coefficient,
+        "rmse": rmse(np.zeros_like(pooled_next), pooled_next),
+        "fold_predictions": fold_predictions,
+        "fold_fitted_train_predictions": fold_fitted_predictions,
+        "next_residuals": next_residuals,
+        "fold_rmse": [
+            rmse(np.zeros_like(residual), residual)
+            for residual in next_residuals
+        ],
+    }
+
+
+def evaluate_rolling_origin_candidate(
+    parsed_data: ParsedData,
+    fold_states: List[Dict[str, Any]],
+    model_name: str,
+    params: Dict[str, Any],
+    round_idx: int,
+) -> Dict[str, Any]:
+    """Evaluate one residual learner against the complete rolling OOF state.
+
+    Standalone training may map folds concurrently. Guided training calls the
+    single-fold helper in separate durable steps and then invokes the same
+    finalizer, preserving identical coefficient and residual math.
+    """
+    if not fold_states:
+        raise ValueError("[VALIDATION] Boosting rolling-origin fold state is missing.")
+    evaluated_folds = controlled_ensemble_map(
+        [
+            lambda fold=fold: evaluate_rolling_origin_fold_candidate(
+                parsed_data,
+                fold,
+                model_name,
+                params,
+                round_idx,
+            )
+            for fold in fold_states
+        ],
+        contains_lstm=model_name == "lstm",
+    )
+    return finalize_rolling_origin_candidate(
+        fold_states,
+        model_name,
+        evaluated_folds,
+    )
+
+
 def _validate_fit_args(
     parsed_data: ParsedData,
     ts: int,
@@ -532,11 +674,11 @@ def predict(
         uncertainty_state.get("reference_series") or [],
         steps,
         calibration_source=str(
-            uncertainty_state.get("calibration_source") or "internal_validation"
+            uncertainty_state.get("calibration_source") or "rolling_origin_oof"
         ),
     )
     summary.setdefault("calibration_source", str(
-        uncertainty_state.get("calibration_source") or "internal_validation"
+        uncertainty_state.get("calibration_source") or "rolling_origin_oof"
     ))
     return normalize_demand_forecast(final_predictions).tolist(), profile, summary
 
@@ -562,24 +704,40 @@ def train_and_evaluate(
     split_plan = plan_ensemble_internal_holdout(
         parsed_data, train_range, models_to_use, model_params, "boosting"
     )
-    boost_split = int(split_plan["prefix_size"])
-    boost_train_range = range(train_range.start, train_range.start + boost_split)
-    boost_val_range = range(train_range.start + boost_split, train_range.stop)
+    fold_ranges = rolling_origin_ranges(train_range, split_plan)
 
     print("[Boosting] 数据划分:", file=sys.stderr)
-    print(f"  Boost Train Range: {boost_train_range} ({len(boost_train_range)} points)", file=sys.stderr)
-    print(f"  Boost Val Range: {boost_val_range} ({len(boost_val_range)} points)", file=sys.stderr)
+    print(
+        f"  Rolling-origin folds: {split_plan['fold_count']} "
+        f"({split_plan['calibration_size']} OOF points)",
+        file=sys.stderr,
+    )
     print(f"  Eval Range: {eval_range} ({len(eval_range)} points)", file=sys.stderr)
     max_rounds = derive_boosting_max_rounds(
-        len(models_to_use), len(boost_val_range)
+        len(models_to_use), int(split_plan["calibration_size"])
     )
-    minimum_relative_improvement = 0.05 if len(boost_val_range) < 5 else 0.01
+    minimum_relative_improvement = (
+        0.05 if int(split_plan["calibration_size"]) < 5 else 0.01
+    )
     print(f"  Max Rounds: {max_rounds}", file=sys.stderr)
 
-    y_true_val = np.asarray(parsed_data.y[boost_val_range], dtype=float)
-    residual_train = np.asarray(parsed_data.y[boost_train_range], dtype=float).copy()
-    residual_val = y_true_val.copy()
-    validation_residual_snapshots = [residual_val.copy()]
+    fold_states: List[Dict[str, Any]] = []
+    for fold_index, (prefix_range, validation_range) in enumerate(fold_ranges):
+        fold_states.append({
+            "fold_index": fold_index,
+            "prefix_range": prefix_range,
+            "validation_range": validation_range,
+            "residual_train": np.asarray(parsed_data.y[prefix_range], dtype=float).copy(),
+            "residual_val": np.asarray(parsed_data.y[validation_range], dtype=float).copy(),
+        })
+
+    def pooled_validation_residuals() -> np.ndarray:
+        return np.concatenate([
+            np.asarray(fold["residual_val"], dtype=float)
+            for fold in fold_states
+        ])
+
+    validation_residual_snapshots = [pooled_validation_residuals().copy()]
 
     model_chain: List[str] = []
     stage_coefficients: List[float] = []
@@ -593,50 +751,25 @@ def train_and_evaluate(
     }
 
     for round_idx in range(max_rounds):
-        current_rmse = rmse(np.zeros_like(residual_val), residual_val)
-        round_parsed_data = _build_residual_parsed_data(parsed_data, boost_train_range, residual_train)
+        current_residual_val = pooled_validation_residuals()
+        current_rmse = rmse(np.zeros_like(current_residual_val), current_residual_val)
 
         stage_results: List[Dict[str, Any]] = []
         for model_name in models_to_use:
             params = model_params[model_name]
-            timeout = _get_model_timeout(model_name, params)
-            round_numeric_records, round_lstm_records = _build_round_records(
-                round_parsed_data,
+            candidate_result = evaluate_rolling_origin_candidate(
+                parsed_data,
+                fold_states,
                 model_name,
                 params,
-            )
-            temp_model_file, stage_predictions, _stage_profile = _train_stage_model(
-                model_name,
-                round_numeric_records,
-                round_lstm_records,
-                boost_train_range,
-                boost_val_range,
-                params,
-                timeout,
-            )
-            fitted_train_predictions = _compute_in_sample_fitted_predictions(
-                model_name,
-                temp_model_file,
-                round_parsed_data,
-                boost_train_range,
-            )
-            stage_predictions = _apply_stage_output_semantics(round_idx, stage_predictions)
-            fitted_train_predictions = _apply_stage_output_semantics(
                 round_idx,
-                fitted_train_predictions,
             )
-            coefficient = _nonnegative_line_search(residual_val, stage_predictions)
-            next_residual_val = residual_val - coefficient * stage_predictions
-            next_rmse = rmse(np.zeros_like(next_residual_val), next_residual_val)
-            stage_results.append({
-                "model_name": model_name,
-                "coefficient": coefficient,
-                "rmse": next_rmse,
-                "temp_model_file": temp_model_file,
-                "fitted_train_predictions": fitted_train_predictions,
-                "next_residual_val": next_residual_val,
-            })
-            print(f"  Round {round_idx + 1} candidate {model_name}: residual RMSE={next_rmse:.4f}", file=sys.stderr)
+            stage_results.append(candidate_result)
+            print(
+                f"  Round {round_idx + 1} candidate {model_name}: "
+                f"residual RMSE={candidate_result['rmse']:.4f}",
+                file=sys.stderr,
+            )
 
         best_result = min(stage_results, key=lambda result: result["rmse"])
         improvement = current_rmse - best_result["rmse"]
@@ -649,6 +782,7 @@ def train_and_evaluate(
                 result["model_name"]: {
                     "rmse": result["rmse"],
                     "coefficient": result["coefficient"],
+                    "fold_rmse": result["fold_rmse"],
                 }
                 for result in stage_results
             },
@@ -662,9 +796,16 @@ def train_and_evaluate(
         if relative_improvement >= minimum_relative_improvement:
             model_chain.append(best_result["model_name"])
             stage_coefficients.append(best_result["coefficient"])
-            residual_train = residual_train - best_result["coefficient"] * best_result["fitted_train_predictions"]
-            residual_val = best_result["next_residual_val"]
-            validation_residual_snapshots.append(residual_val.copy())
+            for fold_index, fold in enumerate(fold_states):
+                fold["residual_train"] = (
+                    np.asarray(fold["residual_train"], dtype=float)
+                    - best_result["coefficient"]
+                    * best_result["fold_fitted_train_predictions"][fold_index]
+                )
+                fold["residual_val"] = best_result["next_residuals"][fold_index]
+            validation_residual_snapshots.append(
+                pooled_validation_residuals().copy()
+            )
             stage_summary["action"] = "selected"
             print(
                 f"  ✓ Selected {best_result['model_name']} (residual RMSE: {best_result['rmse']:.4f})",
@@ -677,13 +818,9 @@ def train_and_evaluate(
                 file=sys.stderr,
             )
             search_summary["stages"].append(stage_summary)
-            for result in stage_results:
-                remove_member_model_artifact(result["model_name"], result["temp_model_file"])
             break
 
         search_summary["stages"].append(stage_summary)
-        for result in stage_results:
-            remove_member_model_artifact(result["model_name"], result["temp_model_file"])
 
     if not model_chain:
         # 空链只会在所有候选模型的验证段预测都无效（RMSE 为 NaN 等）时出现。
@@ -698,7 +835,7 @@ def train_and_evaluate(
     selection_coefficients = list(stage_coefficients)
     search_summary["selection_model_chain"] = selection_model_chain
     refit_model_chain: List[str] = []
-    stage_coefficients = []
+    stage_coefficients = list(selection_coefficients)
     final_eval_preds = np.zeros(len(eval_range), dtype=float)
     residual_full_train = np.asarray(parsed_data.y[train_range], dtype=float).copy()
     y_true_eval = np.asarray(parsed_data.y[eval_range], dtype=float)
@@ -812,22 +949,11 @@ def train_and_evaluate(
             stage_idx,
             fitted_train_predictions,
         )
-        coefficient = _nonnegative_line_search(
-            residual_full_train,
-            fitted_train_predictions,
-        )
-        if coefficient <= np.finfo(float).eps:
-            if artifact_origin == "temporary_training":
-                remove_member_model_artifact(model_name, stage_model_file)
-            search_summary["refit_stop"] = {
-                "stage": stage_idx + 1,
-                "model_name": model_name,
-                "reason": "nonpositive_full_refit_coefficient",
-                "coefficient": coefficient,
-            }
-            break
+        # The deployable chain keeps the coefficient learned from pooled OOF
+        # predictions. Re-estimating gamma on these full-range in-sample fitted
+        # values would optimistically tune deployment behavior after selection.
+        coefficient = float(selection_coefficients[stage_idx])
         refit_model_chain.append(model_name)
-        stage_coefficients.append(coefficient)
         final_eval_preds += coefficient * stage_eval_predictions
         residual_full_train = residual_full_train - coefficient * fitted_train_predictions
         stage_key = f"stage_{stage_idx}_{model_name}"
@@ -848,11 +974,6 @@ def train_and_evaluate(
             file=sys.stderr,
         )
 
-    if not refit_model_chain:
-        raise ValueError(
-            "[MODEL] Boosting selected a validation chain, but its first stage had "
-            "no positive contribution after full-range refitting."
-        )
     model_chain = refit_model_chain
     calibration_residuals = validation_residual_snapshots[len(model_chain)]
 
@@ -863,11 +984,12 @@ def train_and_evaluate(
         calibration_residuals,
         parsed_data.y[train_range],
         eval_forecast_steps,
+        calibration_source="rolling_origin_oof",
     )
     uncertainty_profile = full_uncertainty_profile[
         eval_forecast_offset: eval_forecast_offset + len(eval_range)
     ]
-    uncertainty_summary.setdefault("calibration_source", "internal_validation")
+    uncertainty_summary.setdefault("calibration_source", "rolling_origin_oof")
     metrics = {
         "rmse": rmse(y_true_eval, final_eval_preds),
         "mae": mae(y_true_eval, final_eval_preds),
@@ -896,7 +1018,7 @@ def train_and_evaluate(
             "split": split_plan,
             "uncertainty": {
                 "calibration_residuals": calibration_residuals.tolist(),
-                "calibration_source": "internal_validation",
+                "calibration_source": "rolling_origin_oof",
                 "reference_series": parsed_data.y[train_range].tolist(),
                 "profile": full_uncertainty_profile,
                 "summary": uncertainty_summary,

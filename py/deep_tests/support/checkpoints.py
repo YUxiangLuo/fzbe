@@ -22,8 +22,8 @@ BASE_STEPS = {
     "lstm": ["prepare_data", "preprocess", "build_model", "train_model", "forecast", "evaluate_metrics", "save_artifact"],
 }
 ENSEMBLE_STEPS = {
-    "weighted_avg": ["prepare_data", "split_validation", "validation_predictions", "compute_weights", "eval_predictions", "blend_evaluate", "save_artifact"],
-    "stacking": ["prepare_data", "split_levels", "level1_predictions", "fit_meta_model", "eval_predictions", "meta_evaluate", "save_artifact"],
+    "weighted_avg": ["prepare_data", "split_validation"],
+    "stacking": ["prepare_data", "split_levels"],
 }
 
 
@@ -54,8 +54,31 @@ def run_guided(model: str, data_file: Path, artifact: Path, workspace: Path, *, 
             common += ["--lstm-target-feature", "y", "--lstm-features", "[]", "--feature-types", '{"y":"numeric"}', "--normalization", "minmax"]
     previous = None; final = None; index = 0
     steps = BASE_STEPS.get(model) or ENSEMBLE_STEPS.get(model)
-    if steps:
+    if model in BASE_STEPS:
         for step in steps:
+            receipt = _checkpoint_step(entry, model, step, workspace, previous, common, index, 1200)
+            previous = receipt["_state_path"]; final = receipt.get("final_result", final); index += 1
+        return final
+
+    if model in ENSEMBLE_STEPS:
+        for step in steps:
+            receipt = _checkpoint_step(entry, model, step, workspace, previous, common, index, 1200)
+            previous = receipt["_state_path"]; index += 1
+        with previous.open("rb") as handle: state = pickle.load(handle)
+        members = list(state["models"])
+        prediction_prefix = "validation_prediction" if model == "weighted_avg" else "level1_prediction"
+        for fold_index in range(1, 4):
+            for member in members:
+                step = f"{prediction_prefix}_fold_{fold_index}_{member}"
+                receipt = _checkpoint_step(entry, model, step, workspace, previous, common, index, 1200)
+                previous = receipt["_state_path"]; index += 1
+        combine_step = "compute_weights" if model == "weighted_avg" else "fit_meta_model"
+        receipt = _checkpoint_step(entry, model, combine_step, workspace, previous, common, index, 1200)
+        previous = receipt["_state_path"]; index += 1
+        for member in members:
+            receipt = _checkpoint_step(entry, model, f"eval_prediction_{member}", workspace, previous, common, index, 1200)
+            previous = receipt["_state_path"]; index += 1
+        for step in (("blend_evaluate", "save_artifact") if model == "weighted_avg" else ("meta_evaluate", "save_artifact")):
             receipt = _checkpoint_step(entry, model, step, workspace, previous, common, index, 1200)
             previous = receipt["_state_path"]; final = receipt.get("final_result", final); index += 1
         return final
@@ -65,11 +88,16 @@ def run_guided(model: str, data_file: Path, artifact: Path, workspace: Path, *, 
         receipt = _checkpoint_step(entry, model, step, workspace, previous, common, index, 1800)
         previous = receipt["_state_path"]; index += 1
     with previous.open("rb") as handle: state = pickle.load(handle)
+    members = list(state["models"])
     for round_index in range(int(state["max_rounds"])):
-        for action in ("evaluate_candidates", "select_winner"):
-            step = f"round_{round_index + 1}_{action}"
-            receipt = _checkpoint_step(entry, model, step, workspace, previous, common, index, 1800)
-            previous = receipt["_state_path"]; index += 1
+        for fold_index in range(1, 4):
+            for member in members:
+                step = f"round_{round_index + 1}_evaluate_fold_{fold_index}_{member}"
+                receipt = _checkpoint_step(entry, model, step, workspace, previous, common, index, 1800)
+                previous = receipt["_state_path"]; index += 1
+        step = f"round_{round_index + 1}_select_winner"
+        receipt = _checkpoint_step(entry, model, step, workspace, previous, common, index, 1800)
+        previous = receipt["_state_path"]; index += 1
         output = receipt["output"]
         if output.get("action") == "early_stop" or output.get("stop_reason") == "round_budget": break
     receipt = _checkpoint_step(entry, model, "initialize_refit", workspace, previous, common, index, 1800)

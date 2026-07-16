@@ -26,9 +26,24 @@ export function normalizeYearMonth(
 ): NormalizedYearMonth | null {
   const year = String(yearRaw ?? "").trim();
   const rawMonth = String(monthRaw ?? "").trim();
-  if (!/^\d{4}$/.test(year) || !/^(0?[1-9]|1[0-2])$/.test(rawMonth)) {
+  if (!/^[1-9]\d{3}$/.test(year) || !/^(0?[1-9]|1[0-2])$/.test(rawMonth)) {
     return null;
   }
 
   return { year, month: rawMonth.padStart(2, "0") };
+}
+
+export function yearMonthOrdinal(value: NormalizedYearMonth): number {
+  return Number(value.year) * 12 + Number(value.month) - 1;
+}
+
+export function isConsecutiveYearMonth(
+  previous: NormalizedYearMonth,
+  current: NormalizedYearMonth,
+): boolean {
+  return yearMonthOrdinal(current) === yearMonthOrdinal(previous) + 1;
+}
+
+export function formatYearMonth(value: NormalizedYearMonth): string {
+  return `${value.year}-${value.month}`;
 }

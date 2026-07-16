@@ -31,7 +31,7 @@ from ensemble_utils import (
     remove_member_model_artifact,
 )
 from error_protocol import format_known_error
-from model_info import attach_method_metadata
+from model_info import attach_method_metadata, ensure_state_metadata
 from serialization import dump_model, load_model
 from subprocess_utils import (
     extract_predictions_from_result,
@@ -149,6 +149,30 @@ def _initialize(args, state: Dict[str, Any]) -> Dict[str, Any]:
     source_state = load_model(args.source_model)
     if not isinstance(source_state, dict) or source_state.get("model_type") != args.model_type:
         raise ValueError("[MODEL] Backtest artifact does not match production model type.")
+    source_module = ALL_MODELS[args.model_type]
+    if args.model_type == "lstm":
+        source_strategy = str(
+            source_state.get("forecast_strategy")
+            or lstm.DIRECT_FORECAST_STRATEGY
+        )
+        source_notes = lstm._metadata_for_strategy(source_strategy)[1]
+    else:
+        source_strategy = source_module.FORECAST_STRATEGY
+        source_notes = source_module.IMPLEMENTATION_NOTES
+    ensure_state_metadata(
+        source_state,
+        source_module.METHOD_NAME,
+        source_strategy,
+        source_notes,
+    )
+    if args.model_type == "lstm" and (
+        source_strategy != lstm.DIRECT_FORECAST_STRATEGY
+        or source_state.get("feature_timing") != lstm.FEATURE_TIMING
+        or source_state.get("known_future_features") is not False
+    ):
+        raise ValueError(
+            "[MODEL] Backtest LSTM artifact is not historical-only and must be retrained."
+        )
     state.update({
         "model_type": args.model_type,
         "records": records,
@@ -309,21 +333,10 @@ def _fit_boosting_stage(step_id: str, state: Dict[str, Any]) -> Dict[str, Any]:
         train_range,
     )
     fitted = boosting._apply_stage_output_semantics(stage_idx, fitted)
-    coefficient = float(boosting._nonnegative_line_search(residual_train, fitted))
-    if coefficient <= np.finfo(float).eps:
-        remove_member_model_artifact(model_name, destination)
-        if not state.get("refit_stages"):
-            raise ValueError(
-                "[MODEL] Boosting production refit produced no positive first stage."
-            )
-        state["boosting_refit_terminated"] = True
-        return {
-            "stage": stage_idx + 1,
-            "model": model_name,
-            "coefficient": coefficient,
-            "action": "trim_refit_chain",
-            "trim_remaining": True,
-        }
+    # Preserve the leakage-safe coefficient learned from rolling-origin OOF
+    # predictions. Full-range in-sample fitted values are used only to construct
+    # the next residual target, never to retune deployment coefficients.
+    coefficient = float(stage["coefficient"])
     state["residual_train"] = residual_train - coefficient * fitted
     state["future_prediction"] = np.asarray(state["future_prediction"], dtype=float) + coefficient * stage_predictions
     key = f"stage_{stage_idx}_{model_name}"
@@ -391,19 +404,15 @@ def _finalize(state: Dict[str, Any]) -> Dict[str, Any]:
             raise ValueError("[MODEL] Boosting production refit produced no usable stages.")
         predictions = normalize_demand_forecast(state["future_prediction"])
         coefficients = state["uncertainty_coefficients"]
-        residuals = np.asarray(state["residual_train"], dtype=float).tolist()
         extra = {
             "model_chain": [item["model"] for item in refit_stages],
             "stage_coefficients": [item["coefficient"] for item in refit_stages],
             "boosting_variant": "residual",
         }
 
-    calibration_source = (
-        "production_full_refit_in_sample"
-        if model_type == "boosting"
-        else str(uncertainty.get("calibration_source") or (
-            "level1_holdout" if model_type == "stacking" else "internal_validation"
-        ))
+    calibration_source = str(
+        uncertainty.get("calibration_source")
+        or "rolling_origin_oof"
     )
     profile, summary = ensemble_growth_profile(
         state["member_profiles"],
@@ -421,7 +430,7 @@ def _finalize(state: Dict[str, Any]) -> Dict[str, Any]:
         "uncertainty": {
             **uncertainty,
             "calibration_residuals": residuals,
-            "calibration_source": summary.get("calibration_source", "internal_validation"),
+            "calibration_source": summary.get("calibration_source", calibration_source),
             "profile": profile,
             "summary": summary,
         },

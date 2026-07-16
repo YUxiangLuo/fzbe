@@ -225,7 +225,7 @@ CREATE TABLE IF NOT EXISTS `model_guided_training_sessions` (
   `request_hash` CHAR(64) NOT NULL,
   `dataset_revision` CHAR(64) NOT NULL,
   `runtime_revision` CHAR(64) NOT NULL,
-  `protocol_version` SMALLINT UNSIGNED NOT NULL DEFAULT 3,
+  `protocol_version` SMALLINT UNSIGNED NOT NULL DEFAULT 4,
   `request_payload` JSON NOT NULL,
   `status` ENUM('ready', 'running', 'failed', 'completed', 'superseded') NOT NULL DEFAULT 'ready',
   `current_step_id` VARCHAR(64) DEFAULT NULL,

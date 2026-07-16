@@ -669,19 +669,13 @@ def _run_arima(step_id: str, args, state: Dict[str, Any]) -> Dict[str, Any]:
             "evaluate_indices": list(eval_range),
             "evaluate_months": _month_labels(timestamps, eval_range),
         }
-        calibration_mean_error = float(np.mean(y_eval - y_pred))
-        calibration_count = int(len(y_eval))
         predictions_with_std = arima._format_predictions(
             y_pred.tolist(),
             state["confidence_intervals"],
-            calibration_mean_error,
-            calibration_count,
         )
         state.update({
             "metrics": metrics,
             "predictions": predictions_with_std,
-            "calibration_mean_error": calibration_mean_error,
-            "calibration_count": calibration_count,
         })
         return {"metrics": metrics, "best_order": state["best_order"]}
 
@@ -725,8 +719,6 @@ def _run_arima(step_id: str, args, state: Dict[str, Any]) -> Dict[str, Any]:
                 "search_summary": state["search_summary"],
                 "diagnostics": state["diagnostics"],
                 "prediction_domain": DEMAND_PREDICTION_DOMAIN,
-                "calibration_mean_error": state["calibration_mean_error"],
-                "calibration_count": state["calibration_count"],
             }
             attach_method_metadata(model_state, arima.METHOD_NAME, arima.FORECAST_STRATEGY, arima.IMPLEMENTATION_NOTES)
             dump_model(model_state, state["save_model"])
@@ -1021,7 +1013,11 @@ def _run_lstm(step_id: str, args, state: Dict[str, Any]) -> Dict[str, Any]:
             "predictions": predictions_with_std,
             "uncertainty_summary": state["uncertainty_summary"],
         }
-        attach_method_metadata(final_result, lstm.METHOD_NAME, lstm.DIRECT_FORECAST_STRATEGY, lstm.DIRECT_IMPLEMENTATION_NOTES)
+        lstm.attach_lstm_metadata(
+            final_result,
+            lstm.DIRECT_FORECAST_STRATEGY,
+            lstm.DIRECT_IMPLEMENTATION_NOTES,
+        )
 
         if state.get("save_model"):
             save_path = state["save_model"]
@@ -1060,7 +1056,11 @@ def _run_lstm(step_id: str, args, state: Dict[str, Any]) -> Dict[str, Any]:
                 "reference_series": parsed_data.df[parsed_data.target_key].values[train_range].tolist(),
                 "prediction_domain": DEMAND_PREDICTION_DOMAIN,
             }
-            attach_method_metadata(model_state, lstm.METHOD_NAME, lstm.DIRECT_FORECAST_STRATEGY, lstm.DIRECT_IMPLEMENTATION_NOTES)
+            lstm.attach_lstm_metadata(
+                model_state,
+                lstm.DIRECT_FORECAST_STRATEGY,
+                lstm.DIRECT_IMPLEMENTATION_NOTES,
+            )
             dump_model(model_state, save_path)
             final_result["saved_model"] = save_path
 
@@ -1136,7 +1136,7 @@ def main() -> None:
 
     _save_state(args.output_state_file, state)
     payload = {
-        "protocol_version": 3,
+        "protocol_version": 4,
         "attempt_id": args.attempt_id,
         "step_id": args.step_id,
         "output": _jsonable(output),

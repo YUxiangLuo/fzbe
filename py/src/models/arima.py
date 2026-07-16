@@ -35,6 +35,7 @@ IMPLEMENTATION_NOTES = [
     "选中模型必须收敛；首次搜索结果未收敛时按完整规格将最大迭代数加倍重拟合一次，并记录 Ljung-Box 白噪声诊断。",
     "预测未来销量时使用拟合后的 ARIMA 模型直接生成多步 forecast；原始点预测可能为负，本系统将用于残差、指标和输出的销量点预测按 max(0, y_hat) 截断。该约束是业务后处理，不属于教科书 ARIMA。",
     "默认 95% 预测区间仍由未截断的 ARIMA 预测分布计算；std_dev 按该分布的精确 95% 正态临界值由区间宽度反推，生产用 99% 上侧误差也由同一未截断分布计算。区间本身不是截断正态区间。",
+    "独立评估段只用于报告泛化指标，不写回模型产物，也不作为部署偏差校准；部署区间完全来自训练后 ARIMA 预测分布，因而不会把最终评估标签带入未来预测。",
 ]
 
 
@@ -42,37 +43,12 @@ IMPLEMENTATION_NOTES = [
 def _format_predictions(
     preds: List[float],
     conf_intervals: List[List[float]],
-    calibration_mean_error: float | None = None,
-    calibration_count: int | None = None,
 ) -> List[Dict[str, Any]]:
     """
     Format predictions with 95% prediction intervals for JSON output.
     Converts interval width to its Gaussian std_dev while preserving the
     model's original, untruncated interval bounds.
     """
-    has_mean = calibration_mean_error is not None
-    has_count = calibration_count is not None
-    if has_mean != has_count:
-        raise ValueError("[MODEL] ARIMA bias calibration must provide both mean error and sample count.")
-    if has_mean:
-        try:
-            numeric_mean_error = float(calibration_mean_error)
-            raw_numeric_count = float(calibration_count)
-            numeric_count = int(raw_numeric_count)
-        except (TypeError, ValueError, OverflowError) as exc:
-            raise ValueError("[MODEL] ARIMA bias calibration is invalid.") from exc
-        if (
-            not np.isfinite(numeric_mean_error)
-            or not np.isfinite(raw_numeric_count)
-            or isinstance(calibration_count, bool)
-            or numeric_count <= 0
-            or raw_numeric_count != numeric_count
-        ):
-            raise ValueError("[MODEL] ARIMA bias calibration is invalid.")
-    else:
-        numeric_mean_error = None
-        numeric_count = None
-
     points: List[Dict[str, Any]] = []
     for prediction, interval in zip(preds, conf_intervals):
         numeric_prediction = float(prediction)
@@ -85,8 +61,10 @@ def _format_predictions(
             "std_dev": std_dev,
             "uncertainty_source": "model",
             "calibration_source": "arima_forecast_distribution",
-            "calibration_mean_error": numeric_mean_error,
-            "calibration_count": numeric_count,
+            # Independent evaluation labels are report-only. ARIMA deployment
+            # intervals are already supplied by the fitted forecast distribution.
+            "calibration_mean_error": None,
+            "calibration_count": None,
             "interval_lower": lower,
             "interval_upper": upper,
             "interval_level": 0.95,
@@ -516,8 +494,6 @@ def run(args) -> None:
             "search_summary": state.get("search_summary"),
             "diagnostics": diagnostics,
             "prediction_domain": prediction_domain,
-            "calibration_mean_error": state.get("calibration_mean_error"),
-            "calibration_count": state.get("calibration_count"),
         }
         attach_method_metadata(next_state, METHOD_NAME, FORECAST_STRATEGY, IMPLEMENTATION_NOTES)
         dump_model(next_state, save_path)
@@ -543,8 +519,6 @@ def run(args) -> None:
             out["predictions"] = _format_predictions(
                 preds,
                 confidence_intervals,
-                next_state.get("calibration_mean_error"),
-                next_state.get("calibration_count"),
             )
         attach_method_metadata(out, METHOD_NAME, FORECAST_STRATEGY, IMPLEMENTATION_NOTES)
         out["logs"] = get_log_contents()
@@ -577,8 +551,6 @@ def run(args) -> None:
             predictions_with_std = _format_predictions(
                 preds,
                 conf_int,
-                state.get("calibration_mean_error"),
-                state.get("calibration_count"),
             )
 
         out: Dict[str, Any] = {
@@ -649,13 +621,9 @@ def run(args) -> None:
     log.info(f"Training finished. Best order: {best_order}, Metrics: {metrics}")
     log.debug(f"Search summary: {search_summary}")
 
-    calibration_mean_error = float(np.mean(np.asarray(y_true, dtype=float) - np.asarray(y_pred, dtype=float)))
-    calibration_count = len(y_true)
     predictions_with_std = _format_predictions(
         y_pred,
         conf_int,
-        calibration_mean_error,
-        calibration_count,
     )
 
     out: Dict[str, Any] = {
@@ -685,8 +653,6 @@ def run(args) -> None:
             "search_summary": search_summary,
             "diagnostics": search_summary["diagnostics"],
             "prediction_domain": prediction_domain,
-            "calibration_mean_error": calibration_mean_error,
-            "calibration_count": calibration_count,
         }
         attach_method_metadata(state, METHOD_NAME, FORECAST_STRATEGY, IMPLEMENTATION_NOTES)
         dump_model(state, save_path)

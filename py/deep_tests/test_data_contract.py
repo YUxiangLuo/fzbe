@@ -49,6 +49,85 @@ class DataContractTests(unittest.TestCase):
                 self.assertEqual("", result.stdout.strip())
 
     @profile("fast")
+    def test_time_axis_rejects_duplicates_reordering_and_missing_periods(self):
+        invalid_months = {
+            "duplicate": ["2024-01", "2024-02", "2024-02", "2024-03", "2024-04", "2024-05", "2024-06", "2024-07"],
+            "reordered": ["2024-01", "2024-03", "2024-02", "2024-04", "2024-05", "2024-06", "2024-07", "2024-08"],
+            "missing": ["2024-01", "2024-02", "2024-04", "2024-05", "2024-06", "2024-07", "2024-08", "2024-09"],
+        }
+        for name, months in invalid_months.items():
+            with self.subTest(name=name):
+                records = [{"month": month, "y": 10 + index} for index, month in enumerate(months)]
+                result = self._run_ma_text(json.dumps(records), False)
+                self.assertIn("[DATA]", result.stderr)
+                self.assertIn("Time column 'month'", result.stderr)
+
+    @profile("fast")
+    def test_time_axis_accepts_monthly_and_fixed_numeric_sequences(self):
+        monthly = [{"month": f"2024-{index + 1:02d}", "y": index} for index in range(8)]
+        parsed_monthly = load_data_from_json(json.dumps(monthly))
+        self.assertEqual("monthly", parsed_monthly.time_frequency)
+
+        numeric = [{"date": 100 + 5 * index, "y": index} for index in range(8)]
+        parsed_numeric = load_data_from_json(json.dumps(numeric))
+        self.assertEqual("numeric_step:5", parsed_numeric.time_frequency)
+
+    @profile("fast")
+    def test_composite_year_month_is_strict_and_consecutive(self):
+        valid = [
+            {"年份": 2024 + (index + 10) // 12, "月份": (index + 10) % 12 + 1, "销售数量": index}
+            for index in range(8)
+        ]
+        parsed = load_data_from_json(json.dumps(valid, ensure_ascii=False))
+        self.assertEqual("timestamp", parsed.time_key)
+        self.assertEqual("monthly", parsed.time_frequency)
+
+        invalid = list(valid)
+        invalid[3] = {**invalid[3], "月份": 13}
+        with self.assertRaisesRegex(ValueError, r"\[DATA\].*年份.*月份"):
+            load_data_from_json(json.dumps(invalid, ensure_ascii=False))
+
+        low_year = [{**row, "年份": 999} for row in valid]
+        with self.assertRaisesRegex(ValueError, r"\[DATA\].*年份.*月份"):
+            load_data_from_json(json.dumps(low_year, ensure_ascii=False))
+
+        fractional_cases = {
+            "year": [{**row, "年份": 2024.01} if index == 0 else row for index, row in enumerate(valid)],
+            "month": [{**row, "月份": float(row["月份"]) + 0.00001} if index == 0 else row for index, row in enumerate(valid)],
+        }
+        for name, records in fractional_cases.items():
+            with self.subTest(name=name), self.assertRaisesRegex(ValueError, r"\[DATA\].*年份.*月份"):
+                load_data_from_json(json.dumps(records, ensure_ascii=False))
+
+    @profile("fast")
+    def test_combined_month_legacy_rows_take_precedence_over_redundant_year(self):
+        records = [
+            {
+                "年份": str(2024 + (index + 10) // 12),
+                "月份": f"{2024 + (index + 10) // 12}-{(index + 10) % 12 + 1:02d}",
+                "销售数量": index,
+            }
+            for index in range(8)
+        ]
+        parsed = load_data_from_json(json.dumps(records, ensure_ascii=False))
+        self.assertEqual("月份", parsed.time_key)
+        self.assertEqual("monthly", parsed.time_frequency)
+        self.assertEqual(records[0]["月份"], parsed.df.iloc[0]["月份"])
+
+    @profile("fast")
+    def test_combined_month_rejects_years_before_1000(self):
+        for year in ("0000", "0999"):
+            for time_key in ("month", "period"):
+                with self.subTest(year=year, time_key=time_key):
+                    records = [
+                        {time_key: f"{year}-{month:02d}", "y": month}
+                        for month in range(1, 3)
+                    ]
+                    kwargs = {} if time_key == "month" else {"time_key": time_key}
+                    with self.assertRaisesRegex(ValueError, r"\[DATA\].*Time column"):
+                        load_data_from_json(json.dumps(records), **kwargs)
+
+    @profile("fast")
     def test_strict_json_rejects_constants_without_rejecting_string_content(self):
         payload = parse_strict_json('{"implementation_notes":"NaN and Infinity are forbidden numeric constants"}')
         self.assertIn("Infinity", payload["implementation_notes"])

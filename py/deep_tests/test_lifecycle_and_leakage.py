@@ -33,7 +33,35 @@ class SevenModelLifecycleTests(unittest.TestCase):
                         self.assertTrue(math.isclose(expected, trained.payload["metrics"][name], rel_tol=1e-7, abs_tol=1e-7), (model, name))
                     state = load_model(str(artifact))
                     self.assertEqual(model, state["model_type"])
-                    self.assertGreaterEqual(state["algorithm_revision"], 1)
+                    self.assertEqual(4, state["algorithm_revision"])
+                    self.assertEqual(2, state["artifact_schema_revision"])
+                    self.assertEqual("trusted_pickle_state", state["artifact_format"])
+                    self.assertIn("packages", state["runtime_compatibility"])
+                    if model == "lstm":
+                        self.assertEqual("historical_only", state["feature_timing"])
+                        self.assertIs(False, state["known_future_features"])
+                    if model == "arima":
+                        self.assertNotIn("calibration_mean_error", state)
+                        self.assertNotIn("calibration_count", state)
+                        self.assertTrue(all(
+                            point["calibration_mean_error"] is None
+                            and point["calibration_count"] is None
+                            for point in trained.payload["predictions"]
+                        ))
+                    if model in {"weighted_avg", "stacking", "boosting"}:
+                        split_plan = state["split_plan"]
+                        self.assertEqual(
+                            "expanding_window_rolling_origin",
+                            split_plan["scheme"],
+                        )
+                        self.assertEqual(
+                            split_plan["fold_count"] * split_plan["validation_size"],
+                            split_plan["calibration_size"],
+                        )
+                        self.assertEqual(
+                            "rolling_origin_oof",
+                            state["uncertainty"]["calibration_source"],
+                        )
 
                     first = run_loaded(model, artifact)
                     second = run_loaded(model, artifact)
@@ -92,6 +120,10 @@ class SevenModelLifecycleTests(unittest.TestCase):
                     changed_eval = run_model(model, eval2).payload
                     changed_gap = run_model(model, gap2).payload
                     self.assertNotEqual(baseline["eval_y_true"], changed_eval["eval_y_true"])
+                    if model == "lstm":
+                        for payload in (baseline, changed_eval, changed_gap):
+                            self.assertEqual("historical_only", payload["feature_timing"])
+                            self.assertIs(False, payload["known_future_features"])
                     tolerance = 1e-5 if model == "lstm" else 1e-8 if model == "arima" else 1e-10
                     for candidate in (changed_eval, changed_gap):
                         for left, right in zip(prediction_values(baseline), prediction_values(candidate)):
