@@ -1347,7 +1347,13 @@ def _run_boosting(step_id: str, args, state: Dict[str, Any]) -> Dict[str, Any]:
             dtype=float,
         )
         state["eval_y_true"] = np.asarray(parsed_data.y[eval_range], dtype=float).tolist()
-        return {"action": "refit_stage", **stage_summary}
+        return {
+            "action": "refit_stage",
+            "artifact_origin": artifact_origin,
+            "reused_artifact": artifact_origin == "standalone_base",
+            "evaluation_role": "reporting_only",
+            **stage_summary,
+        }
 
     if step_id == "retrain_chain":
         selection_model_chain = list(state["model_chain"])

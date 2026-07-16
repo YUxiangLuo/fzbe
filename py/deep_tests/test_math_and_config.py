@@ -7,10 +7,12 @@ import threading
 import unittest
 from copy import deepcopy
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import numpy as np
 import pandas as pd
+import guided_model
 
 from py.deep_tests.support.harness import DATASETS, assert_prediction_contract, prediction_values, run_command
 from py.deep_tests.support.oracles import metrics, nonnegative_line_search, recursive_ma, shrunk_inverse_mse_weights
@@ -27,6 +29,42 @@ from py.src.models import arima, boosting, lstm, ma, stacking, weighted_avg
 
 
 class MathematicalGoldenTests(unittest.TestCase):
+    @profile("fast")
+    def test_es_guided_residual_stage_uses_training_data_only(self):
+        guided_model._load_model_module("es")
+        guided_es = guided_model.es
+        self.assertIsNotNone(guided_es)
+        horizons = [{"std_dev": 1.0}] * 12
+        uncertainty_summary = {"method": "ets_ann_analytic", "horizons": horizons}
+        state = {
+            "train_range": {"start_index": 0, "end_index": 3},
+            "evaluate_range": {"start_index": 4, "end_index": 5},
+            "y": [10.0, 12.0, 11.0, 13.0, 20.0, 22.0],
+            "y_pred": [18.0, 21.0],
+            "timestamps": [f"2025-{month:02d}" for month in range(1, 7)],
+            "model": SimpleNamespace(params={"initial_level": 10.0}),
+            "alpha": 0.4,
+        }
+
+        with (
+            patch.object(guided_es, "_training_residuals", return_value=np.asarray([1.0, -1.0, 0.5])),
+            patch.object(guided_es, "_training_residual_scale", return_value=1.0),
+            patch.object(guided_es, "ses_profile", return_value=(horizons, uncertainty_summary)),
+        ):
+            residual_output = guided_model._run_es("estimate_residuals", None, state)
+
+        self.assertEqual(3, residual_output["training_residual_points"])
+        self.assertNotIn("residual_points", residual_output)
+        self.assertNotIn("mean_residual", residual_output)
+        self.assertNotIn("y_true", state)
+        self.assertNotIn("residuals", state)
+
+        with patch.object(guided_es, "_format_predictions", return_value=[{"predicted": 18.0}, {"predicted": 21.0}]):
+            guided_model._run_es("evaluate_metrics", None, state)
+
+        self.assertEqual([20.0, 22.0], state["y_true"])
+        self.assertEqual([2.0, 1.0], state["residuals"])
+
     @profile("fast")
     def test_recursive_ma_exact_and_not_teacher_forced(self):
         expected = [70 / 3, 250 / 9, 820 / 27]

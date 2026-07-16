@@ -2229,13 +2229,13 @@ const buildGuidedTrainingStepPlan = (
     });
   }
   const maxRounds = Math.max(1, requestedModels.length * 2);
-  const [prepareStep, splitStep, retrainStep, combineStep, saveStep] = GUIDED_TRAINING_STEPS.boosting;
+  const [prepareStep, splitStep, deploymentStep, combineStep, saveStep] = GUIDED_TRAINING_STEPS.boosting;
 
   return [
     prepareStep!,
     splitStep!,
     ...buildBoostingRoundStepDefinitions(maxRounds, requestedModels),
-    retrainStep!,
+    deploymentStep!,
     combineStep!,
     saveStep!,
   ];
@@ -2302,7 +2302,21 @@ const trimBoostingStepPlanAfterEarlyStop = (
   ];
 };
 
-const expandBoostingRefitSteps = (
+export const trimBoostingStepPlanToRoundBudget = (
+  stepPlan: GuidedTrainingStepDefinition[],
+  output: unknown,
+) => {
+  if (!isRecordValue(output)) return stepPlan;
+  const maxRounds = output.max_rounds;
+  if (!Number.isInteger(maxRounds) || (maxRounds as number) < 1) return stepPlan;
+
+  return stepPlan.filter((step) => {
+    const match = /^round_(\d+)_(?:evaluate_(?:ma|es|arima|lstm)|select_winner)$/.exec(step.id);
+    return !match || Number(match[1]) <= (maxRounds as number);
+  });
+};
+
+export const expandBoostingDeploymentSteps = (
   stepPlan: GuidedTrainingStepDefinition[],
   output: Record<string, unknown>,
 ) => {
@@ -2315,37 +2329,20 @@ const expandBoostingRefitSteps = (
   const refitSteps: GuidedTrainingStepDefinition[] = [
     {
       id: "initialize_refit",
-      label: "初始化完整训练重拟合",
-      description: "按验证阶段选出的模型链初始化完整训练残差、评估预测和成员产物 checkpoint。",
-      actionLabel: "初始化重拟合",
+      label: "初始化部署模型链",
+      description: "按时间验证阶段选出的模型链，初始化完整训练残差、独立评估预测和成员产物 checkpoint。",
+      actionLabel: "初始化模型链",
     },
     ...modelChain.map((model, index) => ({
       id: `refit_stage_${index + 1}_${model}`,
-      label: `重拟合第 ${index + 1} 阶段：${BASE_MODEL_LABELS[model]}`,
-      description: `在当前完整训练残差上拟合 ${BASE_MODEL_LABELS[model]}，重新计算非负阶段系数并提交该阶段 checkpoint。`,
-      actionLabel: `重拟合第 ${index + 1} 阶段`,
+      label: `准备第 ${index + 1} 阶段：${BASE_MODEL_LABELS[model]}`,
+      description: index === 0
+        ? `优先复用配置和训练区间匹配的 ${BASE_MODEL_LABELS[model]} 已完成产物，无法覆盖当前任务时才在完整训练区间重新拟合；保留时间验证选出的非负阶段系数并提交 checkpoint。完成后报告截至本阶段的独立评估 RMSE，仅用于教学展示，不参与模型链或系数选择。`
+        : `在当前完整训练残差上拟合 ${BASE_MODEL_LABELS[model]}，保留时间验证选出的非负阶段系数并提交 checkpoint。完成后报告截至本阶段的独立评估 RMSE，仅用于教学展示，不参与模型链或系数选择。`,
+      actionLabel: `准备第 ${index + 1} 阶段`,
     })),
   ];
   return stepPlan.flatMap((step) => step.id === "retrain_chain" ? refitSteps : [step]);
-};
-
-const trimBoostingRefitSteps = (
-  stepPlan: GuidedTrainingStepDefinition[],
-  stepId: string,
-  output: unknown,
-) => {
-  if (
-    !/^refit_stage_\d+_(?:ma|es|arima|lstm)$/.test(stepId)
-    || !isRecordValue(output)
-    || output.action !== "trim_refit_chain"
-  ) {
-    return stepPlan;
-  }
-  const currentIndex = stepPlan.findIndex((step) => step.id === stepId);
-  if (currentIndex < 0) return stepPlan;
-  return stepPlan.filter((step, index) => (
-    index <= currentIndex || !/^refit_stage_\d+_(?:ma|es|arima|lstm)$/.test(step.id)
-  ));
 };
 
 const buildGuidedTrainingSessionPayload = (
@@ -3580,14 +3577,14 @@ export async function runGuidedTrainingStep(
           const stepOutputs = parseJsonColumn<Record<string, unknown>>(row.step_outputs, {});
           const nextStepOutputs = { ...stepOutputs, [stepId]: receipt.output ?? {} };
           let nextStepPlan = stepPlan;
+          if (modelType === "boosting" && stepId === "split_residual_sets") {
+            nextStepPlan = trimBoostingStepPlanToRoundBudget(nextStepPlan, receipt.output);
+          }
           if (shouldTrimBoostingRoundSteps(modelType, stepId, receipt.output)) {
             nextStepPlan = trimBoostingStepPlanAfterEarlyStop(nextStepPlan, stepId);
             if (isRecordValue(receipt.output)) {
-              nextStepPlan = expandBoostingRefitSteps(nextStepPlan, receipt.output);
+              nextStepPlan = expandBoostingDeploymentSteps(nextStepPlan, receipt.output);
             }
-          }
-          if (modelType === "boosting") {
-            nextStepPlan = trimBoostingRefitSteps(nextStepPlan, stepId, receipt.output);
           }
 
           let cleanupUncommittedArtifactPath: string | null = null;

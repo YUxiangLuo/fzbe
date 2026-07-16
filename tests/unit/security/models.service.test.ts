@@ -297,6 +297,8 @@ const {
   getGuidedTrainingSession,
   runGuidedTrainingStep,
   resolveGuidedStepTimeoutMs,
+  expandBoostingDeploymentSteps,
+  trimBoostingStepPlanToRoundBudget,
   createOrResumeProductionPreparationSession,
   getProductionPreparationSession,
   runProductionPreparationStep,
@@ -315,6 +317,13 @@ const {
 } = await import(freshModelsServiceModulePath);
 
 const trainModel = createOrResumeGuidedTrainingSession;
+
+const guidedStep = (id: string) => ({
+  id,
+  label: id,
+  description: id,
+  actionLabel: id,
+});
 
 const buildExperimentContextRow = (overrides: Record<string, unknown> = {}) => ({
   student_id: 20240002,
@@ -622,6 +631,49 @@ describe("models service", () => {
       resolveGuidedStepTimeoutMs("boosting", "retrain_chain", ensembleBody),
     ).toBe(630_000);
 
+  });
+
+  test("trims pending Boosting rounds to the Python-derived validation budget", () => {
+    const plan = [
+      guidedStep("prepare_data"),
+      guidedStep("split_residual_sets"),
+      guidedStep("round_1_evaluate_ma"),
+      guidedStep("round_1_select_winner"),
+      guidedStep("round_2_evaluate_ma"),
+      guidedStep("round_2_select_winner"),
+      guidedStep("round_3_evaluate_ma"),
+      guidedStep("round_3_select_winner"),
+      guidedStep("retrain_chain"),
+    ];
+
+    expect(trimBoostingStepPlanToRoundBudget(plan, { max_rounds: 2 }).map((step) => step.id)).toEqual([
+      "prepare_data",
+      "split_residual_sets",
+      "round_1_evaluate_ma",
+      "round_1_select_winner",
+      "round_2_evaluate_ma",
+      "round_2_select_winner",
+      "retrain_chain",
+    ]);
+    expect(trimBoostingStepPlanToRoundBudget(plan, { max_rounds: 0 })).toBe(plan);
+    expect(trimBoostingStepPlanToRoundBudget(plan, { max_rounds: 1.5 })).toBe(plan);
+  });
+
+  test("expands Boosting deployment stages with reuse and retained-coefficient semantics", () => {
+    const expanded = expandBoostingDeploymentSteps(
+      [guidedStep("prepare_data"), guidedStep("retrain_chain"), guidedStep("combine_evaluate")],
+      { model_chain: ["ma", "lstm"] },
+    );
+    const firstStage = expanded.find((step) => step.id === "refit_stage_1_ma");
+    const secondStage = expanded.find((step) => step.id === "refit_stage_2_lstm");
+
+    expect(firstStage?.label).toBe("准备第 1 阶段：移动平均");
+    expect(firstStage?.description).toContain("优先复用");
+    expect(firstStage?.description).toContain("保留时间验证选出的非负阶段系数");
+    expect(secondStage?.description).toContain("当前完整训练残差上拟合 LSTM");
+    expect(secondStage?.description).toContain("保留时间验证选出的非负阶段系数");
+    expect(secondStage?.description).toContain("仅用于教学展示，不参与模型链或系数选择");
+    expect(expanded.map((step) => step.description).join(" ")).not.toContain("重新计算非负阶段系数");
   });
 
   test("classifies auxiliary Python process deadlines as typed model timeouts", async () => {

@@ -78,7 +78,6 @@ def run_guided(model: str, data_file: Path, artifact: Path, workspace: Path, *, 
     for stage_index, member in enumerate(state["selection_model_chain"], 1):
         receipt = _checkpoint_step(entry, model, f"refit_stage_{stage_index}_{member}", workspace, previous, common, index, 1800)
         previous = receipt["_state_path"]; index += 1
-        if receipt["output"].get("action") == "trim_refit_chain": break
     for step in ("combine_evaluate", "save_artifact"):
         receipt = _checkpoint_step(entry, model, step, workspace, previous, common, index, 1800)
         previous = receipt["_state_path"]; final = receipt.get("final_result", final); index += 1

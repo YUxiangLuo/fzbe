@@ -394,33 +394,29 @@ def _run_es(step_id: str, args, state: Dict[str, Any]) -> Dict[str, Any]:
     if step_id == "estimate_residuals":
         train_range, eval_range = _state_ranges(state)
         y = np.asarray(state["y"])
-        y_true = y[eval_range].tolist()
-        y_pred = state["y_pred"]
-        residuals = np.asarray(y_true) - np.asarray(y_pred)
+        training_residuals = es._training_residuals(state["model"], y[train_range])
         std_dev_residuals = es._training_residual_scale(state["model"], y[train_range])
         profile, uncertainty_summary = es.ses_profile(
             std_dev_residuals,
             float(state["alpha"]),
             max(12, eval_range.stop - train_range.stop),
-            es._training_residuals(state["model"], y[train_range]),
+            training_residuals,
         )
         state.update({
-            "y_true": y_true,
-            "residuals": residuals.tolist(),
             "std_dev_residuals": std_dev_residuals,
             "uncertainty_profile": profile,
             "uncertainty_summary": uncertainty_summary,
         })
         return {
-            "residual_points": len(residuals),
-            "mean_residual": float(np.mean(residuals)) if len(residuals) else 0.0,
+            "training_residual_points": len(training_residuals),
             "std_dev_residuals": float(std_dev_residuals),
         }
 
     if step_id == "evaluate_metrics":
         _, eval_range = _state_ranges(state)
-        y_true = state["y_true"]
+        y_true = np.asarray(state["y"])[eval_range].tolist()
         y_pred = state["y_pred"]
+        residuals = np.asarray(y_true) - np.asarray(y_pred)
         timestamps = state["timestamps"]
         metrics = {
             "alpha": float(state["alpha"]),
@@ -446,6 +442,8 @@ def _run_es(step_id: str, args, state: Dict[str, Any]) -> Dict[str, Any]:
             },
         )
         state.update({
+            "y_true": y_true,
+            "residuals": residuals.tolist(),
             "metrics": metrics,
             "predictions": predictions_with_std,
             "initial_level": float(state["model"].params["initial_level"]),

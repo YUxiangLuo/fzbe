@@ -100,7 +100,7 @@ export const GUIDED_TRAINING_STEPS: Record<GuidedModelType, GuidedTrainingStepDe
     {
       id: "estimate_residuals",
       label: "估计残差波动",
-      description: "用训练期一步预测残差估计创新尺度，并按 ETS(A,N,N) 解析公式让多步预测标准差随 horizon 展宽。",
+      description: "只用训练期一步预测残差估计创新尺度，并按 ETS(A,N,N) 解析公式让多步预测标准差随 horizon 展宽；评估区间真实值不参与不确定性校准。",
       actionLabel: "估计残差",
     },
     {
@@ -175,9 +175,9 @@ export const GUIDED_TRAINING_STEPS: Record<GuidedModelType, GuidedTrainingStepDe
     },
     {
       id: "build_model",
-      label: "确定网络结构",
-      description: "构建单层 LSTM 和长度等于预测跨度的线性 Dense 输出层；look-back 在2到12之间动态确定，若无法保留至少两个历史步和四个监督窗口则拒绝训练；隐藏单元和批大小按样本窗数、特征维度及参数预算确定。",
-      actionLabel: "构建网络",
+      label: "确认网络配置",
+      description: "确认后续训练将使用单层 LSTM 和长度等于预测跨度的线性 Dense 输出层；look-back 在2到12之间动态确定，若无法保留至少两个历史步和四个监督窗口则拒绝训练；隐藏单元和批大小按样本窗数、特征维度及参数预算确定。网络会在下一阶段按该配置创建并训练。",
+      actionLabel: "确认配置",
     },
     {
       id: "train_model",
@@ -307,9 +307,9 @@ export const GUIDED_TRAINING_STEPS: Record<GuidedModelType, GuidedTrainingStepDe
     },
     {
       id: "retrain_chain",
-      label: "重训已选模型链",
-      description: "在完整训练段逐级重训已选链，同时保留时间留出验证学到的非负阶段系数；全量样本内拟合只用于构造下一阶段残差，不重新调系数。",
-      actionLabel: "重训模型链",
+      label: "准备部署模型链",
+      description: "按已选模型链准备完整训练区间的部署产物：首阶段可复用配置和训练区间匹配的已完成基础模型，必要时重新拟合；后续阶段按当前完整训练残差拟合。所有阶段都保留时间留出验证学到的非负系数，完整训练拟合值只用于构造下一阶段残差。",
+      actionLabel: "准备模型链",
     },
     {
       id: "combine_evaluate",
