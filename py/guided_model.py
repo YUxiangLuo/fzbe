@@ -571,6 +571,8 @@ def _run_arima(step_id: str, args, state: Dict[str, Any]) -> Dict[str, Any]:
             "criterion": "aicc",
             "order": {"p": best_model.order[0], "d": best_model.order[1], "q": best_model.order[2]},
             "aicc": float(best_model.aicc()),
+            "search_maxiter": arima.ARIMA_SEARCH_MAXITER,
+            "retry_maxiter": arima.ARIMA_RETRY_MAXITER,
             "convergence_retried": convergence_retried,
         }
 
@@ -592,6 +594,8 @@ def _run_arima(step_id: str, args, state: Dict[str, Any]) -> Dict[str, Any]:
             "effective_train_size": len(train_range) - int(state["d"]),
             "max_p": int(state["max_p"]),
             "max_q": int(state["max_q"]),
+            "search_maxiter": arima.ARIMA_SEARCH_MAXITER,
+            "retry_maxiter": arima.ARIMA_RETRY_MAXITER,
             "selected_order": best_order,
             "model_spec": arima._model_spec(best_model),
             "aic": float(best_model.aic()),

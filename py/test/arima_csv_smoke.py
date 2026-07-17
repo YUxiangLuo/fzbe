@@ -61,7 +61,7 @@ def select_reference_model(series: list[float], d: int, max_p: int, max_q: int):
         error_action="ignore",
         information_criterion="aicc",
         with_intercept="auto",
-        maxiter=50,
+        maxiter=100,
         trace=False,
     )
 
@@ -152,12 +152,24 @@ def main() -> None:
         assert search_summary["effective_train_size"] == 19
         assert search_summary["max_p"] == max_p
         assert search_summary["max_q"] == max_q
+        assert search_summary["search_maxiter"] == 100
+        assert search_summary["retry_maxiter"] == 200
         assert isinstance(search_summary["diagnostics"], dict)
+        assert search_summary["diagnostics"]["ljung_box_conclusion"] in {
+            "test_unavailable",
+            "residual_autocorrelation_detected_at_tested_lag",
+            "residual_autocorrelation_not_detected_at_tested_lag",
+        }
         assert_series_close(actual_eval_predictions, expected_eval_predictions.tolist())
         assert_series_close(actual_eval_std, expected_eval_std)
         assert all(
             point["calibration_mean_error"] is None
             and point["calibration_count"] is None
+            for point in train_output["predictions"]
+        )
+        assert all(
+            point["interval_kind"] == "censored_nonnegative_model_prediction_interval"
+            and point["interval_lower"] <= point["prediction"] <= point["interval_upper"]
             for point in train_output["predictions"]
         )
 
@@ -244,6 +256,11 @@ def main() -> None:
         assert all(
             point["calibration_mean_error"] is None
             and point["calibration_count"] is None
+            for point in predict_output["predictions"]
+        )
+        assert all(
+            point["interval_kind"] == "censored_nonnegative_model_prediction_interval"
+            and point["interval_lower"] <= point["prediction"] <= point["interval_upper"]
             for point in predict_output["predictions"]
         )
 

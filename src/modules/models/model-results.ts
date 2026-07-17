@@ -56,6 +56,7 @@ export const normalizeDemandPredictionPoints = (
     if (typeof prediction !== "number" || !Number.isFinite(prediction)) {
       throw new Error(`[PYTHON_DATA] Prediction point ${index} is not finite`);
     }
+    const normalizedPrediction = Math.max(0, prediction);
     if (
       options.requireStdDev
       && (typeof point.std_dev !== "number" || !Number.isFinite(point.std_dev) || point.std_dev < 0)
@@ -140,10 +141,21 @@ export const normalizeDemandPredictionPoints = (
       if (typeof point.interval_kind !== "string" || point.interval_kind.length === 0) {
         throw new Error(`[PYTHON_DATA] Prediction point ${index} interval_kind must be a non-empty string`);
       }
+      if (
+        point.interval_kind === "censored_nonnegative_model_prediction_interval"
+        && (
+          normalizedPrediction < point.interval_lower
+          || normalizedPrediction > point.interval_upper
+        )
+      ) {
+        throw new Error(
+          `[PYTHON_DATA] Prediction point ${index} must lie inside its nonnegative interval`,
+        );
+      }
     }
     return {
       ...point,
-      prediction: Math.max(0, prediction),
+      prediction: normalizedPrediction,
     };
   });
 };

@@ -16,6 +16,7 @@ const runAdf = mock(async () => [{
   used_lags: 1,
   n_obs: 10,
   stationary: true,
+  unit_root_conclusion: "reject_unit_root" as const,
   critical_values: { "1%": -3, "5%": -2, "10%": -1 },
 }]);
 const withModelOperationContext = mock(async (

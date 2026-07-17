@@ -24,6 +24,7 @@ const performAdfTest = mock(async () => ([
     used_lags: 1,
     n_obs: 10,
     stationary: false,
+    unit_root_conclusion: "fail_to_reject_unit_root" as const,
     critical_values: { "1%": -3.5, "5%": -2.9, "10%": -2.6 },
   },
 ]));
@@ -73,6 +74,7 @@ describe("tools controller", () => {
         used_lags: 1,
         n_obs: 10,
         stationary: false,
+        unit_root_conclusion: "fail_to_reject_unit_root" as const,
         critical_values: { "1%": -3.5, "5%": -2.9, "10%": -2.6 },
       },
     ]);

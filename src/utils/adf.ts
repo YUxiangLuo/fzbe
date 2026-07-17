@@ -18,6 +18,8 @@ export interface AdfResultItem {
   p_value: number;
   used_lags: number;
   n_obs: number;
+  /** Interpretation of the ADF unit-root null; `stationary` is retained for compatibility. */
+  unit_root_conclusion: "reject_unit_root" | "fail_to_reject_unit_root";
   stationary: boolean;
   critical_values: {
     "1%": number;
@@ -43,6 +45,11 @@ const isNonNegativeSafeInteger = (value: unknown): value is number =>
 
 const isPositiveSafeInteger = (value: unknown): value is number =>
   typeof value === "number" && Number.isSafeInteger(value) && value >= 1;
+
+const isUnitRootConclusion = (
+  value: unknown,
+): value is AdfResultItem["unit_root_conclusion"] =>
+  value === "reject_unit_root" || value === "fail_to_reject_unit_root";
 
 export const parseAdfResultPayload = (value: unknown): AdfResult => {
   if (!Array.isArray(value)) {
@@ -77,6 +84,9 @@ export const parseAdfResultPayload = (value: unknown): AdfResult => {
       || !isNonNegativeSafeInteger(item.used_lags)
       || !isPositiveSafeInteger(item.n_obs)
       || typeof item.stationary !== "boolean"
+      || !isUnitRootConclusion(item.unit_root_conclusion)
+      || item.unit_root_conclusion
+        !== (item.stationary ? "reject_unit_root" : "fail_to_reject_unit_root")
       || !isFiniteNumber(critical["1%"])
       || !isFiniteNumber(critical["5%"])
       || !isFiniteNumber(critical["10%"])
@@ -94,6 +104,7 @@ export const parseAdfResultPayload = (value: unknown): AdfResult => {
       used_lags: item.used_lags,
       n_obs: item.n_obs,
       stationary: item.stationary,
+      unit_root_conclusion: item.unit_root_conclusion,
       critical_values: {
         "1%": critical["1%"],
         "5%": critical["5%"],

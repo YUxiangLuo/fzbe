@@ -56,9 +56,22 @@ class AdfCoreContractTests(unittest.TestCase):
         results = adf_fixed_d(_series("seeded_arx_96.json"), orders)
         self.assertEqual(list(orders), [entry["diff_order"] for entry in results])
         for entry in results:
-            for key in ("diff_order", "statistic", "p_value", "used_lags", "n_obs", "stationary", "critical_values"):
+            for key in (
+                "diff_order",
+                "statistic",
+                "p_value",
+                "used_lags",
+                "n_obs",
+                "stationary",
+                "unit_root_conclusion",
+                "critical_values",
+            ):
                 self.assertIn(key, entry)
             self.assertEqual({"1%", "5%", "10%"}, set(entry["critical_values"]))
+            self.assertEqual(
+                "reject_unit_root" if entry["stationary"] else "fail_to_reject_unit_root",
+                entry["unit_root_conclusion"],
+            )
 
     @profile("fast")
     def test_pure_trend_is_nonstationary_and_collapses_when_differenced(self):
@@ -66,8 +79,10 @@ class AdfCoreContractTests(unittest.TestCase):
         results = {entry["diff_order"]: entry for entry in adf_fixed_d(_series("trend_48.json"), (0, 1, 2))}
         self.assertFalse(results[0]["stationary"])
         self.assertGreater(results[0]["p_value"], 0.05)
+        self.assertEqual("fail_to_reject_unit_root", results[0]["unit_root_conclusion"])
         for d in (1, 2):
             self.assertIsNone(results[d]["stationary"])
+            self.assertIsNone(results[d]["unit_root_conclusion"])
             self.assertTrue(results[d]["error"])
 
     @profile("fast")
@@ -75,6 +90,7 @@ class AdfCoreContractTests(unittest.TestCase):
         for entry in adf_fixed_d(_series("level_36.json"), (0, 1, 2)):
             self.assertIsNone(entry["p_value"])
             self.assertIsNone(entry["stationary"])
+            self.assertIsNone(entry["unit_root_conclusion"])
             self.assertTrue(entry["error"])
 
     @profile("fast")
@@ -83,6 +99,7 @@ class AdfCoreContractTests(unittest.TestCase):
         # margin is many orders of magnitude below alpha, so the verdict is stable.
         level = adf_fixed_d(_series("seeded_arx_96.json"), (0,))[0]
         self.assertTrue(level["stationary"])
+        self.assertEqual("reject_unit_root", level["unit_root_conclusion"])
         self.assertLess(level["p_value"], 0.05)
         self.assertLess(level["statistic"], level["critical_values"]["5%"])
 
@@ -110,6 +127,10 @@ class AdfCliCrossLanguageContractTests(unittest.TestCase):
             self.assertIsInstance(row["n_obs"], int)
             self.assertGreaterEqual(row["n_obs"], 1)
             self.assertIsInstance(row["stationary"], bool)
+            self.assertEqual(
+                "reject_unit_root" if row["stationary"] else "fail_to_reject_unit_root",
+                row["unit_root_conclusion"],
+            )
             for band in ("1%", "5%", "10%"):
                 self.assertTrue(math.isfinite(row["critical_values"][band]))
 

@@ -25,8 +25,10 @@ def adf_fixed_d(values: Iterable[float],
 
     Example:
         >>> adf_fixed_d([1, 2, 3, 4, 5], diff_orders=(0, 1))
-        [{'diff_order': 0, 'p_value': 0.99, 'stationary': False, ...},
-         {'diff_order': 1, 'p_value': 0.01, 'stationary': True, ...}]
+        [{'diff_order': 0, 'p_value': 0.99, 'stationary': False,
+          'unit_root_conclusion': 'fail_to_reject_unit_root', ...},
+         {'diff_order': 1, 'p_value': 0.01, 'stationary': True,
+          'unit_root_conclusion': 'reject_unit_root', ...}]
 
     Args:
         values: Time series values.
@@ -75,6 +77,7 @@ def adf_fixed_d(values: Iterable[float],
                 "used_lags": None,
                 "n_obs": None,
                 "stationary": None,
+                "unit_root_conclusion": None,
                 "critical_values": None,
             })
             results.append(entry)
@@ -86,12 +89,20 @@ def adf_fixed_d(values: Iterable[float],
                 regression=regression,
                 autolag="AIC",
             )
+            rejects_unit_root = bool(pval < alpha)
             entry.update({
                 "statistic": round(float(stat), ndigits),
                 "p_value": float(pval),
                 "used_lags": int(used_lags),
                 "n_obs": int(nobs),
-                "stationary": bool(pval < alpha),
+                # Compatibility shorthand: True means that this ADF test rejects
+                # its unit-root null. It is not proof of stationarity.
+                "stationary": rejects_unit_root,
+                "unit_root_conclusion": (
+                    "reject_unit_root"
+                    if rejects_unit_root
+                    else "fail_to_reject_unit_root"
+                ),
                 "critical_values": {k: round(float(v), ndigits) for k, v in crit.items()},
             })
         except Exception as e:
@@ -102,6 +113,7 @@ def adf_fixed_d(values: Iterable[float],
                 "used_lags": None,
                 "n_obs": None,
                 "stationary": None,
+                "unit_root_conclusion": None,
                 "critical_values": None,
             })
         results.append(entry)

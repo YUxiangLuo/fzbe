@@ -126,13 +126,13 @@ export const GUIDED_TRAINING_STEPS: Record<GuidedModelType, GuidedTrainingStepDe
     {
       id: "aic_search",
       label: "执行 AICc 搜索",
-      description: "在固定 d 和样本量自适应的 p/q 边界内运行一次 AICc stepwise 搜索，并检查优胜模型是否收敛；必要时用更高迭代上限重试。",
+      description: "在固定 d 和样本量自适应的 p/q 边界内运行 AICc stepwise 搜索，每个候选拟合使用 maxiter=100；检查优胜模型是否收敛，必要时按完整规格以 maxiter=200 重试。",
       actionLabel: "运行 AICc",
     },
     {
       id: "bic_search",
       label: "检查残差诊断",
-      description: "对 AICc 优胜模型执行带模型自由度修正的 Ljung–Box 白噪声检验，记录诊断结果而不再用第二套准则重复搜索。",
+      description: "对 AICc 优胜模型在注明的单个非季节滞后执行带模型自由度修正的 Ljung–Box 检验；未发现残差自相关不等于已经证明完整残差过程为白噪声。",
       actionLabel: "检查残差",
     },
     {
@@ -144,7 +144,7 @@ export const GUIDED_TRAINING_STEPS: Record<GuidedModelType, GuidedTrainingStepDe
     {
       id: "forecast",
       label: "预测评估区间",
-      description: "使用选定的非季节 ARIMA(p,d,q) 直接生成多步预测；点预测按 max(0, ŷ) 截断。95%区间仍来自未截断的 ARIMA 分布，并按精确的 95% 正态临界值 1.9599639845 由区间宽度反推标准差。",
+      description: "使用选定的非季节 ARIMA(p,d,q) 直接生成多步预测；点预测和 95% 区间分位数在销量域同步按 max(0, ·) 映射，标准差仍按未截断分布及精确的 95% 正态临界值 1.9599639845 计算。",
       actionLabel: "生成预测",
     },
     {

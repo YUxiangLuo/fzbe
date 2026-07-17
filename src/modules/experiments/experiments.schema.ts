@@ -76,6 +76,12 @@ const adfResultRowSchema = z.object({
   used_lags: z.number().int().min(0),
   n_obs: z.number().int().min(1),
   stationary: z.boolean(),
+  // Optional for backward compatibility with ADF rows saved before the
+  // explicit unit-root interpretation was added.
+  unit_root_conclusion: z.enum([
+    "reject_unit_root",
+    "fail_to_reject_unit_root",
+  ]).optional(),
   critical_values: z.object({
     "1%": z.number().finite(),
     "5%": z.number().finite(),
@@ -90,6 +96,21 @@ const adfResultRowsSchema = z.array(adfResultRowSchema).max(3).superRefine((rows
       message: "ADF 检验结果不能包含重复的差分阶数",
     });
   }
+  rows.forEach((row, index) => {
+    const expectedConclusion = row.stationary
+      ? "reject_unit_root"
+      : "fail_to_reject_unit_root";
+    if (
+      row.unit_root_conclusion !== undefined
+      && row.unit_root_conclusion !== expectedConclusion
+    ) {
+      context.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: "ADF 单位根结论与兼容平稳性字段不一致",
+        path: [index, "unit_root_conclusion"],
+      });
+    }
+  });
 });
 const optionalAdfResults = z.preprocess(jsonPreprocess, adfResultRowsSchema).nullable().optional();
 

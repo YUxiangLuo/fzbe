@@ -170,6 +170,7 @@ describe("Experiments Schemas", () => {
         used_lags: 2,
         n_obs: 11,
         stationary: true,
+        unit_root_conclusion: "reject_unit_root",
         critical_values: { "1%": -3.75, "5%": -2.99, "10%": -2.64 },
       };
       expect(updateExperimentSchema.safeParse({
@@ -184,6 +185,19 @@ describe("Experiments Schemas", () => {
         expected_version: 0,
         arima_adf_stationarity: [validRow, validRow],
       }).success).toBe(false);
+      expect(updateExperimentSchema.safeParse({
+        expected_version: 0,
+        arima_adf_stationarity: [{
+          ...validRow,
+          unit_root_conclusion: "fail_to_reject_unit_root",
+        }],
+      }).success).toBe(false);
+
+      const { unit_root_conclusion: _legacyOmitted, ...legacyRow } = validRow;
+      expect(updateExperimentSchema.safeParse({
+        expected_version: 0,
+        arima_adf_stationarity: [legacyRow],
+      }).success).toBe(true);
     });
   });
 

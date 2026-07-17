@@ -11,6 +11,7 @@ const validResult = {
   used_lags: 2,
   n_obs: 11,
   stationary: true,
+  unit_root_conclusion: "reject_unit_root" as const,
   critical_values: { "1%": -3.75, "5%": -2.99, "10%": -2.64 },
 };
 
@@ -24,6 +25,13 @@ describe("ADF Python result parser", () => {
     expect(() => parseAdfResultPayload([missingUsedLags])).toThrow(
       "[PYTHON_DATA] ADF result 0 has invalid fields",
     );
+  });
+
+  test("rejects a unit-root conclusion that contradicts the compatibility verdict", () => {
+    expect(() => parseAdfResultPayload([{
+      ...validResult,
+      unit_root_conclusion: "fail_to_reject_unit_root",
+    }])).toThrow("[PYTHON_DATA] ADF result 0 has invalid fields");
   });
 
   test("maps an all-error Python result to the existing small-data validation error", () => {

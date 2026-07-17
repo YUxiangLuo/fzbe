@@ -645,13 +645,23 @@ def assert_horizon_aware_uncertainty_profiles() -> None:
     assert math.isclose(arima_points[0]["std_dev"], 8.0 / (2.0 * NORMAL_95))
     assert arima_points[0]["uncertainty_source"] == "model"
     assert arima_points[0]["calibration_source"] == "arima_forecast_distribution"
-    assert arima_points[0]["interval_lower"] == -3.0
+    assert arima_points[0]["interval_lower"] == 0.0
     assert arima_points[0]["interval_upper"] == 5.0
     assert arima_points[0]["interval_level"] == 0.95
-    assert arima_points[0]["interval_kind"] == "model_prediction_interval"
+    assert arima_points[0]["interval_kind"] == "censored_nonnegative_model_prediction_interval"
     assert arima_points[0]["upper_error_p99"] > 0
     assert arima_points[0]["calibration_mean_error"] is None
     assert arima_points[0]["calibration_count"] is None
+
+    signed_arima_point = arima._format_predictions(
+        [-2.0],
+        [[-3.0, 5.0]],
+        SIGNED_PREDICTION_DOMAIN,
+    )[0]
+    assert signed_arima_point["prediction"] == -2.0
+    assert signed_arima_point["interval_lower"] == -3.0
+    assert signed_arima_point["interval_upper"] == 5.0
+    assert signed_arima_point["interval_kind"] == "model_prediction_interval"
 
     _, biased_summary = ses_profile(0.0, 0.4, 1, [5.0, 5.0, 5.0, 5.0])
     biased_point = format_predictions([100.0], [0.0], biased_summary)[0]

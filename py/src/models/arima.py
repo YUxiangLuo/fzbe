@@ -14,6 +14,7 @@ from statsmodels.stats.diagnostic import acorr_ljungbox
 from data_utils import load_data_from_json
 from forecast_utils import (
     DEMAND_PREDICTION_DOMAIN,
+    SIGNED_PREDICTION_DOMAIN,
     apply_prediction_domain,
     resolve_prediction_domain,
 )
@@ -28,13 +29,18 @@ from uncertainty import NORMAL_95, NORMAL_99
 MODEL_TYPE = "arima"
 METHOD_NAME = "ARIMA 自动定阶"
 FORECAST_STRATEGY = "arima_multi_step_forecast"
+ARIMA_SEARCH_MAXITER = 100
+ARIMA_RETRY_MAXITER = 200
+MODEL_INTERVAL_KIND = "model_prediction_interval"
+NONNEGATIVE_INTERVAL_KIND = "censored_nonnegative_model_prediction_interval"
 IMPLEMENTATION_NOTES = [
     "教科书 ARIMA 通常通过平稳性检验、ACF/PACF 和信息准则定阶。",
     "本系统由用户根据 ADF 结果指定差分阶数 d；模型固定为非季节 ARIMA，并执行一次以 AICc 为目标的 stepwise 搜索来选择 p、q 和是否包含截距。",
     "p/q 搜索上限按差分后的有效样本量自动收紧；少于 6 个有效样本时拒绝拟合，不用不可靠结果冒充完整 ARIMA。",
-    "选中模型必须收敛；首次搜索结果未收敛时按完整规格将最大迭代数加倍重拟合一次，并记录 Ljung-Box 白噪声诊断。",
+    "AICc stepwise 搜索中的每个候选拟合使用 maxiter=100；选中模型必须收敛，首次结果未收敛时按完整规格以 maxiter=200 重拟合一次。",
     "预测未来销量时使用拟合后的 ARIMA 模型直接生成多步 forecast；原始点预测可能为负，本系统将用于残差、指标和输出的销量点预测按 max(0, y_hat) 截断。该约束是业务后处理，不属于教科书 ARIMA。",
-    "默认 95% 预测区间仍由未截断的 ARIMA 预测分布计算；std_dev 按该分布的精确 95% 正态临界值由区间宽度反推，生产用 99% 上侧误差也由同一未截断分布计算。区间本身不是截断正态区间。",
+    "std_dev 和 99% 上侧误差来自未截断 ARIMA 预测分布；非负销量域会把 95% 区间分位数同步映射为 max(0, q)，有符号残差域则保留原始区间。",
+    "Ljung-Box 仅检查输出中注明的单个非季节滞后；兼容字段 residual_white_noise=true 只表示该检验未发现残差自相关，不代表已经证明残差为白噪声。",
     "独立评估段只用于报告泛化指标，不写回模型产物，也不作为部署偏差校准；部署区间完全来自训练后 ARIMA 预测分布，因而不会把最终评估标签带入未来预测。",
 ]
 
@@ -43,19 +49,40 @@ IMPLEMENTATION_NOTES = [
 def _format_predictions(
     preds: List[float],
     conf_intervals: List[List[float]],
+    prediction_domain: str = DEMAND_PREDICTION_DOMAIN,
 ) -> List[Dict[str, Any]]:
     """
     Format predictions with 95% prediction intervals for JSON output.
-    Converts interval width to its Gaussian std_dev while preserving the
-    model's original, untruncated interval bounds.
+    ``std_dev`` remains the scale of the original Gaussian ARIMA distribution.
+    Demand-domain interval quantiles are mapped through ``max(0, q)`` so they
+    remain coherent with the displayed nonnegative point forecast, while
+    signed residual forecasts preserve the original interval.
     """
+    if prediction_domain not in {
+        DEMAND_PREDICTION_DOMAIN,
+        SIGNED_PREDICTION_DOMAIN,
+    }:
+        raise ValueError(f"[VALIDATION] Unknown prediction domain: {prediction_domain}")
+
     points: List[Dict[str, Any]] = []
     for prediction, interval in zip(preds, conf_intervals):
-        numeric_prediction = float(prediction)
-        lower = float(interval[0])
-        upper = float(interval[1])
-        std_dev = max(0.0, (upper - lower) / (2.0 * NORMAL_95))
-        raw_distribution_mean = (lower + upper) / 2.0
+        numeric_prediction = float(
+            apply_prediction_domain([prediction], prediction_domain)[0]
+        )
+        raw_lower = float(interval[0])
+        raw_upper = float(interval[1])
+        std_dev = max(0.0, (raw_upper - raw_lower) / (2.0 * NORMAL_95))
+        raw_distribution_mean = (raw_lower + raw_upper) / 2.0
+        if prediction_domain == DEMAND_PREDICTION_DOMAIN:
+            lower = max(0.0, raw_lower)
+            upper = max(0.0, raw_upper)
+            lower = min(lower, numeric_prediction)
+            upper = max(upper, numeric_prediction)
+            interval_kind = NONNEGATIVE_INTERVAL_KIND
+        else:
+            lower = raw_lower
+            upper = raw_upper
+            interval_kind = MODEL_INTERVAL_KIND
         points.append({
             "prediction": numeric_prediction,
             "std_dev": std_dev,
@@ -68,7 +95,7 @@ def _format_predictions(
             "interval_lower": lower,
             "interval_upper": upper,
             "interval_level": 0.95,
-            "interval_kind": "model_prediction_interval",
+            "interval_kind": interval_kind,
             "upper_error_p99": max(
                 0.0,
                 raw_distribution_mean + NORMAL_99 * std_dev - numeric_prediction,
@@ -117,7 +144,7 @@ def _run_auto_arima_search(
             error_action="ignore",
             information_criterion=criterion,
             with_intercept="auto",
-            maxiter=50,
+            maxiter=ARIMA_SEARCH_MAXITER,
             trace=False,
         )
     except Exception as exc:
@@ -143,7 +170,7 @@ def _fit_arima_spec(
     y_train: np.ndarray,
     spec: Dict[str, Any],
     context: str,
-    maxiter: int = 100,
+    maxiter: int = ARIMA_SEARCH_MAXITER,
 ) -> Any:
     try:
         order = tuple(int(value) for value in spec["order"])
@@ -187,7 +214,12 @@ def _is_deterministic_boundary_case(model: Any, y_train: np.ndarray) -> bool:
 def _ensure_converged(model: Any, y_train: np.ndarray, context: str) -> Tuple[Any, bool]:
     if _is_converged(model):
         return model, False
-    retried = _fit_arima_spec(y_train, _model_spec(model), context, maxiter=100)
+    retried = _fit_arima_spec(
+        y_train,
+        _model_spec(model),
+        context,
+        maxiter=ARIMA_RETRY_MAXITER,
+    )
     if not _is_converged(retried):
         if _is_deterministic_boundary_case(retried, y_train):
             log.warning(
@@ -211,6 +243,7 @@ def _residual_diagnostics(model: Any, effective_train_size: int) -> Dict[str, An
             "ljung_box_lag": None,
             "ljung_box_pvalue": None,
             "residual_white_noise": None,
+            "ljung_box_conclusion": "test_unavailable",
             "warning": "effective sample is too short for a degrees-of-freedom adjusted Ljung-Box test",
         }
     residuals = np.asarray(model.arima_res_.resid, dtype=float)
@@ -221,13 +254,26 @@ def _residual_diagnostics(model: Any, effective_train_size: int) -> Dict[str, An
             "ljung_box_lag": lag,
             "ljung_box_pvalue": None,
             "residual_white_noise": None,
+            "ljung_box_conclusion": "test_unavailable",
             "warning": "residual variance is degenerate, so Ljung-Box is undefined",
         }
+    autocorrelation_detected = pvalue < 0.05
     return {
         "ljung_box_lag": lag,
         "ljung_box_pvalue": pvalue,
-        "residual_white_noise": pvalue >= 0.05,
-        "warning": None if pvalue >= 0.05 else "residual autocorrelation remains at the 5% level",
+        # Compatibility shorthand. A non-rejection at one tested lag does not
+        # prove that the complete residual process is white noise.
+        "residual_white_noise": not autocorrelation_detected,
+        "ljung_box_conclusion": (
+            "residual_autocorrelation_detected_at_tested_lag"
+            if autocorrelation_detected
+            else "residual_autocorrelation_not_detected_at_tested_lag"
+        ),
+        "warning": (
+            "residual autocorrelation remains at the 5% level"
+            if autocorrelation_detected
+            else None
+        ),
     }
 
 
@@ -368,6 +414,8 @@ def train_and_evaluate(
         "effective_train_size": effective_train_size,
         "max_p": max_p,
         "max_q": max_q,
+        "search_maxiter": ARIMA_SEARCH_MAXITER,
+        "retry_maxiter": ARIMA_RETRY_MAXITER,
         "selected_order": best_order,
         "model_spec": _model_spec(best_model),
         "aic": float(best_model.aic()),
@@ -519,6 +567,7 @@ def run(args) -> None:
             out["predictions"] = _format_predictions(
                 preds,
                 confidence_intervals,
+                prediction_domain,
             )
         attach_method_metadata(out, METHOD_NAME, FORECAST_STRATEGY, IMPLEMENTATION_NOTES)
         out["logs"] = get_log_contents()
@@ -528,6 +577,13 @@ def run(args) -> None:
     if load_path:
         log.info(f"Entering prediction mode with model: {load_path}")
         state = _load_state(load_path)
+        allow_negative_predictions = bool(
+            getattr(args, "allow_negative_predictions", False)
+        )
+        prediction_domain = resolve_prediction_domain(
+            state,
+            allow_negative_predictions=allow_negative_predictions,
+        )
         steps = int(getattr(args, "forecast_steps", 0))
         if steps <= 0:
             log.error("forecast_steps must be > 0 for prediction mode.")
@@ -536,21 +592,35 @@ def run(args) -> None:
         log.info(f"Starting prediction with {steps} forecast steps")
         prepared = state.get("prepared_predictions")
         if (
-            not bool(getattr(args, "allow_negative_predictions", False))
+            not allow_negative_predictions
             and isinstance(prepared, list)
             and len(prepared) >= steps
         ):
             predictions_with_std = [dict(point) for point in prepared[:steps]]
+            if prediction_domain == DEMAND_PREDICTION_DOMAIN:
+                for point in predictions_with_std:
+                    point["prediction"] = max(0.0, float(point["prediction"]))
+                    if "interval_lower" in point and "interval_upper" in point:
+                        point["interval_lower"] = min(
+                            point["prediction"],
+                            max(0.0, float(point["interval_lower"])),
+                        )
+                        point["interval_upper"] = max(
+                            point["prediction"],
+                            max(0.0, float(point["interval_upper"])),
+                        )
+                        point["interval_kind"] = NONNEGATIVE_INTERVAL_KIND
         else:
             preds, conf_int = predict(
                 load_path,
                 steps,
                 state=state,
-                allow_negative_predictions=bool(getattr(args, "allow_negative_predictions", False)),
+                allow_negative_predictions=allow_negative_predictions,
             )
             predictions_with_std = _format_predictions(
                 preds,
                 conf_int,
+                prediction_domain,
             )
 
         out: Dict[str, Any] = {
@@ -624,6 +694,7 @@ def run(args) -> None:
     predictions_with_std = _format_predictions(
         y_pred,
         conf_int,
+        prediction_domain,
     )
 
     out: Dict[str, Any] = {

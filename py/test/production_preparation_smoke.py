@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Smoke-test the resumable production preparation protocol.
 
-The test covers MA and LSTM production refits plus all three ensemble shapes.
+The test covers MA, ARIMA, and LSTM production refits plus all three ensemble shapes.
 Weighted averaging intentionally contains LSTM so the checkpoint runner must
 preserve explicit feature selection, create the Keras sidecar, extend the
 direct forecast horizon, and assemble a self-contained ensemble artifact.
@@ -25,7 +25,7 @@ PY_ROOT = Path(__file__).resolve().parents[1]
 RUN_MODEL = PY_ROOT / "run_model.py"
 PREPARE_MODEL = PY_ROOT / "production_prepare_model.py"
 CSV_FIXTURE = Path(__file__).resolve().parent / "fixtures" / "core_models_smoke.csv"
-BASE_MODELS = ("ma", "es", "lstm")
+BASE_MODELS = ("ma", "es", "arima", "lstm")
 ENSEMBLE_MODELS = ("weighted_avg", "stacking", "boosting")
 ENSEMBLE_MEMBERS = {
     "weighted_avg": ("ma", "lstm"),
@@ -89,6 +89,7 @@ def _train_sources(data_json: str, temp_path: Path) -> dict[str, Path]:
     model_args = {
         "ma": ["--window", "3"],
         "es": ["--alpha", "0.4"],
+        "arima": ["--d", "1"],
         "lstm": [
             "--normalization", "minmax",
             "--lstm-target-feature", "销售数量",
@@ -199,6 +200,16 @@ def _assert_current_prediction_contract(payload: dict[str, Any], model_type: str
                 raise AssertionError(f"{model_type}.predictions[{index}].{key} is invalid")
         if float(point["std_dev"]) < 0 or float(point["upper_error_p99"]) < 0:
             raise AssertionError(f"{model_type}.predictions[{index}] has a negative uncertainty scale")
+        lower = float(point["interval_lower"])
+        prediction = float(point["prediction"])
+        upper = float(point["interval_upper"])
+        if lower > upper:
+            raise AssertionError(f"{model_type}.predictions[{index}] has an inverted interval")
+        if model_type == "arima":
+            if point.get("interval_kind") != "censored_nonnegative_model_prediction_interval":
+                raise AssertionError(f"{model_type}.predictions[{index}] lost its demand interval semantics")
+            if not 0.0 <= lower <= prediction <= upper:
+                raise AssertionError(f"{model_type}.predictions[{index}] violates its demand interval")
         if point.get("interval_level") != 0.95:
             raise AssertionError(f"{model_type}.predictions[{index}] is not an exact 95% interval")
         if not isinstance(point.get("uncertainty_source"), str) or not point["uncertainty_source"]:
@@ -226,6 +237,14 @@ def _assert_inherited_parameters(model_type: str, source: Path, production: Path
     if model_type == "ma":
         if production_state.get("window") != source_state.get("window"):
             raise AssertionError("MA production refit did not inherit the selected window")
+        return
+    if model_type == "arima":
+        if production_state.get("model_spec") != source_state.get("model_spec"):
+            raise AssertionError(
+                "ARIMA production refit did not inherit the selected fixed-d specification"
+            )
+        if production_state.get("order") != source_state.get("order"):
+            raise AssertionError("ARIMA production refit changed the selected order")
         return
     if model_type == "lstm":
         for key in ("normalization", "target_key", "feature_keys"):
@@ -378,7 +397,7 @@ def main() -> None:
         data_file = temp_path / "dataset.json"
         data_file.write_text(data_json, encoding="utf-8")
         source_paths = _train_sources(data_json, temp_path)
-        for model_type in ("ma", "lstm", *ENSEMBLE_MODELS):
+        for model_type in ("ma", "arima", "lstm", *ENSEMBLE_MODELS):
             summary[model_type] = _prepare_model(
                 model_type,
                 data_file,

@@ -4,9 +4,15 @@ import { GUIDED_TRAINING_STEPS } from "../../../src/modules/models/model-types";
 describe("guided model teaching copy", () => {
   test("describes ARIMA interval conversion with the implemented normal critical value", () => {
     const forecastStep = GUIDED_TRAINING_STEPS.arima.find((step) => step.id === "forecast");
+    const searchStep = GUIDED_TRAINING_STEPS.arima.find((step) => step.id === "aic_search");
+    const diagnosticsStep = GUIDED_TRAINING_STEPS.arima.find((step) => step.id === "bic_search");
 
     expect(forecastStep?.description).toContain("1.9599639845");
+    expect(forecastStep?.description).toContain("区间分位数");
     expect(forecastStep?.description).not.toContain("除以3.92");
+    expect(searchStep?.description).toContain("maxiter=100");
+    expect(searchStep?.description).toContain("maxiter=200");
+    expect(diagnosticsStep?.description).toContain("不等于已经证明");
   });
 
   test("keeps LSTM configuration separate from network construction", () => {

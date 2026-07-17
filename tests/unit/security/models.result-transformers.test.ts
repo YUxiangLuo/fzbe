@@ -293,6 +293,16 @@ describe("model training result transformers", () => {
       eval_y_true: [10],
       predictions: [{ ...predictionPoint(9), calibration_source: "" }],
     })).toThrow("[PYTHON_DATA] Prediction point 0 calibration_source must be a non-empty string");
+
+    expect(() => normalizeDemandPredictionPoints([{
+      prediction: 0,
+      interval_lower: 1,
+      interval_upper: 2,
+      interval_level: 0.95,
+      interval_kind: "censored_nonnegative_model_prediction_interval",
+    }])).toThrow(
+      "[PYTHON_DATA] Prediction point 0 must lie inside its nonnegative interval",
+    );
   });
 
   test("rejects missing or empty Python prediction arrays", () => {

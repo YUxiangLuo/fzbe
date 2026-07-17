@@ -26,6 +26,7 @@ from py.src.ensemble_utils import (
 from py.src.metrics import mae, mape, r2, rmse
 from py.src.model_info import attach_method_metadata, ensure_state_metadata
 from py.src.models import arima, boosting, lstm, ma, stacking, weighted_avg
+from py.src.forecast_utils import SIGNED_PREDICTION_DOMAIN
 
 
 class MathematicalGoldenTests(unittest.TestCase):
@@ -131,6 +132,27 @@ class MathematicalGoldenTests(unittest.TestCase):
         self.assertEqual("arima_forecast_distribution", point["calibration_source"])
         self.assertIsNone(point["calibration_mean_error"])
         self.assertIsNone(point["calibration_count"])
+
+        clipped = arima._format_predictions([0.0], [[-5.0, -1.0]])[0]
+        self.assertEqual(0.0, clipped["interval_lower"])
+        self.assertEqual(0.0, clipped["interval_upper"])
+        self.assertEqual(
+            "censored_nonnegative_model_prediction_interval",
+            clipped["interval_kind"],
+        )
+        self.assertGreater(clipped["std_dev"], 0.0)
+
+        signed = arima._format_predictions(
+            [-3.0],
+            [[-5.0, -1.0]],
+            SIGNED_PREDICTION_DOMAIN,
+        )[0]
+        self.assertEqual(-3.0, signed["prediction"])
+        self.assertEqual(-5.0, signed["interval_lower"])
+        self.assertEqual(-1.0, signed["interval_upper"])
+        self.assertEqual("model_prediction_interval", signed["interval_kind"])
+        self.assertEqual(100, arima.ARIMA_SEARCH_MAXITER)
+        self.assertEqual(200, arima.ARIMA_RETRY_MAXITER)
 
     @profile("fast")
     def test_artifact_runtime_manifest_is_required_exactly(self):
