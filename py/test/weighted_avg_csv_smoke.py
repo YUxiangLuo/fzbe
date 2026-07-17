@@ -66,6 +66,26 @@ def assert_all_finite(values: list[float], label: str) -> None:
             raise AssertionError(f"{label}[{index}] is not finite: {value}")
 
 
+def assert_weighted_uncertainty_contract(payload: dict) -> None:
+    for index, point in enumerate(payload.get("predictions") or []):
+        if (
+            point.get("coverage_guarantee") is not False
+            or point.get("upper_error_p99_kind") != "uncalibrated_estimate"
+            or point.get("calibration_source")
+            != "weighted_weight_fit_holdout_reused"
+            or point.get("calibration_origins") != 1
+            or point.get("interval_kind")
+            != "censored_nonnegative_uncalibrated_empirical_residual_quantile"
+            or not 0.0
+            <= point["interval_lower"]
+            <= point["prediction"]
+            <= point["interval_upper"]
+        ):
+            raise AssertionError(
+                f"weighted prediction[{index}] violates its nominal uncertainty contract"
+            )
+
+
 def member_model_path(save_path: Path, model_name: str) -> str:
     return str(save_path.with_name(f"{save_path.stem}_base_{model_name}.pkl"))
 
@@ -278,6 +298,7 @@ def main() -> None:
         assert_series_close([actual_weights[name] for name in BASE_MODELS], [expected_weights[name] for name in BASE_MODELS])
         assert_series_close(actual_eval_predictions, expected_eval_predictions)
         assert_all_finite(actual_eval_std_devs, "train_std_devs")
+        assert_weighted_uncertainty_contract(train_output)
 
         weighted_model_production = temp_path / "weighted-avg-production.pkl"
         fit_output = invoke_model(
@@ -345,6 +366,8 @@ def main() -> None:
         assert_series_close(future_predictions_one, future_predictions_two)
         assert_series_close(future_std_devs_one, future_std_devs_two)
         assert_all_finite(future_std_devs_one, "future_std_devs")
+        assert_weighted_uncertainty_contract(predict_output_one)
+        assert_weighted_uncertainty_contract(predict_output_two)
 
     print(
         json.dumps(

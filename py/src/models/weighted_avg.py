@@ -55,15 +55,20 @@ from subprocess_utils import (
 from uncertainty import ensemble_growth_profile
 
 MODEL_TYPE = "weighted_avg"
+WEIGHTED_CALIBRATION_SOURCE = "weighted_weight_fit_holdout_reused"
+LEGACY_WEIGHTED_CALIBRATION_SOURCE = "internal_validation"
+NONNEGATIVE_INTERVAL_KIND_PREFIX = "censored_nonnegative_"
+UNCALIBRATED_INTERVAL_KIND = "uncalibrated_empirical_residual_quantile"
+UNCALIBRATED_P99_KIND = "uncalibrated_estimate"
 METHOD_NAME = "验证残差MSE倒数加权平均融合"
 FORECAST_STRATEGY = "validation_residual_mse_weighted_average"
 IMPLEMENTATION_NOTES = [
     "教科书组合预测常用逆方差或误差方差-协方差思想分配权重；当预测误差近似无偏时，MSE 与方差口径一致。",
-    "本系统按时间顺序留出末段，并根据模型数、样本数及所有成员的最小可训练条件动态缩减留出段；候选权重先按 1/(MSE+epsilon) 归一化，再按验证样本可靠度向等权组合收缩。",
-    "该规则会同时惩罚系统性偏差和残差波动，但没有估计模型误差之间的协方差；可靠度收缩避免很短验证段产生近乎全押单一模型的权重。",
+    "本系统按时间顺序留出末段，并根据模型数、样本数及所有成员的最小可训练条件动态缩减留出段；候选权重先按 1/(MSE+epsilon) 归一化，再按验证点数决定的启发式收缩系数向等权组合收缩。",
+    "该规则会同时惩罚系统性偏差和残差波动，但没有估计模型误差之间的协方差；启发式收缩避免很短验证段产生近乎全押单一模型的权重。",
     "内部验证只沿用用户选择的 MA 窗口、ES alpha、ARIMA d 与 LSTM 特征/归一化；ARIMA 阶数和 LSTM look-back、容量、批大小、轮数均按当前子训练段重新推导，避免完整训练段信息泄漏。",
     "基础模型随后使用完整训练区间的既有匹配产物或重新拟合产物生成评估预测；所有表示实体销量的成员预测会先截断到不小于 0，再按固定权重组合，组合结果也做同样的非负兜底。",
-    "std_dev、95% 区间和生产用 99% 上侧误差仅用内部时间验证段的 actual-prediction 组合残差校准，并继承成员不确定性的逐 horizon 增长形状；经验分位数会保留稳定偏差，独立评估真实值不参与校准，信息不足时明确标记为 fallback。",
+    "std_dev、名义 95% 范围和生产用名义 99% 上侧误差复用计算权重的同一个时间留出段的一次固定原点跨 horizon 组合残差，并继承成员逐 horizon 增长形状；独立评估真实值不参与估计，信息不足时明确标记 fallback。由于该留出段已用于确定权重且只有一个预测原点，输出明确标记 coverage_guarantee=false 和 upper_error_p99_kind=uncalibrated_estimate，不代表已校准覆盖率；最终销量区间限制为非负并保证包含点预测。",
 ]
 
 
@@ -72,7 +77,170 @@ _parse_feature_name_list = parse_feature_name_list
 _load_lstm_source_state = load_lstm_source_state
 _get_lstm_source_forecast_strategy = get_lstm_source_forecast_strategy
 _prepare_lstm_source_model_for_requested_steps = prepare_lstm_source_model_for_requested_steps
-_format_predictions = format_predictions
+
+
+def _label_weighted_uncertainty_contract(metadata: Dict[str, Any]) -> Dict[str, Any]:
+    """Mark reused weight-fit holdout residual ranges as nominal estimates."""
+    normalized = dict(metadata)
+    raw_horizons = normalized.get("horizons")
+    horizons: List[Dict[str, Any]] = []
+    reused_weight_fit_holdout = False
+    if isinstance(raw_horizons, (list, tuple)):
+        for raw_horizon in raw_horizons:
+            if not isinstance(raw_horizon, dict):
+                continue
+            horizon = dict(raw_horizon)
+            horizon["coverage_guarantee"] = False
+            horizon["upper_error_p99_kind"] = UNCALIBRATED_P99_KIND
+            if horizon.get("calibration_source") in {
+                LEGACY_WEIGHTED_CALIBRATION_SOURCE,
+                WEIGHTED_CALIBRATION_SOURCE,
+            }:
+                reused_weight_fit_holdout = True
+                horizon["calibration_source"] = WEIGHTED_CALIBRATION_SOURCE
+                # These are different lead times from one fixed forecast
+                # origin, not repeated calibration origins for every horizon.
+                horizon["calibration_origins"] = 1
+                if horizon.get("interval_kind") == "empirical_residual_quantile":
+                    horizon["interval_kind"] = UNCALIBRATED_INTERVAL_KIND
+            horizons.append(horizon)
+    normalized["horizons"] = horizons
+    normalized["coverage_guarantee"] = False
+    normalized["upper_error_p99_kind"] = UNCALIBRATED_P99_KIND
+    if reused_weight_fit_holdout or normalized.get("calibration_source") in {
+        LEGACY_WEIGHTED_CALIBRATION_SOURCE,
+        WEIGHTED_CALIBRATION_SOURCE,
+    }:
+        normalized["calibration_source"] = WEIGHTED_CALIBRATION_SOURCE
+        normalized["calibration_origins"] = 1
+        normalized["method"] = (
+            "uncalibrated_weight_fit_holdout_residual_quantiles_member_growth"
+        )
+    return normalized
+
+
+def _apply_weighted_prediction_contract(
+    points: List[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    """Qualify and constrain new or previously prepared Weighted points."""
+    normalized: List[Dict[str, Any]] = []
+    for raw_point in points:
+        if not isinstance(raw_point, dict):
+            raise ValueError("[MODEL] Weighted Average prediction point must be an object.")
+        point = dict(raw_point)
+        try:
+            prediction = float(
+                normalize_demand_forecast([point.get("prediction")])[0]
+            )
+            lower = float(point["interval_lower"])
+            upper = float(point["interval_upper"])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ValueError(
+                "[MODEL] Weighted Average prediction interval is invalid."
+            ) from exc
+        if (
+            not np.isfinite(prediction)
+            or not np.isfinite(lower)
+            or not np.isfinite(upper)
+            or lower > upper
+        ):
+            raise ValueError("[MODEL] Weighted Average prediction interval is invalid.")
+
+        point["prediction"] = prediction
+        point["coverage_guarantee"] = False
+        point["upper_error_p99_kind"] = UNCALIBRATED_P99_KIND
+        if point.get("calibration_source") in {
+            LEGACY_WEIGHTED_CALIBRATION_SOURCE,
+            WEIGHTED_CALIBRATION_SOURCE,
+        }:
+            point["calibration_source"] = WEIGHTED_CALIBRATION_SOURCE
+            point["calibration_origins"] = 1
+            if point.get("interval_kind") == "empirical_residual_quantile":
+                point["interval_kind"] = UNCALIBRATED_INTERVAL_KIND
+
+        lower = min(prediction, max(0.0, lower))
+        upper = max(prediction, max(0.0, upper))
+        interval_kind = point.get("interval_kind")
+        if not isinstance(interval_kind, str) or not interval_kind:
+            raise ValueError(
+                "[MODEL] Weighted Average prediction interval kind is invalid."
+            )
+        if not interval_kind.startswith(NONNEGATIVE_INTERVAL_KIND_PREFIX):
+            point["interval_kind"] = NONNEGATIVE_INTERVAL_KIND_PREFIX + interval_kind
+        point["interval_lower"] = lower
+        point["interval_upper"] = upper
+        normalized.append(point)
+    return normalized
+
+
+def _format_predictions(
+    preds: List[float],
+    std_dev: Any,
+    metadata: Optional[Dict[str, Any]] = None,
+) -> List[Dict[str, Any]]:
+    """Format final Weighted demand forecasts without overstating calibration."""
+    profile = (
+        list(std_dev)
+        if isinstance(std_dev, (list, tuple, np.ndarray))
+        else [float(std_dev)] * len(preds)
+    )
+    normalized_preds = normalize_demand_forecast(preds).tolist()
+    points = format_predictions(
+        normalized_preds,
+        profile,
+        _label_weighted_uncertainty_contract(metadata or {}),
+    )
+    return _apply_weighted_prediction_contract(points)
+
+
+def _validate_weights(
+    weights: Any,
+    expected_model_names: List[str],
+    context: str = "Saved Weighted Average model",
+) -> Dict[str, float]:
+    """Validate persisted fixed blend weights without silently repairing them."""
+    if not isinstance(weights, dict) or set(weights) != set(expected_model_names):
+        raise ValueError(f"[VALIDATION] {context} weights do not match base models.")
+
+    normalized: Dict[str, float] = {}
+    for model_name in expected_model_names:
+        value = weights.get(model_name)
+        if isinstance(value, bool) or not isinstance(
+            value, (int, float, np.integer, np.floating)
+        ):
+            raise ValueError(f"[VALIDATION] {context} weights are invalid.")
+        try:
+            numeric = float(value)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"[VALIDATION] {context} weights are invalid.") from exc
+        if not np.isfinite(numeric) or numeric < 0.0:
+            raise ValueError(f"[VALIDATION] {context} weights are invalid.")
+        normalized[model_name] = numeric
+
+    if not np.isclose(sum(normalized.values()), 1.0, rtol=1e-9, atol=1e-9):
+        raise ValueError(f"[VALIDATION] {context} weights must sum to 1.")
+    return normalized
+
+
+def _validate_base_model_states(
+    base_model_states: Any,
+    expected_model_names: List[str],
+    context: str = "Saved Weighted Average model",
+) -> Dict[str, Dict[str, Any]]:
+    """Validate that every selected member has a usable persisted state."""
+    if not isinstance(base_model_states, dict):
+        raise ValueError(f"[VALIDATION] {context} is missing base model states.")
+    for model_name in expected_model_names:
+        model_state = base_model_states.get(model_name)
+        if (
+            not isinstance(model_state, dict)
+            or not isinstance(model_state.get("model_file"), str)
+            or not model_state["model_file"]
+        ):
+            raise ValueError(
+                f"[VALIDATION] {context} is missing state for base model: {model_name}"
+            )
+    return base_model_states
 
 
 def _load_state(model_path: str) -> Dict[str, Any]:
@@ -80,7 +248,11 @@ def _load_state(model_path: str) -> Dict[str, Any]:
     state = load_model(model_path)
     if not isinstance(state, dict) or state.get("model_type") != MODEL_TYPE:
         raise ValueError("[VALIDATION] Invalid Weighted Average model file.")
-    validate_base_model_names(state.get("models"), "Saved Weighted Average model")
+    models_to_use = validate_base_model_names(
+        state.get("models"), "Saved Weighted Average model"
+    )
+    state["weights"] = _validate_weights(state.get("weights"), models_to_use)
+    _validate_base_model_states(state.get("base_model_states"), models_to_use)
     return ensure_state_metadata(state, METHOD_NAME, FORECAST_STRATEGY, IMPLEMENTATION_NOTES)
 
 
@@ -148,16 +320,14 @@ def _validate_fit_args(
         state.get("models"),
         "Saved Weighted Average model",
     )
+    _validate_weights(state.get("weights"), models_to_use)
 
-    base_model_states = state.get("base_model_states")
-    if not isinstance(base_model_states, dict):
-        raise ValueError("[VALIDATION] Saved Weighted Average model is missing base model states.")
+    base_model_states = _validate_base_model_states(
+        state.get("base_model_states"), models_to_use
+    )
 
     for model_name in models_to_use:
         model_state = base_model_states.get(model_name)
-        if not isinstance(model_state, dict) or not isinstance(model_state.get("model_file"), str):
-            raise ValueError(f"[VALIDATION] Missing saved state for base model: {model_name}")
-
         if model_name != "lstm":
             continue
 
@@ -288,9 +458,13 @@ def predict(
         raise ValueError("[VALIDATION] steps must be > 0 for forecasting.")
 
     state = state or _load_state(model_path)
-    weights = state["weights"]
-    base_model_states = state["base_model_states"]
-    models_to_use = state["models"]
+    models_to_use = validate_base_model_names(
+        state.get("models"), "Saved Weighted Average model"
+    )
+    weights = _validate_weights(state.get("weights"), models_to_use)
+    base_model_states = _validate_base_model_states(
+        state.get("base_model_states"), models_to_use
+    )
 
     base_predictions = []
     member_profiles: Dict[str, List[float]] = {}
@@ -317,20 +491,24 @@ def predict(
     final_predictions = normalize_demand_forecast(final_predictions)
 
     uncertainty_state = state.get("uncertainty") or {}
+    calibration_source = str(
+        uncertainty_state.get("calibration_source")
+        or WEIGHTED_CALIBRATION_SOURCE
+    )
     profile, summary = ensemble_growth_profile(
         member_profiles,
         weights,
         uncertainty_state.get("calibration_residuals") or [],
         uncertainty_state.get("reference_series") or [],
         steps,
-        calibration_source=str(
-            uncertainty_state.get("calibration_source") or "internal_validation"
-        ),
+        calibration_source=calibration_source,
     )
-    summary.setdefault("calibration_source", str(
-        uncertainty_state.get("calibration_source") or "internal_validation"
-    ))
-    return final_predictions.tolist(), profile, summary
+    summary.setdefault("calibration_source", calibration_source)
+    return (
+        final_predictions.tolist(),
+        profile,
+        _label_weighted_uncertainty_contract(summary),
+    )
 
 
 # ---------- train and evaluate ----------
@@ -617,11 +795,14 @@ def train_and_evaluate(
         weight_val_residuals,
         parsed_data.y[train_range],
         eval_forecast_steps,
+        calibration_source=WEIGHTED_CALIBRATION_SOURCE,
     )
     uncertainty_profile = full_uncertainty_profile[
         eval_forecast_offset: eval_forecast_offset + len(eval_range)
     ]
-    uncertainty_summary.setdefault("calibration_source", "internal_validation")
+    uncertainty_summary = _label_weighted_uncertainty_contract(
+        uncertainty_summary
+    )
 
     # ✅ 在独立的eval_range上计算指标
     timestamps = parsed_data.timestamps
@@ -638,7 +819,7 @@ def train_and_evaluate(
 
     uncertainty_state = {
         "calibration_residuals": weight_val_residuals.tolist(),
-        "calibration_source": "internal_validation",
+        "calibration_source": WEIGHTED_CALIBRATION_SOURCE,
         "reference_series": parsed_data.y[train_range].tolist(),
         "profile": full_uncertainty_profile,
         "summary": uncertainty_summary,
@@ -748,7 +929,7 @@ def run(args) -> None:
         state = _load_state(load_path)
         prepared = state.get("prepared_predictions")
         if isinstance(prepared, list) and len(prepared) >= steps:
-            predictions = [dict(point) for point in prepared[:steps]]
+            predictions = _apply_weighted_prediction_contract(prepared[:steps])
         else:
             preds, uncertainty_profile, uncertainty_summary = predict(load_path, steps, state=state)
             predictions = _format_predictions(preds, uncertainty_profile, uncertainty_summary)

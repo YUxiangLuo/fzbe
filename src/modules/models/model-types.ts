@@ -238,7 +238,7 @@ export const GUIDED_TRAINING_STEPS: Record<GuidedModelType, GuidedTrainingStepDe
     {
       id: "blend_evaluate",
       label: "加权组合并评估",
-      description: "按收缩权重组合非负成员预测并计算独立评估指标；不确定性仅由内部权重验证段组合残差校准，信息不足会标记 fallback。",
+      description: "按收缩权重组合非负成员预测并计算独立评估指标；名义误差范围复用同一个权重拟合留出段的一次固定原点残差，并明确标记为未校准、无覆盖率保证。",
       actionLabel: "组合评估",
     },
     {

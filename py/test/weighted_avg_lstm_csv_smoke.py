@@ -106,6 +106,26 @@ def assert_all_finite(values: list[float], label: str) -> None:
             raise AssertionError(f"{label}[{index}] is not finite: {value}")
 
 
+def assert_weighted_uncertainty_contract(payload: dict) -> None:
+    for index, point in enumerate(payload.get("predictions") or []):
+        if (
+            point.get("coverage_guarantee") is not False
+            or point.get("upper_error_p99_kind") != "uncalibrated_estimate"
+            or point.get("calibration_source")
+            != "weighted_weight_fit_holdout_reused"
+            or point.get("calibration_origins") != 1
+            or point.get("interval_kind")
+            != "censored_nonnegative_uncalibrated_empirical_residual_quantile"
+            or not 0.0
+            <= point["interval_lower"]
+            <= point["prediction"]
+            <= point["interval_upper"]
+        ):
+            raise AssertionError(
+                f"weighted prediction[{index}] violates its nominal uncertainty contract"
+            )
+
+
 def assert_error(completed: subprocess.CompletedProcess[str], expected_substring: str) -> None:
     if completed.returncode == 0:
         raise AssertionError(f"expected failure containing {expected_substring!r}, got success")
@@ -282,6 +302,7 @@ def main() -> None:
         assert all(weight >= 0 for weight in actual_weights.values())
         assert_series_close(actual_eval_predictions, expected_eval_predictions)
         assert_all_finite(actual_eval_std_devs, "train_std_devs")
+        assert_weighted_uncertainty_contract(train_output)
 
         saved_lstm_member = Path(train_state["base_model_states"]["lstm"]["model_file"])
         if not saved_lstm_member.exists():
@@ -355,6 +376,8 @@ def main() -> None:
         assert_series_close(future_predictions_one, future_predictions_two)
         assert_series_close(future_std_devs_one, future_std_devs_two)
         assert_all_finite(future_std_devs_one, "future_std_devs")
+        assert_weighted_uncertainty_contract(predict_output_one)
+        assert_weighted_uncertainty_contract(predict_output_two)
 
         missing_feature_result = run_command(
             "weighted_avg",

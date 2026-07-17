@@ -297,6 +297,36 @@ def assert_obsolete_ensemble_states_are_rejected() -> None:
             raise AssertionError("invalid Stacking meta-model state was accepted")
 
     with tempfile.TemporaryDirectory() as temp_dir:
+        invalid_weighted_path = os.path.join(temp_dir, "invalid-weighted.pkl")
+        with open(invalid_weighted_path, "wb") as handle:
+            pickle.dump({
+                "model_type": "weighted_avg",
+                "models": ["ma", "es"],
+                "weights": {"ma": 2.0, "es": -1.0},
+                "base_model_states": {
+                    "ma": {"model_file": "ma.pkl"},
+                    "es": {"model_file": "es.pkl"},
+                },
+            }, handle)
+        try:
+            weighted_avg._load_state(invalid_weighted_path)
+        except ValueError as exc:
+            assert "weights are invalid" in str(exc)
+        else:
+            raise AssertionError("Weighted artifact with a negative weight was accepted")
+
+        for invalid_weights, expected_message in (
+            ({"ma": 0.5, "es": 0.4}, "sum to 1"),
+            ({"ma": 0.5, "arima": 0.5}, "do not match base models"),
+            ({"ma": float("nan"), "es": 0.5}, "weights are invalid"),
+        ):
+            try:
+                weighted_avg._validate_weights(invalid_weights, ["ma", "es"])
+            except ValueError as exc:
+                assert expected_message in str(exc)
+            else:
+                raise AssertionError("Invalid Weighted weights were accepted")
+
         legacy_boosting_path = os.path.join(temp_dir, "legacy-boosting.pkl")
         with open(legacy_boosting_path, "wb") as handle:
             pickle.dump({
@@ -756,6 +786,81 @@ def assert_horizon_aware_uncertainty_profiles() -> None:
     assert signed_lstm_point["prediction"] == -1.0
     assert signed_lstm_point["interval_lower"] < 0.0
     assert signed_lstm_point["interval_kind"] == "uncalibrated_empirical_residual_quantile"
+
+    weighted_profile, raw_weighted_summary = ensemble_growth_profile(
+        {"ma": [1.0, 1.2]},
+        {"ma": 1.0},
+        [-5.0, -4.0, -3.0],
+        [1.0, 2.0, 3.0, 4.0],
+        2,
+        calibration_source="internal_validation",
+    )
+    weighted_summary = weighted_avg._label_weighted_uncertainty_contract(
+        raw_weighted_summary
+    )
+    assert weighted_summary["coverage_guarantee"] is False
+    assert weighted_summary["upper_error_p99_kind"] == "uncalibrated_estimate"
+    assert (
+        weighted_summary["calibration_source"]
+        == "weighted_weight_fit_holdout_reused"
+    )
+    assert weighted_summary["calibration_origins"] == 1
+    assert all(
+        horizon["calibration_origins"] == 1
+        for horizon in weighted_summary["horizons"]
+    )
+    demand_weighted_points = weighted_avg._format_predictions(
+        [0.5, 0.25],
+        weighted_profile,
+        raw_weighted_summary,
+    )
+    assert all(point["coverage_guarantee"] is False for point in demand_weighted_points)
+    assert all(
+        point["upper_error_p99_kind"] == "uncalibrated_estimate"
+        for point in demand_weighted_points
+    )
+    assert all(
+        point["calibration_source"] == "weighted_weight_fit_holdout_reused"
+        and point["calibration_origins"] == 1
+        for point in demand_weighted_points
+    )
+    assert all(
+        point["interval_kind"]
+        == "censored_nonnegative_uncalibrated_empirical_residual_quantile"
+        for point in demand_weighted_points
+    )
+    assert all(
+        0.0 <= point["interval_lower"] <= point["prediction"] <= point["interval_upper"]
+        for point in demand_weighted_points
+    )
+    legacy_prepared_weighted_point = weighted_avg._apply_weighted_prediction_contract([
+        {
+            "prediction": 2.0,
+            "std_dev": 1.0,
+            "uncertainty_source": "empirical",
+            "interval_lower": -7.85,
+            "interval_upper": -2.15,
+            "interval_level": 0.95,
+            "interval_kind": "empirical_residual_quantile",
+            "upper_error_p99": 0.0,
+            "coverage_guarantee": True,
+            "calibration_source": "internal_validation",
+            "calibration_mean_error": -5.0,
+            "calibration_count": 4,
+        }
+    ])[0]
+    assert legacy_prepared_weighted_point["interval_lower"] == 0.0
+    assert legacy_prepared_weighted_point["interval_upper"] == 2.0
+    assert legacy_prepared_weighted_point["coverage_guarantee"] is False
+    assert (
+        legacy_prepared_weighted_point["calibration_source"]
+        == "weighted_weight_fit_holdout_reused"
+    )
+    assert legacy_prepared_weighted_point["calibration_origins"] == 1
+    assert (
+        legacy_prepared_weighted_point["interval_kind"]
+        == "censored_nonnegative_uncalibrated_empirical_residual_quantile"
+    )
 
     stacking_profile, raw_stacking_summary = ensemble_growth_profile(
         {"ma": [1.0, 1.2]},

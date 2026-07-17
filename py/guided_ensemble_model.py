@@ -604,6 +604,11 @@ def _run_weighted(step_id: str, args, state: Dict[str, Any]) -> Dict[str, Any]:
         weights, diagnostics = weighted_avg._compute_inverse_residual_mse_weights(
             y_true_val, predictions
         )
+        weights = weighted_avg._validate_weights(
+            weights,
+            models_to_use,
+            "Computed Weighted Average model",
+        )
         state["weights"] = weights
         state["weight_diagnostics"] = diagnostics
         return {"weights": weights, "weight_diagnostics": diagnostics}
@@ -634,7 +639,11 @@ def _run_weighted(step_id: str, args, state: Dict[str, Any]) -> Dict[str, Any]:
 
     if step_id == "blend_evaluate":
         eval_predictions = state["eval_predictions"]
-        weights = state["weights"]
+        weights = weighted_avg._validate_weights(
+            state.get("weights"),
+            models_to_use,
+            "Guided Weighted Average model",
+        )
         x_eval = np.array([eval_predictions[name] for name in models_to_use]).T
         model_weights = np.array([weights[name] for name in models_to_use])
         y_pred_final = np.sum(x_eval * model_weights, axis=1)
@@ -654,11 +663,14 @@ def _run_weighted(step_id: str, args, state: Dict[str, Any]) -> Dict[str, Any]:
             weight_val_residuals,
             parsed_data.y[train_range],
             eval_forecast_steps,
+            calibration_source=weighted_avg.WEIGHTED_CALIBRATION_SOURCE,
         )
         uncertainty_profile = full_uncertainty_profile[
             eval_forecast_offset: eval_forecast_offset + len(eval_range)
         ]
-        uncertainty_summary.setdefault("calibration_source", "internal_validation")
+        uncertainty_summary = weighted_avg._label_weighted_uncertainty_contract(
+            uncertainty_summary
+        )
         timestamps = parsed_data.timestamps
         metrics = {
             "rmse": rmse(y_true, y_pred_final),
@@ -688,7 +700,7 @@ def _run_weighted(step_id: str, args, state: Dict[str, Any]) -> Dict[str, Any]:
         state["y_pred"] = y_pred_final.tolist()
         state["uncertainty"] = {
             "calibration_residuals": weight_val_residuals.tolist(),
-            "calibration_source": "internal_validation",
+            "calibration_source": weighted_avg.WEIGHTED_CALIBRATION_SOURCE,
             "reference_series": parsed_data.y[train_range].tolist(),
             "profile": full_uncertainty_profile,
             "summary": uncertainty_summary,

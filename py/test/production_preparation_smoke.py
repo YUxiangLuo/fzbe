@@ -205,7 +205,7 @@ def _assert_current_prediction_contract(payload: dict[str, Any], model_type: str
         upper = float(point["interval_upper"])
         if lower > upper:
             raise AssertionError(f"{model_type}.predictions[{index}] has an inverted interval")
-        if model_type in {"arima", "lstm", "stacking", "boosting"}:
+        if model_type in {"arima", "lstm", "weighted_avg", "stacking", "boosting"}:
             expected_interval_kind = (
                 "censored_nonnegative_model_prediction_interval"
                 if model_type == "arima"
@@ -220,16 +220,20 @@ def _assert_current_prediction_contract(payload: dict[str, Any], model_type: str
                 raise AssertionError(f"{model_type}.predictions[{index}] lost its demand interval semantics")
             if not 0.0 <= lower <= prediction <= upper:
                 raise AssertionError(f"{model_type}.predictions[{index}] violates its demand interval")
-        if model_type in {"lstm", "stacking", "boosting"} and (
+        if model_type in {"lstm", "weighted_avg", "stacking", "boosting"} and (
             point.get("coverage_guarantee") is not False
             or point.get("upper_error_p99_kind") != "uncalibrated_estimate"
         ):
             raise AssertionError(f"{model_type}.predictions[{index}] overstates uncertainty calibration")
-        if model_type in {"stacking", "boosting"} and point.get("uncertainty_source") == "empirical":
+        if model_type in {"weighted_avg", "stacking", "boosting"} and point.get("uncertainty_source") == "empirical":
             expected_source = (
                 "stacking_meta_fit_holdout_reused"
                 if model_type == "stacking"
-                else "boosting_selection_holdout_reused"
+                else (
+                    "boosting_selection_holdout_reused"
+                    if model_type == "boosting"
+                    else "weighted_weight_fit_holdout_reused"
+                )
             )
             if (
                 point.get("calibration_source") != expected_source

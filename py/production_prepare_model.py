@@ -29,6 +29,7 @@ from ensemble_utils import (
     get_member_model_path,
     normalize_demand_forecast,
     remove_member_model_artifact,
+    validate_base_model_names,
 )
 from error_protocol import format_known_error
 from model_info import attach_method_metadata, ensure_state_metadata
@@ -191,10 +192,21 @@ def _initialize(args, state: Dict[str, Any]) -> Dict[str, Any]:
     if args.model_type in BASE_MODULES:
         work_items = [{"id": "fit_model", "model": args.model_type}]
     elif args.model_type in {"weighted_avg", "stacking"}:
-        models = list(source_state.get("models") or [])
-        if len(models) < 2:
-            raise ValueError("[MODEL] Ensemble artifact has no usable member list.")
-        if args.model_type == "stacking":
+        if args.model_type == "weighted_avg":
+            models = validate_base_model_names(
+                source_state.get("models"),
+                "Saved Weighted Average model",
+            )
+            source_state["weights"] = weighted_avg._validate_weights(
+                source_state.get("weights"),
+                models,
+            )
+            weighted_avg._validate_base_model_states(
+                source_state.get("base_model_states"),
+                models,
+            )
+        else:
+            models = list(source_state.get("models") or [])
             stacking._validate_meta_model(
                 source_state.get("meta_model"),
                 expected_model_names=models,
@@ -381,7 +393,10 @@ def _finalize(state: Dict[str, Any]) -> Dict[str, Any]:
     module = ENSEMBLE_MODULES[model_type]
     if model_type == "weighted_avg":
         models = list(source_state["models"])
-        weights = dict(source_state["weights"])
+        weights = weighted_avg._validate_weights(
+            source_state.get("weights"),
+            models,
+        )
         matrix = np.asarray([state["member_predictions"][name] for name in models], dtype=float).T
         predictions = normalize_demand_forecast(
             matrix @ np.asarray([weights[name] for name in models], dtype=float)
@@ -422,7 +437,11 @@ def _finalize(state: Dict[str, Any]) -> Dict[str, Any]:
         or (
             stacking.STACKING_CALIBRATION_SOURCE
             if model_type == "stacking"
-            else "internal_validation"
+            else (
+                weighted_avg.WEIGHTED_CALIBRATION_SOURCE
+                if model_type == "weighted_avg"
+                else "internal_validation"
+            )
         )
     )
     profile, summary = ensemble_growth_profile(
@@ -433,7 +452,9 @@ def _finalize(state: Dict[str, Any]) -> Dict[str, Any]:
         steps,
         calibration_source=calibration_source,
     )
-    if model_type == "boosting":
+    if model_type == "weighted_avg":
+        summary = weighted_avg._label_weighted_uncertainty_contract(summary)
+    elif model_type == "boosting":
         summary = boosting._label_boosting_uncertainty_contract(summary)
     elif model_type == "stacking":
         summary = stacking._label_stacking_uncertainty_contract(summary)

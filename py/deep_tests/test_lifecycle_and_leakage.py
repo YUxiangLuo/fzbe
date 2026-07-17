@@ -60,14 +60,14 @@ class SevenModelLifecycleTests(unittest.TestCase):
                             else (
                                 "boosting_selection_holdout_reused"
                                 if model == "boosting"
-                                else "internal_validation"
+                                else "weighted_weight_fit_holdout_reused"
                             )
                         )
                         self.assertEqual(
                             expected_calibration_source,
                             state["uncertainty"]["calibration_source"],
                         )
-                        if model in {"stacking", "boosting"}:
+                        if model in {"weighted_avg", "stacking", "boosting"}:
                             self.assertIs(
                                 False,
                                 state["uncertainty"]["summary"]["coverage_guarantee"],
