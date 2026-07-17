@@ -48,7 +48,7 @@ MODEL_ARGS = {
 }
 
 
-def build_medium_sales_records(month_count: int = 18) -> list[dict[str, Any]]:
+def build_medium_sales_records(month_count: int = 26) -> list[dict[str, Any]]:
     records: list[dict[str, Any]] = []
     channels = ["线上", "门店", "批发"]
     regions = ["华东", "华北", "华南", "西南"]
@@ -342,15 +342,17 @@ def assert_stacking_output(payload: dict, expected_length: int, expected_models:
     condition_number = meta_model.get("condition_number")
     if condition_number is not None and not math.isfinite(float(condition_number)):
         raise AssertionError(f"{label} condition_number must be finite or null: {condition_number!r}")
-    weights = meta_model.get("weights")
-    if not isinstance(weights, list) or len(weights) != len(expected_models):
-        raise AssertionError(f"{label} missing stacking weights: {weights!r}")
+    coefficients = meta_model.get("coefficients")
+    if not isinstance(coefficients, list) or len(coefficients) != len(expected_models):
+        raise AssertionError(f"{label} missing stacking coefficients: {coefficients!r}")
     model_names = meta_model.get("model_names")
     if not isinstance(model_names, list) or set(model_names) != set(expected_models):
         raise AssertionError(f"{label} stacking model_names mismatch: {model_names!r}")
-    total = sum(float(value) for value in weights)
-    if not math.isclose(total, 1.0, rel_tol=1e-6, abs_tol=1e-6):
-        raise AssertionError(f"{label} stacking weights do not sum to 1: {weights}")
+    numeric_coefficients = [float(value) for value in coefficients]
+    if any(not math.isfinite(value) or value < 0.0 for value in numeric_coefficients):
+        raise AssertionError(
+            f"{label} stacking coefficients must be finite and non-negative: {coefficients}"
+        )
 
 
 def assert_boosting_output(payload: dict, expected_length: int, label: str) -> None:
@@ -486,10 +488,14 @@ def run_ensemble_lifecycle(
 def main() -> None:
     records = build_medium_sales_records()
     data_json = json.dumps(records, ensure_ascii=False)
-    train_end = 11
-    eval_start = 12
-    eval_end = 14
-    production_end = 17
+    # Twenty training rows are the first boundary at which the full four-model,
+    # full-feature Stacking case can retain six Level-1 rows and an LSTM-feasible
+    # fourteen-row Level-0 prefix. Keep three independent evaluation rows and
+    # three later rows for fit-only production lifecycle checks.
+    train_end = 19
+    eval_start = 20
+    eval_end = 22
+    production_end = 25
     future_steps = 3
     all_combinations = [
         list(combo)

@@ -196,9 +196,16 @@ def plan_internal_holdout(
                 "teaching_small_sample": validation_size < desired or n < 20,
             }
 
+    purpose_label = {
+        "weighted": "加权平均",
+        "boosting": "Boosting",
+        "stacking": "Stacking",
+    }[purpose]
     raise ValueError(
-        "[VALIDATION] No chronological internal holdout can fit every selected base model "
-        f"for {purpose} (train_size={n}, desired_validation={desired})."
+        "[VALIDATION] 当前训练窗口无法同时满足 "
+        f"{purpose_label} 的时间留出要求和所有已选基础模型的训练要求"
+        f"（训练点数={n}，目标留出点数={desired}）。"
+        "请扩大训练窗口，或减少基础模型/历史特征后重试。"
     )
 
 

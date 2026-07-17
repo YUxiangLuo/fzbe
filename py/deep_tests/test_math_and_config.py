@@ -1,12 +1,9 @@
 from __future__ import annotations
 
-import math
 import os
-import tempfile
 import threading
 import unittest
 from copy import deepcopy
-from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -14,7 +11,6 @@ import numpy as np
 import pandas as pd
 import guided_model
 
-from py.deep_tests.support.harness import DATASETS, assert_prediction_contract, prediction_values, run_command
 from py.deep_tests.support.oracles import metrics, nonnegative_line_search, recursive_ma, shrunk_inverse_mse_weights
 from py.deep_tests.support.profiles import profile
 from py.src.dynamic_config import derive_arima_search_limit, derive_boosting_max_rounds, derive_lstm_config, plan_internal_holdout
@@ -240,7 +236,7 @@ class DynamicConfigurationTests(unittest.TestCase):
         feasible = plan_internal_holdout("weighted", 20, 2, lambda prefix, validation: True)
         self.assertEqual(4, feasible["validation_size"])
         self.assertEqual(4, plan_internal_holdout("stacking", 20, 2, lambda p, v: True)["validation_size"])
-        with self.assertRaisesRegex(ValueError, "No chronological"):
+        with self.assertRaisesRegex(ValueError, "当前训练窗口无法同时满足 Boosting"):
             plan_internal_holdout("boosting", 20, 2, lambda p, v: False)
         self.assertEqual([1, 3, 4], [derive_boosting_max_rounds(2, value) for value in (2, 4, 10)])
 

@@ -21,6 +21,7 @@ from scipy.sparse import csr_matrix
 
 from data_utils import ParsedData, infer_feature_types, load_data_from_json
 from ensemble_utils import (
+    SUPPORTED_BASE_MODEL_TYPES,
     build_ensemble_subprocess_data,
     format_predictions,
     get_lstm_source_forecast_strategy,
@@ -117,6 +118,56 @@ def _label_boosting_uncertainty_contract(metadata: Dict[str, Any]) -> Dict[str, 
     return normalized
 
 
+def _apply_boosting_prediction_contract(
+    points: List[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    """Qualify and constrain new or previously prepared Boosting points."""
+    normalized: List[Dict[str, Any]] = []
+    for raw_point in points:
+        if not isinstance(raw_point, dict):
+            raise ValueError("[MODEL] Boosting prediction point must be an object.")
+        point = dict(raw_point)
+        try:
+            prediction = float(
+                normalize_demand_forecast([point.get("prediction")])[0]
+            )
+            lower = float(point["interval_lower"])
+            upper = float(point["interval_upper"])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ValueError("[MODEL] Boosting prediction interval is invalid.") from exc
+        if (
+            not np.isfinite(prediction)
+            or not np.isfinite(lower)
+            or not np.isfinite(upper)
+            or lower > upper
+        ):
+            raise ValueError("[MODEL] Boosting prediction interval is invalid.")
+
+        point["prediction"] = prediction
+        point["coverage_guarantee"] = False
+        point["upper_error_p99_kind"] = UNCALIBRATED_P99_KIND
+        if point.get("calibration_source") in {
+            "internal_validation",
+            BOOSTING_CALIBRATION_SOURCE,
+        }:
+            point["calibration_source"] = BOOSTING_CALIBRATION_SOURCE
+            point["calibration_origins"] = 1
+            if point.get("interval_kind") == "empirical_residual_quantile":
+                point["interval_kind"] = UNCALIBRATED_INTERVAL_KIND
+
+        lower = min(prediction, max(0.0, lower))
+        upper = max(prediction, max(0.0, upper))
+        interval_kind = point.get("interval_kind")
+        if not isinstance(interval_kind, str) or not interval_kind:
+            raise ValueError("[MODEL] Boosting prediction interval kind is invalid.")
+        if not interval_kind.startswith(NONNEGATIVE_INTERVAL_KIND_PREFIX):
+            point["interval_kind"] = NONNEGATIVE_INTERVAL_KIND_PREFIX + interval_kind
+        point["interval_lower"] = lower
+        point["interval_upper"] = upper
+        normalized.append(point)
+    return normalized
+
+
 def _format_predictions(
     preds: List[float],
     std_dev: Any,
@@ -134,32 +185,7 @@ def _format_predictions(
         profile,
         _label_boosting_uncertainty_contract(metadata or {}),
     )
-    normalized: List[Dict[str, Any]] = []
-    for raw_point in points:
-        point = dict(raw_point)
-        point["coverage_guarantee"] = False
-        point["upper_error_p99_kind"] = UNCALIBRATED_P99_KIND
-        if point.get("calibration_source") in {
-            "internal_validation",
-            BOOSTING_CALIBRATION_SOURCE,
-        }:
-            point["calibration_source"] = BOOSTING_CALIBRATION_SOURCE
-            point["calibration_origins"] = 1
-            if point.get("interval_kind") == "empirical_residual_quantile":
-                point["interval_kind"] = UNCALIBRATED_INTERVAL_KIND
-
-        prediction = float(point["prediction"])
-        lower = min(prediction, max(0.0, float(point["interval_lower"])))
-        upper = max(prediction, max(0.0, float(point["interval_upper"])))
-        interval_kind = point.get("interval_kind")
-        if not isinstance(interval_kind, str) or not interval_kind:
-            raise ValueError("[MODEL] Boosting prediction interval kind is invalid.")
-        if not interval_kind.startswith(NONNEGATIVE_INTERVAL_KIND_PREFIX):
-            point["interval_kind"] = NONNEGATIVE_INTERVAL_KIND_PREFIX + interval_kind
-        point["interval_lower"] = lower
-        point["interval_upper"] = upper
-        normalized.append(point)
-    return normalized
+    return _apply_boosting_prediction_contract(points)
 
 
 def _load_state(model_path: str) -> Dict[str, Any]:
@@ -170,17 +196,31 @@ def _load_state(model_path: str) -> Dict[str, Any]:
         or state.get("boosting_variant") != "residual"
     ):
         raise ValueError("[VALIDATION] Invalid Boosting model file.")
-    return ensure_state_metadata(state, METHOD_NAME, FORECAST_STRATEGY, IMPLEMENTATION_NOTES)
+    state = ensure_state_metadata(state, METHOD_NAME, FORECAST_STRATEGY, IMPLEMENTATION_NOTES)
+    # Validate the complete persisted chain even when prepared predictions are
+    # available, so that cached output cannot bypass the artifact schema.
+    list(_iter_stage_models(state))
+    return state
 
 
 def _get_stage_coefficients(model_chain: List[str], state: Dict[str, Any]) -> List[float]:
     explicit_coefficients = state.get("stage_coefficients")
     if not isinstance(explicit_coefficients, list) or len(explicit_coefficients) != len(model_chain):
         raise ValueError("[VALIDATION] Saved Boosting model has invalid stage coefficients.")
-    coefficients = np.asarray(explicit_coefficients, dtype=float).reshape(-1)
-    if not np.isfinite(coefficients).all():
-        raise ValueError("[VALIDATION] Saved Boosting model has non-finite stage coefficients.")
-    return coefficients.tolist()
+    coefficients: List[float] = []
+    for raw_coefficient in explicit_coefficients:
+        if isinstance(raw_coefficient, bool) or not isinstance(
+            raw_coefficient,
+            (int, float, np.integer, np.floating),
+        ):
+            raise ValueError("[VALIDATION] Saved Boosting model has invalid stage coefficients.")
+        coefficient = float(raw_coefficient)
+        if not np.isfinite(coefficient) or coefficient < 0.0:
+            raise ValueError(
+                "[VALIDATION] Saved Boosting model stage coefficients must be finite and non-negative."
+            )
+        coefficients.append(coefficient)
+    return coefficients
 
 
 def _apply_stage_output_semantics(stage_idx: int, values: Any) -> np.ndarray:
@@ -218,20 +258,45 @@ def _iter_stage_models(state: Dict[str, Any]):
     usage_counts: Dict[str, int] = {}
 
     for stage_idx, model_name in enumerate(model_chain):
+        if not isinstance(model_name, str) or model_name not in SUPPORTED_BASE_MODEL_TYPES:
+            raise ValueError(
+                "[VALIDATION] Saved Boosting model contains an unsupported base model "
+                f"at stage {stage_idx + 1}."
+            )
         model_info = base_model_states.get(model_name)
         if not isinstance(model_info, dict):
             raise ValueError(f"[VALIDATION] Missing saved state for base model: {model_name}")
 
         models = model_info.get("models")
-        if not isinstance(models, list):
+        if not isinstance(models, list) or len(models) == 0:
             raise ValueError(f"[VALIDATION] Missing saved rounds for base model: {model_name}")
 
         usage_idx = usage_counts.get(model_name, 0)
         if usage_idx >= len(models):
             raise ValueError(f"[VALIDATION] Missing saved round {usage_idx} for base model: {model_name}")
 
+        model_state = models[usage_idx]
+        if not isinstance(model_state, dict):
+            raise ValueError(
+                f"[VALIDATION] Saved Boosting model stage {stage_idx + 1} has invalid state."
+            )
+        persisted_model_type = model_state.get("model_type", model_name)
+        if persisted_model_type != model_name:
+            raise ValueError(
+                f"[VALIDATION] Saved Boosting model stage {stage_idx + 1} has a mismatched model type."
+            )
+        model_file = model_state.get("model_file")
+        if not isinstance(model_file, str) or not model_file.strip():
+            raise ValueError(
+                f"[VALIDATION] Saved Boosting model stage {stage_idx + 1} is missing a model file."
+            )
+        if "params" in model_state and not isinstance(model_state.get("params"), dict):
+            raise ValueError(
+                f"[VALIDATION] Saved Boosting model stage {stage_idx + 1} has invalid parameters."
+            )
+
         usage_counts[model_name] = usage_idx + 1
-        yield stage_idx, model_name, float(stage_coefficients[stage_idx]), models[usage_idx]
+        yield stage_idx, model_name, stage_coefficients[stage_idx], model_state
 
 
 def _build_residual_parsed_data(
@@ -1075,10 +1140,12 @@ def run(args) -> None:
 
     if load_path:
         steps = int(getattr(args, "forecast_steps", 0))
+        if steps <= 0:
+            raise ValueError("[VALIDATION] --forecast_steps must be > 0.")
         state = _load_state(load_path)
         prepared = state.get("prepared_predictions")
         if isinstance(prepared, list) and len(prepared) >= steps:
-            predictions = [dict(point) for point in prepared[:steps]]
+            predictions = _apply_boosting_prediction_contract(prepared[:steps])
         else:
             preds, uncertainty_profile, uncertainty_summary = predict(load_path, steps, state=state)
             predictions = _format_predictions(preds, uncertainty_profile, uncertainty_summary)

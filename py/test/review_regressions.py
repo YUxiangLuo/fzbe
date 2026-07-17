@@ -452,7 +452,8 @@ def assert_internal_split_boundaries() -> None:
             "stacking",
         )
     except ValueError as exc:
-        assert "No chronological internal holdout" in str(exc)
+        assert "当前训练窗口无法同时满足 Stacking" in str(exc)
+        assert "训练点数=8" in str(exc)
     else:
         raise AssertionError("infeasible stacking holdout was accepted")
 
@@ -1810,6 +1811,93 @@ def assert_loaded_ensemble_demand_semantics() -> None:
         assert predictions == [0.0]
 
 
+def assert_boosting_persisted_state_contract() -> None:
+    valid_chain = ["ma"]
+    for invalid_coefficient in (-0.1, float("nan"), True, "1.0"):
+        try:
+            boosting._get_stage_coefficients(
+                valid_chain,
+                {"stage_coefficients": [invalid_coefficient]},
+            )
+        except ValueError as exc:
+            assert "stage coefficients" in str(exc)
+        else:
+            raise AssertionError(
+                f"Boosting accepted invalid persisted coefficient: {invalid_coefficient!r}"
+            )
+
+    valid_stage_state = {
+        "model_chain": ["ma"],
+        "stage_coefficients": [1.0],
+        "base_model_states": {
+            "ma": {"models": [{"model_type": "ma", "model_file": "ma.pkl", "params": {}}]},
+        },
+    }
+    invalid_states = [
+        {
+            **valid_stage_state,
+            "model_chain": ["unknown"],
+            "base_model_states": {
+                "unknown": {"models": [{"model_file": "unknown.pkl"}]},
+            },
+        },
+        {
+            **valid_stage_state,
+            "base_model_states": {
+                "ma": {"models": [{"model_type": "ma", "model_file": ""}]},
+            },
+        },
+        {
+            **valid_stage_state,
+            "base_model_states": {
+                "ma": {"models": [{"model_type": "es", "model_file": "ma.pkl"}]},
+            },
+        },
+    ]
+    for invalid_state in invalid_states:
+        try:
+            list(boosting._iter_stage_models(invalid_state))
+        except ValueError as exc:
+            assert str(exc).startswith("[VALIDATION]")
+        else:
+            raise AssertionError(f"Boosting accepted invalid persisted stage state: {invalid_state!r}")
+
+    prepared_point = {
+        "prediction": -8.0,
+        "std_dev": 2.0,
+        "uncertainty_source": "empirical",
+        "calibration_source": "internal_validation",
+        "interval_lower": -10.0,
+        "interval_upper": -6.0,
+        "interval_level": 0.95,
+        "interval_kind": "empirical_residual_quantile",
+        "upper_error_p99": 3.0,
+    }
+    normalized_point = boosting._apply_boosting_prediction_contract([prepared_point])[0]
+    assert normalized_point["prediction"] == 0.0
+    assert normalized_point["interval_lower"] == 0.0
+    assert normalized_point["interval_upper"] == 0.0
+    assert normalized_point["coverage_guarantee"] is False
+    assert normalized_point["calibration_origins"] == 1
+    assert (
+        normalized_point["interval_kind"]
+        == "censored_nonnegative_uncalibrated_empirical_residual_quantile"
+    )
+
+    invalid_forecast_args = argparse.Namespace(
+        pretty=False,
+        save_model=None,
+        load_model="missing-boosting.pkl",
+        fit_only=False,
+        forecast_steps=0,
+    )
+    try:
+        boosting.run(invalid_forecast_args)
+    except ValueError as exc:
+        assert "--forecast_steps must be > 0" in str(exc)
+    else:
+        raise AssertionError("Boosting accepted a zero loaded-prediction horizon")
+
 def assert_same_path_artifact_replay() -> None:
     with tempfile.TemporaryDirectory() as temp_dir:
         model_path = os.path.join(temp_dir, "member.pkl")
@@ -2155,6 +2243,7 @@ def main() -> None:
     assert_boosting_refit_preserves_validation_coefficients_and_calibration()
     assert_subprocess_prediction_domains()
     assert_loaded_ensemble_demand_semantics()
+    assert_boosting_persisted_state_contract()
     assert_same_path_artifact_replay()
     assert_corrupt_state_errors()
     assert_large_dataset_uses_data_file()
