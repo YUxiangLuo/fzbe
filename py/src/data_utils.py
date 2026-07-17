@@ -382,6 +382,7 @@ def _data_error(message: str) -> ValueError:
 
 _YEAR_MONTH_SHAPE_PATTERN = re.compile(r"^\s*(\d{4})[-/](0?[1-9]|1[0-2])\s*$")
 _YEAR_MONTH_PATTERN = re.compile(r"^\s*([1-9]\d{3})[-/](0?[1-9]|1[0-2])\s*$")
+_YEAR_MONTH_CANDIDATE_PATTERN = re.compile(r"^\s*\d{4}[-/]\d{1,2}\s*$")
 
 
 def _raise_time_axis_error(time_key: str, message: str) -> None:
@@ -411,6 +412,28 @@ def _validate_order_and_spacing(
             "must use one fixed frequency with no missing periods.",
         )
     return step
+
+
+def _has_consistent_monthly_anchor(timestamps: pd.Series) -> bool:
+    """Return whether full timestamps represent one stable calendar-month slot."""
+    if len(timestamps) <= 1:
+        return True
+
+    # A calendar-month series must keep the same local time.  Otherwise merely
+    # having one observation in each consecutive month is not enough to infer a
+    # monthly frequency.
+    time_of_day = timestamps - timestamps.dt.normalize()
+    if not bool(time_of_day.eq(time_of_day.iloc[0]).all()):
+        return False
+
+    # Accept a fixed day of month and the usual end-of-shorter-month clamping
+    # (for example Jan 30, Feb 29, Mar 30).  This also covers month-start and
+    # month-end sequences without accepting arbitrary intra-month dates.
+    days = timestamps.dt.day.to_numpy(dtype=np.int64)
+    days_in_month = timestamps.dt.days_in_month.to_numpy(dtype=np.int64)
+    anchor_day = int(days.max())
+    expected_days = np.minimum(anchor_day, days_in_month)
+    return bool(np.array_equal(days, expected_days))
 
 
 def _validate_time_axis(df: pd.DataFrame, time_key: str) -> str:
@@ -483,13 +506,14 @@ def _validate_time_axis(df: pd.DataFrame, time_key: str) -> str:
         if np.any(differences < 0):
             _raise_time_axis_error(time_key, "must be strictly increasing in input row order.")
 
-        # Consecutive calendar months are fixed-frequency even though their
-        # durations vary between 28 and 31 days.
+        # Consecutive calendar months are monthly only when they refer to a
+        # stable position within each month.  Arbitrary dates that merely land
+        # in adjacent months must still satisfy the exact fixed-step rule.
         month_ordinals = np.asarray(
             [stamp.year * 12 + stamp.month - 1 for stamp in timestamps],
             dtype=np.int64,
         )
-        if np.all(np.diff(month_ordinals) == 1):
+        if np.all(np.diff(month_ordinals) == 1) and _has_consistent_monthly_anchor(timestamps):
             return "monthly"
 
         _validate_order_and_spacing(timestamp_ns, time_key=time_key)
@@ -577,6 +601,21 @@ def load_data_from_json(
                 df["年份"] = year_values
                 df["月份"] = month_values
                 log.info(f"Created composite time_key: '{time_key}'")
+
+        elif (
+            "月份" in df.columns
+            and df["月份"]
+            .astype(str)
+            .map(_YEAR_MONTH_CANDIDATE_PATTERN.fullmatch)
+            .notna()
+            .any()
+        ):
+            # Legacy dataset rows can contain a single Chinese month column
+            # whose values already carry the complete YYYY-MM timestamp.
+            # Treat mixed/malformed candidates as a time axis as well so
+            # validation rejects them instead of silently using row indices.
+            time_key = "月份"
+            log.info("Using standalone combined '月份' values as the monthly time axis.")
 
         elif "month" in df.columns:
             time_key = "month"

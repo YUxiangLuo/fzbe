@@ -115,6 +115,61 @@ class DataContractTests(unittest.TestCase):
         self.assertEqual(records[0]["月份"], parsed.df.iloc[0]["月份"])
 
     @profile("fast")
+    def test_standalone_chinese_year_month_is_detected_and_validated_end_to_end(self):
+        months = [f"2024-{index + 1:02d}" for index in range(8)]
+        records = [{"月份": month, "销售数量": 10 + index} for index, month in enumerate(months)]
+
+        parsed = load_data_from_json(json.dumps(records, ensure_ascii=False))
+        self.assertEqual("月份", parsed.time_key)
+        self.assertEqual("monthly", parsed.time_frequency)
+        self.assertNotIn("月份", parsed.feature_keys)
+
+        result = self._run_ma_text(json.dumps(records, ensure_ascii=False), True)
+        self.assertEqual(months[6:8], result.payload["evaluate_range"]["months"])
+
+        invalid_months = {
+            "duplicate": [
+                "2024-01", "2024-02", "2024-03", "2024-04",
+                "2024-04", "2024-05", "2024-06", "2024-07",
+            ],
+            "reordered": [
+                "2024-01", "2024-02", "2024-04", "2024-03",
+                "2024-05", "2024-06", "2024-07", "2024-08",
+            ],
+            "missing": [
+                "2024-01", "2024-02", "2024-03", "2024-04",
+                "2024-06", "2024-07", "2024-08", "2024-09",
+            ],
+        }
+        for name, invalid in invalid_months.items():
+            with self.subTest(name=name):
+                invalid_records = [
+                    {"月份": month, "销售数量": 10 + index}
+                    for index, month in enumerate(invalid)
+                ]
+                result = self._run_ma_text(json.dumps(invalid_records, ensure_ascii=False), False)
+                self.assertIn("[DATA]", result.stderr)
+                self.assertIn("Time column '月份'", result.stderr)
+
+    @profile("fast")
+    def test_full_dates_require_a_consistent_calendar_month_anchor(self):
+        valid_cases = {
+            "same_day": ["2024-01-15", "2024-02-15", "2024-03-15", "2024-04-15"],
+            "clamped_month_end": ["2024-01-31", "2024-02-29", "2024-03-31", "2024-04-30"],
+            "clamped_day_30": ["2024-01-30", "2024-02-29", "2024-03-30", "2024-04-30"],
+        }
+        for name, dates in valid_cases.items():
+            with self.subTest(name=name):
+                records = [{"date": date, "y": index} for index, date in enumerate(dates)]
+                parsed = load_data_from_json(json.dumps(records))
+                self.assertEqual("monthly", parsed.time_frequency)
+
+        inconsistent_dates = ["2024-01-02", "2024-02-21", "2024-03-04", "2024-04-27"]
+        records = [{"date": date, "y": index} for index, date in enumerate(inconsistent_dates)]
+        with self.assertRaisesRegex(ValueError, r"\[DATA\].*Time column 'date'.*fixed frequency"):
+            load_data_from_json(json.dumps(records))
+
+    @profile("fast")
     def test_combined_month_rejects_years_before_1000(self):
         for year in ("0000", "0999"):
             for time_key in ("month", "period"):
