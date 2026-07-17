@@ -182,7 +182,7 @@ export const GUIDED_TRAINING_STEPS: Record<GuidedModelType, GuidedTrainingStepDe
     {
       id: "train_model",
       label: "训练神经网络",
-      description: "标准数据量下按时间顺序划分并隔离相邻窗口，用验证 loss 早停选择轮数，再以该轮数在全部窗口重拟合；样本太少时进入明确标注的教学演示模式。",
+      description: "监督窗口足够时进入有限时间验证模式：按时间顺序划分并隔离相邻窗口，用验证 loss 早停选择轮数，再以该轮数在全部窗口重拟合；样本太少时进入明确标注的教学演示模式。两种模式都不代表生产级泛化验证。",
       actionLabel: "训练模型",
     },
     {
@@ -194,7 +194,7 @@ export const GUIDED_TRAINING_STEPS: Record<GuidedModelType, GuidedTrainingStepDe
     {
       id: "evaluate_metrics",
       label: "计算误差指标",
-      description: "比较非负截断后的预测和真实值并计算指标；标准模式按验证窗口逐 horizon 估计波动，教学演示模式明确使用 fallback。",
+      description: "比较非负截断后的预测和真实值并计算指标；有限时间验证模式复用 EarlyStopping 验证窗口逐 horizon 形成名义误差范围，教学演示模式明确使用 fallback。两者均不宣称 95%/99% 覆盖率已校准，并应另行对比朴素基线。",
       actionLabel: "计算指标",
     },
     {

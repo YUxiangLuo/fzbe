@@ -148,6 +148,16 @@ def train_guided(
             [sys.executable, str(GUIDED_MODEL), model_type, step_id, *protocol_args, *args],
             f"guided {model_type}/{step_id}",
         )
+        if model_type == "lstm" and step_id in {"build_model", "train_model"}:
+            output = payload.get("output")
+            if not isinstance(output, dict):
+                raise AssertionError(f"guided lstm/{step_id} produced no step output")
+            expected_validation = output.get("training_regime") == "limited_time_validation"
+            validation_key = "uses_validation" if step_id == "build_model" else "used_validation"
+            if output.get(validation_key) is not expected_validation:
+                raise AssertionError(
+                    f"guided lstm/{step_id} {validation_key} disagrees with training_regime"
+                )
         input_state = candidate_state
         final_result = payload.get("final_result", final_result)
     if not isinstance(final_result, dict):

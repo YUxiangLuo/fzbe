@@ -19,6 +19,7 @@ from sklearn.preprocessing import MinMaxScaler, OneHotEncoder, StandardScaler
 from data_utils import ParsedData, infer_feature_types as infer_parsed_feature_types, load_data_from_json
 from forecast_utils import (
     DEMAND_PREDICTION_DOMAIN,
+    SIGNED_PREDICTION_DOMAIN,
     apply_prediction_domain,
     resolve_prediction_domain,
 )
@@ -27,7 +28,7 @@ from log_safety import summarize_cli_args
 from metrics import mae, mape, r2, rmse
 from model_info import attach_method_metadata, ensure_state_metadata
 from serialization import dump_model, load_model
-from dynamic_config import derive_lstm_config
+from dynamic_config import LSTM_LIMITED_TIME_VALIDATION_REGIME, derive_lstm_config
 from uncertainty import (
     fallback_profile,
     format_predictions,
@@ -41,14 +42,18 @@ LEGACY_FORECAST_STRATEGY = "autoregressive"
 DEFAULT_PRODUCTION_FORECAST_HORIZON = 6
 FEATURE_TIMING = "historical_only"
 KNOWN_FUTURE_FEATURES = False
+NONNEGATIVE_INTERVAL_KIND_PREFIX = "censored_nonnegative_"
+UNCALIBRATED_INTERVAL_KIND = "uncalibrated_empirical_residual_quantile"
+UNCALIBRATED_P99_KIND = "uncalibrated_estimate"
 METHOD_NAME = "历史协变量直接多步 LSTM 销量预测"
 DIRECT_IMPLEMENTATION_NOTES = [
     "教科书 LSTM 定义的是带遗忘门、输入门和输出门的循环神经网络单元。",
     "本系统仅用训练区间拟合数值缩放器和类别 One-Hot 编码器，再采用单层 LSTM 加线性 Dense 多步输出；look-back 在 2 到 12 之间，隐藏单元、批大小和训练预算由样本量、预测跨度及编码后维度共同确定。",
     "为了服务未来多期销量预测，新训练模型采用直接多步策略，一次输出完整预测 horizon，减少递归预测的误差累积；输入只包含预测起点之前最后 look_back 期的历史目标与历史特征，不读取未来特征值。",
-    "样本足够时使用带 horizon 隔离带的时间顺序验证集监控 val_loss；选择轮数的临时预处理器和网络容量都只依据验证起点之前可见的数据，随后在全部训练窗口重新推导最终容量并拟合预处理器和网络。小样本明确标记为教学演示并使用有限训练预算，不以训练 loss 冒充泛化早停。",
-    "Dense 输出层本身不带非负约束；本系统将逆缩放后的最终销量点预测按 max(0, y_hat) 截断，并以截断值计算评估残差和指标。该业务后处理不是 LSTM 单元定义的一部分。",
-    "std_dev 优先来自时间顺序验证窗口中逆缩放、未做非负截断的逐输出 horizon 残差；95% 区间和生产用 99% 上侧误差取各 horizon 的 actual-prediction 经验残差分位数，因而保留稳定偏差。教学演示模式使用明确标记的一阶差分 sqrt(h) 正态近似回退。",
+    "监督窗口足够时使用带 horizon 隔离带的有限时间验证段监控 val_loss；选择轮数的临时预处理器和网络容量都只依据验证起点之前可见的数据，随后在全部训练窗口重新推导最终容量并拟合预处理器和网络。小样本明确标记为教学演示并使用有限训练预算，不以训练 loss 冒充泛化早停。",
+    "Dense 输出层本身不带非负约束；本系统将逆缩放后的最终销量点预测按 max(0, y_hat) 截断，并以截断值计算评估残差和指标；销量区间上下界也同步限制为非负并保证包含点预测。该业务后处理不是 LSTM 单元定义的一部分。",
+    "std_dev 优先来自选择轮数时复用的有限时间验证窗口中、逆缩放且未做非负截断的逐 horizon 残差。名义 95% 范围和名义 99% 上侧误差估计取经验分位数以保留稳定偏差，但该短验证段同时用于 EarlyStopping，最终网络又会重拟合，因此输出明确标记 coverage_guarantee=false 和 upper_error_p99_kind=uncalibrated_estimate；它们不是覆盖率已校准的概率保证。教学演示模式使用同样明确标记的一阶差分 sqrt(h) 正态近似回退。",
+    "本教学实现不会自动证明 LSTM 优于上一期值、季节上一期值或漂移等朴素基线；解释独立评估指标时应另行比较这些基线。",
 ]
 AUTOREGRESSIVE_IMPLEMENTATION_NOTES = [
     "教科书 LSTM 定义的是带遗忘门、输入门和输出门的循环神经网络单元。",
@@ -90,12 +95,101 @@ def _format_predictions(
     preds: List[float],
     std_dev: Any,
     metadata: Optional[Dict[str, Any]] = None,
+    prediction_domain: str = DEMAND_PREDICTION_DOMAIN,
 ) -> List[Dict[str, Any]]:
     """
     Format predictions with standard deviation for JSON output.
     """
     profile = list(std_dev) if isinstance(std_dev, (list, tuple, np.ndarray)) else [float(std_dev)] * len(preds)
-    return format_predictions(preds, profile, metadata or {"source": "empirical", "fallback": False})
+    points = format_predictions(
+        preds,
+        profile,
+        metadata or {"source": "empirical", "fallback": False},
+    )
+    return _apply_prediction_point_domain(points, prediction_domain)
+
+
+def _apply_prediction_point_domain(
+    points: List[Dict[str, Any]],
+    prediction_domain: str,
+) -> List[Dict[str, Any]]:
+    if prediction_domain not in {
+        DEMAND_PREDICTION_DOMAIN,
+        SIGNED_PREDICTION_DOMAIN,
+    }:
+        raise ValueError(f"[VALIDATION] Unknown prediction domain: {prediction_domain}")
+
+    normalized: List[Dict[str, Any]] = []
+    for raw_point in points:
+        if not isinstance(raw_point, dict):
+            raise ValueError("[MODEL] LSTM prediction point must be an object.")
+        point = dict(raw_point)
+        try:
+            numeric_prediction = float(
+                apply_prediction_domain([point.get("prediction")], prediction_domain)[0]
+            )
+        except (TypeError, ValueError) as exc:
+            raise ValueError("[MODEL] LSTM prediction point must be finite.") from exc
+        if not np.isfinite(numeric_prediction):
+            raise ValueError("[MODEL] LSTM prediction point must be finite.")
+        point["prediction"] = numeric_prediction
+
+        has_interval = "interval_lower" in point or "interval_upper" in point
+        if has_interval:
+            try:
+                lower = float(point["interval_lower"])
+                upper = float(point["interval_upper"])
+            except (KeyError, TypeError, ValueError) as exc:
+                raise ValueError("[MODEL] LSTM prediction interval is invalid.") from exc
+            if not np.isfinite(lower) or not np.isfinite(upper) or lower > upper:
+                raise ValueError("[MODEL] LSTM prediction interval is invalid.")
+            if prediction_domain == DEMAND_PREDICTION_DOMAIN:
+                lower = min(numeric_prediction, max(0.0, lower))
+                upper = max(numeric_prediction, max(0.0, upper))
+                interval_kind = point.get("interval_kind")
+                if not isinstance(interval_kind, str) or not interval_kind:
+                    raise ValueError("[MODEL] LSTM prediction interval kind is invalid.")
+                if not interval_kind.startswith(NONNEGATIVE_INTERVAL_KIND_PREFIX):
+                    point["interval_kind"] = (
+                        NONNEGATIVE_INTERVAL_KIND_PREFIX + interval_kind
+                    )
+            point["interval_lower"] = lower
+            point["interval_upper"] = upper
+        normalized.append(point)
+    return normalized
+
+
+def _label_lstm_uncertainty_contract(
+    metadata: Dict[str, Any],
+    *,
+    reused_early_stopping_validation: bool,
+) -> Dict[str, Any]:
+    """Mark LSTM residual ranges as nominal estimates, not calibrated coverage."""
+    normalized = dict(metadata)
+    raw_horizons = normalized.get("horizons")
+    horizons: List[Dict[str, Any]] = []
+    if isinstance(raw_horizons, (list, tuple)):
+        for raw_horizon in raw_horizons:
+            if not isinstance(raw_horizon, dict):
+                continue
+            horizon = dict(raw_horizon)
+            horizon["coverage_guarantee"] = False
+            horizon["upper_error_p99_kind"] = UNCALIBRATED_P99_KIND
+            if (
+                reused_early_stopping_validation
+                and horizon.get("calibration_source") == "internal_time_validation"
+            ):
+                horizon["calibration_source"] = "early_stopping_validation_reused"
+            if horizon.get("interval_kind") == "empirical_residual_quantile":
+                horizon["interval_kind"] = UNCALIBRATED_INTERVAL_KIND
+            horizons.append(horizon)
+    normalized["horizons"] = horizons
+    normalized["coverage_guarantee"] = False
+    normalized["upper_error_p99_kind"] = UNCALIBRATED_P99_KIND
+    if reused_early_stopping_validation:
+        normalized["calibration_source"] = "early_stopping_validation_reused"
+        normalized["method"] = "uncalibrated_validation_residual_quantiles_by_horizon"
+    return normalized
 
 
 def _parse_feature_key_list(raw_value: Optional[str]) -> List[str]:
@@ -500,12 +594,19 @@ def _fit_direct_model(
     normalization: str,
     forecast_horizon: int,
 ):
+    import tensorflow as tf
     from tensorflow.keras.layers import LSTM as KerasLSTM
     from tensorflow.keras.layers import Dense
     from tensorflow.keras.layers import Input
     from tensorflow.keras.callbacks import EarlyStopping
     from tensorflow.keras.models import Sequential
     from tensorflow.keras.optimizers import Adam
+
+    # Model loading and other Keras work can advance TensorFlow's random state.
+    # Reset at the actual fit boundary so monolithic and fit-only lifecycles
+    # create identical fresh networks from identical data.
+    tf.keras.utils.set_random_seed(42)
+    _set_random_seed(42)
 
     df = parsed_data.df
     preprocessor, scaled_series = _build_preprocessor(parsed_data, feature_types, train_range, normalization)
@@ -552,7 +653,7 @@ def _fit_direct_model(
 
     validation_residuals = None
     epochs_ran = int(config["max_epochs"])
-    if config["regime"] == "standard":
+    if config["regime"] == LSTM_LIMITED_TIME_VALIDATION_REGIME:
         validation_count = int(config["validation_windows"])
         selection_count = int(config["selection_train_windows"])
         validation_start = len(trainX) - validation_count
@@ -631,6 +732,7 @@ def _fit_direct_model(
             validationY[validation_start:],
         ).reshape(validationY[validation_start:].shape)
         validation_residuals = validation_actuals - validation_predictions
+        tf.keras.utils.set_random_seed(42)
         _set_random_seed(42)
 
     model = build_model()
@@ -660,6 +762,10 @@ def _fit_direct_model(
             reference_series,
             forecast_horizon,
         )
+    uncertainty_summary = _label_lstm_uncertainty_contract(
+        uncertainty_summary,
+        reused_early_stopping_validation=validation_residuals is not None,
+    )
 
     return (
         model,
@@ -997,7 +1103,12 @@ def run(args) -> None:
                 next_state["uncertainty_summary"],
             )
             out["forecast_steps"] = fit_predict_steps
-            out["predictions"] = _format_predictions(preds, resolved_profile, resolved_summary)
+            out["predictions"] = _format_predictions(
+                preds,
+                resolved_profile,
+                resolved_summary,
+                prediction_domain,
+            )
         attach_lstm_metadata(out, output_strategy, output_notes)
         out["logs"] = get_log_contents()
         print(json.dumps(out, ensure_ascii=False, indent=2 if pretty else None))
@@ -1012,19 +1123,29 @@ def run(args) -> None:
             raise ValueError("[VALIDATION] --forecast_steps must be > 0.")
 
         log.info(f"Starting prediction with {steps} forecast steps")
+        allow_negative_predictions = bool(
+            getattr(args, "allow_negative_predictions", False)
+        )
+        prediction_domain = resolve_prediction_domain(
+            state,
+            allow_negative_predictions=allow_negative_predictions,
+        )
         prepared = state.get("prepared_predictions")
         if (
-            not bool(getattr(args, "allow_negative_predictions", False))
+            not allow_negative_predictions
             and isinstance(prepared, list)
             and len(prepared) >= steps
         ):
-            predictions_with_std = [dict(point) for point in prepared[:steps]]
+            predictions_with_std = _apply_prediction_point_domain(
+                [dict(point) for point in prepared[:steps]],
+                prediction_domain,
+            )
         else:
             preds, profile = predict(
                 load_path,
                 steps,
                 state=state,
-                allow_negative_predictions=bool(getattr(args, "allow_negative_predictions", False)),
+                allow_negative_predictions=allow_negative_predictions,
             )
             _, resolved_uncertainty_summary = profile_for_steps(
                 state.get("uncertainty_profile"),
@@ -1032,7 +1153,12 @@ def run(args) -> None:
                 state.get("reference_series") or [],
                 state.get("uncertainty_summary") or {},
             )
-            predictions_with_std = _format_predictions(preds, profile, resolved_uncertainty_summary)
+            predictions_with_std = _format_predictions(
+                preds,
+                profile,
+                resolved_uncertainty_summary,
+                prediction_domain,
+            )
 
         out: Dict[str, Any] = {
             "mode": "lstm_loaded_predict",
@@ -1136,6 +1262,7 @@ def run(args) -> None:
             y_pred,
             evaluation_profile,
             {**uncertainty_summary, "horizon_start": forecast_offset + 1},
+            prediction_domain,
         )
 
         out: Dict[str, Any] = {

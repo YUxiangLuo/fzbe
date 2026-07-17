@@ -118,6 +118,17 @@ def assert_series_close(actual: list[float], expected: list[float], tol: float =
             )
 
 
+def assert_lstm_uncertainty_contract(payload: dict) -> None:
+    summary = payload["uncertainty_summary"]
+    assert summary["coverage_guarantee"] is False
+    assert summary["upper_error_p99_kind"] == "uncalibrated_estimate"
+    for point in payload["predictions"]:
+        assert point["coverage_guarantee"] is False
+        assert point["upper_error_p99_kind"] == "uncalibrated_estimate"
+        assert point["interval_kind"].startswith("censored_nonnegative_")
+        assert 0.0 <= point["interval_lower"] <= point["prediction"] <= point["interval_upper"]
+
+
 def load_pickled_state(model_path: Path) -> dict:
     with model_path.open("rb") as handle:
         return pickle.load(handle)
@@ -195,7 +206,7 @@ def main() -> None:
         assert "epochs" not in train_output
         assert train_output["normalization"] == "minmax"
         assert train_output["forecast_horizon"] == 3
-        assert train_output["training_regime"] in {"standard", "teaching_demo"}
+        assert train_output["training_regime"] in {"limited_time_validation", "teaching_demo"}
         assert train_output["metrics"]["evaluate_months"] == timestamps[28:31]
         assert train_output["metrics"]["forecast_horizon"] == 3
         assert len(train_output["eval_y_true"]) == 3
@@ -203,6 +214,7 @@ def main() -> None:
         assert len(FEATURE_KEYS) == 9
         assert_all_finite(train_predictions, "train_predictions")
         assert_all_finite(train_std_devs, "train_std_devs")
+        assert_lstm_uncertainty_contract(train_output)
         if not all(std_dev > 0 for std_dev in train_std_devs):
             raise AssertionError(f"expected positive std_dev values, got {train_std_devs}")
         backtest_state = load_pickled_state(backtest_model)
@@ -239,7 +251,9 @@ def main() -> None:
         assert production_state["forecast_horizon"] == 6
         assert production_state["production_forecast_horizon"] == 6
         assert production_state["derived_config"]["regime"] == fit_output["training_regime"]
-        if production_state["derived_config"]["regime"] == "standard":
+        assert production_state["uncertainty_summary"]["coverage_guarantee"] is False
+        assert production_state["uncertainty_summary"]["upper_error_p99_kind"] == "uncalibrated_estimate"
+        if production_state["derived_config"]["regime"] == "limited_time_validation":
             config = production_state["derived_config"]
             assert config["validation_preprocessor_fit_points"] < 36
             assert config["selection_parameter_count"] == lstm_parameter_count(
@@ -278,6 +292,7 @@ def main() -> None:
         assert len(future_predictions_one) == 6
         assert_all_finite(future_predictions_one, "future_predictions")
         assert_all_finite(future_std_devs_one, "future_std_devs")
+        assert_lstm_uncertainty_contract(predict_output_one)
         assert_series_close(future_predictions_one, future_predictions_two)
         assert_series_close(future_std_devs_one, future_std_devs_two)
 

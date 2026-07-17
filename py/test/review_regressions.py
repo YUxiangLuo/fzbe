@@ -49,6 +49,7 @@ from uncertainty import (  # noqa: E402
     fallback_profile,
     format_predictions,
     moving_average_profile,
+    residual_profile_by_horizon,
     ses_profile,
 )
 from data_utils import load_data_from_json  # noqa: E402
@@ -326,7 +327,7 @@ def assert_target_only_lstm_training() -> None:
     payload = json.loads(completed.stdout)
     assert len(payload["predictions"]) == 3
     assert payload["feature_types"] == {"销售数量": "numeric"}
-    assert payload["training_regime"] in {"standard", "teaching_demo"}
+    assert payload["training_regime"] in {"limited_time_validation", "teaching_demo"}
     assert "look_back" not in payload and "epochs" not in payload
 
     with tempfile.TemporaryDirectory() as temp_dir:
@@ -541,13 +542,13 @@ def assert_dynamic_hidden_configuration() -> None:
     assert derive_arima_search_limit(40, 1)["max_p"] == 5
 
     demo = derive_lstm_config(14, 3, 1)
-    standard = derive_lstm_config(80, 4, 3)
+    limited_validation = derive_lstm_config(80, 4, 3)
     assert demo["regime"] == "teaching_demo"
     assert demo["units"] <= 4 and demo["validation_windows"] == 0
-    assert standard["regime"] == "standard"
-    assert standard["validation_windows"] >= 4
-    assert standard["parameter_count"] <= standard["parameter_budget"]
-    assert standard["max_epochs"] >= 50
+    assert limited_validation["regime"] == "limited_time_validation"
+    assert limited_validation["validation_windows"] >= 4
+    assert limited_validation["parameter_count"] <= limited_validation["parameter_budget"]
+    assert limited_validation["max_epochs"] >= 50
 
     try:
         derive_lstm_config(7, 3, 1)
@@ -671,6 +672,55 @@ def assert_horizon_aware_uncertainty_profiles() -> None:
     assert biased_point["std_dev"] == 0.0
     assert biased_point["calibration_mean_error"] == 5.0
     assert biased_point["calibration_count"] == 4
+
+    lstm_profile, raw_lstm_summary = residual_profile_by_horizon(
+        np.asarray([
+            [-5.0, -8.0],
+            [-4.0, -7.0],
+            [-3.0, -6.0],
+            [-2.0, -5.0],
+        ]),
+        [1.0, 1.2, 0.9, 1.1],
+        2,
+    )
+    lstm_summary = lstm._label_lstm_uncertainty_contract(
+        raw_lstm_summary,
+        reused_early_stopping_validation=True,
+    )
+    demand_lstm_points = lstm._format_predictions(
+        [0.5, 0.25],
+        lstm_profile,
+        lstm_summary,
+        DEMAND_PREDICTION_DOMAIN,
+    )
+    assert all(point["coverage_guarantee"] is False for point in demand_lstm_points)
+    assert all(
+        point["upper_error_p99_kind"] == "uncalibrated_estimate"
+        for point in demand_lstm_points
+    )
+    assert all(
+        point["calibration_source"] == "early_stopping_validation_reused"
+        for point in demand_lstm_points
+    )
+    assert all(
+        point["interval_kind"].startswith(
+            "censored_nonnegative_uncalibrated_empirical_residual_quantile"
+        )
+        for point in demand_lstm_points
+    )
+    assert all(
+        0.0 <= point["interval_lower"] <= point["prediction"] <= point["interval_upper"]
+        for point in demand_lstm_points
+    )
+    signed_lstm_point = lstm._format_predictions(
+        [-1.0],
+        lstm_profile[:1],
+        lstm_summary,
+        SIGNED_PREDICTION_DOMAIN,
+    )[0]
+    assert signed_lstm_point["prediction"] == -1.0
+    assert signed_lstm_point["interval_lower"] < 0.0
+    assert signed_lstm_point["interval_kind"] == "uncalibrated_empirical_residual_quantile"
 
     guarded, guarded_summary = ensemble_growth_profile(
         {"member": [0.0, 2.0, 3.0]},

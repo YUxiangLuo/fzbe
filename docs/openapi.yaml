@@ -520,7 +520,13 @@ components:
         upper_error_p99:
           type: number
           minimum: 0
-          description: 生产容量场景使用的单侧 P99 误差偏移。
+          description: 单侧名义 P99 误差估计；是否经过覆盖率校准由 upper_error_p99_kind 与 coverage_guarantee 说明。当前安全库存公式不使用此字段。
+        upper_error_p99_kind:
+          type: string
+          description: P99 数值的统计性质；uncalibrated_estimate 表示未校准估计，不能解释为99%覆盖率保证。
+        coverage_guarantee:
+          type: boolean
+          description: 是否能够把名义区间或尾部误差解释为已校准覆盖率保证；LSTM 当前明确返回 false。
         uncertainty_source:
           type: string
           enum: [model, empirical, fallback]

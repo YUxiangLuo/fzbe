@@ -8,6 +8,10 @@ import math
 from typing import Any, Callable, Dict, Iterable
 
 
+LSTM_LIMITED_TIME_VALIDATION_REGIME = "limited_time_validation"
+LSTM_TEACHING_DEMO_REGIME = "teaching_demo"
+
+
 def clamp(value: int, minimum: int, maximum: int) -> int:
     return max(minimum, min(maximum, value))
 
@@ -78,19 +82,24 @@ def derive_lstm_config(
     validation_windows = max(4, math.ceil(0.2 * windows))
     purge_windows = max(0, horizon - 1)
     selection_train_windows = windows - validation_windows - purge_windows
-    proper_validation = windows >= 20 and selection_train_windows >= 4
-    regime = "standard" if proper_validation else "teaching_demo"
-    if not proper_validation:
+    uses_limited_time_validation = windows >= 20 and selection_train_windows >= 4
+    regime = (
+        LSTM_LIMITED_TIME_VALIDATION_REGIME
+        if uses_limited_time_validation
+        else LSTM_TEACHING_DEMO_REGIME
+    )
+    if not uses_limited_time_validation:
         validation_windows = 0
         purge_windows = 0
         selection_train_windows = windows
 
-    maximum_units = 16 if proper_validation else 4
+    maximum_units = 16 if uses_limited_time_validation else 4
     # The explicitly labelled teaching demo may tolerate a slightly higher
     # parameter-to-supervised-target ratio so that the smallest 2-unit network
-    # remains executable on a genuinely small classroom example.  Standard
-    # training keeps the stricter budget because it is presented as validated.
-    parameters_per_target = 4 if proper_validation else 6
+    # remains executable on a genuinely small classroom example.  The limited
+    # time-validation regime keeps the stricter budget, without presenting the
+    # short reused holdout as production-grade validation.
+    parameters_per_target = 4 if uses_limited_time_validation else 6
     parameter_budget = parameters_per_target * windows * horizon
     candidates = [2, 4, 8, 16]
     valid_units = [
@@ -114,7 +123,7 @@ def derive_lstm_config(
         16,
     )
     steps_per_epoch = max(1, math.ceil(selection_train_windows / batch_size))
-    if proper_validation:
+    if uses_limited_time_validation:
         max_epochs = clamp(math.ceil(600 / steps_per_epoch), 50, 200)
         patience = clamp(math.ceil(max_epochs * 0.1), 5, 20)
     else:

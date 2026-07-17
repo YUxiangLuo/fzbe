@@ -16,6 +16,8 @@ interface PredictionPoint extends Record<string, unknown> {
   interval_level?: unknown;
   interval_kind?: unknown;
   upper_error_p99?: unknown;
+  upper_error_p99_kind?: unknown;
+  coverage_guarantee?: unknown;
   calibration_mean_error?: unknown;
   calibration_count?: unknown;
 }
@@ -92,6 +94,21 @@ export const normalizeDemandPredictionPoints = (
     ) {
       throw new Error(`[PYTHON_DATA] Prediction point ${index} calibration_source must be a non-empty string`);
     }
+    if (
+      point.coverage_guarantee !== undefined
+      && typeof point.coverage_guarantee !== "boolean"
+    ) {
+      throw new Error(`[PYTHON_DATA] Prediction point ${index} coverage_guarantee must be a boolean`);
+    }
+    if (
+      point.upper_error_p99_kind !== undefined
+      && (
+        typeof point.upper_error_p99_kind !== "string"
+        || point.upper_error_p99_kind.length === 0
+      )
+    ) {
+      throw new Error(`[PYTHON_DATA] Prediction point ${index} upper_error_p99_kind must be a non-empty string`);
+    }
     const hasCalibrationMeanError = point.calibration_mean_error !== undefined;
     const hasCalibrationCount = point.calibration_count !== undefined;
     if (
@@ -141,10 +158,13 @@ export const normalizeDemandPredictionPoints = (
       if (typeof point.interval_kind !== "string" || point.interval_kind.length === 0) {
         throw new Error(`[PYTHON_DATA] Prediction point ${index} interval_kind must be a non-empty string`);
       }
+      const isNonnegativeInterval = point.interval_kind.startsWith("censored_nonnegative_");
       if (
-        point.interval_kind === "censored_nonnegative_model_prediction_interval"
+        isNonnegativeInterval
         && (
-          normalizedPrediction < point.interval_lower
+          point.interval_lower < 0
+          || point.interval_upper < 0
+          || normalizedPrediction < point.interval_lower
           || normalizedPrediction > point.interval_upper
         )
       ) {

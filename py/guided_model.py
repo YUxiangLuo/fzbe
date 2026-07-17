@@ -843,7 +843,7 @@ def _run_lstm(step_id: str, args, state: Dict[str, Any]) -> Dict[str, Any]:
         return {
             "training_regime": config["regime"],
             "window_count": config["windows"],
-            "uses_validation": config["regime"] == "standard",
+            "uses_validation": config["regime"] == lstm.LSTM_LIMITED_TIME_VALIDATION_REGIME,
             "units": config["units"],
             "parameter_count": config["parameter_count"],
             "parameter_budget": config["parameter_budget"],
@@ -898,7 +898,7 @@ def _run_lstm(step_id: str, args, state: Dict[str, Any]) -> Dict[str, Any]:
         })
         return {
             "training_regime": config["regime"],
-            "used_validation": config["regime"] == "standard",
+            "used_validation": config["regime"] == lstm.LSTM_LIMITED_TIME_VALIDATION_REGIME,
             "epochs_ran": config["epochs_ran"],
             "uncertainty_summary": uncertainty_summary,
         }

@@ -104,11 +104,9 @@ class CheckpointModeParityTests(unittest.TestCase):
                         ).payload
                         assert_prediction_contract(independent, 4)
                         expected = prediction_values(independent)
-                    # LSTM fit-only loads the source sidecar before reseeding a fresh
-                    # architecture, so its deterministic random-op sequence differs
-                    # slightly from monolithic training. Keep this a statistical parity
-                    # bound rather than freezing backend-specific weights.
-                    production_tolerance = 0.02 if model == "lstm" else tolerance
+                    # Every fresh LSTM fit resets TensorFlow's seed at the fit boundary,
+                    # so loading the source sidecar cannot perturb production refits.
+                    production_tolerance = tolerance
                     for left, right in zip(prediction_values(loaded.payload), expected):
                         self.assertTrue(math.isclose(left, right, rel_tol=production_tolerance, abs_tol=production_tolerance), (model, left, right))
 

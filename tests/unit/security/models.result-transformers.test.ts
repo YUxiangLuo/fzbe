@@ -303,6 +303,33 @@ describe("model training result transformers", () => {
     }])).toThrow(
       "[PYTHON_DATA] Prediction point 0 must lie inside its nonnegative interval",
     );
+
+    expect(() => normalizeDemandPredictionPoints([{
+      prediction: 1,
+      interval_lower: -1,
+      interval_upper: 2,
+      interval_level: 0.95,
+      interval_kind: "censored_nonnegative_uncalibrated_empirical_residual_quantile",
+    }])).toThrow(
+      "[PYTHON_DATA] Prediction point 0 must lie inside its nonnegative interval",
+    );
+  });
+
+  test("preserves and validates explicit uncertainty qualification", () => {
+    expect(normalizeDemandPredictionPoints([{
+      prediction: 1,
+      coverage_guarantee: false,
+      upper_error_p99_kind: "uncalibrated_estimate",
+    }])).toEqual([{
+      prediction: 1,
+      coverage_guarantee: false,
+      upper_error_p99_kind: "uncalibrated_estimate",
+    }]);
+
+    expect(() => normalizeDemandPredictionPoints([{
+      prediction: 1,
+      coverage_guarantee: "no",
+    }])).toThrow("coverage_guarantee must be a boolean");
   });
 
   test("rejects missing or empty Python prediction arrays", () => {

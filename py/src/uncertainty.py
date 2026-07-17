@@ -131,6 +131,14 @@ def _metadata_from_horizons(
     }
     if len(non_fallback_sources) == 1:
         metadata["source"] = next(iter(non_fallback_sources))
+    for optional_key in ("coverage_guarantee", "upper_error_p99_kind"):
+        optional_values = {
+            horizon.get(optional_key)
+            for horizon in normalized
+            if optional_key in horizon
+        }
+        if len(optional_values) == 1:
+            metadata[optional_key] = next(iter(optional_values))
     if reason and fallback_horizons:
         metadata["reason"] = reason
     return metadata
@@ -199,6 +207,16 @@ def _valid_saved_horizon(value: Any) -> Dict[str, Any] | None:
     if std_dev < 0 or upper_p99 < 0 or lower > upper:
         return None
     normalized = dict(value)
+    if "coverage_guarantee" in value:
+        coverage_guarantee = value.get("coverage_guarantee")
+        if not isinstance(coverage_guarantee, bool):
+            return None
+        normalized["coverage_guarantee"] = coverage_guarantee
+    if "upper_error_p99_kind" in value:
+        upper_error_p99_kind = value.get("upper_error_p99_kind")
+        if not isinstance(upper_error_p99_kind, str) or not upper_error_p99_kind:
+            return None
+        normalized["upper_error_p99_kind"] = upper_error_p99_kind
     mean_error = value.get("calibration_mean_error")
     calibration_count = value.get("calibration_count")
     if mean_error is None and calibration_count is None:
@@ -324,6 +342,10 @@ def format_predictions(
             if not isinstance(reason, str) or not reason:
                 raise ValueError("[MODEL] Uncertainty reason must be a non-empty string.")
             point["uncertainty_reason"] = reason
+        if "coverage_guarantee" in calibration:
+            point["coverage_guarantee"] = calibration["coverage_guarantee"]
+        if "upper_error_p99_kind" in calibration:
+            point["upper_error_p99_kind"] = calibration["upper_error_p99_kind"]
         points.append(point)
     return points
 
