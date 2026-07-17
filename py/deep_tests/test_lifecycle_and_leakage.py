@@ -55,7 +55,7 @@ class SevenModelLifecycleTests(unittest.TestCase):
                         self.assertNotIn("scheme", split_plan)
                         self.assertNotIn("folds", split_plan)
                         expected_calibration_source = (
-                            "level1_holdout"
+                            "stacking_meta_fit_holdout_reused"
                             if model == "stacking"
                             else (
                                 "boosting_selection_holdout_reused"
@@ -67,7 +67,7 @@ class SevenModelLifecycleTests(unittest.TestCase):
                             expected_calibration_source,
                             state["uncertainty"]["calibration_source"],
                         )
-                        if model == "boosting":
+                        if model in {"stacking", "boosting"}:
                             self.assertIs(
                                 False,
                                 state["uncertainty"]["summary"]["coverage_guarantee"],

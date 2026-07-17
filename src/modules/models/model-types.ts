@@ -282,7 +282,7 @@ export const GUIDED_TRAINING_STEPS: Record<GuidedModelType, GuidedTrainingStepDe
     {
       id: "meta_evaluate",
       label: "元模型组合并评估",
-      description: "把非负成员预测交给 NNLS 元模型并对最终销量做非负兜底；不确定性仅由 Level-1 组合残差校准，独立评估真实值不参与校准。",
+      description: "把非负成员预测交给 NNLS 元模型并对最终销量做非负兜底；名义误差范围复用同一个元模型拟合 Level-1 留出段的一次固定原点残差，明确标记为未校准、无覆盖率保证。",
       actionLabel: "组合评估",
     },
     {

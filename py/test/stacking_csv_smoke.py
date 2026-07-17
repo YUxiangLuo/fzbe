@@ -77,6 +77,26 @@ def assert_all_finite(values: list[float], label: str) -> None:
             raise AssertionError(f"{label}[{index}] is not finite: {value}")
 
 
+def assert_stacking_uncertainty_contract(payload: dict) -> None:
+    for index, point in enumerate(payload["predictions"]):
+        if (
+            point.get("coverage_guarantee") is not False
+            or point.get("upper_error_p99_kind") != "uncalibrated_estimate"
+            or point.get("calibration_source")
+            != "stacking_meta_fit_holdout_reused"
+            or point.get("calibration_origins") != 1
+            or point.get("interval_kind")
+            != "censored_nonnegative_uncalibrated_empirical_residual_quantile"
+            or not 0.0
+            <= float(point["interval_lower"])
+            <= float(point["prediction"])
+            <= float(point["interval_upper"])
+        ):
+            raise AssertionError(
+                f"stacking prediction[{index}] violates its nominal uncertainty contract"
+            )
+
+
 def compute_expected_stacking_weights(
     model_names: list[str],
     level1_predictions: dict[str, list[float]],
@@ -278,6 +298,7 @@ def main() -> None:
         assert_series_close(train_output["meta_model"]["coefficients"], expected_weights.tolist())
         assert_series_close(actual_eval_predictions, expected_eval_predictions)
         assert_all_finite(actual_eval_std_devs, "train_std_devs")
+        assert_stacking_uncertainty_contract(train_output)
 
         stacking_model_production = temp_path / "stacking-production.pkl"
         fit_output = invoke_model(
@@ -349,6 +370,8 @@ def main() -> None:
         assert_series_close(future_predictions_one, future_predictions_two)
         assert_series_close(future_std_devs_one, future_std_devs_two)
         assert_all_finite(future_std_devs_one, "future_std_devs")
+        assert_stacking_uncertainty_contract(predict_output_one)
+        assert_stacking_uncertainty_contract(predict_output_two)
 
     print(
         json.dumps(

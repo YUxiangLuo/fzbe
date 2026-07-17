@@ -843,13 +843,17 @@ def _run_stacking(step_id: str, args, state: Dict[str, Any]) -> Dict[str, Any]:
                 state["eval_prediction_map"][name] for name in models_to_use
             ]
         x_meta_eval = np.column_stack(state["eval_predictions"])
-        y_pred_final = stacking._predict_with_meta_model(state["meta_model"], x_meta_eval)
+        y_pred_final = stacking._predict_with_meta_model(
+            state["meta_model"], x_meta_eval, models_to_use
+        )
         y_pred_final = normalize_demand_forecast(y_pred_final)
         y_true = parsed_data.y[eval_range]
         level1_range = _state_range(state, "level1_range")
         x_meta_train = np.column_stack(state["level1_predictions"])
         level1_blend = normalize_demand_forecast(
-            stacking._predict_with_meta_model(state["meta_model"], x_meta_train)
+            stacking._predict_with_meta_model(
+                state["meta_model"], x_meta_train, models_to_use
+            )
         )
         level1_residuals = parsed_data.y[level1_range] - level1_blend
         coefficients = dict(zip(
@@ -864,12 +868,17 @@ def _run_stacking(step_id: str, args, state: Dict[str, Any]) -> Dict[str, Any]:
             level1_residuals,
             parsed_data.y[train_range],
             eval_forecast_steps,
-            calibration_source="level1_holdout",
+            calibration_source=stacking.STACKING_CALIBRATION_SOURCE,
+        )
+        uncertainty_summary = stacking._label_stacking_uncertainty_contract(
+            uncertainty_summary
         )
         uncertainty_profile = full_uncertainty_profile[
             eval_forecast_offset: eval_forecast_offset + len(eval_range)
         ]
-        uncertainty_summary.setdefault("calibration_source", "level1_holdout")
+        uncertainty_summary.setdefault(
+            "calibration_source", stacking.STACKING_CALIBRATION_SOURCE
+        )
         timestamps = parsed_data.timestamps
         metrics = {
             "rmse": rmse(y_true, y_pred_final),
@@ -898,7 +907,7 @@ def _run_stacking(step_id: str, args, state: Dict[str, Any]) -> Dict[str, Any]:
         state["y_pred"] = y_pred_final.tolist()
         state["uncertainty"] = {
             "calibration_residuals": level1_residuals.tolist(),
-            "calibration_source": "level1_holdout",
+            "calibration_source": stacking.STACKING_CALIBRATION_SOURCE,
             "reference_series": parsed_data.y[train_range].tolist(),
             "profile": full_uncertainty_profile,
             "summary": uncertainty_summary,

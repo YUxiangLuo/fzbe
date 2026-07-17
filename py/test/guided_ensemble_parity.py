@@ -235,7 +235,7 @@ def compare_results(
     }
 
     expected_calibration_source = (
-        "level1_holdout"
+        "stacking_meta_fit_holdout_reused"
         if model_type == "stacking"
         else (
             "boosting_selection_holdout_reused"
@@ -257,7 +257,7 @@ def compare_results(
                 )
             expected_interval_kind = (
                 "censored_nonnegative_uncalibrated_empirical_residual_quantile"
-                if model_type == "boosting"
+                if model_type in {"stacking", "boosting"}
                 else "empirical_residual_quantile"
             )
             if point.get("interval_kind") != expected_interval_kind:
@@ -268,7 +268,7 @@ def compare_results(
                 raise AssertionError(
                     f"{label} {model_type}.predictions[{index}] has reversed interval bounds"
                 )
-            if model_type == "boosting" and (
+            if model_type in {"stacking", "boosting"} and (
                 point.get("coverage_guarantee") is not False
                 or point.get("upper_error_p99_kind") != "uncalibrated_estimate"
                 or point.get("calibration_origins") != 1

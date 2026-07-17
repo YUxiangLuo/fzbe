@@ -261,6 +261,41 @@ def assert_obsolete_ensemble_states_are_rejected() -> None:
     else:
         raise AssertionError("legacy sklearn Stacking meta-model was accepted")
 
+    valid_meta_model = {
+        "kind": "nnls",
+        "strategy": "nonnegative_least_squares",
+        "model_names": ["ma", "es"],
+        "coefficients": [0.4, 0.6],
+        "residual_norm": 1.0,
+    }
+    for invalid_meta_model, expected_names, expected_message in (
+        (
+            {**valid_meta_model, "coefficients": [0.4, -0.6]},
+            ["ma", "es"],
+            "weights are invalid",
+        ),
+        (
+            valid_meta_model,
+            ["es", "ma"],
+            "do not match base model order",
+        ),
+        (
+            {**valid_meta_model, "strategy": "legacy_regression"},
+            ["ma", "es"],
+            "meta-model state is invalid",
+        ),
+    ):
+        try:
+            stacking._predict_with_meta_model(
+                invalid_meta_model,
+                np.ones((2, 2)),
+                expected_names,
+            )
+        except ValueError as exc:
+            assert expected_message in str(exc)
+        else:
+            raise AssertionError("invalid Stacking meta-model state was accepted")
+
     with tempfile.TemporaryDirectory() as temp_dir:
         legacy_boosting_path = os.path.join(temp_dir, "legacy-boosting.pkl")
         with open(legacy_boosting_path, "wb") as handle:
@@ -721,6 +756,104 @@ def assert_horizon_aware_uncertainty_profiles() -> None:
     assert signed_lstm_point["prediction"] == -1.0
     assert signed_lstm_point["interval_lower"] < 0.0
     assert signed_lstm_point["interval_kind"] == "uncalibrated_empirical_residual_quantile"
+
+    stacking_profile, raw_stacking_summary = ensemble_growth_profile(
+        {"ma": [1.0, 1.2]},
+        {"ma": 1.0},
+        [-5.0, -4.0, -3.0],
+        [1.0, 2.0, 3.0, 4.0],
+        2,
+        calibration_source="level1_holdout",
+    )
+    stacking_summary = stacking._label_stacking_uncertainty_contract(
+        raw_stacking_summary
+    )
+    assert stacking_summary["coverage_guarantee"] is False
+    assert stacking_summary["upper_error_p99_kind"] == "uncalibrated_estimate"
+    assert (
+        stacking_summary["calibration_source"]
+        == "stacking_meta_fit_holdout_reused"
+    )
+    assert stacking_summary["calibration_origins"] == 1
+    assert all(
+        horizon["calibration_origins"] == 1
+        for horizon in stacking_summary["horizons"]
+    )
+    demand_stacking_points = stacking._format_predictions(
+        [0.5, 0.25],
+        stacking_profile,
+        raw_stacking_summary,
+    )
+    assert all(point["coverage_guarantee"] is False for point in demand_stacking_points)
+    assert all(
+        point["upper_error_p99_kind"] == "uncalibrated_estimate"
+        for point in demand_stacking_points
+    )
+    assert all(
+        point["calibration_source"] == "stacking_meta_fit_holdout_reused"
+        and point["calibration_origins"] == 1
+        for point in demand_stacking_points
+    )
+    assert all(
+        point["interval_kind"]
+        == "censored_nonnegative_uncalibrated_empirical_residual_quantile"
+        for point in demand_stacking_points
+    )
+    assert all(
+        0.0 <= point["interval_lower"] <= point["prediction"] <= point["interval_upper"]
+        for point in demand_stacking_points
+    )
+    legacy_prepared_stacking_point = stacking._apply_stacking_prediction_contract([
+        {
+            "prediction": 2.0,
+            "std_dev": 1.0,
+            "uncertainty_source": "empirical",
+            "interval_lower": -7.85,
+            "interval_upper": -2.15,
+            "interval_level": 0.95,
+            "interval_kind": "empirical_residual_quantile",
+            "upper_error_p99": 0.0,
+            "calibration_source": "level1_holdout",
+            "calibration_mean_error": -5.0,
+            "calibration_count": 4,
+        }
+    ])[0]
+    assert legacy_prepared_stacking_point["interval_lower"] == 0.0
+    assert legacy_prepared_stacking_point["interval_upper"] == 2.0
+    assert legacy_prepared_stacking_point["coverage_guarantee"] is False
+    assert (
+        legacy_prepared_stacking_point["calibration_source"]
+        == "stacking_meta_fit_holdout_reused"
+    )
+    assert legacy_prepared_stacking_point["calibration_origins"] == 1
+    assert (
+        legacy_prepared_stacking_point["interval_kind"]
+        == "censored_nonnegative_uncalibrated_empirical_residual_quantile"
+    )
+
+    fallback_stacking_profile, fallback_stacking_summary = fallback_profile(
+        [1.0, 2.0, 3.0],
+        1,
+    )
+    fallback_stacking_point = stacking._format_predictions(
+        [-2.0],
+        fallback_stacking_profile,
+        fallback_stacking_summary,
+    )[0]
+    assert fallback_stacking_point["prediction"] == 0.0
+    assert fallback_stacking_point["coverage_guarantee"] is False
+    assert fallback_stacking_point["calibration_source"] == "training_history"
+    assert "calibration_origins" not in fallback_stacking_point
+    assert (
+        fallback_stacking_point["interval_kind"]
+        == "censored_nonnegative_fallback_normal_approximation"
+    )
+    assert (
+        0.0
+        <= fallback_stacking_point["interval_lower"]
+        <= fallback_stacking_point["prediction"]
+        <= fallback_stacking_point["interval_upper"]
+    )
 
     boosting_profile, raw_boosting_summary = ensemble_growth_profile(
         {"stage_0_ma": [1.0, 1.2]},
@@ -1535,8 +1668,10 @@ def assert_loaded_ensemble_demand_semantics() -> None:
         predictions, _profile, _summary = stacking.predict("", 1, {
             "meta_model": {
                 "kind": "nnls",
+                "strategy": "nonnegative_least_squares",
                 "model_names": ["ma", "es"],
                 "coefficients": [0.5, 0.5],
+                "residual_norm": 0.0,
             },
             "base_model_states": base_states,
             "models": ["ma", "es"],

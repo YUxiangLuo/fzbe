@@ -194,6 +194,11 @@ def _initialize(args, state: Dict[str, Any]) -> Dict[str, Any]:
         models = list(source_state.get("models") or [])
         if len(models) < 2:
             raise ValueError("[MODEL] Ensemble artifact has no usable member list.")
+        if args.model_type == "stacking":
+            stacking._validate_meta_model(
+                source_state.get("meta_model"),
+                expected_model_names=models,
+            )
         work_items = [{"id": f"fit_member_{name}", "model": name} for name in models]
     else:
         stages = []
@@ -391,7 +396,9 @@ def _finalize(state: Dict[str, Any]) -> Dict[str, Any]:
         models = list(source_state["models"])
         matrix = np.asarray([state["member_predictions"][name] for name in models], dtype=float).T
         predictions = normalize_demand_forecast(
-            stacking._predict_with_meta_model(source_state["meta_model"], matrix)
+            stacking._predict_with_meta_model(
+                source_state["meta_model"], matrix, models
+            )
         )
         coefficients = dict(zip(
             source_state["meta_model"]["model_names"],
@@ -412,7 +419,11 @@ def _finalize(state: Dict[str, Any]) -> Dict[str, Any]:
 
     calibration_source = str(
         uncertainty.get("calibration_source")
-        or ("level1_holdout" if model_type == "stacking" else "internal_validation")
+        or (
+            stacking.STACKING_CALIBRATION_SOURCE
+            if model_type == "stacking"
+            else "internal_validation"
+        )
     )
     profile, summary = ensemble_growth_profile(
         state["member_profiles"],
@@ -424,6 +435,8 @@ def _finalize(state: Dict[str, Any]) -> Dict[str, Any]:
     )
     if model_type == "boosting":
         summary = boosting._label_boosting_uncertainty_contract(summary)
+    elif model_type == "stacking":
+        summary = stacking._label_stacking_uncertainty_contract(summary)
     prepared_predictions = module._format_predictions(predictions.tolist(), profile, summary)
     artifact_state = {
         "model_type": model_type,

@@ -53,14 +53,20 @@ from subprocess_utils import (
 from uncertainty import ensemble_growth_profile
 
 MODEL_TYPE = "stacking"
+META_MODEL_STRATEGY = "nonnegative_least_squares"
+STACKING_CALIBRATION_SOURCE = "stacking_meta_fit_holdout_reused"
+LEGACY_STACKING_CALIBRATION_SOURCE = "level1_holdout"
+NONNEGATIVE_INTERVAL_KIND_PREFIX = "censored_nonnegative_"
+UNCALIBRATED_INTERVAL_KIND = "uncalibrated_empirical_residual_quantile"
+UNCALIBRATED_P99_KIND = "uncalibrated_estimate"
 METHOD_NAME = "时间顺序留出 Stacking 融合"
 FORECAST_STRATEGY = "holdout_nonnegative_least_squares"
 IMPLEMENTATION_NOTES = [
     "教科书 Stacking 用基础模型预测作为二级特征，再训练元学习器组合预测。",
-    "本系统按时间顺序拆分，Level-1 至少保留基础模型数加 2 个点；若所有成员无法在剩余前缀上训练则直接给出数据不足，而不悄悄改变算法。",
+    "本系统按时间顺序拆分，Level-1 至少保留基础模型数加 2 个点；该数量只是 NNLS 的最低可运行门槛，不代表统计样本已经充足。若所有成员无法在剩余前缀上训练则直接给出数据不足，而不悄悄改变算法。",
     "Level-0 只沿用用户选择的 MA 窗口、ES alpha、ARIMA d 与 LSTM 特征/归一化；ARIMA 阶数和 LSTM 隐藏参数按 Level-0 前缀重新推导，避免完整训练段信息泄漏。",
     "元学习器使用无截距非负最小二乘（NNLS）；系数不再人为归一化，也不以逆误差加权冒充 Stacking。",
-    "实体销量成员预测和最终组合结果均截断到不小于 0。std_dev、95% 区间和生产用 99% 上侧误差仅用 Level-1 时间留出段的 actual-prediction 组合残差校准成员逐 horizon 的增长形状；经验分位数会保留稳定偏差，独立评估真实值不参与校准，信息不足时明确标记 fallback。",
+    "实体销量成员预测和最终组合结果均截断到不小于 0，最终销量区间也同步限制为非负并保证包含点预测。std_dev、名义 95% 范围和生产用名义 99% 上侧误差复用拟合元模型的同一个 Level-1 时间留出段的一次固定原点跨 horizon 组合残差；经验分位数会保留稳定偏差，独立评估真实值不参与估计，信息不足时明确标记 fallback。由于该留出段已用于拟合 NNLS 且只有一个预测原点，输出明确标记 coverage_guarantee=false 和 upper_error_p99_kind=uncalibrated_estimate，不代表已校准覆盖率。",
 ]
 
 
@@ -69,7 +75,116 @@ _parse_feature_name_list = parse_feature_name_list
 _load_lstm_source_state = load_lstm_source_state
 _get_lstm_source_forecast_strategy = get_lstm_source_forecast_strategy
 _prepare_lstm_source_model_for_requested_steps = prepare_lstm_source_model_for_requested_steps
-_format_predictions = format_predictions
+
+
+def _label_stacking_uncertainty_contract(metadata: Dict[str, Any]) -> Dict[str, Any]:
+    """Mark reused meta-fit holdout residual ranges as nominal estimates."""
+    normalized = dict(metadata)
+    raw_horizons = normalized.get("horizons")
+    horizons: List[Dict[str, Any]] = []
+    reused_meta_fit_holdout = False
+    if isinstance(raw_horizons, (list, tuple)):
+        for raw_horizon in raw_horizons:
+            if not isinstance(raw_horizon, dict):
+                continue
+            horizon = dict(raw_horizon)
+            horizon["coverage_guarantee"] = False
+            horizon["upper_error_p99_kind"] = UNCALIBRATED_P99_KIND
+            if horizon.get("calibration_source") in {
+                LEGACY_STACKING_CALIBRATION_SOURCE,
+                STACKING_CALIBRATION_SOURCE,
+            }:
+                reused_meta_fit_holdout = True
+                horizon["calibration_source"] = STACKING_CALIBRATION_SOURCE
+                # These are different lead times from one fixed forecast
+                # origin, not repeated calibration origins for every horizon.
+                horizon["calibration_origins"] = 1
+                if horizon.get("interval_kind") == "empirical_residual_quantile":
+                    horizon["interval_kind"] = UNCALIBRATED_INTERVAL_KIND
+            horizons.append(horizon)
+    normalized["horizons"] = horizons
+    normalized["coverage_guarantee"] = False
+    normalized["upper_error_p99_kind"] = UNCALIBRATED_P99_KIND
+    if reused_meta_fit_holdout or normalized.get("calibration_source") in {
+        LEGACY_STACKING_CALIBRATION_SOURCE,
+        STACKING_CALIBRATION_SOURCE,
+    }:
+        normalized["calibration_source"] = STACKING_CALIBRATION_SOURCE
+        normalized["calibration_origins"] = 1
+        normalized["method"] = (
+            "uncalibrated_meta_fit_holdout_residual_quantiles_member_growth"
+        )
+    return normalized
+
+
+def _apply_stacking_prediction_contract(
+    points: List[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    """Qualify and constrain new or previously prepared Stacking points."""
+    normalized: List[Dict[str, Any]] = []
+    for raw_point in points:
+        if not isinstance(raw_point, dict):
+            raise ValueError("[MODEL] Stacking prediction point must be an object.")
+        point = dict(raw_point)
+        try:
+            prediction = float(
+                normalize_demand_forecast([point.get("prediction")])[0]
+            )
+            lower = float(point["interval_lower"])
+            upper = float(point["interval_upper"])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ValueError("[MODEL] Stacking prediction interval is invalid.") from exc
+        if (
+            not np.isfinite(prediction)
+            or not np.isfinite(lower)
+            or not np.isfinite(upper)
+            or lower > upper
+        ):
+            raise ValueError("[MODEL] Stacking prediction interval is invalid.")
+
+        point["prediction"] = prediction
+        point["coverage_guarantee"] = False
+        point["upper_error_p99_kind"] = UNCALIBRATED_P99_KIND
+        if point.get("calibration_source") in {
+            LEGACY_STACKING_CALIBRATION_SOURCE,
+            STACKING_CALIBRATION_SOURCE,
+        }:
+            point["calibration_source"] = STACKING_CALIBRATION_SOURCE
+            point["calibration_origins"] = 1
+            if point.get("interval_kind") == "empirical_residual_quantile":
+                point["interval_kind"] = UNCALIBRATED_INTERVAL_KIND
+
+        lower = min(prediction, max(0.0, lower))
+        upper = max(prediction, max(0.0, upper))
+        interval_kind = point.get("interval_kind")
+        if not isinstance(interval_kind, str) or not interval_kind:
+            raise ValueError("[MODEL] Stacking prediction interval kind is invalid.")
+        if not interval_kind.startswith(NONNEGATIVE_INTERVAL_KIND_PREFIX):
+            point["interval_kind"] = NONNEGATIVE_INTERVAL_KIND_PREFIX + interval_kind
+        point["interval_lower"] = lower
+        point["interval_upper"] = upper
+        normalized.append(point)
+    return normalized
+
+
+def _format_predictions(
+    preds: List[float],
+    std_dev: Any,
+    metadata: Optional[Dict[str, Any]] = None,
+) -> List[Dict[str, Any]]:
+    """Format final Stacking demand forecasts without overstating calibration."""
+    profile = (
+        list(std_dev)
+        if isinstance(std_dev, (list, tuple, np.ndarray))
+        else [float(std_dev)] * len(preds)
+    )
+    normalized_preds = normalize_demand_forecast(preds).tolist()
+    points = format_predictions(
+        normalized_preds,
+        profile,
+        _label_stacking_uncertainty_contract(metadata or {}),
+    )
+    return _apply_stacking_prediction_contract(points)
 
 
 def _fit_meta_model(
@@ -93,23 +208,83 @@ def _fit_meta_model(
 
     return {
         "kind": "nnls",
-        "strategy": "nonnegative_least_squares",
+        "strategy": META_MODEL_STRATEGY,
         "model_names": list(model_names),
         "coefficients": coefficients.tolist(),
         "residual_norm": float(residual_norm),
     }
 
 
-def _predict_with_meta_model(meta_model: Dict[str, Any], X_meta: np.ndarray) -> np.ndarray:
-    """Predict with the persisted NNLS meta-model."""
-    X_meta = np.asarray(X_meta, dtype=float)
-    if not isinstance(meta_model, dict) or meta_model.get("kind") != "nnls":
+def _validate_meta_model(
+    meta_model: Any,
+    *,
+    expected_model_names: Optional[List[str]] = None,
+    expected_input_count: Optional[int] = None,
+) -> np.ndarray:
+    """Validate the persisted NNLS state and return its coefficient vector."""
+    if (
+        not isinstance(meta_model, dict)
+        or meta_model.get("kind") != "nnls"
+        or meta_model.get("strategy") != META_MODEL_STRATEGY
+    ):
         raise ValueError("[VALIDATION] Saved Stacking meta-model state is invalid.")
-    coefficients = np.asarray(meta_model.get("coefficients", []), dtype=float).reshape(-1)
-    if coefficients.size != X_meta.shape[1] or not np.isfinite(coefficients).all():
-        raise ValueError(
-            "[VALIDATION] Saved Stacking meta-model weights do not match base model count."
+
+    try:
+        model_names = validate_base_model_names(
+            meta_model.get("model_names"),
+            "Saved Stacking meta-model",
         )
+    except ValueError as exc:
+        raise ValueError(
+            "[VALIDATION] Saved Stacking meta-model names are invalid."
+        ) from exc
+    if expected_model_names is not None and model_names != list(expected_model_names):
+        raise ValueError(
+            "[VALIDATION] Saved Stacking meta-model names do not match base model order."
+        )
+
+    try:
+        coefficients = np.asarray(
+            meta_model.get("coefficients", []), dtype=float
+        ).reshape(-1)
+        residual_norm = float(meta_model.get("residual_norm"))
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            "[VALIDATION] Saved Stacking meta-model numeric state is invalid."
+        ) from exc
+    if (
+        coefficients.size != len(model_names)
+        or (expected_input_count is not None and coefficients.size != expected_input_count)
+        or not np.isfinite(coefficients).all()
+        or np.any(coefficients < 0)
+    ):
+        raise ValueError(
+            "[VALIDATION] Saved Stacking meta-model weights are invalid or do not match base models."
+        )
+    if not np.isfinite(residual_norm) or residual_norm < 0:
+        raise ValueError(
+            "[VALIDATION] Saved Stacking meta-model residual norm is invalid."
+        )
+    return coefficients
+
+
+def _predict_with_meta_model(
+    meta_model: Dict[str, Any],
+    X_meta: np.ndarray,
+    expected_model_names: Optional[List[str]] = None,
+) -> np.ndarray:
+    """Predict with the persisted NNLS meta-model."""
+    try:
+        X_meta = np.asarray(X_meta, dtype=float)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("[VALIDATION] Stacking meta-model input is invalid.") from exc
+    if X_meta.ndim != 2 or not np.isfinite(X_meta).all():
+        raise ValueError("[VALIDATION] Stacking meta-model input must be a finite matrix.")
+    coefficients = _validate_meta_model(
+        meta_model,
+        expected_model_names=expected_model_names,
+        expected_input_count=X_meta.shape[1],
+    )
     return X_meta @ coefficients
 
 
@@ -118,7 +293,12 @@ def _load_state(model_path: str) -> Dict[str, Any]:
     state = load_model(model_path)
     if not isinstance(state, dict) or state.get("model_type") != MODEL_TYPE:
         raise ValueError("[VALIDATION] Invalid Stacking model file.")
-    validate_base_model_names(state.get("models"), "Saved Stacking model")
+    models_to_use = validate_base_model_names(
+        state.get("models"), "Saved Stacking model"
+    )
+    _validate_meta_model(
+        state.get("meta_model"), expected_model_names=models_to_use
+    )
     return ensure_state_metadata(state, METHOD_NAME, FORECAST_STRATEGY, IMPLEMENTATION_NOTES)
 
 
@@ -136,6 +316,9 @@ def _validate_fit_args(
     models_to_use = validate_base_model_names(
         state.get("models"),
         "Saved Stacking model",
+    )
+    _validate_meta_model(
+        state.get("meta_model"), expected_model_names=models_to_use
     )
 
     base_model_states = state.get("base_model_states")
@@ -317,7 +500,9 @@ def predict(
         base_predictions.append(normalize_demand_forecast(preds).tolist())
 
     X_meta_future = np.array(base_predictions).T
-    final_predictions = _predict_with_meta_model(meta_model, X_meta_future)
+    final_predictions = _predict_with_meta_model(
+        meta_model, X_meta_future, models_to_use
+    )
     final_predictions = normalize_demand_forecast(final_predictions)
 
     uncertainty_state = state.get("uncertainty") or {}
@@ -329,12 +514,18 @@ def predict(
         uncertainty_state.get("reference_series") or [],
         steps,
         calibration_source=str(
-            uncertainty_state.get("calibration_source") or "level1_holdout"
+            uncertainty_state.get("calibration_source")
+            or STACKING_CALIBRATION_SOURCE
         ),
     )
-    summary.setdefault("calibration_source", str(
-        uncertainty_state.get("calibration_source") or "level1_holdout"
-    ))
+    summary.setdefault(
+        "calibration_source",
+        str(
+            uncertainty_state.get("calibration_source")
+            or STACKING_CALIBRATION_SOURCE
+        ),
+    )
+    summary = _label_stacking_uncertainty_contract(summary)
     return final_predictions.tolist(), profile, summary
 
 
@@ -605,12 +796,14 @@ def train_and_evaluate(
     # === Step 5: Final prediction and evaluation on eval_range ===
     print("\n[Stacking Phase 4] 元模型最终预测和评估", file=sys.stderr)
     X_meta_eval = np.column_stack(eval_predictions)  # ✅ eval_range的预测
-    y_pred_final = _predict_with_meta_model(meta_model, X_meta_eval)  # ✅ 元模型在独立测试集上预测
+    y_pred_final = _predict_with_meta_model(
+        meta_model, X_meta_eval, models_to_use
+    )  # ✅ 元模型在独立测试集上预测
     y_pred_final = normalize_demand_forecast(y_pred_final)
     y_true_final = parsed_data.y[eval_range]  # ✅ 真实标签
 
     level1_blend = normalize_demand_forecast(
-        _predict_with_meta_model(meta_model, X_meta_train)
+        _predict_with_meta_model(meta_model, X_meta_train, models_to_use)
     )
     level1_residuals = y_meta_train - level1_blend
     coefficients = dict(zip(meta_model["model_names"], meta_model["coefficients"]))
@@ -620,12 +813,17 @@ def train_and_evaluate(
         level1_residuals,
         parsed_data.y[train_range],
         eval_forecast_steps,
-        calibration_source="level1_holdout",
+        calibration_source=STACKING_CALIBRATION_SOURCE,
+    )
+    uncertainty_summary = _label_stacking_uncertainty_contract(
+        uncertainty_summary
     )
     uncertainty_profile = full_uncertainty_profile[
         eval_forecast_offset: eval_forecast_offset + len(eval_range)
     ]
-    uncertainty_summary.setdefault("calibration_source", "level1_holdout")
+    uncertainty_summary.setdefault(
+        "calibration_source", STACKING_CALIBRATION_SOURCE
+    )
 
     # ✅ 在独立的eval_range上计算指标
     timestamps = parsed_data.timestamps
@@ -644,7 +842,7 @@ def train_and_evaluate(
         "split": split_plan,
         "uncertainty": {
             "calibration_residuals": level1_residuals.tolist(),
-            "calibration_source": "level1_holdout",
+            "calibration_source": STACKING_CALIBRATION_SOURCE,
             "reference_series": parsed_data.y[train_range].tolist(),
             "profile": full_uncertainty_profile,
             "summary": uncertainty_summary,
@@ -749,7 +947,9 @@ def run(args) -> None:
         state = _load_state(load_path)
         prepared = state.get("prepared_predictions")
         if isinstance(prepared, list) and len(prepared) >= steps:
-            predictions_with_std = [dict(point) for point in prepared[:steps]]
+            predictions_with_std = _apply_stacking_prediction_contract(
+                prepared[:steps]
+            )
         else:
             preds, uncertainty_profile, uncertainty_summary = predict(load_path, steps, state=state)
             predictions_with_std = _format_predictions(preds, uncertainty_profile, uncertainty_summary)
