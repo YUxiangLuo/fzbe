@@ -1539,7 +1539,9 @@ def _run_boosting(step_id: str, args, state: Dict[str, Any]) -> Dict[str, Any]:
         uncertainty_profile = full_uncertainty_profile[
             eval_forecast_offset: eval_forecast_offset + len(eval_range)
         ]
-        uncertainty_summary.setdefault("calibration_source", "internal_validation")
+        uncertainty_summary = boosting._label_boosting_uncertainty_contract(
+            uncertainty_summary
+        )
         timestamps = parsed_data.timestamps
         metrics = {
             "rmse": rmse(y_true_eval, final_eval_preds),
@@ -1571,7 +1573,10 @@ def _run_boosting(step_id: str, args, state: Dict[str, Any]) -> Dict[str, Any]:
         state["search_summary"]["refit_coefficients"] = state["stage_coefficients"]
         state["uncertainty"] = {
             "calibration_residuals": calibration_residuals.tolist(),
-            "calibration_source": "internal_validation",
+            "calibration_source": uncertainty_summary.get(
+                "calibration_source",
+                boosting.BOOSTING_CALIBRATION_SOURCE,
+            ),
             "reference_series": parsed_data.y[train_range].tolist(),
             "profile": full_uncertainty_profile,
             "summary": uncertainty_summary,

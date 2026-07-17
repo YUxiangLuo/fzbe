@@ -42,6 +42,7 @@ describe("OpenAPI model contracts", () => {
     ]));
     expect(point.properties.uncertainty_source.enum).toEqual(["model", "empirical", "fallback"]);
     expect(point.properties.interval_level.enum).toEqual([0.95]);
+    expect(point.properties.calibration_origins.minimum).toBe(1);
     expect(
       document.paths["/api/v1/models/{model_type}/predict"].post.responses["200"]
         .content["application/json"].schema.$ref,

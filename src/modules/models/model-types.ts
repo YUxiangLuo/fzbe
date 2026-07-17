@@ -314,7 +314,7 @@ export const GUIDED_TRAINING_STEPS: Record<GuidedModelType, GuidedTrainingStepDe
     {
       id: "combine_evaluate",
       label: "累加阶段预测并评估",
-      description: "按验证阶段系数累加预测，最后仅把物理销量结果截断到不小于0，再计算独立评估指标；不确定性由内部时间验证残差校准。",
+      description: "按验证阶段系数累加预测，把最终销量点预测和误差范围限制为非负并计算独立评估指标；名义误差范围复用同一个 Boosting 选模留出段的一次固定原点跨 horizon 残差，明确标记为未校准、无覆盖率保证。",
       actionLabel: "组合评估",
     },
     {

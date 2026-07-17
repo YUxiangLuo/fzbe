@@ -320,16 +320,22 @@ describe("model training result transformers", () => {
       prediction: 1,
       coverage_guarantee: false,
       upper_error_p99_kind: "uncalibrated_estimate",
+      calibration_origins: 1,
     }])).toEqual([{
       prediction: 1,
       coverage_guarantee: false,
       upper_error_p99_kind: "uncalibrated_estimate",
+      calibration_origins: 1,
     }]);
 
     expect(() => normalizeDemandPredictionPoints([{
       prediction: 1,
       coverage_guarantee: "no",
     }])).toThrow("coverage_guarantee must be a boolean");
+    expect(() => normalizeDemandPredictionPoints([{
+      prediction: 1,
+      calibration_origins: 0,
+    }])).toThrow("calibration_origins must be a positive integer");
   });
 
   test("rejects missing or empty Python prediction arrays", () => {

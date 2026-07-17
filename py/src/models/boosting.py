@@ -53,6 +53,10 @@ from uncertainty import ensemble_growth_profile
 
 MODEL_TYPE = "boosting"
 SUPPORTED_BASE_MODELS = ["ma", "es", "arima", "lstm"]
+BOOSTING_CALIBRATION_SOURCE = "boosting_selection_holdout_reused"
+NONNEGATIVE_INTERVAL_KIND_PREFIX = "censored_nonnegative_"
+UNCALIBRATED_INTERVAL_KIND = "uncalibrated_empirical_residual_quantile"
+UNCALIBRATED_P99_KIND = "uncalibrated_estimate"
 METHOD_NAME = "残差提升融合"
 FORECAST_STRATEGY = "greedy_residual_additive_ensemble"
 IMPLEMENTATION_NOTES = [
@@ -63,7 +67,7 @@ IMPLEMENTATION_NOTES = [
     "候选只沿用用户选择的 MA 窗口、ES alpha、ARIMA d 及 LSTM 特征/归一化。ARIMA 阶数和 LSTM 隐藏参数针对每轮当前数据段与目标重新推导。",
     "更新训练段残差时，若某阶段在序列开头还没有可定义的样本内拟合值（如 MA 尚未凑满完整窗口、LSTM 尚未凑满 look_back），该前缀按零修正处理，即保持原残差；系统不会改用较短窗口伪造拟合值。",
     "每个候选阶段以平方损失的一维非负线搜索求系数 gamma=max(0,<r,h>/<h,h>)；短验证段要求至少 5% 相对改善，其余要求 1%，无足够改善即提前停止。选出的模型链随后准备完整训练区间的部署产物：首阶段可复用配置和训练区间匹配的已完成基础模型，必要时重新拟合；后续阶段按当前完整训练残差拟合，并始终保留时间留出验证选出的 gamma。",
-    "只有原始销量阶段和最终销量预测会截断到不小于 0，中间残差保持有符号。std_dev、95% 区间和生产用 99% 上侧误差仅用与最终保留模型链对应的 actual-prediction 组合残差校准各阶段逐 horizon 的增长形状；经验分位数会保留稳定偏差，独立评估真实值不参与校准，信息不足时明确标记 fallback。",
+    "只有原始销量阶段和最终销量预测会截断到不小于 0，中间残差保持有符号；最终销量区间也同步限制为非负并保证包含点预测。std_dev、名义 95% 范围和生产用名义 99% 上侧误差复用同一个 Boosting 选模时间留出段的一次固定原点跨 horizon 组合残差；经验分位数会保留稳定偏差，独立评估真实值不参与估计，信息不足时明确标记 fallback。由于该留出段还用于候选、系数与轮数选择且只有一个预测原点，输出明确标记 coverage_guarantee=false 和 upper_error_p99_kind=uncalibrated_estimate，不代表已校准覆盖率。",
 ]
 
 
@@ -72,7 +76,90 @@ _parse_feature_name_list = parse_feature_name_list
 _load_lstm_source_state = load_lstm_source_state
 _get_lstm_source_forecast_strategy = get_lstm_source_forecast_strategy
 _prepare_lstm_source_model_for_requested_steps = prepare_lstm_source_model_for_requested_steps
-_format_predictions = format_predictions
+
+
+def _label_boosting_uncertainty_contract(metadata: Dict[str, Any]) -> Dict[str, Any]:
+    """Mark selection-holdout residual ranges as nominal, not calibrated coverage."""
+    normalized = dict(metadata)
+    raw_horizons = normalized.get("horizons")
+    horizons: List[Dict[str, Any]] = []
+    reused_selection_holdout = False
+    if isinstance(raw_horizons, (list, tuple)):
+        for raw_horizon in raw_horizons:
+            if not isinstance(raw_horizon, dict):
+                continue
+            horizon = dict(raw_horizon)
+            horizon["coverage_guarantee"] = False
+            horizon["upper_error_p99_kind"] = UNCALIBRATED_P99_KIND
+            if horizon.get("calibration_source") in {
+                "internal_validation",
+                BOOSTING_CALIBRATION_SOURCE,
+            }:
+                reused_selection_holdout = True
+                horizon["calibration_source"] = BOOSTING_CALIBRATION_SOURCE
+                # The residual vector contains one error at each lead time from
+                # one fixed forecast origin, not repeated calibration origins
+                # for every horizon.
+                horizon["calibration_origins"] = 1
+                if horizon.get("interval_kind") == "empirical_residual_quantile":
+                    horizon["interval_kind"] = UNCALIBRATED_INTERVAL_KIND
+            horizons.append(horizon)
+    normalized["horizons"] = horizons
+    normalized["coverage_guarantee"] = False
+    normalized["upper_error_p99_kind"] = UNCALIBRATED_P99_KIND
+    if reused_selection_holdout or normalized.get("calibration_source") in {
+        "internal_validation",
+        BOOSTING_CALIBRATION_SOURCE,
+    }:
+        normalized["calibration_source"] = BOOSTING_CALIBRATION_SOURCE
+        normalized["calibration_origins"] = 1
+        normalized["method"] = "uncalibrated_selection_holdout_residual_quantiles_member_growth"
+    return normalized
+
+
+def _format_predictions(
+    preds: List[float],
+    std_dev: Any,
+    metadata: Optional[Dict[str, Any]] = None,
+) -> List[Dict[str, Any]]:
+    """Format final Boosting demand forecasts without overstating calibration."""
+    profile = (
+        list(std_dev)
+        if isinstance(std_dev, (list, tuple, np.ndarray))
+        else [float(std_dev)] * len(preds)
+    )
+    normalized_preds = normalize_demand_forecast(preds).tolist()
+    points = format_predictions(
+        normalized_preds,
+        profile,
+        _label_boosting_uncertainty_contract(metadata or {}),
+    )
+    normalized: List[Dict[str, Any]] = []
+    for raw_point in points:
+        point = dict(raw_point)
+        point["coverage_guarantee"] = False
+        point["upper_error_p99_kind"] = UNCALIBRATED_P99_KIND
+        if point.get("calibration_source") in {
+            "internal_validation",
+            BOOSTING_CALIBRATION_SOURCE,
+        }:
+            point["calibration_source"] = BOOSTING_CALIBRATION_SOURCE
+            point["calibration_origins"] = 1
+            if point.get("interval_kind") == "empirical_residual_quantile":
+                point["interval_kind"] = UNCALIBRATED_INTERVAL_KIND
+
+        prediction = float(point["prediction"])
+        lower = min(prediction, max(0.0, float(point["interval_lower"])))
+        upper = max(prediction, max(0.0, float(point["interval_upper"])))
+        interval_kind = point.get("interval_kind")
+        if not isinstance(interval_kind, str) or not interval_kind:
+            raise ValueError("[MODEL] Boosting prediction interval kind is invalid.")
+        if not interval_kind.startswith(NONNEGATIVE_INTERVAL_KIND_PREFIX):
+            point["interval_kind"] = NONNEGATIVE_INTERVAL_KIND_PREFIX + interval_kind
+        point["interval_lower"] = lower
+        point["interval_upper"] = upper
+        normalized.append(point)
+    return normalized
 
 
 def _load_state(model_path: str) -> Dict[str, Any]:
@@ -538,6 +625,7 @@ def predict(
     summary.setdefault("calibration_source", str(
         uncertainty_state.get("calibration_source") or "internal_validation"
     ))
+    summary = _label_boosting_uncertainty_contract(summary)
     return normalize_demand_forecast(final_predictions).tolist(), profile, summary
 
 
@@ -851,7 +939,7 @@ def train_and_evaluate(
     uncertainty_profile = full_uncertainty_profile[
         eval_forecast_offset: eval_forecast_offset + len(eval_range)
     ]
-    uncertainty_summary.setdefault("calibration_source", "internal_validation")
+    uncertainty_summary = _label_boosting_uncertainty_contract(uncertainty_summary)
     metrics = {
         "rmse": rmse(y_true_eval, final_eval_preds),
         "mae": mae(y_true_eval, final_eval_preds),
@@ -880,7 +968,10 @@ def train_and_evaluate(
             "split": split_plan,
             "uncertainty": {
                 "calibration_residuals": calibration_residuals.tolist(),
-                "calibration_source": "internal_validation",
+                "calibration_source": uncertainty_summary.get(
+                    "calibration_source",
+                    BOOSTING_CALIBRATION_SOURCE,
+                ),
                 "reference_series": parsed_data.y[train_range].tolist(),
                 "profile": full_uncertainty_profile,
                 "summary": uncertainty_summary,

@@ -422,6 +422,8 @@ def _finalize(state: Dict[str, Any]) -> Dict[str, Any]:
         steps,
         calibration_source=calibration_source,
     )
+    if model_type == "boosting":
+        summary = boosting._label_boosting_uncertainty_contract(summary)
     prepared_predictions = module._format_predictions(predictions.tolist(), profile, summary)
     artifact_state = {
         "model_type": model_type,

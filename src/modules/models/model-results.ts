@@ -18,6 +18,7 @@ interface PredictionPoint extends Record<string, unknown> {
   upper_error_p99?: unknown;
   upper_error_p99_kind?: unknown;
   coverage_guarantee?: unknown;
+  calibration_origins?: unknown;
   calibration_mean_error?: unknown;
   calibration_count?: unknown;
 }
@@ -108,6 +109,16 @@ export const normalizeDemandPredictionPoints = (
       )
     ) {
       throw new Error(`[PYTHON_DATA] Prediction point ${index} upper_error_p99_kind must be a non-empty string`);
+    }
+    if (
+      point.calibration_origins !== undefined
+      && (
+        typeof point.calibration_origins !== "number"
+        || !Number.isInteger(point.calibration_origins)
+        || point.calibration_origins <= 0
+      )
+    ) {
+      throw new Error(`[PYTHON_DATA] Prediction point ${index} calibration_origins must be a positive integer`);
     }
     const hasCalibrationMeanError = point.calibration_mean_error !== undefined;
     const hasCalibrationCount = point.calibration_count !== undefined;

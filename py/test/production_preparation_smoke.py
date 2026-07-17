@@ -205,7 +205,7 @@ def _assert_current_prediction_contract(payload: dict[str, Any], model_type: str
         upper = float(point["interval_upper"])
         if lower > upper:
             raise AssertionError(f"{model_type}.predictions[{index}] has an inverted interval")
-        if model_type in {"arima", "lstm"}:
+        if model_type in {"arima", "lstm", "boosting"}:
             expected_interval_kind = (
                 "censored_nonnegative_model_prediction_interval"
                 if model_type == "arima"
@@ -220,11 +220,18 @@ def _assert_current_prediction_contract(payload: dict[str, Any], model_type: str
                 raise AssertionError(f"{model_type}.predictions[{index}] lost its demand interval semantics")
             if not 0.0 <= lower <= prediction <= upper:
                 raise AssertionError(f"{model_type}.predictions[{index}] violates its demand interval")
-        if model_type == "lstm" and (
+        if model_type in {"lstm", "boosting"} and (
             point.get("coverage_guarantee") is not False
             or point.get("upper_error_p99_kind") != "uncalibrated_estimate"
         ):
             raise AssertionError(f"{model_type}.predictions[{index}] overstates uncertainty calibration")
+        if model_type == "boosting" and point.get("uncertainty_source") == "empirical" and (
+            point.get("calibration_source") != "boosting_selection_holdout_reused"
+            or point.get("calibration_origins") != 1
+            or point.get("interval_kind")
+            != "censored_nonnegative_uncalibrated_empirical_residual_quantile"
+        ):
+            raise AssertionError(f"{model_type}.predictions[{index}] lost its selection-holdout diagnostics")
         if point.get("interval_level") != 0.95:
             raise AssertionError(f"{model_type}.predictions[{index}] lost its nominal 95% level")
         if not isinstance(point.get("uncertainty_source"), str) or not point["uncertainty_source"]:

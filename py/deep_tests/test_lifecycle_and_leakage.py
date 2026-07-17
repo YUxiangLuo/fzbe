@@ -54,10 +54,41 @@ class SevenModelLifecycleTests(unittest.TestCase):
                         self.assertGreaterEqual(split_plan["validation_size"], 2)
                         self.assertNotIn("scheme", split_plan)
                         self.assertNotIn("folds", split_plan)
+                        expected_calibration_source = (
+                            "level1_holdout"
+                            if model == "stacking"
+                            else (
+                                "boosting_selection_holdout_reused"
+                                if model == "boosting"
+                                else "internal_validation"
+                            )
+                        )
                         self.assertEqual(
-                            "level1_holdout" if model == "stacking" else "internal_validation",
+                            expected_calibration_source,
                             state["uncertainty"]["calibration_source"],
                         )
+                        if model == "boosting":
+                            self.assertIs(
+                                False,
+                                state["uncertainty"]["summary"]["coverage_guarantee"],
+                            )
+                            self.assertEqual(
+                                1,
+                                state["uncertainty"]["summary"]["calibration_origins"],
+                            )
+                            self.assertTrue(all(
+                                point["coverage_guarantee"] is False
+                                and point["upper_error_p99_kind"] == "uncalibrated_estimate"
+                                and point["calibration_source"] == expected_calibration_source
+                                and point["calibration_origins"] == 1
+                                and point["interval_kind"]
+                                == "censored_nonnegative_uncalibrated_empirical_residual_quantile"
+                                and 0
+                                <= point["interval_lower"]
+                                <= point["prediction"]
+                                <= point["interval_upper"]
+                                for point in trained.payload["predictions"]
+                            ))
 
                     first = run_loaded(model, artifact)
                     second = run_loaded(model, artifact)

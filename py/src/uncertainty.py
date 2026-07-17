@@ -131,7 +131,11 @@ def _metadata_from_horizons(
     }
     if len(non_fallback_sources) == 1:
         metadata["source"] = next(iter(non_fallback_sources))
-    for optional_key in ("coverage_guarantee", "upper_error_p99_kind"):
+    for optional_key in (
+        "coverage_guarantee",
+        "upper_error_p99_kind",
+        "calibration_origins",
+    ):
         optional_values = {
             horizon.get(optional_key)
             for horizon in normalized
@@ -217,6 +221,21 @@ def _valid_saved_horizon(value: Any) -> Dict[str, Any] | None:
         if not isinstance(upper_error_p99_kind, str) or not upper_error_p99_kind:
             return None
         normalized["upper_error_p99_kind"] = upper_error_p99_kind
+    if "calibration_origins" in value:
+        calibration_origins = value.get("calibration_origins")
+        try:
+            raw_numeric_origins = float(calibration_origins)
+            numeric_origins = int(raw_numeric_origins)
+        except (TypeError, ValueError, OverflowError):
+            return None
+        if (
+            not math.isfinite(raw_numeric_origins)
+            or isinstance(calibration_origins, bool)
+            or numeric_origins <= 0
+            or raw_numeric_origins != numeric_origins
+        ):
+            return None
+        normalized["calibration_origins"] = numeric_origins
     mean_error = value.get("calibration_mean_error")
     calibration_count = value.get("calibration_count")
     if mean_error is None and calibration_count is None:
@@ -346,6 +365,8 @@ def format_predictions(
             point["coverage_guarantee"] = calibration["coverage_guarantee"]
         if "upper_error_p99_kind" in calibration:
             point["upper_error_p99_kind"] = calibration["upper_error_p99_kind"]
+        if "calibration_origins" in calibration:
+            point["calibration_origins"] = calibration["calibration_origins"]
         points.append(point)
     return points
 

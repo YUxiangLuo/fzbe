@@ -722,6 +722,72 @@ def assert_horizon_aware_uncertainty_profiles() -> None:
     assert signed_lstm_point["interval_lower"] < 0.0
     assert signed_lstm_point["interval_kind"] == "uncalibrated_empirical_residual_quantile"
 
+    boosting_profile, raw_boosting_summary = ensemble_growth_profile(
+        {"stage_0_ma": [1.0, 1.2]},
+        {"stage_0_ma": 1.0},
+        [-5.0, -4.0, -3.0],
+        [1.0, 2.0, 3.0, 4.0],
+        2,
+    )
+    boosting_summary = boosting._label_boosting_uncertainty_contract(
+        raw_boosting_summary
+    )
+    assert boosting_summary["coverage_guarantee"] is False
+    assert boosting_summary["upper_error_p99_kind"] == "uncalibrated_estimate"
+    assert boosting_summary["calibration_source"] == "boosting_selection_holdout_reused"
+    assert boosting_summary["calibration_origins"] == 1
+    assert all(
+        horizon["calibration_origins"] == 1
+        for horizon in boosting_summary["horizons"]
+    )
+    demand_boosting_points = boosting._format_predictions(
+        [0.5, 0.25],
+        boosting_profile,
+        raw_boosting_summary,
+    )
+    assert all(point["coverage_guarantee"] is False for point in demand_boosting_points)
+    assert all(
+        point["upper_error_p99_kind"] == "uncalibrated_estimate"
+        for point in demand_boosting_points
+    )
+    assert all(
+        point["calibration_source"] == "boosting_selection_holdout_reused"
+        and point["calibration_origins"] == 1
+        for point in demand_boosting_points
+    )
+    assert all(
+        point["interval_kind"]
+        == "censored_nonnegative_uncalibrated_empirical_residual_quantile"
+        for point in demand_boosting_points
+    )
+    assert all(
+        0.0 <= point["interval_lower"] <= point["prediction"] <= point["interval_upper"]
+        for point in demand_boosting_points
+    )
+    fallback_boosting_profile, fallback_boosting_summary = fallback_profile(
+        [1.0, 2.0, 3.0],
+        1,
+    )
+    fallback_boosting_point = boosting._format_predictions(
+        [-2.0],
+        fallback_boosting_profile,
+        fallback_boosting_summary,
+    )[0]
+    assert fallback_boosting_point["prediction"] == 0.0
+    assert fallback_boosting_point["coverage_guarantee"] is False
+    assert fallback_boosting_point["calibration_source"] == "training_history"
+    assert "calibration_origins" not in fallback_boosting_point
+    assert (
+        fallback_boosting_point["interval_kind"]
+        == "censored_nonnegative_fallback_normal_approximation"
+    )
+    assert (
+        0.0
+        <= fallback_boosting_point["interval_lower"]
+        <= fallback_boosting_point["prediction"]
+        <= fallback_boosting_point["interval_upper"]
+    )
+
     guarded, guarded_summary = ensemble_growth_profile(
         {"member": [0.0, 2.0, 3.0]},
         {"member": 1.0},
@@ -1397,7 +1463,12 @@ def assert_boosting_refit_preserves_validation_coefficients_and_calibration() ->
         guided_state["uncertainty"]["calibration_residuals"]
     )
     assert np.allclose(guided_calibration, expected_validation_residuals)
-    assert guided_state["uncertainty"]["calibration_source"] == "internal_validation"
+    assert (
+        guided_state["uncertainty"]["calibration_source"]
+        == "boosting_selection_holdout_reused"
+    )
+    assert guided_state["uncertainty"]["summary"]["coverage_guarantee"] is False
+    assert guided_state["uncertainty"]["summary"]["calibration_origins"] == 1
 
 
 def assert_subprocess_prediction_domains() -> None:

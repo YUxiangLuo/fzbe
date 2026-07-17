@@ -72,6 +72,25 @@ def assert_all_finite(values: list[float], label: str) -> None:
             raise AssertionError(f"{label}[{index}] is not finite: {value}")
 
 
+def assert_uncalibrated_demand_contract(payload: dict) -> None:
+    for index, point in enumerate(payload["predictions"]):
+        if point.get("coverage_guarantee") is not False:
+            raise AssertionError(f"prediction[{index}] overstates interval coverage")
+        if point.get("upper_error_p99_kind") != "uncalibrated_estimate":
+            raise AssertionError(f"prediction[{index}] overstates its P99 estimate")
+        if point.get("calibration_source") != "boosting_selection_holdout_reused":
+            raise AssertionError(f"prediction[{index}] lost its reused holdout source")
+        if point.get("calibration_origins") != 1:
+            raise AssertionError(f"prediction[{index}] lost its single-origin diagnostic")
+        if point.get("interval_kind") != "censored_nonnegative_uncalibrated_empirical_residual_quantile":
+            raise AssertionError(f"prediction[{index}] lost its demand interval semantics")
+        lower = float(point["interval_lower"])
+        prediction = float(point["prediction"])
+        upper = float(point["interval_upper"])
+        if not 0.0 <= lower <= prediction <= upper:
+            raise AssertionError(f"prediction[{index}] violates the nonnegative demand interval")
+
+
 def load_pickled_state(model_path: Path) -> dict:
     with model_path.open("rb") as handle:
         return pickle.load(handle)
@@ -224,6 +243,11 @@ def main() -> None:
         )
         assert_series_close(actual_eval_predictions, expected_eval_predictions)
         assert_all_finite(actual_eval_std_devs, "train_std_devs")
+        assert_uncalibrated_demand_contract(train_output)
+        assert (
+            train_state["uncertainty"]["calibration_source"]
+            == "boosting_selection_holdout_reused"
+        )
 
         first_stage_idx, first_stage_model_name, first_stage_coefficient, first_stage_model_state = next(iter_stage_models(train_state))
         assert first_stage_idx == 0
@@ -308,6 +332,7 @@ def main() -> None:
         assert_series_close(future_predictions_one, future_predictions_two)
         assert_series_close(future_std_devs_one, future_std_devs_two)
         assert_all_finite(future_std_devs_one, "future_std_devs")
+        assert_uncalibrated_demand_contract(predict_output_one)
 
     print(
         json.dumps(

@@ -526,7 +526,11 @@ components:
           description: P99 数值的统计性质；uncalibrated_estimate 表示未校准估计，不能解释为99%覆盖率保证。
         coverage_guarantee:
           type: boolean
-          description: 是否能够把名义区间或尾部误差解释为已校准覆盖率保证；LSTM 当前明确返回 false。
+          description: 是否能够把名义区间或尾部误差解释为已校准覆盖率保证；LSTM 与 Boosting 当前明确返回 false。
+        calibration_origins:
+          type: integer
+          minimum: 1
+          description: 用于误差范围估计的历史固定预测原点数。Boosting 当前复用一次选模时间留出预测，因此经验范围返回 1；该值与跨 horizon 残差点数 calibration_count 含义不同。
         uncertainty_source:
           type: string
           enum: [model, empirical, fallback]
@@ -543,7 +547,7 @@ components:
           type: integer
           minimum: 1
           nullable: true
-          description: 与 calibration_mean_error 同时为 null，或同时提供有效校准诊断。
+          description: 与 calibration_mean_error 同时为 null，或同时提供有效误差诊断；它表示参与当前经验计算的残差值数量，不一定等于独立历史预测原点数。
         interval_lower:
           type: number
         interval_upper:
