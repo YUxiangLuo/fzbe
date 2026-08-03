@@ -7,9 +7,8 @@ import os
 import subprocess
 import sys
 import unittest
-from pathlib import Path
 
-from py.deep_tests.support.generate_datasets import DATASET_DIR, DEFAULT_SEED, canonical_json_bytes, check, generate_all
+from py.deep_tests.support.generate_datasets import DATASET_DIR, DEFAULT_SEED, check, generate_all
 from py.deep_tests.support.profiles import profile
 
 

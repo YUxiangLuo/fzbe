@@ -25,8 +25,6 @@ from data_utils import (
 )
 from ensemble_utils import (
     build_ensemble_subprocess_data,
-    can_refit_source_artifact_for_internal_holdout,
-    fit_and_predict_from_source_model,
     format_predictions,
     get_lstm_source_forecast_strategy,
     get_member_model_path,
@@ -35,7 +33,8 @@ from ensemble_utils import (
     parse_base_model_files_arg,
     parse_base_model_names,
     parse_feature_name_list,
-    plan_ensemble_internal_holdout,
+    plan_ensemble_selection_calibration_split,
+    predict_member_on_chronological_holdout,
     persist_member_model_artifact,
     prepare_lstm_source_model_for_requested_steps,
     require_explicit_lstm_feature_names,
@@ -55,15 +54,15 @@ from subprocess_utils import (
 from uncertainty import ensemble_growth_profile
 
 MODEL_TYPE = "weighted_avg"
-METHOD_NAME = "验证残差MSE倒数加权平均融合"
+METHOD_NAME = "选择残差 MSE 倒数加权平均融合"
 FORECAST_STRATEGY = "validation_residual_mse_weighted_average"
 IMPLEMENTATION_NOTES = [
     "教科书组合预测常用逆方差或误差方差-协方差思想分配权重；当预测误差近似无偏时，MSE 与方差口径一致。",
-    "本系统按时间顺序留出末段，并根据模型数、样本数及所有成员的最小可训练条件动态缩减留出段；候选权重先按 1/(MSE+epsilon) 归一化，再按验证样本可靠度向等权组合收缩。",
-    "该规则会同时惩罚系统性偏差和残差波动，但没有估计模型误差之间的协方差；可靠度收缩避免很短验证段产生近乎全押单一模型的权重。",
-    "内部验证只沿用用户选择的 MA 窗口、ES alpha、ARIMA d 与 LSTM 特征/归一化；ARIMA 阶数和 LSTM look-back、容量、批大小、轮数均按当前子训练段重新推导，避免完整训练段信息泄漏。",
-    "基础模型随后使用完整训练区间的既有匹配产物或重新拟合产物生成评估预测；所有表示实体销量的成员预测会先截断到不小于 0，再按固定权重组合，组合结果也做同样的非负兜底。",
-    "std_dev、95% 区间和生产用 99% 上侧误差仅用内部时间验证段的 actual-prediction 组合残差校准，并继承成员不确定性的逐 horizon 增长形状；经验分位数会保留稳定偏差，独立评估真实值不参与校准，信息不足时明确标记为 fallback。",
+    "本系统按时间顺序拆分训练前缀、权重选择集和选择后校准集，并根据模型数、样本数及所有成员的最小可训练条件动态缩减留出段；候选权重先按 1/(MSE+epsilon) 归一化，再按选择样本可靠度向等权组合收缩。",
+    "该规则会同时惩罚系统性偏差和残差波动，但没有估计模型误差之间的协方差；可靠度收缩避免很短选择段产生近乎全押单一模型的权重。",
+    "内部选择只沿用用户选择的 MA 窗口、ES alpha、ARIMA d 与 LSTM 特征/归一化；ARIMA 阶数和 LSTM look-back、容量、批大小、轮数均按当前子训练段重新推导，避免完整训练段信息泄漏。",
+    "固定权重后，各成员仅用选择集之前及选择集的数据重新拟合，并在更晚的校准段生成组合残差；基础模型最后使用完整训练区间的既有匹配产物或重新拟合产物生成外层选择评估预测。",
+    "std_dev、经验范围和 P99 压力诊断只使用选择后校准段的 actual-prediction 组合残差，并继承成员不确定性的逐 horizon 增长形状；外层选择评估真实值不参与校准。若样本不足以形成不重叠校准段，则明确回退到训练尺度，不复用权重选择残差。",
 ]
 
 
@@ -125,11 +124,30 @@ def _compute_inverse_residual_mse_weights(
         name: reliability * raw_weights[name] + (1.0 - reliability) * uniform_weight
         for name in raw_weights
     }
+    prediction_matrix = np.asarray(
+        [predictions_by_model[name] for name in raw_weights],
+        dtype=float,
+    ).T
+    equal_weight_predictions = np.mean(prediction_matrix, axis=1)
+    selected_weight_predictions = prediction_matrix @ np.asarray(
+        [weights[name] for name in raw_weights],
+        dtype=float,
+    )
+    equal_weight_rmse = float(np.sqrt(np.mean(np.square(targets - equal_weight_predictions))))
+    selected_weight_rmse = float(np.sqrt(np.mean(np.square(targets - selected_weight_predictions))))
+    best_member_name = min(residual_mses, key=residual_mses.get)
     return weights, {
         "residual_mse": residual_mses,
         "raw_weights": raw_weights,
+        "final_weights": weights,
         "reliability": float(reliability),
         "epsilon": float(epsilon),
+        "equal_weight_rmse": equal_weight_rmse,
+        "selected_weight_rmse": selected_weight_rmse,
+        "best_member": {
+            "model_name": best_member_name,
+            "rmse": float(np.sqrt(residual_mses[best_member_name])),
+        },
     }
 
 
@@ -268,7 +286,7 @@ def _validate_training_args(
                     f"[VALIDATION] LSTM feature columns not found in dataset: {missing_feature_names}"
                 )
 
-    plan_ensemble_internal_holdout(
+    plan_ensemble_selection_calibration_split(
         parsed_data,
         range(ts, te + 1),
         models_to_use,
@@ -348,11 +366,14 @@ def train_and_evaluate(
     """Trains and evaluates the Weighted Average model using inverse residual-MSE weighting.
 
     Time-ordered error-weighted flow:
-    1. Dynamically split train_range into chronological weight_train and weight_val
-    2. Train base models on weight_train, predict on weight_val
+    1. Split train_range into chronological weight_train, weight_selection, and
+       post-selection calibration ranges whenever feasible
+    2. Train base models on weight_train, predict on weight_selection
     3. Calculate inverse-MSE candidates and shrink them toward equal weights
-    4. Retrain base models on full train_range
-    5. Evaluate weighted combination on independent eval_range
+    4. Freeze weights, refit members through weight_selection, and calibrate
+       uncertainty only on the later calibration range
+    5. Retrain base models on full train_range
+    6. Assess the fixed workflow on the outer selection-assessment eval_range
 
     Algorithm: inverse validation residual-MSE weighting
     (an inverse-variance-inspired rule adapted for potentially biased forecasts)
@@ -363,24 +384,52 @@ def train_and_evaluate(
     - final_prediction = sum(weight_i * prediction_i)
     """
 
-    # === Step 1: Split train_range into weight_train and weight_val ===
-    # This prevents data leakage: weights are calculated on "unseen" weight_val predictions
+    # === Step 1: Split train_range into selection and post-selection calibration ===
     train_len = len(train_range)
     if train_len < 8:
         raise ValueError("[VALIDATION] train_range too small for weighted average (需要至少8个点，推荐≥12点)")
 
-    split_plan = plan_ensemble_internal_holdout(
+    split_plan = plan_ensemble_selection_calibration_split(
         parsed_data, train_range, models_to_use, model_params, "weighted"
     )
-    weight_split = int(split_plan["prefix_size"])
-
-    weight_train_range = range(train_range.start, train_range.start + weight_split)
-    weight_val_range = range(train_range.start + weight_split, train_range.stop)
+    prefix_size = int(split_plan["prefix_size"])
+    selection_size = int(split_plan["selection_size"])
+    calibration_size = int(split_plan["calibration_size"])
+    weight_train_range = range(
+        train_range.start,
+        train_range.start + prefix_size,
+    )
+    weight_selection_range = range(
+        weight_train_range.stop,
+        weight_train_range.stop + selection_size,
+    )
+    calibration_range = range(
+        weight_selection_range.stop,
+        weight_selection_range.stop + calibration_size,
+    )
+    split_plan = {
+        **split_plan,
+        "ranges": {
+            "prefix": {
+                "start": weight_train_range.start,
+                "end_exclusive": weight_train_range.stop,
+            },
+            "selection": {
+                "start": weight_selection_range.start,
+                "end_exclusive": weight_selection_range.stop,
+            },
+            "calibration": {
+                "start": calibration_range.start,
+                "end_exclusive": calibration_range.stop,
+            },
+        },
+    }
 
     print("[Weighted Average] 数据划分:", file=sys.stderr)
     print(f"  权重训练集: {weight_train_range} ({len(weight_train_range)} points)", file=sys.stderr)
-    print(f"  权重验证集 (计算权重): {weight_val_range} ({len(weight_val_range)} points)", file=sys.stderr)
-    print(f"  评估集: {eval_range} ({len(eval_range)} points)", file=sys.stderr)
+    print(f"  权重选择集: {weight_selection_range} ({len(weight_selection_range)} points)", file=sys.stderr)
+    print(f"  选择后校准集: {calibration_range} ({len(calibration_range)} points)", file=sys.stderr)
+    print(f"  外层选择评估集: {eval_range} ({len(eval_range)} points)", file=sys.stderr)
 
     # Non-LSTM base models keep numeric-only rows; LSTM can use categorical features.
     numeric_data_dicts, lstm_data_dicts = build_ensemble_subprocess_data(
@@ -389,9 +438,9 @@ def train_and_evaluate(
         model_params,
     )
 
-    # === Step 2: Phase 1 - Train on weight_train, predict on weight_val ===
-    print("\n[Weighted Average Phase 1] 训练基础模型并生成权重验证集预测", file=sys.stderr)
-    weight_val_predictions = {}
+    # === Step 2: Train on prefix, predict on the weight-selection range ===
+    print("\n[Weighted Average Phase 1] 训练基础模型并生成权重选择集预测", file=sys.stderr)
+    weight_selection_predictions = {}
 
     # Calculate dynamic timeout for LSTM models
     base_timeout = 600 if "lstm" in models_to_use else 120
@@ -400,61 +449,29 @@ def train_and_evaluate(
         params = model_params[model_name]
         source_model_file = (base_model_files or {}).get(model_name)
 
-        print(f"  训练 {model_name} 在 weight_train，预测 weight_val...", file=sys.stderr)
-        if (
-            source_model_file
-            and can_refit_source_artifact_for_internal_holdout(model_name)
-        ):
-            adjusted_source_model_file = source_model_file
-            temp_source_model_file = None
-            try:
-                if model_name == "lstm":
-                    source_model_state = _load_lstm_source_state(
-                        source_model_file,
-                        "Saved Weighted Average LSTM base model",
-                    )
-                    adjusted_source_model_file, temp_source_model_file = _prepare_lstm_source_model_for_requested_steps(
-                        source_model_file,
-                        source_model_state,
-                        requested_steps=len(weight_val_range),
-                    )
-                y_pred_val = fit_and_predict_from_source_model(
-                    model_name=model_name,
-                    source_model_file=adjusted_source_model_file,
-                    data=lstm_data_dicts if model_name == "lstm" else numeric_data_dicts,
-                    train_start=weight_train_range.start,
-                    train_end=weight_train_range.stop - 1,
-                    forecast_steps=len(weight_val_range),
-                    timeout=base_timeout,
-                )
-            finally:
-                if temp_source_model_file and os.path.exists(temp_source_model_file):
-                    os.remove(temp_source_model_file)
-        else:
-            result = run_base_model_subprocess(
-                model_type=model_name,
-                data=lstm_data_dicts if model_name == "lstm" else numeric_data_dicts,
-                train_start=weight_train_range.start,
-                train_end=weight_train_range.stop - 1,
-                eval_start=weight_val_range.start,
-                eval_end=weight_val_range.stop - 1,
-                model_params=params.copy(),
-                timeout=base_timeout,
-            )
-
-            y_pred_val = extract_predictions_from_result(result)
-        weight_val_predictions[model_name] = normalize_demand_forecast(y_pred_val).tolist()
-        print(f"    ✓ 生成 {len(y_pred_val)} 个weight_val预测", file=sys.stderr)
+        print(f"  训练 {model_name} 在 weight_train，预测 weight_selection...", file=sys.stderr)
+        predictions = predict_member_on_chronological_holdout(
+            model_name=model_name,
+            params=params,
+            source_model_file=source_model_file,
+            numeric_data=numeric_data_dicts,
+            lstm_data=lstm_data_dicts,
+            train_range=weight_train_range,
+            holdout_range=weight_selection_range,
+            timeout=base_timeout,
+        )
+        weight_selection_predictions[model_name] = predictions
+        print(f"    ✓ 生成 {len(predictions)} 个weight_selection预测", file=sys.stderr)
 
     # === Step 3: Calculate weights using validation residual MSE ===
     print("\n[Weighted Average Phase 2] 计算权重（验证集残差MSE倒数加权）", file=sys.stderr)
-    y_true_val = parsed_data.y[weight_val_range]  # ✅ weight_val的真实值
-    print("  误差计算 (基于weight_val残差MSE):", file=sys.stderr)
+    y_true_val = parsed_data.y[weight_selection_range]
+    print("  误差计算 (基于weight_selection残差MSE):", file=sys.stderr)
     weights, weight_diagnostics = _compute_inverse_residual_mse_weights(
-        y_true_val, weight_val_predictions
+        y_true_val, weight_selection_predictions
     )
     for name in models_to_use:
-        residuals = y_true_val - np.asarray(weight_val_predictions[name], dtype=float)
+        residuals = y_true_val - np.asarray(weight_selection_predictions[name], dtype=float)
         residual_mse = float(np.mean(np.square(residuals)))
         inverse_error = 1.0 / (residual_mse + weight_diagnostics["epsilon"])
         print(f"    {name}: residual_mse={residual_mse:.6f}, inverse_error={inverse_error:.6f}", file=sys.stderr)
@@ -462,8 +479,48 @@ def train_and_evaluate(
     for name in models_to_use:
         print(f"    {name}: normalized_weight={weights[name]:.6f}", file=sys.stderr)
 
-    # === Step 4: Phase 2 - Retrain on full train_range, predict on eval_range ===
-    print("\n[Weighted Average Phase 3] 在完整训练集上重新训练基础模型", file=sys.stderr)
+    # === Step 4: Freeze weights and calibrate on a later, disjoint range ===
+    calibration_residuals = np.asarray([], dtype=float)
+    calibration_source = "unavailable_post_selection_calibration"
+    if calibration_size > 0:
+        calibration_predictions: Dict[str, List[float]] = {}
+        print("\n[Weighted Average Phase 3] 固定权重并生成选择后校准预测", file=sys.stderr)
+        for model_name in models_to_use:
+            calibration_predictions[model_name] = (
+                predict_member_on_chronological_holdout(
+                    model_name=model_name,
+                    params=model_params[model_name],
+                    source_model_file=(base_model_files or {}).get(model_name),
+                    numeric_data=numeric_data_dicts,
+                    lstm_data=lstm_data_dicts,
+                    train_range=range(train_range.start, calibration_range.start),
+                    holdout_range=calibration_range,
+                    timeout=base_timeout,
+                )
+            )
+        x_calibration = np.asarray(
+            [calibration_predictions[name] for name in models_to_use],
+            dtype=float,
+        ).T
+        calibration_blend = normalize_demand_forecast(
+            np.sum(x_calibration * np.asarray(
+                [weights[name] for name in models_to_use],
+                dtype=float,
+            ), axis=1)
+        )
+        calibration_residuals = (
+            parsed_data.y[calibration_range] - calibration_blend
+        )
+        calibration_source = "post_selection_calibration"
+    else:
+        print(
+            "\n[Weighted Average Phase 3] 样本不足，未复用权重选择残差；"
+            "不确定性将回退到训练尺度",
+            file=sys.stderr,
+        )
+
+    # === Step 5: Retrain on full train_range, predict on eval_range ===
+    print("\n[Weighted Average Phase 4] 在完整训练集上重新训练基础模型", file=sys.stderr)
     eval_predictions = {}
     full_uncertainty_profiles = {}
     base_model_states = {}
@@ -599,31 +656,27 @@ def train_and_evaluate(
         }
         print(f"    ✓ 生成 {len(y_pred_eval)} 个eval预测", file=sys.stderr)
 
-    # === Step 5: Final weighted prediction and evaluation on eval_range ===
-    print("\n[Weighted Average Phase 4] 加权组合和最终评估", file=sys.stderr)
+    # === Step 6: Fixed-workflow assessment on the outer evaluation range ===
+    print("\n[Weighted Average Phase 5] 加权组合和外层选择评估", file=sys.stderr)
     X_eval = np.array([eval_predictions[name] for name in models_to_use]).T  # ✅ eval_range的预测
     model_weights = np.array([weights[name] for name in models_to_use])
     y_pred_final = np.sum(X_eval * model_weights, axis=1)  # ✅ 加权组合（保持原有算法）
     y_pred_final = normalize_demand_forecast(y_pred_final)
 
     y_true = parsed_data.y[eval_range]  # ✅ 真实标签
-    x_weight_val = np.array([weight_val_predictions[name] for name in models_to_use]).T
-    weight_val_blend = np.sum(x_weight_val * model_weights, axis=1)
-    weight_val_blend = normalize_demand_forecast(weight_val_blend)
-    weight_val_residuals = y_true_val - weight_val_blend
     full_uncertainty_profile, uncertainty_summary = ensemble_growth_profile(
         full_uncertainty_profiles,
         weights,
-        weight_val_residuals,
+        calibration_residuals,
         parsed_data.y[train_range],
         eval_forecast_steps,
+        calibration_source=calibration_source,
     )
     uncertainty_profile = full_uncertainty_profile[
         eval_forecast_offset: eval_forecast_offset + len(eval_range)
     ]
-    uncertainty_summary.setdefault("calibration_source", "internal_validation")
-
-    # ✅ 在独立的eval_range上计算指标
+    # The outer range assesses the selected workflow; it is not an untouched
+    # final test set because the UI can compare and select models using it.
     timestamps = parsed_data.timestamps
     metrics = {
         "rmse": rmse(y_true, y_pred_final),
@@ -637,8 +690,8 @@ def train_and_evaluate(
     print(f"  ✓ 评估完成: RMSE={metrics['rmse']:.4f}, R²={metrics['r2']:.4f}", file=sys.stderr)
 
     uncertainty_state = {
-        "calibration_residuals": weight_val_residuals.tolist(),
-        "calibration_source": "internal_validation",
+        "calibration_residuals": calibration_residuals.tolist(),
+        "calibration_source": calibration_source,
         "reference_series": parsed_data.y[train_range].tolist(),
         "profile": full_uncertainty_profile,
         "summary": uncertainty_summary,

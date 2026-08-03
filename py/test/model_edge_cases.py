@@ -334,14 +334,10 @@ def run_contract_failure_cases(temp_path: Path) -> list[dict[str, str]]:
             "--eval-end",
             "14",
             "--models",
-            "ma,es",
+            "ma",
             "--window",
             "3",
-            "--alpha",
-            "0.3",
-            "--learning-rate",
-            "0",
-            label="boosting invalid learning rate is rejected",
+            label="boosting single model is rejected",
             expected_tag="[VALIDATION]",
         ),
     ]
@@ -382,16 +378,34 @@ def run_contract_failure_cases(temp_path: Path) -> list[dict[str, str]]:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Run full backend Python model edge-case checks.")
-    parser.add_argument("--profile", choices=["full"], default="full")
+    parser = argparse.ArgumentParser(description="Run backend Python model edge-case checks.")
+    parser.add_argument(
+        "--profile",
+        choices=["focused", "full"],
+        default="focused",
+        help="focused runs only unique edge cases; full also replays existing lifecycle workflows",
+    )
     parser.add_argument("--json", action="store_true", help="Kept for symmetry with the Bun runner.")
     args = parser.parse_args()
 
     with tempfile.TemporaryDirectory(prefix="fangzhen-model-edge-cases-") as temp_dir:
         temp_path = Path(temp_dir)
-        existing_results = [run_existing_script(script_name) for script_name in EXISTING_FULL_SCRIPTS]
+        existing_results = (
+            [run_existing_script(script_name) for script_name in EXISTING_FULL_SCRIPTS]
+            if args.profile == "full"
+            else []
+        )
         print("[model-edge] contract failures", file=sys.stderr, flush=True)
         failure_results = run_contract_failure_cases(temp_path)
+
+    checked_paths = [
+        "strict_json_outputs",
+        "finite_numeric_outputs",
+        "training_validation_failures",
+        "loaded_prediction_validation_failures",
+    ]
+    if existing_results:
+        checked_paths.insert(0, "existing_python_smoke_and_diagnostics")
 
     print(
         json.dumps(
@@ -399,13 +413,7 @@ def main() -> None:
                 "profile": args.profile,
                 "existing_scripts": existing_results,
                 "contract_failures": failure_results,
-                "checked_paths": [
-                    "existing_python_smoke_and_diagnostics",
-                    "strict_json_outputs",
-                    "finite_numeric_outputs",
-                    "training_validation_failures",
-                    "loaded_prediction_validation_failures",
-                ],
+                "checked_paths": checked_paths,
                 "status": "ok",
             },
             ensure_ascii=False,

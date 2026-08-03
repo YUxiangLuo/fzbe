@@ -108,7 +108,17 @@ def iter_stage_models(state: dict):
 
 
 def combine_stage_predictions(state: dict, forecast_steps: int) -> list[float]:
-    combined: list[float] | None = None
+    baseline = state["baseline"]
+    if baseline["kind"] == "mean":
+        combined = [float(baseline["training_mean"])] * forecast_steps
+    elif baseline["kind"] == "naive":
+        combined = [float(baseline["last_value"])] * forecast_steps
+    elif baseline["kind"] == "seasonal_naive":
+        tail = [float(value) for value in baseline["seasonal_tail"]]
+        combined = [tail[index % len(tail)] for index in range(forecast_steps)]
+    else:
+        raise AssertionError(f"unknown boosting baseline: {baseline}")
+
     for _stage_idx, model_name, coefficient, model_state in iter_stage_models(state):
         predictions = extract_predictions(
             subprocess_payload_to_json(
@@ -116,14 +126,9 @@ def combine_stage_predictions(state: dict, forecast_steps: int) -> list[float]:
             )
         )
         weighted_predictions = [coefficient * prediction for prediction in predictions]
-        if combined is None:
-            combined = weighted_predictions
-        else:
-            combined = [left + right for left, right in zip(combined, weighted_predictions)]
+        combined = [left + right for left, right in zip(combined, weighted_predictions)]
 
-    if combined is None:
-        raise AssertionError("boosting state produced no stages")
-    return combined
+    return [max(0.0, value) for value in combined]
 
 
 def run_member_command(model_type: str, model_file: str, forecast_steps: int) -> subprocess.CompletedProcess[str]:
@@ -135,6 +140,7 @@ def run_member_command(model_type: str, model_file: str, forecast_steps: int) ->
         model_file,
         "--forecast-steps",
         str(forecast_steps),
+        "--allow-negative-predictions",
         "--pretty",
     ]
     return subprocess.run(command, capture_output=True, text=True, check=False)
@@ -246,7 +252,7 @@ def main() -> None:
         expected_eval_predictions = combine_stage_predictions(train_state, forecast_steps=3)
         assert train_output["mode"] == "boosting_residual_learning"
         assert train_output["models"] == ["ma", "lstm"]
-        assert "lstm" in train_output["model_chain"], train_output["model_chain"]
+        assert "lstm" in train_output["search_summary"]["selection_model_chain"]
         assert len(train_output["model_chain"]) == len(train_output["stage_coefficients"])
         assert all(
             math.isfinite(float(value)) and float(value) > 0.0
@@ -258,15 +264,25 @@ def main() -> None:
         assert_all_finite(actual_eval_predictions, "train_predictions")
         assert_all_finite(actual_eval_std_devs, "train_std_devs")
 
-        saved_lstm_member = Path(train_state["base_model_states"]["lstm"]["models"][0]["model_file"])
-        if not saved_lstm_member.exists():
-            raise AssertionError(f"saved boosting LSTM member artifact missing: {saved_lstm_member}")
-        saved_lstm_state = load_pickled_state(saved_lstm_member)
-        assert saved_lstm_state["forecast_strategy"] == "direct_multi_horizon"
-        assert saved_lstm_state["forecast_horizon"] == 3
-        saved_lstm_keras = saved_lstm_member.with_name(f"{saved_lstm_member.stem}_keras_model.h5")
-        if not saved_lstm_keras.exists():
-            raise AssertionError(f"saved boosting LSTM keras artifact missing: {saved_lstm_keras}")
+        if "lstm" in train_output["model_chain"]:
+            saved_lstm_member = Path(
+                train_state["base_model_states"]["lstm"]["models"][0]["model_file"]
+            )
+            if not saved_lstm_member.exists():
+                raise AssertionError(f"saved boosting LSTM member artifact missing: {saved_lstm_member}")
+            saved_lstm_state = load_pickled_state(saved_lstm_member)
+            assert saved_lstm_state["forecast_strategy"] == "direct_multi_horizon"
+            assert saved_lstm_state["forecast_horizon"] == 3
+            saved_lstm_keras = saved_lstm_member.with_name(
+                f"{saved_lstm_member.stem}_keras_model.h5"
+            )
+            if not saved_lstm_keras.exists():
+                raise AssertionError(f"saved boosting LSTM keras artifact missing: {saved_lstm_keras}")
+        else:
+            assert train_output["search_summary"]["refit_outcome"] == (
+                "baseline_retained_after_refit_trim"
+            )
+            assert train_state["base_model_states"] == {}
 
         fit_output = invoke_model(
             data_json,
@@ -286,12 +302,19 @@ def main() -> None:
         assert fit_output["saved_model"] == str(production_model)
 
         production_state = load_pickled_state(production_model)
-        production_lstm_member = Path(production_state["base_model_states"]["lstm"]["models"][0]["model_file"])
-        if not production_lstm_member.exists():
-            raise AssertionError(f"production boosting LSTM member artifact missing: {production_lstm_member}")
-        production_lstm_state = load_pickled_state(production_lstm_member)
-        assert production_lstm_state["forecast_strategy"] == "direct_multi_horizon"
-        assert production_lstm_state["forecast_horizon"] == future_steps
+        if "lstm" in production_state["model_chain"]:
+            production_lstm_member = Path(
+                production_state["base_model_states"]["lstm"]["models"][0]["model_file"]
+            )
+            if not production_lstm_member.exists():
+                raise AssertionError(
+                    f"production boosting LSTM member artifact missing: {production_lstm_member}"
+                )
+            production_lstm_state = load_pickled_state(production_lstm_member)
+            assert production_lstm_state["forecast_strategy"] == "direct_multi_horizon"
+            assert production_lstm_state["forecast_horizon"] == future_steps
+        else:
+            assert production_state["base_model_states"] == {}
 
         predict_output_one = invoke_model(
             None,
@@ -376,23 +399,41 @@ def main() -> None:
         assert hidden_params_ignored_output["mode"] == "boosting_residual_learning"
         assert hidden_params_ignored_output["search_summary"]["max_rounds"] >= 1
 
-        short_fit_result = run_command(
-            "--train-start",
-            "0",
-            "--train-end",
-            "3",
-            "--load-model",
-            str(backtest_model),
-            "--save-model",
-            str(temp_path / "boosting-lstm-short-fit.pkl"),
-            "--fit-only",
-            "--pretty",
-            data_json=data_json,
-        )
-        assert_error(
-            short_fit_result,
-            "Training range is too short for a direct LSTM forecast",
-        )
+        short_fit_path = temp_path / "boosting-lstm-short-fit.pkl"
+        if "lstm" in train_output["model_chain"]:
+            short_fit_result = run_command(
+                "--train-start",
+                "0",
+                "--train-end",
+                "3",
+                "--load-model",
+                str(backtest_model),
+                "--save-model",
+                str(short_fit_path),
+                "--fit-only",
+                "--pretty",
+                data_json=data_json,
+            )
+            assert_error(
+                short_fit_result,
+                "Training range is too short for a direct LSTM forecast",
+            )
+        else:
+            short_fit_output = invoke_model(
+                data_json,
+                "--train-start",
+                "0",
+                "--train-end",
+                "3",
+                "--load-model",
+                str(backtest_model),
+                "--save-model",
+                str(short_fit_path),
+                "--fit-only",
+                "--pretty",
+            )
+            assert short_fit_output["mode"] == "boosting_fit_only"
+            assert short_fit_output["model_chain"] == []
 
         reused_short_source_model = temp_path / "boosting-lstm-reuse-short-source.pkl"
         reused_short_source_output = invoke_model(
@@ -430,19 +471,37 @@ def main() -> None:
         reused_short_source_state = load_pickled_state(reused_short_source_model)
         reused_short_source_predictions = extract_predictions(reused_short_source_output)
         assert reused_short_source_output["mode"] == "boosting_residual_learning"
-        assert "lstm" in reused_short_source_output["model_chain"]
+        assert "lstm" in reused_short_source_output["search_summary"]["selection_model_chain"]
         assert len(reused_short_source_predictions) == 3
         assert_all_finite(reused_short_source_predictions, "reused_short_source_predictions")
-        reused_short_source_member = Path(
-            reused_short_source_state["base_model_states"]["lstm"]["models"][0]["model_file"]
+        assert_series_close(
+            reused_short_source_predictions,
+            combine_stage_predictions(
+                reused_short_source_state,
+                forecast_steps=len(reused_short_source_predictions),
+            ),
         )
-        reused_short_source_member_state = load_pickled_state(reused_short_source_member)
-        assert reused_short_source_member_state["look_back"] == reused_short_source_member_state["derived_config"]["look_back"]
-        reused_lstm_params = reused_short_source_state["base_model_states"]["lstm"]["models"][0]["params"]
-        assert "look_back" not in reused_lstm_params
-        assert "epochs" not in reused_lstm_params
-        assert reused_short_source_member_state["forecast_strategy"] == "direct_multi_horizon"
-        assert reused_short_source_member_state["forecast_horizon"] == len(reused_short_source_predictions)
+        if "lstm" in reused_short_source_output["model_chain"]:
+            reused_short_source_member = Path(
+                reused_short_source_state["base_model_states"]["lstm"]["models"][0]["model_file"]
+            )
+            reused_short_source_member_state = load_pickled_state(reused_short_source_member)
+            assert reused_short_source_member_state["look_back"] == (
+                reused_short_source_member_state["derived_config"]["look_back"]
+            )
+            reused_lstm_params = (
+                reused_short_source_state["base_model_states"]["lstm"]["models"][0]["params"]
+            )
+            assert "look_back" not in reused_lstm_params
+            assert "epochs" not in reused_lstm_params
+            assert reused_short_source_member_state["forecast_strategy"] == (
+                "direct_multi_horizon"
+            )
+            assert reused_short_source_member_state["forecast_horizon"] == len(
+                reused_short_source_predictions
+            )
+        else:
+            assert reused_short_source_state["base_model_states"] == {}
 
     print(
         json.dumps(
@@ -453,8 +512,9 @@ def main() -> None:
                 "edge_cases": [
                     "missing_lstm_feature",
                     "hidden_lstm_params_ignored",
-                    "fit_only_short_window",
-                    "reused_short_horizon_source",
+                    "baseline_only_after_lstm_refit_trim",
+                    "fit_only_short_history_contract",
+                    "saved_lstm_source_config_precedence",
                 ],
                 "status": "ok",
             },

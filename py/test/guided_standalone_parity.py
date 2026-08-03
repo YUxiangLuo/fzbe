@@ -214,6 +214,27 @@ def compare_results(model_type: str, standalone: dict[str, Any], guided: dict[st
         raise AssertionError(f"{model_type}.evaluate_indices differs")
     if standalone["metrics"].get("evaluate_months") != guided["metrics"].get("evaluate_months"):
         raise AssertionError(f"{model_type}.evaluate_months differs")
+    if model_type == "arima":
+        for key in ("model_spec", "convergence_boundary_case"):
+            if standalone.get("search_summary", {}).get(key) != guided.get(
+                "search_summary", {}
+            ).get(key):
+                raise AssertionError(f"arima.search_summary.{key} differs")
+        if standalone["metrics"].get("convergence_boundary_case") != guided[
+            "metrics"
+        ].get("convergence_boundary_case"):
+            raise AssertionError("arima.metrics.convergence_boundary_case differs")
+    if model_type == "lstm":
+        for key in (
+            "target_key",
+            "feature_keys",
+            "feature_types",
+            "normalization",
+            "forecast_horizon",
+            "training_regime",
+        ):
+            if standalone.get(key) != guided.get(key):
+                raise AssertionError(f"lstm.{key} differs")
     assert_calibration_diagnostics(standalone.get("predictions"), f"standalone {model_type}")
     assert_calibration_diagnostics(guided.get("predictions"), f"guided {model_type}")
 

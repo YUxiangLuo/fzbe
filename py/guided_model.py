@@ -366,10 +366,14 @@ def _run_es(step_id: str, args, state: Dict[str, Any]) -> Dict[str, Any]:
         y_train = np.asarray(state["y"])[train_range]
         model = es._fit_textbook_ses(y_train, float(state["alpha"]))
         state["model"] = model
+        state["alpha_comparison"] = es.build_alpha_comparison(
+            y_train,
+            float(state["alpha"]),
+        )
         return {
             "alpha": float(state["alpha"]),
             "fitted_points": len(y_train),
-            "level": float(model.params.get("initial_level", y_train[0] if len(y_train) else 0.0)),
+            "initial_level": float(model.params.get("initial_level", y_train[0] if len(y_train) else 0.0)),
         }
 
     if step_id == "forecast":
@@ -459,6 +463,10 @@ def _run_es(step_id: str, args, state: Dict[str, Any]) -> Dict[str, Any]:
         y_true = state["y_true"]
         metrics = state["metrics"]
         predictions_with_std = state["predictions"]
+        alpha_comparison = state.get("alpha_comparison") or es.build_alpha_comparison(
+            np.asarray(state["y"])[train_range],
+            float(state["alpha"]),
+        )
         final_result: Dict[str, Any] = {
             "mode": "fixed_alpha_only",
             "data_points": int(state["data_points"]),
@@ -476,6 +484,8 @@ def _run_es(step_id: str, args, state: Dict[str, Any]) -> Dict[str, Any]:
             "metrics": metrics,
             "eval_y_true": y_true,
             "predictions": predictions_with_std,
+            "alpha_comparison": alpha_comparison,
+            "uncertainty_summary": state["uncertainty_summary"],
         }
         attach_method_metadata(final_result, es.METHOD_NAME, es.FORECAST_STRATEGY, es.IMPLEMENTATION_NOTES)
 
@@ -555,25 +565,27 @@ def _run_arima(step_id: str, args, state: Dict[str, Any]) -> Dict[str, Any]:
     if step_id == "aic_search":
         train_range, _ = _state_ranges(state)
         y_train = np.asarray(state["y"])[train_range]
-        best_model = arima._run_auto_arima_search(
+        (
+            best_model,
+            convergence_retried,
+            candidate_selection,
+        ) = arima._select_converged_auto_arima(
             y_train=y_train,
             d=int(state["d"]),
             max_p=int(state["max_p"]),
             max_q=int(state["max_q"]),
+            context="Selected guided ARIMA model",
             criterion="aicc",
-        )
-        best_model, convergence_retried = arima._ensure_converged(
-            best_model,
-            y_train,
-            "Selected guided ARIMA model",
         )
         state["best_model"] = best_model
         state["convergence_retried"] = convergence_retried
+        state["candidate_selection"] = candidate_selection
         return {
             "criterion": "aicc",
             "order": {"p": best_model.order[0], "d": best_model.order[1], "q": best_model.order[2]},
             "aicc": float(best_model.aicc()),
             "convergence_retried": convergence_retried,
+            "candidate_selection": candidate_selection,
         }
 
     if step_id == "bic_search":
@@ -588,7 +600,13 @@ def _run_arima(step_id: str, args, state: Dict[str, Any]) -> Dict[str, Any]:
     if step_id == "select_model":
         train_range, _ = _state_ranges(state)
         best_model = state["best_model"]
+        y_train = np.asarray(state["y"])[train_range]
         best_order = {"p": best_model.order[0], "d": best_model.order[1], "q": best_model.order[2]}
+        converged = arima._is_converged(best_model)
+        convergence_boundary_case = (
+            not converged
+            and arima._is_deterministic_boundary_case(best_model, y_train)
+        )
         search_summary = {
             "selection_criterion": "aicc",
             "effective_train_size": len(train_range) - int(state["d"]),
@@ -600,11 +618,18 @@ def _run_arima(step_id: str, args, state: Dict[str, Any]) -> Dict[str, Any]:
             "aicc": float(best_model.aicc()),
             "bic": float(best_model.bic()),
             "convergence_retried": bool(state["convergence_retried"]),
+            "convergence_boundary_case": convergence_boundary_case,
+            "candidate_selection": state.get("candidate_selection", {}),
             "diagnostics": state["diagnostics"],
         }
         state["best_order"] = best_order
         state["search_summary"] = search_summary
-        return {"best_order": best_order, "selection_criterion": "aicc"}
+        state["convergence_boundary_case"] = convergence_boundary_case
+        return {
+            "best_order": best_order,
+            "selection_criterion": "aicc",
+            "convergence_boundary_case": convergence_boundary_case,
+        }
 
     if step_id == "forecast":
         train_range, eval_range = _state_ranges(state)
@@ -650,11 +675,25 @@ def _run_arima(step_id: str, args, state: Dict[str, Any]) -> Dict[str, Any]:
         }
 
     if step_id == "evaluate_metrics":
-        _, eval_range = _state_ranges(state)
+        train_range, eval_range = _state_ranges(state)
         y_eval = np.asarray(state["y_true"])
         y_pred = np.asarray(state["y_pred"])
         best_model = state["best_model"]
         timestamps = state["timestamps"]
+        convergence_boundary_case = bool(
+            state.get("convergence_boundary_case", False)
+        )
+        if not convergence_boundary_case and not bool(state["converged"]):
+            y_train = np.asarray(state["y"])[train_range]
+            convergence_boundary_case = arima._is_deterministic_boundary_case(
+                best_model,
+                y_train,
+            )
+            state["convergence_boundary_case"] = convergence_boundary_case
+            if isinstance(state.get("search_summary"), dict):
+                state["search_summary"][
+                    "convergence_boundary_case"
+                ] = convergence_boundary_case
         metrics = {
             "rmse": rmse(y_eval, y_pred),
             "mae": mae(y_eval, y_pred),
@@ -664,6 +703,7 @@ def _run_arima(step_id: str, args, state: Dict[str, Any]) -> Dict[str, Any]:
             "aicc": float(best_model.aicc()),
             "bic": float(best_model.bic()),
             "converged": bool(state["converged"]),
+            "convergence_boundary_case": convergence_boundary_case,
             "diagnostics": state["diagnostics"],
             "evaluated_points": len(y_eval),
             "evaluate_indices": list(eval_range),
@@ -692,6 +732,20 @@ def _run_arima(step_id: str, args, state: Dict[str, Any]) -> Dict[str, Any]:
         best_model = state["best_model"]
         metrics = state["metrics"]
         predictions_with_std = state["predictions"]
+        if (
+            metrics.get("convergence_boundary_case") is not True
+            and metrics.get("converged") is False
+        ):
+            y_train = np.asarray(state["y"])[train_range]
+            convergence_boundary_case = arima._is_deterministic_boundary_case(
+                best_model,
+                y_train,
+            )
+            metrics["convergence_boundary_case"] = convergence_boundary_case
+            if isinstance(state.get("search_summary"), dict):
+                state["search_summary"][
+                    "convergence_boundary_case"
+                ] = convergence_boundary_case
         final_result: Dict[str, Any] = {
             "mode": "arima_search_pq_fixed_d",
             "data_points": int(state["data_points"]),
@@ -967,6 +1021,10 @@ def _run_lstm(step_id: str, args, state: Dict[str, Any]) -> Dict[str, Any]:
             "r2": r2(y_true, y_pred),
             "forecast_horizon": forecast_horizon,
             "training_regime": state["derived_config"]["regime"],
+            "training_metadata": lstm._training_metadata(
+                state["derived_config"],
+                parsed_data.feature_keys,
+            ),
             "evaluated_points": len(y_true),
             "evaluate_indices": list(eval_range),
             "evaluate_months": _month_labels(state["months"], eval_range),
@@ -1002,10 +1060,15 @@ def _run_lstm(step_id: str, args, state: Dict[str, Any]) -> Dict[str, Any]:
             "mode": "lstm_train_eval",
             "data_points": int(state["data_points"]),
             "target_key": parsed_data.target_key,
+            "feature_keys": parsed_data.feature_keys,
             "feature_types": state["feature_types"],
             "normalization": state["normalization"],
             "forecast_horizon": forecast_horizon,
             "training_regime": state["derived_config"]["regime"],
+            "training_metadata": lstm._training_metadata(
+                state["derived_config"],
+                parsed_data.feature_keys,
+            ),
             "train_range": {
                 "start_index": train_range.start,
                 "end_index": train_range.stop - 1,
@@ -1104,10 +1167,10 @@ def main() -> None:
     parser.add_argument("--window", type=int)
     parser.add_argument("--alpha", type=float)
     parser.add_argument("--d", type=int)
-    parser.add_argument("--max-p", type=int)
-    parser.add_argument("--max-q", type=int)
-    parser.add_argument("--look-back", type=int)
-    parser.add_argument("--epochs", type=int)
+    parser.add_argument("--max-p", type=int, help="Deprecated compatibility flag; the ARIMA p limit is data-derived")
+    parser.add_argument("--max-q", type=int, help="Deprecated compatibility flag; the ARIMA q limit is data-derived")
+    parser.add_argument("--look-back", type=int, help="Deprecated compatibility flag; LSTM look-back is data-derived")
+    parser.add_argument("--epochs", type=int, help="Deprecated compatibility flag; LSTM epochs are data-derived")
     parser.add_argument("--feature-types", type=str)
     parser.add_argument("--lstm-features", type=str)
     parser.add_argument("--lstm-target-feature", type=str)

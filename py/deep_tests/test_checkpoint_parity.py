@@ -4,6 +4,7 @@ import math
 import unittest
 from pathlib import Path
 
+from baselines import forecast_from_baseline_state
 from py.deep_tests.support.checkpoints import run_guided, run_production
 from py.deep_tests.support.harness import DATASETS, ENSEMBLES, MODEL_TYPES, IsolatedWorkspace, assert_prediction_contract, common_args, prediction_values, run_command, run_loaded, run_model
 from py.deep_tests.support.profiles import profile
@@ -32,13 +33,22 @@ def production_ensemble_oracle(model: str, artifact: Path) -> list[float]:
         ]
 
     counters: dict[str, int] = {}
-    total = [0.0] * steps
+    baseline = state.get("baseline")
+    has_explicit_baseline = (
+        isinstance(baseline, dict)
+        and baseline.get("kind") != "zero"
+    )
+    total = (
+        forecast_from_baseline_state(baseline, steps).astype(float).tolist()
+        if isinstance(baseline, dict)
+        else [0.0] * steps
+    )
     for stage_index, (name, coefficient) in enumerate(zip(state["model_chain"], state["stage_coefficients"])):
         member_index = counters.get(name, 0)
         counters[name] = member_index + 1
         member = state["base_model_states"][name]["models"][member_index]
         values = prediction_values(run_loaded(name, Path(member["model_file"]), steps, allow_negative=True).payload)
-        if stage_index == 0:
+        if stage_index == 0 and not has_explicit_baseline:
             values = [max(0.0, value) for value in values]
         for index, value in enumerate(values):
             total[index] += float(coefficient) * value
@@ -46,6 +56,29 @@ def production_ensemble_oracle(model: str, artifact: Path) -> list[float]:
 
 
 class CheckpointModeParityTests(unittest.TestCase):
+    @profile("fast")
+    def test_guided_es_final_result_includes_uncertainty_summary(self):
+        source = DATASETS / "seasonal_pulse_60.json"
+        with IsolatedWorkspace() as temp:
+            artifact = temp / "guided-es.pkl"
+            checkpoint_dir = temp / "guided-es-checkpoints"
+            checkpoint_dir.mkdir()
+            result = run_guided(
+                "es",
+                source,
+                artifact,
+                checkpoint_dir,
+            )
+
+        summary = result.get("uncertainty_summary")
+        self.assertIsInstance(summary, dict)
+        self.assertEqual(
+            "training_one_step_residuals",
+            summary["calibration_source"],
+        )
+        self.assertIn("horizons", summary)
+        self.assertTrue(summary["horizons"])
+
     @profile("nightly")
     def test_all_seven_standalone_guided_and_production_contracts(self):
         source = DATASETS / "seasonal_pulse_60.json"

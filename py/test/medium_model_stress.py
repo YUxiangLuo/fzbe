@@ -342,25 +342,46 @@ def assert_stacking_output(payload: dict, expected_length: int, expected_models:
     condition_number = meta_model.get("condition_number")
     if condition_number is not None and not math.isfinite(float(condition_number)):
         raise AssertionError(f"{label} condition_number must be finite or null: {condition_number!r}")
-    weights = meta_model.get("weights")
-    if not isinstance(weights, list) or len(weights) != len(expected_models):
-        raise AssertionError(f"{label} missing stacking weights: {weights!r}")
+    coefficients = meta_model.get("coefficients")
+    if not isinstance(coefficients, list) or len(coefficients) != len(expected_models):
+        raise AssertionError(f"{label} missing stacking coefficients: {coefficients!r}")
     model_names = meta_model.get("model_names")
     if not isinstance(model_names, list) or set(model_names) != set(expected_models):
         raise AssertionError(f"{label} stacking model_names mismatch: {model_names!r}")
-    total = sum(float(value) for value in weights)
-    if not math.isclose(total, 1.0, rel_tol=1e-6, abs_tol=1e-6):
-        raise AssertionError(f"{label} stacking weights do not sum to 1: {weights}")
+    if any(
+        not math.isfinite(float(value)) or float(value) < 0
+        for value in coefficients
+    ):
+        raise AssertionError(f"{label} stacking coefficients must be finite and non-negative: {coefficients}")
+    if int(meta_model.get("oof_fold_count", 0)) < 2:
+        raise AssertionError(f"{label} stacking should persist rolling OOF evidence: {meta_model!r}")
 
 
 def assert_boosting_output(payload: dict, expected_length: int, label: str) -> None:
     assert_prediction_payload(payload, "boosting", expected_length, label)
     model_chain = payload.get("model_chain")
     coefficients = payload.get("stage_coefficients")
-    if not isinstance(model_chain, list) or not model_chain:
-        raise AssertionError(f"{label} expected a non-empty model_chain")
+    if not isinstance(model_chain, list):
+        raise AssertionError(f"{label} expected a model_chain list")
     if not isinstance(coefficients, list) or len(coefficients) != len(model_chain):
         raise AssertionError(f"{label} stage_coefficients mismatch: {coefficients!r}")
+    if any(
+        model_name not in BASE_MODELS
+        for model_name in model_chain
+    ):
+        raise AssertionError(f"{label} model_chain contains an unknown member: {model_chain!r}")
+    if any(
+        not math.isfinite(float(coefficient)) or float(coefficient) <= 0
+        for coefficient in coefficients
+    ):
+        raise AssertionError(f"{label} stage_coefficients must be positive and finite: {coefficients!r}")
+    baseline = payload.get("baseline")
+    if not isinstance(baseline, dict) or baseline.get("kind") not in {
+        "mean",
+        "naive",
+        "seasonal_naive",
+    }:
+        raise AssertionError(f"{label} missing a valid stage-zero baseline: {baseline!r}")
 
 
 def run_ensemble_lifecycle(
@@ -484,12 +505,12 @@ def run_ensemble_lifecycle(
 
 
 def main() -> None:
-    records = build_medium_sales_records()
+    records = build_medium_sales_records(36)
     data_json = json.dumps(records, ensure_ascii=False)
-    train_end = 11
-    eval_start = 12
-    eval_end = 14
-    production_end = 17
+    train_end = 29
+    eval_start = 30
+    eval_end = 32
+    production_end = 35
     future_steps = 3
     all_combinations = [
         list(combo)

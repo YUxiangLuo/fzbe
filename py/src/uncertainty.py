@@ -2,8 +2,8 @@
 # -*- coding: utf-8 -*-
 """Shared horizon-aware uncertainty calibration and JSON formatting.
 
-Point forecasts are intentionally left untouched.  Prediction intervals and
-the production P99 buffer are offsets calibrated from ``actual - prediction``
+Point forecasts are intentionally left untouched. Prediction ranges and the
+P99 stress diagnostic are offsets calibrated from ``actual - prediction``
 residuals, so a stable non-zero bias is not mistaken for zero risk.
 
 ``std_dev`` remains the centered sample standard deviation required by the
@@ -26,6 +26,7 @@ INTERVAL_LEVEL = 0.95
 P99_LEVEL = 0.99
 NORMAL_95 = 1.959963984540054
 NORMAL_99 = 2.3263478740408408
+COVERAGE_CLAIM_NONE = "none"
 
 
 def _finite_nonnegative(value: Any) -> float | None:
@@ -65,7 +66,9 @@ def _normal_horizon(
         "calibration_source": calibration_source,
         "calibration_mean_error": None,
         "calibration_count": None,
+        "bias_diagnostic_source": None,
         "interval_kind": "fallback_normal_approximation" if source == UNCERTAINTY_FALLBACK else "normal_approximation",
+        "coverage_claim": COVERAGE_CLAIM_NONE,
     }
     if reason:
         horizon["reason"] = reason
@@ -101,6 +104,8 @@ def _empirical_horizon(
         "calibration_mean_error": float(np.mean(scaled)),
         "interval_kind": "empirical_residual_quantile",
         "calibration_count": int(finite.size),
+        "bias_diagnostic_source": calibration_source,
+        "coverage_claim": COVERAGE_CLAIM_NONE,
     }
 
 
@@ -199,11 +204,16 @@ def _valid_saved_horizon(value: Any) -> Dict[str, Any] | None:
     if std_dev < 0 or upper_p99 < 0 or lower > upper:
         return None
     normalized = dict(value)
+    coverage_claim = value.get("coverage_claim", COVERAGE_CLAIM_NONE)
+    if coverage_claim != COVERAGE_CLAIM_NONE:
+        return None
+    normalized["coverage_claim"] = COVERAGE_CLAIM_NONE
     mean_error = value.get("calibration_mean_error")
     calibration_count = value.get("calibration_count")
     if mean_error is None and calibration_count is None:
         normalized["calibration_mean_error"] = None
         normalized["calibration_count"] = None
+        normalized["bias_diagnostic_source"] = None
     elif mean_error is None or calibration_count is None:
         return None
     else:
@@ -223,6 +233,10 @@ def _valid_saved_horizon(value: Any) -> Dict[str, Any] | None:
             return None
         normalized["calibration_mean_error"] = numeric_mean_error
         normalized["calibration_count"] = numeric_count
+        raw_bias_source = value.get("bias_diagnostic_source", calibration_source)
+        if not isinstance(raw_bias_source, str) or not raw_bias_source:
+            return None
+        normalized["bias_diagnostic_source"] = raw_bias_source
     return normalized
 
 
@@ -314,10 +328,12 @@ def format_predictions(
             "interval_upper": upper,
             "interval_level": INTERVAL_LEVEL,
             "interval_kind": str(calibration["interval_kind"]),
+            "coverage_claim": str(calibration["coverage_claim"]),
             "upper_error_p99": upper_error_p99,
             "calibration_source": str(calibration["calibration_source"]),
             "calibration_mean_error": calibration["calibration_mean_error"],
             "calibration_count": calibration["calibration_count"],
+            "bias_diagnostic_source": calibration["bias_diagnostic_source"],
         }
         reason = calibration.get("reason")
         if reason is not None:

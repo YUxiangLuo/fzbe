@@ -190,12 +190,23 @@ def main() -> None:
         assert_method_metadata(train_output, "lstm_direct")
         assert train_output["data_points"] == len(records)
         assert train_output["target_key"] == "销售数量"
+        assert train_output["feature_keys"] == FEATURE_KEYS
         assert train_output["feature_types"] == INFERRED_SELECTED_FEATURE_TYPES
         assert "look_back" not in train_output
         assert "epochs" not in train_output
         assert train_output["normalization"] == "minmax"
         assert train_output["forecast_horizon"] == 3
         assert train_output["training_regime"] in {"standard", "teaching_demo"}
+        training_metadata = train_output["training_metadata"]
+        assert training_metadata["raw_feature_count"] == len(FEATURE_KEYS) + 1
+        if train_output["training_regime"] == "standard":
+            assert training_metadata["seed_runs"] == 3
+            assert training_metadata["seed_stability"]["seeds"] == [42, 314, 2718]
+            assert training_metadata["seed_stability"]["scope"] == "internal_time_validation"
+            assert len(training_metadata["seed_stability"]["runs"]) == 3
+        else:
+            assert training_metadata["seed_runs"] == 1
+            assert training_metadata["seed_stability"] is None
         assert train_output["metrics"]["evaluate_months"] == timestamps[28:31]
         assert train_output["metrics"]["forecast_horizon"] == 3
         assert len(train_output["eval_y_true"]) == 3
@@ -206,6 +217,7 @@ def main() -> None:
         if not all(std_dev > 0 for std_dev in train_std_devs):
             raise AssertionError(f"expected positive std_dev values, got {train_std_devs}")
         backtest_state = load_pickled_state(backtest_model)
+        assert training_metadata["feature_count"] == backtest_state["derived_config"]["feature_count"]
         assert backtest_state["look_back"] == backtest_state["derived_config"]["look_back"]
         assert backtest_state["derived_config"]["max_epochs"] != 2
         assert backtest_state["derived_config"]["regime"] == train_output["training_regime"]
@@ -233,6 +245,8 @@ def main() -> None:
         assert fit_output["feature_keys"] == FEATURE_KEYS
         assert fit_output["feature_types"] == INFERRED_SELECTED_FEATURE_TYPES
         assert fit_output["saved_model"] == str(production_model)
+        if fit_output["training_regime"] == "standard":
+            assert fit_output["training_metadata"]["seed_runs"] == 3
         production_state = load_pickled_state(production_model)
         assert production_state["forecast_strategy"] == "direct_multi_horizon"
         assert_method_metadata(production_state, "lstm_direct")

@@ -178,8 +178,13 @@ def verify_stacking_state(model_path: Path) -> None:
 def verify_boosting_state(model_path: Path) -> None:
     state = load_pickled_state(model_path)
     model_chain = state["model_chain"]
-    if not model_chain:
-        raise AssertionError("boosting saved state has empty model_chain")
+    coefficients = [float(value) for value in state["stage_coefficients"]]
+    if len(coefficients) != len(model_chain):
+        raise AssertionError("boosting stage coefficients do not match model_chain")
+    if state["baseline"]["kind"] not in {"mean", "naive", "seasonal_naive"}:
+        raise AssertionError(f"unexpected boosting baseline: {state['baseline']}")
+    if not model_chain and state["base_model_states"]:
+        raise AssertionError("baseline-only boosting persisted unused member states")
     for model_name, model_info in state["base_model_states"].items():
         for round_state in model_info["models"]:
             member_model = Path(round_state["model_file"])
@@ -189,6 +194,45 @@ def verify_boosting_state(model_path: Path) -> None:
                 keras_path = member_model.with_name(f"{member_model.stem}_keras_model.h5")
                 if not keras_path.exists():
                     raise AssertionError(f"missing boosting LSTM keras artifact: {keras_path}")
+
+
+def combine_boosting_predictions(state: dict, forecast_steps: int) -> list[float]:
+    baseline = state["baseline"]
+    if baseline["kind"] == "mean":
+        combined = [float(baseline["training_mean"])] * forecast_steps
+    elif baseline["kind"] == "naive":
+        combined = [float(baseline["last_value"])] * forecast_steps
+    elif baseline["kind"] == "seasonal_naive":
+        tail = [float(value) for value in baseline["seasonal_tail"]]
+        combined = [tail[index % len(tail)] for index in range(forecast_steps)]
+    else:
+        raise AssertionError(f"unknown boosting baseline: {baseline}")
+
+    usage_counts: dict[str, int] = {}
+    for stage_index, (model_name, coefficient) in enumerate(
+        zip(state["model_chain"], state["stage_coefficients"])
+    ):
+        usage_index = usage_counts.get(model_name, 0)
+        usage_counts[model_name] = usage_index + 1
+        member = state["base_model_states"][model_name]["models"][usage_index]
+        stage_predictions = extract_predictions(
+            invoke_model(
+                model_name,
+                None,
+                "--load-model",
+                member["model_file"],
+                "--forecast-steps",
+                str(forecast_steps),
+                "--allow-negative-predictions",
+                "--pretty",
+            )
+        )
+        combined = [
+            current + float(coefficient) * stage
+            for current, stage in zip(combined, stage_predictions)
+        ]
+
+    return [max(0.0, value) for value in combined]
 
 
 def train_and_verify_ensemble(
@@ -250,6 +294,15 @@ def train_and_verify_ensemble(
     train_std_devs = extract_std_devs(train_output)
     assert_all_finite(train_predictions, f"{model_type}_train_predictions")
     assert_all_finite(train_std_devs, f"{model_type}_train_std_devs")
+    if model_type == "boosting":
+        boosting_state = load_pickled_state(save_model)
+        assert_series_close(
+            train_predictions,
+            combine_boosting_predictions(
+                boosting_state,
+                forecast_steps=len(expected_eval_y_true),
+            ),
+        )
 
     loaded_predict_output = invoke_model(
         model_type,
@@ -270,8 +323,6 @@ def train_and_verify_ensemble(
     elif model_type == "stacking":
         verify_stacking_state(save_model)
     elif model_type == "boosting":
-        if not train_output["model_chain"]:
-            raise AssertionError("boosting train_output has empty model_chain")
         verify_boosting_state(save_model)
 
 

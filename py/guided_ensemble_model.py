@@ -26,17 +26,17 @@ from data_utils import infer_feature_types, load_data_from_json
 from error_protocol import format_known_error
 from ensemble_utils import (
     build_ensemble_subprocess_data,
-    can_refit_source_artifact_for_internal_holdout,
-    fit_and_predict_from_source_model,
     get_member_model_path,
     normalize_demand_forecast,
     parse_base_model_files_arg,
     parse_base_model_names,
-    plan_ensemble_internal_holdout,
+    plan_ensemble_selection_calibration_split,
+    predict_member_on_chronological_holdout,
     persist_member_model_artifact,
     remove_member_model_artifact,
     require_explicit_lstm_feature_names,
     resolve_base_model_artifact_configs,
+    warn_ignored_boosting_controls,
 )
 from dynamic_config import derive_boosting_max_rounds
 from logger import get_log_contents
@@ -256,7 +256,7 @@ def _initialize_state(model_type: str, args, state: Dict[str, Any]) -> Dict[str,
         "stacking": "stacking",
         "boosting": "boosting",
     }[model_type]
-    split_plan = plan_ensemble_internal_holdout(
+    split_plan = plan_ensemble_selection_calibration_split(
         parsed_data,
         train_range,
         models_to_use,
@@ -286,13 +286,20 @@ def _initialize_state(model_type: str, args, state: Dict[str, Any]) -> Dict[str,
             0.05 if int(split_plan["validation_size"]) < 5 else 0.01
         )
 
-    return {
+    initialized: Dict[str, Any] = {
         "data_points": parsed_data.n_obs,
         "train_size": len(train_range),
         "evaluate_size": len(eval_range),
         "models": models_to_use,
-        "reused_artifacts": sorted(base_model_files.keys()),
     }
+    # Weighted average and Stacking predict the evaluation range from a saved
+    # member artifact when one matches. Boosting cannot: after the stage-zero
+    # baseline every stage learns a signed residual, so a saved demand-scale
+    # artifact has nothing to contribute and each stage is retrained. Reporting
+    # the available files as "复用产物" there would be a false teaching claim.
+    if model_type != "boosting":
+        initialized["reused_artifacts"] = sorted(base_model_files.keys())
+    return initialized
 
 
 def _base_timeout(models_to_use: List[str], model_params: Dict[str, Dict[str, Any]]) -> int:
@@ -318,50 +325,51 @@ def _holdout_predictions(
     for model_name in models_to_use:
         params = model_params[model_name]
         source_model_file = base_model_files.get(model_name)
-        if (
-            source_model_file
-            and can_refit_source_artifact_for_internal_holdout(model_name)
-        ):
-            adjusted_source_model_file = source_model_file
-            temp_source_model_file = None
-            try:
-                if model_name == "lstm":
-                    source_model_state = module._load_lstm_source_state(source_model_file, source_context)
-                    adjusted_source_model_file, temp_source_model_file = (
-                        module._prepare_lstm_source_model_for_requested_steps(
-                            source_model_file,
-                            source_model_state,
-                            requested_steps=len(holdout_range),
-                        )
-                    )
-                predictions[model_name] = normalize_demand_forecast(fit_and_predict_from_source_model(
-                    model_name=model_name,
-                    source_model_file=adjusted_source_model_file,
-                    data=lstm_data_dicts if model_name == "lstm" else numeric_data_dicts,
-                    train_start=train_range.start,
-                    train_end=train_range.stop - 1,
-                    forecast_steps=len(holdout_range),
-                    timeout=timeout,
-                )).tolist()
-            finally:
-                if temp_source_model_file and os.path.exists(temp_source_model_file):
-                    os.remove(temp_source_model_file)
-            continue
-
-        result = run_base_model_subprocess(
-            model_type=model_name,
-            data=lstm_data_dicts if model_name == "lstm" else numeric_data_dicts,
-            train_start=train_range.start,
-            train_end=train_range.stop - 1,
-            eval_start=holdout_range.start,
-            eval_end=holdout_range.stop - 1,
-            model_params=params.copy(),
+        predictions[model_name] = predict_member_on_chronological_holdout(
+            model_name=model_name,
+            params=params,
+            source_model_file=source_model_file,
+            numeric_data=numeric_data_dicts,
+            lstm_data=lstm_data_dicts,
+            train_range=train_range,
+            holdout_range=holdout_range,
             timeout=timeout,
         )
-        predictions[model_name] = normalize_demand_forecast(
-            extract_predictions_from_result(result)
-        ).tolist()
 
+    return predictions
+
+
+def _rolling_oof_predictions(
+    module,
+    parsed_data,
+    models_to_use: List[str],
+    model_params: Dict[str, Dict[str, Any]],
+    base_model_files: Dict[str, str],
+    folds: List[Dict[str, int]],
+    source_context: str,
+) -> Dict[str, List[float]]:
+    predictions: Dict[str, List[float]] = {
+        model_name: [] for model_name in models_to_use
+    }
+    for fold in folds:
+        fold_predictions = _holdout_predictions(
+            module,
+            parsed_data,
+            models_to_use,
+            model_params,
+            base_model_files,
+            range(
+                int(fold["train_start"]),
+                int(fold["train_end_exclusive"]),
+            ),
+            range(
+                int(fold["holdout_start"]),
+                int(fold["holdout_end_exclusive"]),
+            ),
+            source_context,
+        )
+        for model_name in models_to_use:
+            predictions[model_name].extend(fold_predictions[model_name])
     return predictions
 
 
@@ -567,15 +575,43 @@ def _run_weighted(step_id: str, args, state: Dict[str, Any]) -> Dict[str, Any]:
         }
 
     if step_id == "split_validation":
-        split = int(state["split_plan"]["prefix_size"])
-        weight_train_range = range(train_range.start, train_range.start + split)
-        weight_val_range = range(train_range.start + split, train_range.stop)
+        prefix_size = int(state["split_plan"]["prefix_size"])
+        selection_size = int(state["split_plan"]["selection_size"])
+        calibration_size = int(state["split_plan"]["calibration_size"])
+        weight_train_range = range(
+            train_range.start,
+            train_range.start + prefix_size,
+        )
+        weight_val_range = range(
+            weight_train_range.stop,
+            weight_train_range.stop + selection_size,
+        )
+        calibration_range = range(
+            weight_val_range.stop,
+            weight_val_range.stop + calibration_size,
+        )
         state["weight_train_range"] = _range_to_state(weight_train_range)
         state["weight_val_range"] = _range_to_state(weight_val_range)
+        state["calibration_range"] = _range_to_state(calibration_range)
+        state["split_plan"]["ranges"] = {
+            "prefix": {
+                "start": weight_train_range.start,
+                "end_exclusive": weight_train_range.stop,
+            },
+            "selection": {
+                "start": weight_val_range.start,
+                "end_exclusive": weight_val_range.stop,
+            },
+            "calibration": {
+                "start": calibration_range.start,
+                "end_exclusive": calibration_range.stop,
+            },
+        }
         return {
             "train_size": len(train_range),
             "weight_train_size": len(weight_train_range),
             "weight_val_size": len(weight_val_range),
+            "calibration_size": len(calibration_range),
             "evaluate_size": len(eval_range),
             "split_plan": state["split_plan"],
         }
@@ -640,25 +676,45 @@ def _run_weighted(step_id: str, args, state: Dict[str, Any]) -> Dict[str, Any]:
         y_pred_final = np.sum(x_eval * model_weights, axis=1)
         y_pred_final = normalize_demand_forecast(y_pred_final)
         y_true = parsed_data.y[eval_range]
-        weight_val_range = _state_range(state, "weight_val_range")
-        weight_val_predictions = state["weight_val_predictions"]
-        x_weight_val = np.array([weight_val_predictions[name] for name in models_to_use]).T
-        weight_val_blend = np.sum(x_weight_val * model_weights, axis=1)
-        weight_val_blend = normalize_demand_forecast(weight_val_blend)
-        weight_val_residuals = parsed_data.y[weight_val_range] - weight_val_blend
+        calibration_range = _state_range(state, "calibration_range")
+        calibration_residuals = np.asarray([], dtype=float)
+        calibration_source = "unavailable_post_selection_calibration"
+        if len(calibration_range) > 0:
+            calibration_predictions = _holdout_predictions(
+                weighted_avg,
+                parsed_data,
+                models_to_use,
+                model_params,
+                base_model_files,
+                range(train_range.start, calibration_range.start),
+                calibration_range,
+                "Saved Weighted Average LSTM base model",
+            )
+            x_calibration = np.asarray(
+                [calibration_predictions[name] for name in models_to_use],
+                dtype=float,
+            ).T
+            calibration_blend = normalize_demand_forecast(
+                np.sum(x_calibration * model_weights, axis=1)
+            )
+            calibration_residuals = (
+                parsed_data.y[calibration_range] - calibration_blend
+            )
+            calibration_source = "post_selection_calibration"
+            state["calibration_predictions"] = calibration_predictions
         eval_forecast_steps = eval_range.stop - train_range.stop
         eval_forecast_offset = eval_range.start - train_range.stop
         full_uncertainty_profile, uncertainty_summary = ensemble_growth_profile(
             state["full_uncertainty_profiles"],
             weights,
-            weight_val_residuals,
+            calibration_residuals,
             parsed_data.y[train_range],
             eval_forecast_steps,
+            calibration_source=calibration_source,
         )
         uncertainty_profile = full_uncertainty_profile[
             eval_forecast_offset: eval_forecast_offset + len(eval_range)
         ]
-        uncertainty_summary.setdefault("calibration_source", "internal_validation")
         timestamps = parsed_data.timestamps
         metrics = {
             "rmse": rmse(y_true, y_pred_final),
@@ -687,8 +743,8 @@ def _run_weighted(step_id: str, args, state: Dict[str, Any]) -> Dict[str, Any]:
         state["eval_y_true"] = y_true.tolist()
         state["y_pred"] = y_pred_final.tolist()
         state["uncertainty"] = {
-            "calibration_residuals": weight_val_residuals.tolist(),
-            "calibration_source": "internal_validation",
+            "calibration_residuals": calibration_residuals.tolist(),
+            "calibration_source": calibration_source,
             "reference_series": parsed_data.y[train_range].tolist(),
             "profile": full_uncertainty_profile,
             "summary": uncertainty_summary,
@@ -733,14 +789,13 @@ def _run_stacking(step_id: str, args, state: Dict[str, Any]) -> Dict[str, Any]:
         if model_name not in models_to_use:
             raise ValueError("[VALIDATION] Stacking member step is not part of this session.")
         if action == "level1_prediction":
-            prediction = _holdout_predictions(
+            prediction = _rolling_oof_predictions(
                 stacking,
                 parsed_data,
                 [model_name],
                 model_params,
                 base_model_files,
-                _state_range(state, "level0_range"),
-                _state_range(state, "level1_range"),
+                state["oof_folds"],
                 "Saved Stacking LSTM base model",
             )[model_name]
             state.setdefault("level1_prediction_map", {})[model_name] = prediction
@@ -768,28 +823,65 @@ def _run_stacking(step_id: str, args, state: Dict[str, Any]) -> Dict[str, Any]:
         }
 
     if step_id == "split_levels":
-        split = int(state["split_plan"]["prefix_size"])
-        level0_range = range(train_range.start, train_range.start + split)
-        level1_range = range(train_range.start + split, train_range.stop)
+        prefix_size = int(state["split_plan"]["prefix_size"])
+        selection_size = int(state["split_plan"]["selection_size"])
+        calibration_size = int(state["split_plan"]["calibration_size"])
+        level0_range = range(
+            train_range.start,
+            train_range.start + prefix_size,
+        )
+        level1_range = range(
+            level0_range.stop,
+            level0_range.stop + selection_size,
+        )
+        calibration_range = range(
+            level1_range.stop,
+            level1_range.stop + calibration_size,
+        )
+        oof_folds = [dict(fold) for fold in state["split_plan"]["oof_folds"]]
         state["level0_range"] = _range_to_state(level0_range)
         state["level1_range"] = _range_to_state(level1_range)
+        state["calibration_range"] = _range_to_state(calibration_range)
+        state["oof_folds"] = oof_folds
+        state["split_plan"].update(
+            {
+                "oof_strategy": "expanding_window_rolling_origin",
+                "oof_fold_count": len(oof_folds),
+                "oof_folds": oof_folds,
+                "ranges": {
+                    "prefix": {
+                        "start": level0_range.start,
+                        "end_exclusive": level0_range.stop,
+                    },
+                    "selection": {
+                        "start": level1_range.start,
+                        "end_exclusive": level1_range.stop,
+                    },
+                    "calibration": {
+                        "start": calibration_range.start,
+                        "end_exclusive": calibration_range.stop,
+                    },
+                },
+            }
+        )
         return {
             "train_size": len(train_range),
             "level0_size": len(level0_range),
             "level1_size": len(level1_range),
+            "calibration_size": len(calibration_range),
+            "oof_fold_count": len(oof_folds),
             "evaluate_size": len(eval_range),
             "split_plan": state["split_plan"],
         }
 
     if step_id == "level1_predictions":
-        prediction_map = _holdout_predictions(
+        prediction_map = _rolling_oof_predictions(
             stacking,
             parsed_data,
             models_to_use,
             model_params,
             base_model_files,
-            _state_range(state, "level0_range"),
-            _state_range(state, "level1_range"),
+            state["oof_folds"],
             "Saved Stacking LSTM base model",
         )
         state["level1_predictions"] = [prediction_map[name] for name in models_to_use]
@@ -807,6 +899,13 @@ def _run_stacking(step_id: str, args, state: Dict[str, Any]) -> Dict[str, Any]:
         x_meta_train = np.column_stack(state["level1_predictions"])
         y_meta_train = parsed_data.y[level1_range]
         meta_model = stacking._fit_meta_model(x_meta_train, y_meta_train, models_to_use)
+        meta_model.update(
+            {
+                "training_strategy": "expanding_window_rolling_origin_oof",
+                "oof_fold_count": len(state["oof_folds"]),
+                "oof_row_count": int(x_meta_train.shape[0]),
+            }
+        )
         state["meta_model"] = meta_model
         return {
             "meta_model": meta_model,
@@ -846,12 +945,37 @@ def _run_stacking(step_id: str, args, state: Dict[str, Any]) -> Dict[str, Any]:
         y_pred_final = stacking._predict_with_meta_model(state["meta_model"], x_meta_eval)
         y_pred_final = normalize_demand_forecast(y_pred_final)
         y_true = parsed_data.y[eval_range]
-        level1_range = _state_range(state, "level1_range")
-        x_meta_train = np.column_stack(state["level1_predictions"])
-        level1_blend = normalize_demand_forecast(
-            stacking._predict_with_meta_model(state["meta_model"], x_meta_train)
-        )
-        level1_residuals = parsed_data.y[level1_range] - level1_blend
+        calibration_range = _state_range(state, "calibration_range")
+        calibration_residuals = np.asarray([], dtype=float)
+        calibration_source = "unavailable_post_selection_calibration"
+        if len(calibration_range) > 0:
+            calibration_prediction_map = _holdout_predictions(
+                stacking,
+                parsed_data,
+                models_to_use,
+                model_params,
+                base_model_files,
+                range(train_range.start, calibration_range.start),
+                calibration_range,
+                "Saved Stacking LSTM base model",
+            )
+            x_meta_calibration = np.column_stack(
+                [
+                    calibration_prediction_map[name]
+                    for name in models_to_use
+                ]
+            )
+            calibration_blend = normalize_demand_forecast(
+                stacking._predict_with_meta_model(
+                    state["meta_model"],
+                    x_meta_calibration,
+                )
+            )
+            calibration_residuals = (
+                parsed_data.y[calibration_range] - calibration_blend
+            )
+            calibration_source = "post_selection_calibration"
+            state["calibration_predictions"] = calibration_prediction_map
         coefficients = dict(zip(
             state["meta_model"]["model_names"],
             state["meta_model"]["coefficients"],
@@ -861,15 +985,14 @@ def _run_stacking(step_id: str, args, state: Dict[str, Any]) -> Dict[str, Any]:
         full_uncertainty_profile, uncertainty_summary = ensemble_growth_profile(
             state["full_uncertainty_profiles"],
             coefficients,
-            level1_residuals,
+            calibration_residuals,
             parsed_data.y[train_range],
             eval_forecast_steps,
-            calibration_source="level1_holdout",
+            calibration_source=calibration_source,
         )
         uncertainty_profile = full_uncertainty_profile[
             eval_forecast_offset: eval_forecast_offset + len(eval_range)
         ]
-        uncertainty_summary.setdefault("calibration_source", "level1_holdout")
         timestamps = parsed_data.timestamps
         metrics = {
             "rmse": rmse(y_true, y_pred_final),
@@ -897,8 +1020,8 @@ def _run_stacking(step_id: str, args, state: Dict[str, Any]) -> Dict[str, Any]:
         state["eval_y_true"] = y_true.tolist()
         state["y_pred"] = y_pred_final.tolist()
         state["uncertainty"] = {
-            "calibration_residuals": level1_residuals.tolist(),
-            "calibration_source": "level1_holdout",
+            "calibration_residuals": calibration_residuals.tolist(),
+            "calibration_source": calibration_source,
             "reference_series": parsed_data.y[train_range].tolist(),
             "profile": full_uncertainty_profile,
             "summary": uncertainty_summary,
@@ -932,7 +1055,6 @@ def _run_boosting(step_id: str, args, state: Dict[str, Any]) -> Dict[str, Any]:
     eval_range = _state_range(state, "eval_range")
     models_to_use = state["models"]
     model_params = state["model_params"]
-    base_model_files = state["base_model_files"]
 
     candidate_match = re.fullmatch(
         r"round_(\d+)_evaluate_(ma|es|arima|lstm)",
@@ -986,10 +1108,15 @@ def _run_boosting(step_id: str, args, state: Dict[str, Any]) -> Dict[str, Any]:
             round_parsed_data,
             boost_train_range,
         )
-        stage_predictions = boosting._apply_stage_output_semantics(round_idx, stage_predictions)
+        stage_predictions = boosting._apply_stage_output_semantics(
+            round_idx,
+            stage_predictions,
+            residual_target=True,
+        )
         fitted_train_predictions = boosting._apply_stage_output_semantics(
             round_idx,
             fitted_train_predictions,
+            residual_target=True,
         )
         coefficient = boosting._nonnegative_line_search(residual_val, stage_predictions)
         next_residual_val = residual_val - coefficient * stage_predictions
@@ -1011,29 +1138,78 @@ def _run_boosting(step_id: str, args, state: Dict[str, Any]) -> Dict[str, Any]:
         }
 
     if step_id == "split_residual_sets":
-        split = int(state["split_plan"]["prefix_size"])
-        boost_train_range = range(train_range.start, train_range.start + split)
-        boost_val_range = range(train_range.start + split, train_range.stop)
+        prefix_size = int(state["split_plan"]["prefix_size"])
+        selection_size = int(state["split_plan"]["selection_size"])
+        calibration_size = int(state["split_plan"]["calibration_size"])
+        boost_train_range = range(
+            train_range.start,
+            train_range.start + prefix_size,
+        )
+        boost_val_range = range(
+            boost_train_range.stop,
+            boost_train_range.stop + selection_size,
+        )
+        calibration_range = range(
+            boost_val_range.stop,
+            boost_val_range.stop + calibration_size,
+        )
+        (
+            selected_baseline,
+            baseline_fitted_train,
+            baseline_selection_predictions,
+            baseline_diagnostics,
+        ) = boosting.choose_stage_zero_baseline(
+            parsed_data,
+            boost_train_range,
+            boost_val_range,
+        )
         y_true_val = np.asarray(parsed_data.y[boost_val_range], dtype=float)
         state["boost_train_range"] = _range_to_state(boost_train_range)
         state["boost_val_range"] = _range_to_state(boost_val_range)
-        state["residual_train"] = np.asarray(parsed_data.y[boost_train_range], dtype=float)
-        state["residual_val"] = y_true_val
-        state["validation_residual_snapshots"] = [y_true_val.copy()]
+        state["calibration_range"] = _range_to_state(calibration_range)
+        state["selection_baseline"] = selected_baseline
+        state["baseline_diagnostics"] = baseline_diagnostics
+        state["residual_train"] = (
+            np.asarray(parsed_data.y[boost_train_range], dtype=float)
+            - baseline_fitted_train
+        )
+        state["residual_val"] = (
+            y_true_val - baseline_selection_predictions
+        )
         state["model_chain"] = []
         state["stage_coefficients"] = []
         state["next_round_index"] = 0
         state["search_summary"] = {
             "algorithm": "residual_boosting",
             "coefficient_strategy": "nonnegative_squared_error_line_search",
+            "post_line_search_shrinkage": (
+                boosting.get_post_line_search_shrinkage_metadata()
+            ),
             "minimum_relative_improvement": state["minimum_relative_improvement"],
             "max_rounds": state["max_rounds"],
             "split_plan": state["split_plan"],
+            "baseline": baseline_diagnostics,
             "stages": [],
+        }
+        state["split_plan"]["ranges"] = {
+            "prefix": {
+                "start": boost_train_range.start,
+                "end_exclusive": boost_train_range.stop,
+            },
+            "selection": {
+                "start": boost_val_range.start,
+                "end_exclusive": boost_val_range.stop,
+            },
+            "calibration": {
+                "start": calibration_range.start,
+                "end_exclusive": calibration_range.stop,
+            },
         }
         return {
             "boost_train_size": len(boost_train_range),
             "boost_val_size": len(boost_val_range),
+            "calibration_size": len(calibration_range),
+            "baseline": baseline_diagnostics,
             "max_rounds": state["max_rounds"],
             "split_plan": state["split_plan"],
         }
@@ -1078,10 +1254,12 @@ def _run_boosting(step_id: str, args, state: Dict[str, Any]) -> Dict[str, Any]:
                 stage_predictions = boosting._apply_stage_output_semantics(
                     round_idx,
                     stage_predictions,
+                    residual_target=True,
                 )
                 fitted_train_predictions = boosting._apply_stage_output_semantics(
                     round_idx,
                     fitted_train_predictions,
+                    residual_target=True,
                 )
                 coefficient = boosting._nonnegative_line_search(
                     residual_val, stage_predictions
@@ -1151,9 +1329,6 @@ def _run_boosting(step_id: str, args, state: Dict[str, Any]) -> Dict[str, Any]:
             state["stage_coefficients"].append(best_result["coefficient"])
             state["residual_train"] = residual_train - best_result["coefficient"] * best_result["fitted_train_predictions"]
             state["residual_val"] = best_result["next_residual_val"]
-            state["validation_residual_snapshots"].append(
-                np.asarray(state["residual_val"], dtype=float).copy()
-            )
             state["next_round_index"] = round_idx + 1
             stage_summary["action"] = "selected"
             if round_idx + 1 >= int(state["max_rounds"]):
@@ -1174,23 +1349,67 @@ def _run_boosting(step_id: str, args, state: Dict[str, Any]) -> Dict[str, Any]:
 
     if step_id == "initialize_refit":
         selection_model_chain = list(state["model_chain"])
-        if not selection_model_chain:
-            raise ValueError(
-                "[DATA] Boosting 未能选出任何有效阶段：所有候选基础模型都无法降低验证残差 RMSE。"
-            )
+        state["search_summary"]["selection_outcome"] = (
+            "residual_chain_selected"
+            if selection_model_chain
+            else "baseline_retained_no_improvement"
+        )
         state["search_summary"]["selection_model_chain"] = selection_model_chain
         state["selection_model_chain"] = selection_model_chain
         state["selection_coefficients"] = list(state["stage_coefficients"])
         state["refit_model_chain"] = []
         state["refit_stage_coefficients"] = []
-        state["final_eval_preds"] = np.zeros(len(eval_range), dtype=float)
-        state["residual_full_train"] = np.asarray(parsed_data.y[train_range], dtype=float).copy()
+        baseline_kind = str(state["selection_baseline"]["kind"])
+        baseline_period = state["selection_baseline"].get("seasonal_period")
+        (
+            calibration_residuals,
+            calibration_source,
+            calibration_refit,
+        ) = boosting._prepare_selected_chain_calibration(
+            parsed_data,
+            train_range,
+            _state_range(state, "calibration_range"),
+            selection_model_chain,
+            model_params,
+            baseline_kind,
+            baseline_period,
+        )
+        state["calibration_candidate_residuals"] = calibration_residuals.tolist()
+        state["calibration_candidate_source"] = calibration_source
+        state["calibration_refit"] = calibration_refit
+        state["baseline"] = boosting.fit_baseline_state_for_range(
+            parsed_data,
+            train_range,
+            baseline_kind,
+            baseline_period,
+        )
+        state["final_eval_preds"] = boosting.baseline_forecast_for_range(
+            parsed_data,
+            train_range,
+            eval_range,
+            baseline_kind,
+            baseline_period,
+        )
+        state["residual_full_train"] = (
+            np.asarray(parsed_data.y[train_range], dtype=float)
+            - boosting.baseline_fitted_values_for_range(
+                parsed_data,
+                train_range,
+                baseline_kind,
+                baseline_period,
+            )
+        )
         state["base_model_states"] = {}
         state["full_uncertainty_profiles"] = {}
         state["uncertainty_coefficients"] = {}
         state["stage_eval_summaries"] = []
+        state["eval_y_true"] = np.asarray(
+            parsed_data.y[eval_range],
+            dtype=float,
+        ).tolist()
         return {
             "selection_model_chain": selection_model_chain,
+            "baseline": state["baseline"],
             "stage_count": len(selection_model_chain),
         }
 
@@ -1213,94 +1432,22 @@ def _run_boosting(step_id: str, args, state: Dict[str, Any]) -> Dict[str, Any]:
             train_range,
             residual_full_train,
         )
-        artifact_origin = "temporary_training"
-        eval_forecast_steps = eval_range.stop - train_range.stop
-        eval_forecast_offset = eval_range.start - train_range.stop
-
-        if stage_idx == 0 and model_name in base_model_files:
-            source_model_file = base_model_files[model_name]
-            if model_name == "lstm":
-                source_model_state = boosting._load_lstm_source_state(
-                    source_model_file,
-                    "Saved Boosting LSTM base model",
-                )
-                source_strategy = boosting._get_lstm_source_forecast_strategy(source_model_state)
-                source_horizon = int(source_model_state.get("forecast_horizon", 0) or 0)
-                if source_strategy == "direct_multi_horizon" and eval_forecast_steps > source_horizon:
-                    stage_model_file = os.path.join(
-                        state["artifact_dir"],
-                        f"boosting_stage_{model_name}_{stage_idx}_{os.getpid()}.pkl",
-                    )
-                    round_numeric_records, round_lstm_records = boosting._build_round_records(
-                        round_parsed_data,
-                        model_name,
-                        params,
-                    )
-                    adjusted_source_model_file = source_model_file
-                    temp_source_model_file = None
-                    try:
-                        adjusted_source_model_file, temp_source_model_file = (
-                            boosting._prepare_lstm_source_model_for_requested_steps(
-                                source_model_file,
-                                source_model_state,
-                                requested_steps=eval_forecast_steps,
-                            )
-                        )
-                        fit_result = run_base_model_fit_subprocess(
-                            model_type=model_name,
-                            data=round_lstm_records,
-                            train_start=train_range.start,
-                            train_end=train_range.stop - 1,
-                            source_model_file=adjusted_source_model_file,
-                            save_model_file=stage_model_file,
-                            fit_forecast_steps=eval_forecast_steps,
-                            predict_steps=eval_forecast_steps,
-                            allow_negative_predictions=True,
-                            timeout=timeout,
-                        )
-                    finally:
-                        if temp_source_model_file and os.path.exists(temp_source_model_file):
-                            os.remove(temp_source_model_file)
-                    full_predictions = np.asarray(extract_predictions_from_result(fit_result), dtype=float)
-                    stage_eval_predictions = full_predictions[
-                        eval_forecast_offset: eval_forecast_offset + len(eval_range)
-                    ]
-                    stage_uncertainty_profile = extract_uncertainty_profile_from_result(fit_result)
-                else:
-                    stage_model_file = source_model_file
-                    stage_eval_predictions, stage_uncertainty_profile = boosting._predict_eval_segment(
-                        model_name,
-                        stage_model_file,
-                        train_range,
-                        eval_range,
-                        timeout,
-                    )
-                    artifact_origin = "standalone_base"
-            else:
-                stage_model_file = source_model_file
-                stage_eval_predictions, stage_uncertainty_profile = boosting._predict_eval_segment(
-                    model_name,
-                    stage_model_file,
-                    train_range,
-                    eval_range,
-                    timeout,
-                )
-                artifact_origin = "standalone_base"
-        else:
-            round_numeric_records, round_lstm_records = boosting._build_round_records(
-                round_parsed_data,
-                model_name,
-                params,
-            )
-            stage_model_file, stage_eval_predictions, stage_uncertainty_profile = boosting._train_stage_model(
-                model_name,
-                round_numeric_records,
-                round_lstm_records,
-                train_range,
-                eval_range,
-                params,
-                timeout,
-            )
+        # Every stage is a signed-residual learner: stage 0 is the statistical
+        # baseline, so a demand-scale base-model artifact cannot be replayed here.
+        round_numeric_records, round_lstm_records = boosting._build_round_records(
+            round_parsed_data,
+            model_name,
+            params,
+        )
+        stage_model_file, stage_eval_predictions, stage_uncertainty_profile = boosting._train_stage_model(
+            model_name,
+            round_numeric_records,
+            round_lstm_records,
+            train_range,
+            eval_range,
+            params,
+            timeout,
+        )
 
         fitted_train_predictions = boosting._compute_in_sample_fitted_predictions(
             model_name,
@@ -1308,28 +1455,28 @@ def _run_boosting(step_id: str, args, state: Dict[str, Any]) -> Dict[str, Any]:
             round_parsed_data,
             train_range,
         )
-        stage_eval_predictions = boosting._apply_stage_output_semantics(stage_idx, stage_eval_predictions)
+        stage_eval_predictions = boosting._apply_stage_output_semantics(
+            stage_idx,
+            stage_eval_predictions,
+            residual_target=True,
+        )
         fitted_train_predictions = boosting._apply_stage_output_semantics(
             stage_idx,
             fitted_train_predictions,
+            residual_target=True,
         )
         coefficient = boosting._nonnegative_line_search(
             residual_full_train,
             fitted_train_predictions,
         )
         if coefficient <= np.finfo(float).eps:
-            if artifact_origin == "temporary_training":
-                boosting.remove_member_model_artifact(model_name, stage_model_file)
+            boosting.remove_member_model_artifact(model_name, stage_model_file)
             state["search_summary"]["refit_stop"] = {
                 "stage": stage_idx + 1,
                 "model_name": model_name,
                 "reason": "nonpositive_full_refit_coefficient",
                 "coefficient": coefficient,
             }
-            if stage_idx == 0:
-                raise ValueError(
-                    "[MODEL] Boosting selected a validation chain, but its first stage had no positive contribution after full-range refitting."
-                )
             return {
                 "action": "trim_refit_chain",
                 "stage": stage_idx + 1,
@@ -1352,7 +1499,6 @@ def _run_boosting(step_id: str, args, state: Dict[str, Any]) -> Dict[str, Any]:
             "params": params,
             "round": stage_idx,
             "coefficient": coefficient,
-            "artifact_origin": artifact_origin,
         })
         stage_summary = {
             "round": stage_idx + 1,
@@ -1361,10 +1507,6 @@ def _run_boosting(step_id: str, args, state: Dict[str, Any]) -> Dict[str, Any]:
             "rmse": rmse(np.asarray(parsed_data.y[eval_range], dtype=float), final_eval_preds),
         }
         state["stage_eval_summaries"].append(stage_summary)
-        state["calibration_residuals"] = np.asarray(
-            state["validation_residual_snapshots"][len(state["refit_model_chain"])],
-            dtype=float,
-        )
         state["eval_y_true"] = np.asarray(parsed_data.y[eval_range], dtype=float).tolist()
         return {"action": "refit_stage", **stage_summary}
 
@@ -1372,106 +1514,75 @@ def _run_boosting(step_id: str, args, state: Dict[str, Any]) -> Dict[str, Any]:
         selection_model_chain = list(state["model_chain"])
         selection_coefficients = list(state["stage_coefficients"])
         state["search_summary"]["selection_model_chain"] = selection_model_chain
+        state["selection_model_chain"] = selection_model_chain
         refit_model_chain: List[str] = []
         stage_coefficients: List[float] = []
         y_true_eval = np.asarray(parsed_data.y[eval_range], dtype=float)
-        if not selection_model_chain:
-            raise ValueError(
-                "[DATA] Boosting 未能选出任何有效阶段：所有候选基础模型在验证段的预测均无效，"
-                "无法降低残差 RMSE。请检查所选数据区间的质量，或调整基础模型参数后重试。"
+        baseline_kind = str(state["selection_baseline"]["kind"])
+        baseline_period = state["selection_baseline"].get("seasonal_period")
+        (
+            calibration_residuals,
+            calibration_source,
+            calibration_refit,
+        ) = boosting._prepare_selected_chain_calibration(
+            parsed_data,
+            train_range,
+            _state_range(state, "calibration_range"),
+            selection_model_chain,
+            model_params,
+            baseline_kind,
+            baseline_period,
+        )
+        state["calibration_candidate_residuals"] = calibration_residuals.tolist()
+        state["calibration_candidate_source"] = calibration_source
+        state["calibration_refit"] = calibration_refit
+        state["baseline"] = boosting.fit_baseline_state_for_range(
+            parsed_data,
+            train_range,
+            baseline_kind,
+            baseline_period,
+        )
+        final_eval_preds = boosting.baseline_forecast_for_range(
+            parsed_data,
+            train_range,
+            eval_range,
+            baseline_kind,
+            baseline_period,
+        )
+        residual_full_train = (
+            np.asarray(parsed_data.y[train_range], dtype=float)
+            - boosting.baseline_fitted_values_for_range(
+                parsed_data,
+                train_range,
+                baseline_kind,
+                baseline_period,
             )
-
-        final_eval_preds = np.zeros(len(eval_range), dtype=float)
-        residual_full_train = np.asarray(parsed_data.y[train_range], dtype=float).copy()
+        )
         base_model_states: Dict[str, Any] = {}
         full_uncertainty_profiles: Dict[str, List[float]] = {}
         uncertainty_coefficients: Dict[str, float] = {}
         stage_eval_summaries = []
-        eval_forecast_offset = eval_range.start - train_range.stop
 
         for stage_idx, model_name in enumerate(selection_model_chain):
             params = model_params[model_name]
             timeout = boosting._get_model_timeout(model_name, params)
             round_parsed_data = boosting._build_residual_parsed_data(parsed_data, train_range, residual_full_train)
-            artifact_origin = "temporary_training"
-
-            if stage_idx == 0 and model_name in base_model_files:
-                source_model_file = base_model_files[model_name]
-                if model_name == "lstm":
-                    source_model_state = boosting._load_lstm_source_state(source_model_file, "Saved Boosting LSTM base model")
-                    source_forecast_strategy = boosting._get_lstm_source_forecast_strategy(source_model_state)
-                    source_forecast_horizon = int(source_model_state.get("forecast_horizon", 0) or 0)
-                    if source_forecast_strategy == "direct_multi_horizon" and (eval_range.stop - train_range.stop) > source_forecast_horizon:
-                        adjusted_source_model_file = source_model_file
-                        temp_source_model_file = None
-                        stage_model_file = os.path.join(state["artifact_dir"], f"boosting_stage_{model_name}_{stage_idx}_{os.getpid()}.pkl")
-                        round_numeric_records, round_lstm_records = boosting._build_round_records(round_parsed_data, model_name, params)
-                        try:
-                            adjusted_source_model_file, temp_source_model_file = (
-                                boosting._prepare_lstm_source_model_for_requested_steps(
-                                    source_model_file,
-                                    source_model_state,
-                                    requested_steps=eval_range.stop - train_range.stop,
-                                )
-                            )
-                            fit_result = run_base_model_fit_subprocess(
-                                model_type=model_name,
-                                data=round_lstm_records,
-                                train_start=train_range.start,
-                                train_end=train_range.stop - 1,
-                                source_model_file=adjusted_source_model_file,
-                                save_model_file=stage_model_file,
-                                fit_forecast_steps=eval_range.stop - train_range.stop,
-                                predict_steps=eval_range.stop - train_range.stop,
-                                allow_negative_predictions=True,
-                                timeout=timeout,
-                            )
-                        finally:
-                            if temp_source_model_file and os.path.exists(temp_source_model_file):
-                                os.remove(temp_source_model_file)
-                        full_predictions = np.asarray(
-                            extract_predictions_from_result(fit_result),
-                            dtype=float,
-                        )
-                        stage_eval_predictions = full_predictions[
-                            eval_forecast_offset: eval_forecast_offset + len(eval_range)
-                        ]
-                        stage_uncertainty_profile = extract_uncertainty_profile_from_result(fit_result)
-                    else:
-                        stage_model_file = source_model_file
-                        stage_eval_predictions, stage_uncertainty_profile = boosting._predict_eval_segment(
-                            model_name,
-                            stage_model_file,
-                            train_range,
-                            eval_range,
-                            timeout,
-                        )
-                        artifact_origin = "standalone_base"
-                else:
-                    stage_model_file = source_model_file
-                    stage_eval_predictions, stage_uncertainty_profile = boosting._predict_eval_segment(
-                        model_name,
-                        stage_model_file,
-                        train_range,
-                        eval_range,
-                        timeout,
-                    )
-                    artifact_origin = "standalone_base"
-            else:
-                round_numeric_records, round_lstm_records = boosting._build_round_records(
-                    round_parsed_data,
-                    model_name,
-                    params,
-                )
-                stage_model_file, stage_eval_predictions, stage_uncertainty_profile = boosting._train_stage_model(
-                    model_name,
-                    round_numeric_records,
-                    round_lstm_records,
-                    train_range,
-                    eval_range,
-                    params,
-                    timeout,
-                )
+            # Every stage is a signed-residual learner: stage 0 is the statistical
+            # baseline, so a demand-scale base-model artifact cannot be replayed here.
+            round_numeric_records, round_lstm_records = boosting._build_round_records(
+                round_parsed_data,
+                model_name,
+                params,
+            )
+            stage_model_file, stage_eval_predictions, stage_uncertainty_profile = boosting._train_stage_model(
+                model_name,
+                round_numeric_records,
+                round_lstm_records,
+                train_range,
+                eval_range,
+                params,
+                timeout,
+            )
 
             fitted_train_predictions = boosting._compute_in_sample_fitted_predictions(
                 model_name,
@@ -1482,17 +1593,18 @@ def _run_boosting(step_id: str, args, state: Dict[str, Any]) -> Dict[str, Any]:
             stage_eval_predictions = boosting._apply_stage_output_semantics(
                 stage_idx,
                 stage_eval_predictions,
+                residual_target=True,
             )
             fitted_train_predictions = boosting._apply_stage_output_semantics(
                 stage_idx,
                 fitted_train_predictions,
+                residual_target=True,
             )
             coefficient = boosting._nonnegative_line_search(
                 residual_full_train, fitted_train_predictions
             )
             if coefficient <= np.finfo(float).eps:
-                if artifact_origin == "temporary_training":
-                    boosting.remove_member_model_artifact(model_name, stage_model_file)
+                boosting.remove_member_model_artifact(model_name, stage_model_file)
                 state["search_summary"]["refit_stop"] = {
                     "stage": stage_idx + 1,
                     "model_name": model_name,
@@ -1515,7 +1627,6 @@ def _run_boosting(step_id: str, args, state: Dict[str, Any]) -> Dict[str, Any]:
                 "params": params,
                 "round": stage_idx,
                 "coefficient": coefficient,
-                "artifact_origin": artifact_origin,
             })
             stage_eval_summaries.append({
                 "round": stage_idx + 1,
@@ -1524,15 +1635,6 @@ def _run_boosting(step_id: str, args, state: Dict[str, Any]) -> Dict[str, Any]:
                 "rmse": stage_rmse,
             })
 
-        if not refit_model_chain:
-            raise ValueError(
-                "[MODEL] Boosting selected a validation chain, but its first stage had "
-                "no positive contribution after full-range refitting."
-            )
-        calibration_residuals = np.asarray(
-            state["validation_residual_snapshots"][len(refit_model_chain)],
-            dtype=float,
-        )
         state["model_chain"] = refit_model_chain
         state["base_model_states"] = base_model_states
         state["final_eval_preds"] = final_eval_preds
@@ -1542,7 +1644,6 @@ def _run_boosting(step_id: str, args, state: Dict[str, Any]) -> Dict[str, Any]:
         state["stage_coefficients"] = stage_coefficients
         state["full_uncertainty_profiles"] = full_uncertainty_profiles
         state["uncertainty_coefficients"] = uncertainty_coefficients
-        state["calibration_residuals"] = calibration_residuals
         return {
             "model_chain": refit_model_chain,
             "stage_count": len(refit_model_chain),
@@ -1551,26 +1652,113 @@ def _run_boosting(step_id: str, args, state: Dict[str, Any]) -> Dict[str, Any]:
 
     if step_id == "combine_evaluate":
         if "refit_model_chain" in state:
-            if not state["refit_model_chain"]:
-                raise ValueError("[MODEL] Boosting full-range refit produced no usable stages.")
             state["model_chain"] = list(state["refit_model_chain"])
             state["stage_coefficients"] = list(state["refit_stage_coefficients"])
+        state["search_summary"]["post_line_search_shrinkage"] = (
+            boosting.get_post_line_search_shrinkage_metadata()
+        )
         y_true_eval = np.asarray(state["eval_y_true"], dtype=float)
         final_eval_preds = normalize_demand_forecast(state["final_eval_preds"])
-        calibration_residuals = np.asarray(state["calibration_residuals"], dtype=float)
+        calibration_range = _state_range(state, "calibration_range")
+        calibration_refit = state.get("calibration_refit")
+        calibration_candidate_source = state.get("calibration_candidate_source")
+        calibration_candidate_residuals = state.get(
+            "calibration_candidate_residuals"
+        )
+        if (
+            not isinstance(calibration_refit, dict)
+            or not isinstance(calibration_candidate_source, str)
+            or not isinstance(calibration_candidate_residuals, list)
+        ):
+            selection_model_chain = state.get("selection_model_chain")
+            if not isinstance(selection_model_chain, list):
+                summary_chain = state["search_summary"].get("selection_model_chain")
+                selection_model_chain = (
+                    summary_chain if isinstance(summary_chain, list) else None
+                )
+            if len(calibration_range) > 0 and selection_model_chain is not None:
+                calibration_baseline = state.get("selection_baseline")
+                if not isinstance(calibration_baseline, dict):
+                    calibration_baseline = state["baseline"]
+                (
+                    prepared_residuals,
+                    calibration_candidate_source,
+                    calibration_refit,
+                ) = boosting._prepare_selected_chain_calibration(
+                    parsed_data,
+                    train_range,
+                    calibration_range,
+                    list(selection_model_chain),
+                    model_params,
+                    str(calibration_baseline["kind"]),
+                    calibration_baseline.get("seasonal_period"),
+                    prepared_before_full_refit=False,
+                )
+                calibration_candidate_residuals = prepared_residuals.tolist()
+            else:
+                calibration_candidate_residuals = []
+                calibration_candidate_source = (
+                    "unavailable_post_selection_calibration"
+                    if len(calibration_range) == 0
+                    else "unavailable_missing_pre_refit_calibration"
+                )
+                calibration_refit = {
+                    "requested_chain": list(selection_model_chain or []),
+                    "retained_chain": [],
+                    "coefficients": [],
+                    "matched_selection_structure": False,
+                    "matched_final_structure": False,
+                    "prepared_before_full_refit": False,
+                    "preparation_mode": "unavailable_missing_selection_chain",
+                    "selection_chain_frozen_before_calibration_labels": False,
+                    "full_refit_includes_calibration_segment": (
+                        len(calibration_range) > 0
+                    ),
+                    "final_refit_parameters_may_use_calibration_labels": (
+                        len(calibration_range) > 0
+                    ),
+                    "final_refit_stage_coefficients_may_use_calibration_labels": bool(
+                        len(calibration_range) > 0 and state.get("model_chain")
+                    ),
+                    "coverage_claim": "none",
+                }
+
+        (
+            calibration_residuals,
+            calibration_source,
+            calibration_refit,
+        ) = boosting._finalize_selected_chain_calibration(
+            np.asarray(calibration_candidate_residuals, dtype=float),
+            calibration_candidate_source,
+            calibration_refit,
+            list(state["model_chain"]),
+        )
+        state["calibration_candidate_residuals"] = list(
+            calibration_candidate_residuals
+        )
+        state["calibration_candidate_source"] = calibration_candidate_source
+        state["calibration_refit"] = calibration_refit
+        state["search_summary"]["calibration_refit"] = calibration_refit
         eval_forecast_steps = eval_range.stop - train_range.stop
         eval_forecast_offset = eval_range.start - train_range.stop
+        boosting._add_baseline_uncertainty_member(
+            state["full_uncertainty_profiles"],
+            state["uncertainty_coefficients"],
+            state["baseline"],
+            eval_forecast_steps,
+            has_member_stages=bool(state["model_chain"]),
+        )
         full_uncertainty_profile, uncertainty_summary = ensemble_growth_profile(
             state["full_uncertainty_profiles"],
             state["uncertainty_coefficients"],
             calibration_residuals,
             parsed_data.y[train_range],
             eval_forecast_steps,
+            calibration_source=calibration_source,
         )
         uncertainty_profile = full_uncertainty_profile[
             eval_forecast_offset: eval_forecast_offset + len(eval_range)
         ]
-        uncertainty_summary.setdefault("calibration_source", "internal_validation")
         timestamps = parsed_data.timestamps
         metrics = {
             "rmse": rmse(y_true_eval, final_eval_preds),
@@ -1582,7 +1770,11 @@ def _run_boosting(step_id: str, args, state: Dict[str, Any]) -> Dict[str, Any]:
         }
         final_result = {
             "mode": "boosting_residual_learning",
+            "post_line_search_shrinkage": (
+                boosting.get_post_line_search_shrinkage_metadata()
+            ),
             "models": models_to_use,
+            "baseline": state["baseline"],
             "model_chain": state["model_chain"],
             "stage_coefficients": state["stage_coefficients"],
             "split_plan": state["split_plan"],
@@ -1600,9 +1792,19 @@ def _run_boosting(step_id: str, args, state: Dict[str, Any]) -> Dict[str, Any]:
         state["search_summary"]["selection_coefficients"] = state["selection_coefficients"]
         state["search_summary"]["refit_model_chain"] = state["model_chain"]
         state["search_summary"]["refit_coefficients"] = state["stage_coefficients"]
+        if state["model_chain"]:
+            state["search_summary"]["refit_outcome"] = "residual_chain_retained"
+        elif state.get("selection_model_chain"):
+            state["search_summary"]["refit_outcome"] = (
+                "baseline_retained_after_refit_trim"
+            )
+        else:
+            state["search_summary"]["refit_outcome"] = (
+                "baseline_retained_no_improvement"
+            )
         state["uncertainty"] = {
             "calibration_residuals": calibration_residuals.tolist(),
-            "calibration_source": "internal_validation",
+            "calibration_source": calibration_source,
             "reference_series": parsed_data.y[train_range].tolist(),
             "profile": full_uncertainty_profile,
             "summary": uncertainty_summary,
@@ -1624,14 +1826,17 @@ def _run_boosting(step_id: str, args, state: Dict[str, Any]) -> Dict[str, Any]:
                     move_source=False,
                 )
                 model_state["model_file"] = perm_file
-                model_state.pop("artifact_origin", None)
 
         model_state = {
             "model_type": boosting.MODEL_TYPE,
             "boosting_variant": "residual",
+            "post_line_search_shrinkage": (
+                boosting.get_post_line_search_shrinkage_metadata()
+            ),
             "model_chain": state["model_chain"],
             "stage_coefficients": state["stage_coefficients"],
             "base_model_states": base_model_states,
+            "baseline": state["baseline"],
             "split_plan": state["split_plan"],
             "uncertainty": state["uncertainty"],
         }
@@ -1676,18 +1881,21 @@ def main() -> None:
     parser.add_argument("--window", type=int)
     parser.add_argument("--alpha", type=float)
     parser.add_argument("--d", type=int)
-    parser.add_argument("--max-p", type=int)
-    parser.add_argument("--max-q", type=int)
-    parser.add_argument("--look-back", type=int)
-    parser.add_argument("--epochs", type=int)
+    parser.add_argument("--max-p", type=int, help="Deprecated compatibility flag; the ARIMA p limit is data-derived")
+    parser.add_argument("--max-q", type=int, help="Deprecated compatibility flag; the ARIMA q limit is data-derived")
+    parser.add_argument("--look-back", type=int, help="Deprecated compatibility flag; LSTM look-back is data-derived")
+    parser.add_argument("--epochs", type=int, help="Deprecated compatibility flag; LSTM epochs are data-derived")
     parser.add_argument("--feature-types", type=str)
     parser.add_argument("--lstm-features", type=str)
     parser.add_argument("--lstm-target-feature", type=str)
     parser.add_argument("--normalization", type=str, choices=["minmax", "zscore"])
     parser.add_argument("--base-model-files", type=str)
-    parser.add_argument("--learning-rate", type=float)
-    parser.add_argument("--max-rounds", type=int)
+    parser.add_argument("--learning-rate", type=float, help="Deprecated compatibility flag; Boosting uses line search")
+    parser.add_argument("--max-rounds", type=int, help="Deprecated compatibility flag; Boosting rounds are data-derived")
     args = parser.parse_args()
+
+    if args.model_type == "boosting":
+        warn_ignored_boosting_controls(args)
 
     os.makedirs(args.artifact_dir, exist_ok=True)
     existing_receipt = _load_existing_receipt(
