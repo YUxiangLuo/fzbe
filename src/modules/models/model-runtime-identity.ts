@@ -2,7 +2,10 @@ import crypto from "crypto";
 import fs from "fs";
 import path from "path";
 import { PY_DIR } from "../../utils/python";
-import { ModelValidationError } from "./model-errors";
+import {
+  buildModelRetrainingRequiredDetails,
+  ModelValidationError,
+} from "./model-errors";
 import type { ModelTrainingRunRow } from "./model-run-store";
 
 const MODEL_PIPELINE_REVISION = "model-run-v3";
@@ -64,10 +67,16 @@ export const assertRunRevisionMatches = (
   label = run.model_type.toUpperCase(),
 ) => {
   if (typeof run.runtime_revision === "string" && run.runtime_revision !== runtimeRevision) {
-    throw new ModelValidationError(`${label} 模型运行环境已变化，请重新训练该模型`);
+    throw new ModelValidationError(
+      `${label} 模型运行环境已变化，请重新训练该模型`,
+      buildModelRetrainingRequiredDetails(run.model_type),
+    );
   }
   if (typeof run.dataset_revision === "string" && run.dataset_revision !== datasetRevision) {
-    throw new ModelValidationError(`${label} 模型对应的数据集版本已变化，请重新训练该模型`);
+    throw new ModelValidationError(
+      `${label} 模型对应的数据集版本已变化，请重新训练该模型`,
+      buildModelRetrainingRequiredDetails(run.model_type),
+    );
   }
 };
 

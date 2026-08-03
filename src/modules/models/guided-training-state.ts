@@ -6,7 +6,11 @@ import { pool } from "../../config";
 import { TIMEOUTS } from "../../utils/constants";
 import { withBoundedPoolTransaction } from "../../utils/bounded-pool-transaction";
 import logger from "../../utils/logger";
-import { acquireConnectionWithTimeout, queryWithTimeout } from "./model-db-guard";
+import {
+  acquireConnectionWithTimeout,
+  commitConnectionWithOutcomeGuard,
+  queryWithTimeout,
+} from "./model-db-guard";
 import type { ModelType, TrainInput } from "./models.schema";
 import {
   ModelAccessError,
@@ -113,6 +117,8 @@ export interface GuidedTrainingStepAttemptRow extends RowDataPacket {
   error_message: string | null;
   run_count: number;
   lease_expires_at: Date | string | null;
+  /** Computed by MySQL so DB_DATE_STRINGS and application timezone cannot skew lease ownership. */
+  lease_is_active?: number | boolean | string | null;
 }
 
 export const buildMemberStepDefinitions = (
@@ -139,13 +145,13 @@ export const buildBoostingRoundStepDefinitions = (
         `round_${round}_evaluate`,
         `第 ${round} 轮评估候选`,
         (model) => round === 1
-          ? `用原始销量训练 ${BASE_MODEL_LABELS[model]}，通过非负平方损失线搜索求阶段系数并记录验证残差 RMSE。`
-          : `用当前有正有负的残差训练 ${BASE_MODEL_LABELS[model]}，动态求非负阶段系数并记录第 ${round} 轮验证残差 RMSE。`,
+          ? `用第 0 阶段基线留下的有符号残差训练 ${BASE_MODEL_LABELS[model]}，通过非负平方损失线搜索求阶段系数并记录选择段残差 RMSE。`
+          : `用当前有正有负的残差训练 ${BASE_MODEL_LABELS[model]}，动态求非负阶段系数并记录第 ${round} 轮选择残差 RMSE。`,
       ),
       {
         id: `round_${round}_select_winner`,
         label: `第 ${round} 轮选择胜出模型`,
-        description: "选择本轮使时间留出验证段 RMSE 最小且达到相对改善阈值的模型；短验证段要求更强改善，无候选达标则提前停止。",
+        description: "选择本轮使内部时间选择段 RMSE 最小且达到相对改善阈值的模型；短选择段要求更强改善，无候选达标则提前停止。",
         actionLabel: "选择模型",
       },
     );
@@ -168,8 +174,8 @@ export const buildGuidedTrainingStepPlan = (
         return buildMemberStepDefinitions(
           requestedModels,
           "validation_prediction",
-          "生成权重验证预测",
-          (model) => `只在权重训练段拟合 ${BASE_MODEL_LABELS[model]}，并为时间留出的权重验证段生成预测。`,
+          "生成权重选择预测",
+          (model) => `只在权重训练前缀拟合 ${BASE_MODEL_LABELS[model]}，并为紧随其后的权重选择段生成预测。`,
         );
       }
       if (step.id === "eval_predictions") {
@@ -177,7 +183,7 @@ export const buildGuidedTrainingStepPlan = (
           requestedModels,
           "eval_prediction",
           "生成评估预测",
-          (model) => `在完整训练区间拟合或复用 ${BASE_MODEL_LABELS[model]}，生成独立评估区间预测。`,
+          (model) => `在完整训练区间拟合或复用 ${BASE_MODEL_LABELS[model]}，生成统一评估区间预测。`,
         );
       }
       return [step];
@@ -189,8 +195,8 @@ export const buildGuidedTrainingStepPlan = (
         return buildMemberStepDefinitions(
           requestedModels,
           "level1_prediction",
-          "生成 Level-1 特征",
-          (model) => `只在 Level-0 拟合 ${BASE_MODEL_LABELS[model]}，生成 Level-1 时间留出预测。`,
+          "生成元模型训练特征",
+          (model) => `在多个扩展窗口起点拟合 ${BASE_MODEL_LABELS[model]}，生成严格按时间顺序排列的折外预测。`,
         );
       }
       if (step.id === "eval_predictions") {
@@ -198,7 +204,7 @@ export const buildGuidedTrainingStepPlan = (
           requestedModels,
           "eval_prediction",
           "生成评估预测",
-          (model) => `在完整训练区间拟合或复用 ${BASE_MODEL_LABELS[model]}，生成独立评估区间预测。`,
+          (model) => `在完整训练区间拟合或复用 ${BASE_MODEL_LABELS[model]}，生成统一评估区间预测。`,
         );
       }
       return [step];
@@ -291,14 +297,14 @@ export const expandBoostingRefitSteps = (
   const refitSteps: GuidedTrainingStepDefinition[] = [
     {
       id: "initialize_refit",
-      label: "初始化完整训练重拟合",
-      description: "按验证阶段选出的模型链初始化完整训练残差、评估预测和成员产物 checkpoint。",
+      label: "准备留出校准与完整重拟合",
+      description: "先冻结内部选择链，并用更晚时间留出段之前的历史生成候选残差；随后初始化会重新纳入该留出段的完整训练重拟合。",
       actionLabel: "初始化重拟合",
     },
     ...modelChain.map((model, index) => ({
       id: `refit_stage_${index + 1}_${model}`,
       label: `重拟合第 ${index + 1} 阶段：${BASE_MODEL_LABELS[model]}`,
-      description: `在当前完整训练残差上拟合 ${BASE_MODEL_LABELS[model]}，重新计算非负阶段系数并提交该阶段 checkpoint。`,
+      description: `在当前完整训练残差上拟合 ${BASE_MODEL_LABELS[model]}，重新计算非负阶段系数并提交该阶段检查点。`,
       actionLabel: `重拟合第 ${index + 1} 阶段`,
     })),
   ];
@@ -716,7 +722,8 @@ export const fetchGuidedAttempt = async (
   attemptId: string,
 ) => {
   const [rows] = await connection.query<GuidedTrainingStepAttemptRow[]>(
-    `SELECT *
+    `SELECT *,
+            lease_expires_at > NOW() AS lease_is_active
        FROM model_guided_training_step_attempts
       WHERE attempt_id = ?
       LIMIT 1`,
@@ -731,6 +738,18 @@ export const beginGuidedStepAttempt = async (
   timeoutMs: number,
 ) => {
   const connection = await acquireConnectionWithTimeout(pool);
+  let transactionPhase: "before-commit" | "commit-attempted" | "committed" = "before-commit";
+  let disposed = false;
+  const commitTransaction = async () => {
+    transactionPhase = "commit-attempted";
+    try {
+      await commitConnectionWithOutcomeGuard(connection);
+    } catch (error) {
+      disposed = true;
+      throw error;
+    }
+    transactionPhase = "committed";
+  };
   try {
     await connection.beginTransaction();
     const [sessionRows] = await connection.query<GuidedTrainingSessionRow[]>(
@@ -761,13 +780,13 @@ export const beginGuidedStepAttempt = async (
               WHERE session_id = ?`,
             [row.session_id],
           );
-          await connection.commit();
+          await commitTransaction();
           return { attempt: activeAttempt, receipt, recovered: true };
         }
-        const leaseExpiresAt = activeAttempt.lease_expires_at
-          ? new Date(activeAttempt.lease_expires_at).getTime()
-          : 0;
-        if (activeAttempt.status === "running" && leaseExpiresAt > Date.now()) {
+        if (
+          activeAttempt.status === "running"
+          && Number(activeAttempt.lease_is_active) === 1
+        ) {
           throw new ModelConflictError(
             "当前训练步骤仍在执行",
             "GUIDED_STEP_IN_PROGRESS",
@@ -823,15 +842,17 @@ export const beginGuidedStepAttempt = async (
     if (Number((updateResult as { affectedRows?: number }).affectedRows ?? 0) !== 1) {
       throw new ModelConflictError("训练会话状态已变化", "GUIDED_STEP_IN_PROGRESS");
     }
-    await connection.commit();
+    await commitTransaction();
     const attempt = await fetchGuidedAttempt(connection, attemptId);
     if (!attempt) throw new Error("创建训练步骤 attempt 失败");
     return { attempt, receipt: null, recovered: false };
   } catch (error) {
-    await connection.rollback().catch(() => {});
+    if (transactionPhase === "before-commit") {
+      await connection.rollback().catch(() => {});
+    }
     throw error;
   } finally {
-    connection.release();
+    if (!disposed) connection.release();
   }
 };
 
@@ -846,6 +867,8 @@ export const commitGuidedIntermediateStep = async (input: {
   receipt: Record<string, unknown>;
 }) => {
   const connection = await acquireConnectionWithTimeout(pool);
+  let transactionPhase: "before-commit" | "commit-attempted" | "committed" = "before-commit";
+  let disposed = false;
   try {
     await connection.beginTransaction();
     const [sessionRows] = await connection.query<RowDataPacket[]>(
@@ -905,12 +928,21 @@ export const commitGuidedIntermediateStep = async (input: {
         input.sessionId,
       ],
     );
-    await connection.commit();
+    transactionPhase = "commit-attempted";
+    try {
+      await commitConnectionWithOutcomeGuard(connection);
+    } catch (error) {
+      disposed = true;
+      throw error;
+    }
+    transactionPhase = "committed";
   } catch (error) {
-    await connection.rollback().catch(() => {});
+    if (transactionPhase === "before-commit") {
+      await connection.rollback().catch(() => {});
+    }
     throw error;
   } finally {
-    connection.release();
+    if (!disposed) connection.release();
   }
 };
 
@@ -948,13 +980,24 @@ export const recordGuidedAttemptFailure = async (
       pool,
       TIMEOUTS.MODEL_FAILURE_RECORD,
       async (connection) => {
+        const [sessionRows] = await connection.query<RowDataPacket[]>(
+          `SELECT session_id
+             FROM model_guided_training_sessions
+            WHERE session_id = ?
+            LIMIT 1
+            FOR UPDATE`,
+          [sessionId],
+        );
+        if (!sessionRows[0]) return;
+
         await connection.query(
           `UPDATE model_guided_training_step_attempts
               SET status = IF(status = 'python_completed', status, 'failed'),
                   error_message = ?
             WHERE attempt_id = ?
+              AND session_id = ?
               AND status IN ('running', 'python_completed')`,
-          [detail, attemptId],
+          [detail, attemptId, sessionId],
         );
         await connection.query(
           `UPDATE model_guided_training_sessions

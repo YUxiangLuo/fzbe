@@ -1,8 +1,16 @@
 import crypto from "crypto";
 import type { PoolConnection, RowDataPacket } from "mysql2/promise";
 import { pool } from "../../config";
-import { acquireConnectionWithTimeout, queryWithTimeout } from "./model-db-guard";
-import type { ModelType, TrainInput } from "./models.schema";
+import {
+  acquireConnectionWithTimeout,
+  commitConnectionWithOutcomeGuard,
+  queryWithTimeout,
+} from "./model-db-guard";
+import {
+  MAX_LSTM_ADDITIONAL_FEATURES,
+  type ModelType,
+  type TrainInput,
+} from "./models.schema";
 import type { BaseModelType, EnsembleModelType, GuidedModelType } from "./model-types";
 import { ModelValidationError } from "./model-errors";
 
@@ -103,6 +111,7 @@ const CLIENT_EXPERIMENT_STATE_FIELDS = [
   "production_target_service_level",
   "production_safety_stock_z_score",
   "production_forecast_results",
+  "production_forecast_evidence",
   "production_mps_table",
   "production_capacity_mode",
   "production_capacity_scenario",
@@ -143,6 +152,37 @@ export interface ModelTrainingRunRow extends RowDataPacket {
   production_revision: string | null;
   is_active: number | boolean;
 }
+
+export interface CommitProductionPreparationResultInput {
+  experimentId: number;
+  studentId: number;
+  modelType: ModelType;
+  runId: string;
+  sessionId: string;
+  forecastSteps: number;
+  expectedProductionRevision: string | null;
+  productionRevision: string;
+  completedStepIds: string[];
+  stepPlan: unknown[];
+  attempt?: {
+    attemptId: string;
+    artifactPath: string;
+    artifactSha256: string;
+    committedStatePath: string;
+    committedStateSha256: string;
+    outputPayload: unknown;
+  };
+}
+
+export type CommitProductionPreparationResult =
+  | {
+    committed: true;
+    replacedProductionArtifactPath: string | null;
+  }
+  | {
+    committed: false;
+    reason: "experiment_completed" | "stale";
+  };
 
 export interface CompletedGuidedSessionUpdate {
   sessionId: string;
@@ -218,6 +258,340 @@ const requireFiniteMetric = (metrics: Record<string, unknown>, key: "rmse" | "ma
     throw new ModelValidationError(`模型训练结果缺少有效的 ${key.toUpperCase()} 指标`);
   }
   return value;
+};
+
+const isRecord = (value: unknown): value is Record<string, unknown> =>
+  Boolean(value) && typeof value === "object" && !Array.isArray(value);
+
+const OBSERVABILITY_STRING_MAX_LENGTH = 512;
+// Bound student-facing metadata without applying the frontend's former
+// 16-field display limit. feature_keys contains only additional inputs;
+// feature_types may also contain the target, hence the +1 check below.
+const LSTM_OBSERVABILITY_MAX_FEATURES = MAX_LSTM_ADDITIONAL_FEATURES;
+const UNCERTAINTY_SOURCES = ["model", "empirical", "fallback"] as const;
+const INTERVAL_KINDS = [
+  "model_prediction_interval",
+  "empirical_residual_quantile",
+  "normal_approximation",
+  "fallback_normal_approximation",
+] as const;
+const COVERAGE_CLAIMS = ["model_nominal", "none"] as const;
+
+const boundedString = (value: unknown): string | undefined => {
+  if (typeof value !== "string" || value.length === 0) return undefined;
+  return value.slice(0, OBSERVABILITY_STRING_MAX_LENGTH);
+};
+
+const LSTM_METADATA_SCALAR_FIELDS = [
+  "regime",
+  "look_back",
+  "units",
+  "parameter_count",
+  "parameter_budget",
+  "batch_size",
+  "max_epochs",
+  "epochs_ran",
+  "windows",
+  "validation_windows",
+  "purge_windows",
+  "selection_train_windows",
+  "feature_count",
+  "raw_feature_count",
+  "random_seed",
+  "seed_runs",
+  "stability_note",
+] as const;
+
+const LSTM_SEED_STABILITY_FIELDS = [
+  "scope",
+  "run_count",
+  "validation_rmse_mean",
+  "validation_rmse_std",
+  "validation_mae_mean",
+  "validation_mae_std",
+] as const;
+
+const boundedStringArray = (
+  value: unknown,
+  maxItems = LSTM_OBSERVABILITY_MAX_FEATURES,
+): string[] | undefined => {
+  if (!Array.isArray(value) || value.length > maxItems) return undefined;
+  return value.every((item) => (
+    typeof item === "string"
+    && item.length > 0
+    && item.length <= OBSERVABILITY_STRING_MAX_LENGTH
+  ))
+    ? [...value] as string[]
+    : undefined;
+};
+
+const copyBoundedScalars = (
+  source: Record<string, unknown>,
+  fields: readonly string[],
+): Record<string, unknown> => {
+  const bounded: Record<string, unknown> = {};
+  for (const field of fields) {
+    const value = source[field];
+    if (typeof value === "number" && Number.isFinite(value)) {
+      bounded[field] = value;
+      continue;
+    }
+    if (typeof value === "boolean") {
+      bounded[field] = value;
+      continue;
+    }
+    const text = boundedString(value);
+    if (text !== undefined) bounded[field] = text;
+  }
+  return bounded;
+};
+
+const buildBoundedLstmTrainingMetadata = (
+  value: unknown,
+  canonicalFeatureKeys: string[] | undefined,
+): Record<string, unknown> | undefined => {
+  if (!isRecord(value)) return undefined;
+  const metadata = copyBoundedScalars(value, LSTM_METADATA_SCALAR_FIELDS);
+  const featureKeys = canonicalFeatureKeys ?? boundedStringArray(value.feature_keys);
+  if (featureKeys !== undefined) metadata.feature_keys = featureKeys;
+  if (isRecord(value.seed_stability)) {
+    const seedStability = copyBoundedScalars(
+      value.seed_stability,
+      LSTM_SEED_STABILITY_FIELDS,
+    );
+    if (Object.keys(seedStability).length > 0) metadata.seed_stability = seedStability;
+  }
+  return Object.keys(metadata).length > 0 ? metadata : undefined;
+};
+
+const buildBoundedLstmFeatureTypes = (
+  value: unknown,
+): Record<string, "numeric" | "categorical"> | undefined => {
+  if (
+    !isRecord(value)
+    || Object.keys(value).length > LSTM_OBSERVABILITY_MAX_FEATURES + 1
+  ) return undefined;
+  const entries = Object.entries(value);
+  if (entries.some(([field, type]) => (
+    field.length === 0
+    || field.length > OBSERVABILITY_STRING_MAX_LENGTH
+    || (type !== "numeric" && type !== "categorical")
+  ))) {
+    return undefined;
+  }
+  return Object.fromEntries(entries) as Record<string, "numeric" | "categorical">;
+};
+
+const buildBoundedLstmObservability = (
+  results: Record<string, unknown>,
+): Record<string, unknown> => {
+  const observability: Record<string, unknown> = {};
+  const targetKey = (
+    typeof results.target_key === "string"
+    && results.target_key.length > 0
+    && results.target_key.length <= OBSERVABILITY_STRING_MAX_LENGTH
+  )
+    ? results.target_key
+    : undefined;
+  if (targetKey !== undefined) observability.target_key = targetKey;
+
+  const metadataSource = isRecord(results.training_metadata)
+    ? results.training_metadata
+    : undefined;
+  const featureKeys = boundedStringArray(results.feature_keys)
+    ?? boundedStringArray(metadataSource?.feature_keys);
+  if (featureKeys !== undefined) observability.feature_keys = featureKeys;
+
+  const featureTypes = buildBoundedLstmFeatureTypes(results.feature_types);
+  if (featureTypes !== undefined) observability.feature_types = featureTypes;
+  if (results.normalization === "minmax" || results.normalization === "zscore") {
+    observability.normalization = results.normalization;
+  }
+  if (
+    typeof results.forecast_horizon === "number"
+    && Number.isSafeInteger(results.forecast_horizon)
+    && results.forecast_horizon > 0
+  ) {
+    observability.forecast_horizon = results.forecast_horizon;
+  }
+  if (results.training_regime === "standard" || results.training_regime === "teaching_demo") {
+    observability.training_regime = results.training_regime;
+  }
+  const trainingMetadata = buildBoundedLstmTrainingMetadata(
+    results.training_metadata,
+    featureKeys,
+  );
+  if (trainingMetadata !== undefined) observability.training_metadata = trainingMetadata;
+  return observability;
+};
+
+const finiteNumberRange = (
+  rows: readonly Record<string, unknown>[],
+  field: string,
+): { min: number; max: number } | null => {
+  const values = rows
+    .map((row) => row[field])
+    .filter((value): value is number => typeof value === "number" && Number.isFinite(value));
+  return values.length === 0
+    ? null
+    : { min: Math.min(...values), max: Math.max(...values) };
+};
+
+const collectKnownValues = <T extends string>(
+  rows: readonly Record<string, unknown>[],
+  field: string,
+  allowed: readonly T[],
+): T[] => allowed.filter((candidate) =>
+  rows.some((row) => row[field] === candidate));
+
+const buildBoundedUncertaintySummary = (
+  value: unknown,
+): Record<string, unknown> | undefined => {
+  if (!isRecord(value)) return undefined;
+
+  const horizons = Array.isArray(value.horizons)
+    ? value.horizons.filter(isRecord)
+    : [];
+  const horizonStart = (
+    typeof value.horizon_start === "number"
+    && Number.isSafeInteger(value.horizon_start)
+    && value.horizon_start > 0
+  )
+    ? value.horizon_start
+    : 1;
+  const explicitFallbackHorizons = Array.isArray(value.fallback_horizons)
+    ? value.fallback_horizons
+      .filter((horizon): horizon is number =>
+        typeof horizon === "number"
+        && Number.isSafeInteger(horizon)
+        && horizon > 0)
+      .map((horizon) => horizonStart + horizon - 1)
+    : [];
+  const fallbackHorizons = explicitFallbackHorizons.length > 0
+    ? explicitFallbackHorizons
+    : horizons.flatMap((horizon, index) =>
+      horizon.source === "fallback" ? [horizonStart + index] : []);
+  const bounded: Record<string, unknown> = {
+    fallback: typeof value.fallback === "boolean"
+      ? value.fallback
+      : fallbackHorizons.length > 0,
+    horizon_start: horizonStart,
+    horizons_total: horizons.length,
+    horizons_included: 0,
+    horizons_truncated: horizons.length > 0,
+    fallback_horizons_total: fallbackHorizons.length,
+    fallback_horizons_included: 0,
+    fallback_horizons_truncated: fallbackHorizons.length > 0,
+    fallback_horizon_start: fallbackHorizons.length > 0
+      ? Math.min(...fallbackHorizons)
+      : null,
+    fallback_horizon_end: fallbackHorizons.length > 0
+      ? Math.max(...fallbackHorizons)
+      : null,
+    sources: collectKnownValues(horizons, "source", UNCERTAINTY_SOURCES),
+    interval_kinds: collectKnownValues(horizons, "interval_kind", INTERVAL_KINDS),
+    coverage_claims: collectKnownValues(horizons, "coverage_claim", COVERAGE_CLAIMS),
+    horizon_statistics: {
+      std_dev: finiteNumberRange(horizons, "std_dev"),
+      upper_error_p99: finiteNumberRange(horizons, "upper_error_p99"),
+      calibration_mean_error: finiteNumberRange(horizons, "calibration_mean_error"),
+      calibration_count: finiteNumberRange(horizons, "calibration_count"),
+    },
+  };
+  for (const field of ["method", "source", "calibration_source", "reason"] as const) {
+    const normalized = boundedString(value[field]);
+    if (normalized !== undefined) bounded[field] = normalized;
+  }
+  return bounded;
+};
+
+const MODEL_OBSERVABILITY_FIELDS: Record<GuidedModelType, readonly string[]> = {
+  ma: [],
+  es: ["alpha_comparison", "uncertainty_summary"],
+  arima: ["best_order", "search_summary", "diagnostics"],
+  lstm: ["uncertainty_summary"],
+  weighted_avg: ["model_names", "weights", "weight_diagnostics", "split_plan"],
+  boosting: [
+    "model_names",
+    "stage_coefficients",
+    "post_line_search_shrinkage",
+    "baseline",
+    "split_plan",
+    "search_summary",
+  ],
+  stacking: ["model_names", "meta_model", "split_plan"],
+};
+
+export const buildTrainingObservability = (
+  modelType: GuidedModelType,
+  results: Record<string, unknown>,
+  metrics: Record<string, unknown>,
+): Record<string, unknown> => {
+  const predictionPoints = Array.isArray(results.prediction_points)
+    ? results.prediction_points.filter(isRecord)
+    : [];
+  const collectStrings = (field: string) => Array.from(new Set(
+    predictionPoints
+      .map((point) => point[field])
+      .filter((value): value is string => typeof value === "string" && value.length > 0),
+  ));
+  const calibrationCounts = predictionPoints
+    .filter((point) => (
+      typeof point.bias_diagnostic_source !== "string"
+      || point.bias_diagnostic_source === point.calibration_source
+    ))
+    .map((point) => point.calibration_count)
+    .filter((value): value is number => typeof value === "number" && Number.isInteger(value) && value > 0);
+  const biasDiagnosticCounts = predictionPoints
+    .filter((point) => typeof point.bias_diagnostic_source === "string")
+    .map((point) => point.calibration_count)
+    .filter((value): value is number => typeof value === "number" && Number.isInteger(value) && value > 0);
+  const modelSpecific = Object.fromEntries(
+    MODEL_OBSERVABILITY_FIELDS[modelType]
+      .filter((field) => results[field] !== undefined)
+      .map((field) => [field, results[field]]),
+  );
+  if (modelType === "lstm") {
+    Object.assign(modelSpecific, buildBoundedLstmObservability(results));
+  }
+  if (modelType === "arima" && isRecord(modelSpecific.diagnostics)) {
+    const { y_pred_eval: _predictionArray, ...boundedDiagnostics } = modelSpecific.diagnostics;
+    modelSpecific.diagnostics = boundedDiagnostics;
+  }
+  if ("uncertainty_summary" in modelSpecific) {
+    const boundedSummary = buildBoundedUncertaintySummary(modelSpecific.uncertainty_summary);
+    if (boundedSummary === undefined) {
+      delete modelSpecific.uncertainty_summary;
+    } else {
+      modelSpecific.uncertainty_summary = boundedSummary;
+    }
+  }
+
+  return {
+    method_name: results.method_name ?? null,
+    forecast_strategy: results.forecast_strategy ?? null,
+    implementation_notes: Array.isArray(results.implementation_notes)
+      ? results.implementation_notes
+      : [],
+    outer_interval_evaluation: isRecord(metrics.interval_evaluation)
+      ? metrics.interval_evaluation
+      : null,
+    uncertainty_evidence: {
+      sources: collectStrings("uncertainty_source"),
+      interval_kinds: collectStrings("interval_kind"),
+      coverage_claims: collectStrings("coverage_claim"),
+      calibration_sources: collectStrings("calibration_source"),
+      bias_diagnostic_sources: collectStrings("bias_diagnostic_source"),
+      calibration_count_min: calibrationCounts.length > 0 ? Math.min(...calibrationCounts) : null,
+      calibration_count_max: calibrationCounts.length > 0 ? Math.max(...calibrationCounts) : null,
+      bias_diagnostic_count_min: biasDiagnosticCounts.length > 0 ? Math.min(...biasDiagnosticCounts) : null,
+      bias_diagnostic_count_max: biasDiagnosticCounts.length > 0 ? Math.max(...biasDiagnosticCounts) : null,
+      upper_error_p99_points: predictionPoints.filter(
+        (point) => typeof point.upper_error_p99 === "number",
+      ).length,
+    },
+    ...modelSpecific,
+  };
 };
 
 const parseRequestedBaseModels = (models: string | undefined): BaseModelType[] => {
@@ -312,6 +686,7 @@ const productionResetPatch = (): Record<string, unknown> => ({
   production_safety_stock_z_score: null,
   production_mps_table: null,
   production_forecast_results: null,
+  production_forecast_evidence: null,
   production_capacity_mode: null,
   production_capacity_scenario: null,
   production_capacity: null,
@@ -403,6 +778,9 @@ export const buildAuthoritativeResult = (
     rmse: requireFiniteMetric(metricsRecord, "rmse"),
     mae: requireFiniteMetric(metricsRecord, "mae"),
     r2: requireFiniteMetric(metricsRecord, "r2"),
+    ...(isRecord(metricsRecord.interval_evaluation)
+      ? { interval_evaluation: metricsRecord.interval_evaluation }
+      : {}),
   };
 
   const parameters: Record<string, unknown> = {};
@@ -499,6 +877,12 @@ export const buildAuthoritativeResult = (
       break;
     }
   }
+
+  parameters.observability = buildTrainingObservability(
+    modelType,
+    result.results,
+    metricsRecord,
+  );
 
   return { parameters, metrics, experimentPatch };
 };
@@ -744,8 +1128,42 @@ export async function commitModelTrainingRun(
   input: CommitModelTrainingRunInput,
 ): Promise<CommitModelTrainingRunResult> {
   const connection = await acquireConnectionWithTimeout(pool);
+  let transactionPhase: "before-commit" | "commit-attempted" | "committed" = "before-commit";
+  let disposed = false;
+  const commitTransaction = async () => {
+    transactionPhase = "commit-attempted";
+    try {
+      await commitConnectionWithOutcomeGuard(connection);
+    } catch (error) {
+      disposed = true;
+      throw error;
+    }
+    transactionPhase = "committed";
+  };
   try {
     await connection.beginTransaction();
+    // Keep every transaction that can create a student-owned FK row on the
+    // same users -> experiment_status order as report submission, step events,
+    // retry creation, and account deletion. Locking the experiment first and
+    // only reaching users through the model_training_runs INSERT creates the
+    // inverse edge and can deadlock a concurrent step event.
+    const [studentRows] = await connection.query<RowDataPacket[]>(
+      `SELECT user_id, role
+         FROM users
+        WHERE user_id = ?
+        LIMIT 1
+        FOR UPDATE`,
+      [input.studentId],
+    );
+    const student = studentRows[0];
+    if (
+      !student
+      || Number(student.user_id) !== input.studentId
+      || student.role !== "Student"
+    ) {
+      throw new ModelValidationError("学生账号不存在或身份已变化，请重新登录后重试");
+    }
+
     const [experimentRows] = await connection.query<RowDataPacket[]>(
       `SELECT *
          FROM experiment_status
@@ -798,7 +1216,7 @@ export async function commitModelTrainingRun(
           [input.artifactSha256, existingRun.run_id],
         );
       }
-      await connection.commit();
+      await commitTransaction();
       return { runId: existingRun.run_id, stateVersion, reusedExistingRun: true };
     }
 
@@ -966,13 +1384,15 @@ export async function commitModelTrainingRun(
       }
     }
 
-    await connection.commit();
+    await commitTransaction();
     return { runId, stateVersion, reusedExistingRun: Boolean(existingRun) };
   } catch (error) {
-    await connection.rollback().catch(() => {});
+    if (transactionPhase === "before-commit") {
+      await connection.rollback().catch(() => {});
+    }
     throw error;
   } finally {
-    connection.release();
+    if (!disposed) connection.release();
   }
 }
 
@@ -993,6 +1413,236 @@ export async function getActiveModelTrainingRun(
     [experimentId, studentId, modelType],
   );
   return rows[0] ?? null;
+}
+
+/**
+ * Publishes a production artifact and its preparation-session result under the
+ * same experiment -> run -> session lock order used by report submission.
+ * This prevents a preparation request that started before report submission
+ * from publishing a new revision after the experiment becomes immutable.
+ */
+export async function commitProductionPreparationResult(
+  input: CommitProductionPreparationResultInput,
+): Promise<CommitProductionPreparationResult> {
+  const connection = await acquireConnectionWithTimeout(pool);
+  let transactionPhase: "before-commit" | "commit-attempted" | "committed" = "before-commit";
+  let disposed = false;
+  const rollbackResult = async (
+    reason: "experiment_completed" | "stale",
+  ): Promise<CommitProductionPreparationResult> => {
+    await connection.rollback();
+    return { committed: false, reason };
+  };
+
+  try {
+    await connection.beginTransaction();
+
+    const [experimentRows] = await connection.query<RowDataPacket[]>(
+      `SELECT experiment_id, student_id, status
+         FROM experiment_status
+        WHERE experiment_id = ?
+        LIMIT 1
+        FOR UPDATE`,
+      [input.experimentId],
+    );
+    const experiment = experimentRows[0];
+    if (!experiment || Number(experiment.student_id) !== input.studentId) {
+      return await rollbackResult("stale");
+    }
+    if (experiment.status === "Completed") {
+      return await rollbackResult("experiment_completed");
+    }
+
+    const [runRows] = await connection.query<ModelTrainingRunRow[]>(
+      `SELECT run_id,
+              experiment_id,
+              student_id,
+              model_type,
+              production_artifact_path,
+              production_artifact_forecast_steps,
+              production_revision,
+              is_active
+         FROM model_training_runs
+        WHERE run_id = ?
+          AND experiment_id = ?
+          AND student_id = ?
+          AND model_type = ?
+          AND is_active = TRUE
+        LIMIT 1
+        FOR UPDATE`,
+      [input.runId, input.experimentId, input.studentId, input.modelType],
+    );
+    const activeRun = runRows[0];
+    if (
+      !activeRun
+      || activeRun.production_revision !== input.expectedProductionRevision
+    ) {
+      return await rollbackResult("stale");
+    }
+
+    const [sessionRows] = await connection.query<RowDataPacket[]>(
+      `SELECT session_id, run_id, experiment_id, student_id, model_type,
+              status, active_attempt_id
+         FROM model_production_preparation_sessions
+        WHERE session_id = ?
+        LIMIT 1
+        FOR UPDATE`,
+      [input.sessionId],
+    );
+    const session = sessionRows[0];
+    if (
+      !session
+      || session.run_id !== input.runId
+      || Number(session.experiment_id) !== input.experimentId
+      || Number(session.student_id) !== input.studentId
+      || session.model_type !== input.modelType
+      || session.status === "completed"
+      || session.status === "superseded"
+      || (
+        input.attempt
+        && session.active_attempt_id !== input.attempt.attemptId
+      )
+    ) {
+      return await rollbackResult("stale");
+    }
+
+    let replacedProductionArtifactPath = activeRun.production_artifact_path;
+    if (input.attempt) {
+      if (
+        activeRun.production_artifact_forecast_steps !== null
+        && Number(activeRun.production_artifact_forecast_steps) >= input.forecastSteps
+      ) {
+        return await rollbackResult("stale");
+      }
+      const [runUpdate] = await connection.query(
+        `UPDATE model_training_runs
+            SET production_artifact_path = ?,
+                production_artifact_sha256 = ?,
+                production_artifact_forecast_steps = ?,
+                production_revision = ?
+          WHERE run_id = ?
+            AND is_active = TRUE
+            AND production_revision <=> ?
+            AND (
+              production_artifact_forecast_steps IS NULL
+              OR production_artifact_forecast_steps < ?
+            )`,
+        [
+          input.attempt.artifactPath,
+          input.attempt.artifactSha256,
+          input.forecastSteps,
+          input.productionRevision,
+          input.runId,
+          input.expectedProductionRevision,
+          input.forecastSteps,
+        ],
+      );
+      if (Number((runUpdate as { affectedRows?: number }).affectedRows ?? 0) !== 1) {
+        return await rollbackResult("stale");
+      }
+
+      const [attemptUpdate] = await connection.query(
+        `UPDATE model_production_preparation_step_attempts
+            SET status = 'committed',
+                candidate_state_sha256 = ?,
+                output_payload = ?,
+                error_message = NULL
+          WHERE attempt_id = ?
+            AND session_id = ?
+            AND status = 'running'`,
+        [
+          input.attempt.committedStateSha256,
+          JSON.stringify(input.attempt.outputPayload ?? {}),
+          input.attempt.attemptId,
+          input.sessionId,
+        ],
+      );
+      if (Number((attemptUpdate as { affectedRows?: number }).affectedRows ?? 0) !== 1) {
+        return await rollbackResult("stale");
+      }
+
+      const [sessionUpdate] = await connection.query(
+        `UPDATE model_production_preparation_sessions
+            SET status = 'completed',
+                current_step_id = NULL,
+                completed_step_ids = ?,
+                step_plan = ?,
+                committed_state_path = ?,
+                committed_state_sha256 = ?,
+                active_attempt_id = NULL,
+                production_revision = ?,
+                error_message = NULL,
+                expires_at = DATE_ADD(NOW(), INTERVAL 7 DAY)
+          WHERE session_id = ?
+            AND active_attempt_id = ?
+            AND status = 'running'`,
+        [
+          JSON.stringify(input.completedStepIds),
+          JSON.stringify(input.stepPlan),
+          input.attempt.committedStatePath,
+          input.attempt.committedStateSha256,
+          input.productionRevision,
+          input.sessionId,
+          input.attempt.attemptId,
+        ],
+      );
+      if (Number((sessionUpdate as { affectedRows?: number }).affectedRows ?? 0) !== 1) {
+        return await rollbackResult("stale");
+      }
+    } else {
+      if (
+        !activeRun.production_artifact_path
+        || activeRun.production_artifact_forecast_steps === null
+        || Number(activeRun.production_artifact_forecast_steps) < input.forecastSteps
+        || input.productionRevision !== input.expectedProductionRevision
+      ) {
+        return await rollbackResult("stale");
+      }
+      const [sessionUpdate] = await connection.query(
+        `UPDATE model_production_preparation_sessions
+            SET status = 'completed',
+                current_step_id = NULL,
+                completed_step_ids = ?,
+                step_plan = ?,
+                active_attempt_id = NULL,
+                observed_production_revision = ?,
+                production_revision = ?,
+                error_message = NULL,
+                expires_at = DATE_ADD(NOW(), INTERVAL 7 DAY)
+          WHERE session_id = ?
+            AND status NOT IN ('completed', 'superseded')`,
+        [
+          JSON.stringify(input.completedStepIds),
+          JSON.stringify(input.stepPlan),
+          input.expectedProductionRevision,
+          input.productionRevision,
+          input.sessionId,
+        ],
+      );
+      if (Number((sessionUpdate as { affectedRows?: number }).affectedRows ?? 0) !== 1) {
+        return await rollbackResult("stale");
+      }
+      // No artifact changed in the reusable path.
+      replacedProductionArtifactPath = null;
+    }
+
+    transactionPhase = "commit-attempted";
+    try {
+      await commitConnectionWithOutcomeGuard(connection);
+    } catch (error) {
+      disposed = true;
+      throw error;
+    }
+    transactionPhase = "committed";
+    return { committed: true, replacedProductionArtifactPath };
+  } catch (error) {
+    if (transactionPhase === "before-commit") {
+      await connection.rollback().catch(() => {});
+    }
+    throw error;
+  } finally {
+    if (!disposed) connection.release();
+  }
 }
 
 export async function setProductionArtifactForRun(
@@ -1096,11 +1746,39 @@ const MODEL_CONFIG_FIELDS: Record<BaseModelType | EnsembleModelType, Set<string>
   stacking: new Set(["ensemble_stacking_base_models"]),
 };
 
+const getChangedModelConfigFields = (
+  changedFields: ReadonlySet<string>,
+): Set<string> => {
+  const changedConfigFields = new Set<string>();
+  for (const fields of Object.values(MODEL_CONFIG_FIELDS)) {
+    for (const field of fields) {
+      if (changedFields.has(field)) changedConfigFields.add(field);
+    }
+  }
+  return changedConfigFields;
+};
+
+const preserveChangedModelConfigs = (
+  patch: Record<string, unknown>,
+  changedConfigFields: ReadonlySet<string>,
+) => {
+  for (const field of changedConfigFields) {
+    delete patch[field];
+  }
+};
+
 export function getServerInvalidationPatch(changedFields: ReadonlySet<string>) {
+  const changedConfigFields = getChangedModelConfigFields(changedFields);
   if ([...CONTEXT_FIELDS].some((field) => changedFields.has(field))) {
+    const patch = allModelResetPatch();
+    // A context change invalidates every trained result, but configuration
+    // values explicitly supplied in this same atomic request are the new source
+    // inputs, not stale derived state. Preserve them just like the narrower
+    // per-model invalidation path below.
+    preserveChangedModelConfigs(patch, changedConfigFields);
     return {
       modelsToDeactivate: [...BASE_MODELS, ...ENSEMBLE_MODELS] as ModelType[],
-      patch: allModelResetPatch(),
+      patch,
     };
   }
 
@@ -1120,6 +1798,21 @@ export function getServerInvalidationPatch(changedFields: ReadonlySet<string>) {
     }
     Object.assign(patch, productionResetPatch());
   }
+
+  // Keep the newly selected configuration values themselves; only the training,
+  // quiz, forecast, and production outputs derived from them are invalidated.
+  //
+  // This must run after the whole loop, not inside it. A base-model iteration
+  // resets *every* ensemble, including each `ensemble_*_base_models` selection,
+  // so deleting per iteration would silently depend on MODEL_CONFIG_FIELDS
+  // listing base models before ensembles: reorder that object and a request
+  // that changes both a base config and an ensemble selection would wipe the
+  // ensemble selection the student just made.
+  //
+  // Only configuration fields are exempt. A changed field that is an *output*
+  // (production_plan_completed, quiz flags, metrics …) must still be reset —
+  // that is the entire point of invalidation.
+  preserveChangedModelConfigs(patch, changedConfigFields);
 
   if (changedFields.has("selected_best_model")) {
     Object.assign(patch, productionResetPatch());

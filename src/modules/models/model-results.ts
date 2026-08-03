@@ -15,18 +15,31 @@ interface PredictionPoint extends Record<string, unknown> {
   interval_upper?: unknown;
   interval_level?: unknown;
   interval_kind?: unknown;
+  coverage_claim?: unknown;
   upper_error_p99?: unknown;
   calibration_mean_error?: unknown;
   calibration_count?: unknown;
+  bias_diagnostic_source?: unknown;
 }
 
 interface DemandPredictionNormalizationOptions {
   requireStdDev?: boolean;
   requireUpperErrorP99?: boolean;
   requireCalibrationDiagnostics?: boolean;
+  requireIntervalMetadata?: boolean;
 }
 
 const METRIC_EPSILON = 1e-12;
+const INTERVAL_KINDS = [
+  "model_prediction_interval",
+  "empirical_residual_quantile",
+  "normal_approximation",
+  "fallback_normal_approximation",
+] as const;
+type IntervalKind = (typeof INTERVAL_KINDS)[number];
+
+const isIntervalKind = (value: unknown): value is IntervalKind =>
+  typeof value === "string" && INTERVAL_KINDS.includes(value as IntervalKind);
 
 export const normalizeDemandPredictionPoints = (
   value: unknown,
@@ -114,11 +127,19 @@ export const normalizeDemandPredictionPoints = (
         );
       }
     }
-    const hasIntervalField = [
+    if (
+      point.bias_diagnostic_source !== undefined
+      && point.bias_diagnostic_source !== null
+      && (typeof point.bias_diagnostic_source !== "string" || point.bias_diagnostic_source.length === 0)
+    ) {
+      throw new Error(`[PYTHON_DATA] Prediction point ${index} bias_diagnostic_source must be a non-empty string or null`);
+    }
+    const hasIntervalField = options.requireIntervalMetadata || [
       point.interval_lower,
       point.interval_upper,
       point.interval_level,
       point.interval_kind,
+      point.coverage_claim,
     ].some((value) => value !== undefined);
     if (hasIntervalField) {
       if (
@@ -137,8 +158,18 @@ export const normalizeDemandPredictionPoints = (
       ) {
         throw new Error(`[PYTHON_DATA] Prediction point ${index} interval_level must equal 0.95`);
       }
-      if (typeof point.interval_kind !== "string" || point.interval_kind.length === 0) {
-        throw new Error(`[PYTHON_DATA] Prediction point ${index} interval_kind must be a non-empty string`);
+      if (!isIntervalKind(point.interval_kind)) {
+        throw new Error(
+          `[PYTHON_DATA] Prediction point ${index} interval_kind must be one of ${INTERVAL_KINDS.join(", ")}`,
+        );
+      }
+      const expectedCoverageClaim = point.interval_kind === "model_prediction_interval"
+        ? "model_nominal"
+        : "none";
+      if (point.coverage_claim !== expectedCoverageClaim) {
+        throw new Error(
+          `[PYTHON_DATA] Prediction point ${index} coverage_claim must equal ${expectedCoverageClaim} for ${point.interval_kind}`,
+        );
       }
     }
     return {
@@ -173,6 +204,12 @@ const recomputeCanonicalMetrics = (
   actual: number[],
   predictions: PredictionPoint[],
 ): TrainingMetricsPayload => {
+  const {
+    // Interval evaluation is derived exclusively from the validated outer
+    // evaluation rows below. Never retain a runner-supplied aggregate.
+    interval_evaluation: _untrustedIntervalEvaluation,
+    ...trustedMetrics
+  } = metrics ?? {};
   const predicted = predictions.map((point) => Number(point.prediction));
 
   const squaredErrors = actual.map((value, index) => (value - predicted[index]!) ** 2);
@@ -186,13 +223,65 @@ const recomputeCanonicalMetrics = (
     (sum, value) => sum + (value - meanActual) ** 2,
     0,
   );
+  const intervalRows = predictions.flatMap((point, index) => {
+    if (
+      typeof point.interval_lower !== "number"
+      || typeof point.interval_upper !== "number"
+      || typeof point.interval_level !== "number"
+    ) {
+      return [];
+    }
+    return [{
+      actual: actual[index]!,
+      lower: point.interval_lower,
+      upper: point.interval_upper,
+      level: point.interval_level,
+      coverageClaim: point.coverage_claim,
+    }];
+  });
+  const intervalEvaluation = intervalRows.length === 0
+    ? undefined
+    : (() => {
+      const includedCount = intervalRows.filter(
+        ({ actual: value, lower, upper }) => value >= lower && value <= upper,
+      ).length;
+      const totalWidth = intervalRows.reduce(
+        (sum, { lower, upper }) => sum + (upper - lower),
+        0,
+      );
+      const totalWinkler = intervalRows.reduce(
+        (sum, { actual: value, lower, upper, level }) => {
+          const alpha = 1 - level;
+          const width = upper - lower;
+          if (value < lower) return sum + width + (2 / alpha) * (lower - value);
+          if (value > upper) return sum + width + (2 / alpha) * (value - upper);
+          return sum + width;
+        },
+        0,
+      );
+      const levels = [...new Set(intervalRows.map(({ level }) => level))];
+
+      return {
+        scope: "outer_evaluation_descriptive",
+        count: intervalRows.length,
+        observed_inclusion_rate: includedCount / intervalRows.length,
+        mean_width: totalWidth / intervalRows.length,
+        mean_winkler_score: totalWinkler / intervalRows.length,
+        nominal_level: levels.length === 1 ? levels[0] : null,
+        coverage_claim: intervalRows.every(
+          ({ coverageClaim }) => coverageClaim === "model_nominal",
+        )
+          ? "model_nominal"
+          : "none",
+      };
+    })();
 
   return {
-    ...(metrics ?? {}),
+    ...trustedMetrics,
     rmse: Math.sqrt(residualSumOfSquares / actual.length),
     mae: absoluteErrors.reduce((sum, value) => sum + value, 0) / actual.length,
     mape: nonzeroIndices.length === 0
-      ? 0
+      ? null
       : 100 * nonzeroIndices.reduce(
         (sum, index) => sum + absoluteErrors[index]! / Math.abs(actual[index]!),
         0,
@@ -200,6 +289,7 @@ const recomputeCanonicalMetrics = (
     r2: totalSumOfSquares <= METRIC_EPSILON
       ? (residualSumOfSquares <= METRIC_EPSILON ? 1 : 0)
       : 1 - residualSumOfSquares / totalSumOfSquares,
+    ...(intervalEvaluation ? { interval_evaluation: intervalEvaluation } : {}),
   };
 };
 
@@ -229,18 +319,32 @@ const resultTransformers: Record<ModelType, (result: Record<string, unknown>) =>
   }),
   es: (result) => ({
     initial_level: result.initial_level,
+    alpha_comparison: result.alpha_comparison,
     uncertainty_summary: result.uncertainty_summary,
   }),
   ma: () => ({}),
-  lstm: (result) => ({
-    feature_types: result.feature_types,
-    forecast_horizon: result.forecast_horizon,
-    training_regime: result.training_regime,
-    uncertainty_summary: result.uncertainty_summary,
-    diagnostics: result.diagnostics
-      ? { ...(result.diagnostics as object), y_pred_eval: (result.predictions as { prediction: number }[] | undefined)?.map((p) => p.prediction) || [] }
-      : undefined,
-  }),
+  lstm: (result) => {
+    const trainingMetadata = (
+      result.training_metadata
+      && typeof result.training_metadata === "object"
+      && !Array.isArray(result.training_metadata)
+    )
+      ? result.training_metadata as Record<string, unknown>
+      : undefined;
+    return {
+      target_key: result.target_key,
+      feature_keys: result.feature_keys ?? trainingMetadata?.feature_keys,
+      feature_types: result.feature_types,
+      normalization: result.normalization,
+      forecast_horizon: result.forecast_horizon,
+      training_regime: result.training_regime,
+      training_metadata: result.training_metadata,
+      uncertainty_summary: result.uncertainty_summary,
+      diagnostics: result.diagnostics
+        ? { ...(result.diagnostics as object), y_pred_eval: (result.predictions as { prediction: number }[] | undefined)?.map((p) => p.prediction) || [] }
+        : undefined,
+    };
+  },
   stacking: (result) => ({
     model_names: result.models,
     meta_model: result.meta_model,
@@ -255,6 +359,8 @@ const resultTransformers: Record<ModelType, (result: Record<string, unknown>) =>
   boosting: (result) => ({
     model_names: result.model_chain,
     stage_coefficients: result.stage_coefficients,
+    post_line_search_shrinkage: result.post_line_search_shrinkage,
+    baseline: result.baseline,
     split_plan: result.split_plan,
     search_summary: result.search_summary,
   }),
@@ -272,7 +378,7 @@ export function transformTrainingResult(
   const predictions = normalizeDemandPredictionPoints(
     result.predictions,
     expectedEvaluationLength,
-    { requireStdDev: true },
+    { requireStdDev: true, requireIntervalMetadata: true },
   );
   const actual = normalizeEvaluationActuals(result.eval_y_true, predictions.length);
   const metrics = recomputeCanonicalMetrics(originalMetrics, actual, predictions);

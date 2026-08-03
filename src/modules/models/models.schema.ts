@@ -1,7 +1,10 @@
 import { z } from "zod";
+import { coercedProductionForecastPeriodsSchema } from "./production-forecast-contract";
 
 export const ALL_MODELS = ["ma", "es", "arima", "lstm", "stacking", "weighted_avg", "boosting"] as const;
 export type ModelType = (typeof ALL_MODELS)[number];
+
+export const MAX_LSTM_ADDITIONAL_FEATURES = 64;
 
 const baseDataSchema = z.object({
   experiment_id: z.coerce.number().int().min(1),
@@ -32,7 +35,41 @@ const normalizeLstmFeaturesInput = (value: unknown) => {
   return value;
 };
 
-const lstmFeaturesSchema = z.preprocess(normalizeLstmFeaturesInput, z.string().min(1).max(20_000));
+const parseLstmAdditionalFeatures = (value: string): string[] => {
+  const trimmed = value.trim();
+  if (!trimmed) return [];
+
+  try {
+    const parsed: unknown = JSON.parse(trimmed);
+    if (Array.isArray(parsed)) {
+      return parsed
+        .filter((item): item is string => typeof item === "string")
+        .map((item) => item.trim())
+        .filter((item) => item.length > 0);
+    }
+  } catch {
+    // Legacy clients send a comma-separated string. JSON is the unambiguous
+    // representation when a field name itself contains a comma.
+  }
+
+  return trimmed
+    .split(",")
+    .map((item) => item.trim())
+    .filter((item) => item.length > 0);
+};
+
+const lstmFeaturesSchema = z.preprocess(
+  normalizeLstmFeaturesInput,
+  z.string().min(1).max(20_000).superRefine((value, context) => {
+    const featureCount = parseLstmAdditionalFeatures(value).length;
+    if (featureCount <= MAX_LSTM_ADDITIONAL_FEATURES) return;
+
+    context.addIssue({
+      code: z.ZodIssueCode.custom,
+      message: `LSTM 附加输入特征最多可选择 ${MAX_LSTM_ADDITIONAL_FEATURES} 个（目标字段不计入上限），请减少所选特征后重试`,
+    });
+  }),
+);
 
 const BASE_MODEL_NAMES = new Set(["ma", "es", "arima", "lstm"]);
 const ensembleModelsSchema = z.string().min(1).max(64).superRefine((value, context) => {
@@ -198,13 +235,13 @@ export function getTrainSchemaForModel(modelType: ModelType) {
 
 export const predictSchema = z.object({
   experiment_id: z.coerce.number().int().min(1),
-  forecast_steps: z.coerce.number().int().min(1).max(12),
+  forecast_steps: coercedProductionForecastPeriodsSchema,
   preparation_token: z.string().uuid(),
 });
 
 export const prepareProductionSchema = z.object({
   experiment_id: z.coerce.number().int().min(1),
-  forecast_steps: z.coerce.number().int().min(1).max(12),
+  forecast_steps: coercedProductionForecastPeriodsSchema,
 });
 
 export function isModelType(value: unknown): value is ModelType {

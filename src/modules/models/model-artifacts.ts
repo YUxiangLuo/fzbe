@@ -27,6 +27,13 @@ import {
   type EnsembleModelType,
   type GuidedModelType,
 } from "./model-types";
+import {
+  computeBaseModelArtifactManifestSha256,
+  getLstmSidecarPath,
+  hashFileContents,
+} from "./base-model-artifact-digest";
+
+export { hashFileContents };
 
 const isPathInsideDirectory = (candidatePath: string, rootDirectory: string) => {
   const resolvedCandidate = path.resolve(candidatePath);
@@ -61,7 +68,6 @@ export const buildProductionCandidateModelPath = (
   );
 };
 
-const getLstmSidecarPath = (modelPath: string) => modelPath.replace(/\.pkl$/, "_keras_model.h5");
 const AUXILIARY_PYTHON_TIMEOUT_MS = 30_000;
 const AUXILIARY_SETSID_PATH = process.platform === "win32" ? undefined : Bun.which("setsid");
 
@@ -223,6 +229,7 @@ export const hasSavedModelArtifact = (modelType: ModelType, modelPath: string) =
 
 const ENSEMBLE_ARTIFACT_VALIDATION_SCRIPT = `
 import json
+import math
 import os
 import pickle
 import sys
@@ -252,14 +259,66 @@ def iter_model_states(base_model_states):
 
     return flattened
 
+def is_finite_number(value):
+    try:
+        numeric = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return False
+    return not isinstance(value, bool) and math.isfinite(numeric)
+
+def has_valid_persisted_baseline(state):
+    baseline = state.get("baseline")
+    if not isinstance(baseline, dict):
+        return False
+    kind = baseline.get("kind")
+    if kind == "mean":
+        return is_finite_number(baseline.get("training_mean"))
+    if kind == "naive":
+        return is_finite_number(baseline.get("last_value"))
+    if kind == "seasonal_naive":
+        try:
+            period = int(baseline.get("seasonal_period"))
+        except (TypeError, ValueError, OverflowError):
+            return False
+        tail = baseline.get("seasonal_tail")
+        return (
+            period >= 2
+            and isinstance(tail, (list, tuple))
+            and len(tail) == period
+            and all(is_finite_number(value) for value in tail)
+        )
+    # A zero baseline is supported only for replaying legacy artifacts that
+    # still contain member stages. By itself it is not a meaningful model.
+    return False
+
+def is_baseline_only_boosting(state):
+    return (
+        isinstance(state, dict)
+        and state.get("model_type") == "boosting"
+        and state.get("boosting_variant") == "residual"
+        and state.get("model_chain") == []
+        and state.get("stage_coefficients") == []
+        and state.get("base_model_states") == {}
+        and has_valid_persisted_baseline(state)
+    )
+
 try:
     with open(sys.argv[1], "rb") as handle:
         state = pickle.load(handle)
 
     flattened_states = iter_model_states(state.get("base_model_states"))
-    is_valid = flattened_states is not None and len(flattened_states) > 0 and all(
-        artifact_exists(model_type, model_file)
-        for model_type, model_file in flattened_states
+    is_valid = flattened_states is not None and (
+        (
+            len(flattened_states) > 0
+            and all(
+                artifact_exists(model_type, model_file)
+                for model_type, model_file in flattened_states
+            )
+        )
+        or (
+            len(flattened_states) == 0
+            and is_baseline_only_boosting(state)
+        )
     )
     print(json.dumps({"valid": bool(is_valid)}))
 except Exception:
@@ -313,40 +372,6 @@ const hasCompleteEnsembleArtifact = async (
   }
 };
 
-const BASE_ARTIFACT_DIGEST_PROTOCOL = "fz-base-model-artifact-v1";
-
-export const hashFileContents = async (
-  filePath: string,
-  terminationSignal?: AbortSignal,
-) => await new Promise<string>((resolve, reject) => {
-  if (terminationSignal?.aborted) {
-    reject(getAuxiliaryTerminationError(terminationSignal));
-    return;
-  }
-  const digest = crypto.createHash("sha256");
-  const stream = fs.createReadStream(filePath);
-  const onAbort = () => stream.destroy(getAuxiliaryTerminationError(terminationSignal!));
-  terminationSignal?.addEventListener("abort", onAbort, { once: true });
-  const cleanup = () => terminationSignal?.removeEventListener("abort", onAbort);
-  stream.on("data", (chunk) => digest.update(chunk));
-  stream.once("error", (error) => {
-    cleanup();
-    reject(error);
-  });
-  stream.once("end", () => {
-    cleanup();
-    resolve(digest.digest("hex"));
-  });
-});
-
-const getBaseArtifactFiles = (modelType: BaseModelType, modelPath: string) => {
-  const files = [{ role: "state", filePath: modelPath }];
-  if (modelType === "lstm") {
-    files.push({ role: "keras", filePath: getLstmSidecarPath(modelPath) });
-  }
-  return files;
-};
-
 export const computeBaseModelArtifactSha256 = async (
   modelType: BaseModelType,
   modelPath: string,
@@ -357,18 +382,11 @@ export const computeBaseModelArtifactSha256 = async (
   }
 
   try {
-    const manifest = crypto.createHash("sha256");
-    manifest.update(BASE_ARTIFACT_DIGEST_PROTOCOL);
-    manifest.update("\0");
-    manifest.update(modelType);
-    for (const artifact of getBaseArtifactFiles(modelType, modelPath)) {
-      if (terminationSignal?.aborted) throw getAuxiliaryTerminationError(terminationSignal);
-      manifest.update("\0");
-      manifest.update(artifact.role);
-      manifest.update("\0");
-      manifest.update(await hashFileContents(artifact.filePath, terminationSignal));
-    }
-    return manifest.digest("hex");
+    return await computeBaseModelArtifactManifestSha256(
+      modelType,
+      modelPath,
+      terminationSignal,
+    );
   } catch (error) {
     if (terminationSignal?.aborted) throw getAuxiliaryTerminationError(terminationSignal);
     if (error instanceof ModelArtifactError) throw error;
@@ -394,6 +412,7 @@ const artifactDigestMatches = (actual: string, expected: string) => {
 const ENSEMBLE_ARTIFACT_DIGEST_SCRIPT = `
 import hashlib
 import json
+import math
 import os
 import pickle
 import sys
@@ -437,6 +456,50 @@ def iter_model_states(base_model_states):
             ))
     return flattened
 
+def is_finite_number(value):
+    try:
+        numeric = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return False
+    return not isinstance(value, bool) and math.isfinite(numeric)
+
+def has_valid_persisted_baseline(state):
+    baseline = state.get("baseline")
+    if not isinstance(baseline, dict):
+        return False
+    kind = baseline.get("kind")
+    if kind == "mean":
+        return is_finite_number(baseline.get("training_mean"))
+    if kind == "naive":
+        return is_finite_number(baseline.get("last_value"))
+    if kind == "seasonal_naive":
+        try:
+            period = int(baseline.get("seasonal_period"))
+        except (TypeError, ValueError, OverflowError):
+            return False
+        tail = baseline.get("seasonal_tail")
+        return (
+            period >= 2
+            and isinstance(tail, (list, tuple))
+            and len(tail) == period
+            and all(is_finite_number(value) for value in tail)
+        )
+    # A zero baseline is supported only for replaying legacy artifacts that
+    # still contain member stages. By itself it is not a meaningful model.
+    return False
+
+def is_baseline_only_boosting(state, requested_model_type):
+    return (
+        requested_model_type == "boosting"
+        and isinstance(state, dict)
+        and state.get("model_type") == "boosting"
+        and state.get("boosting_variant") == "residual"
+        and state.get("model_chain") == []
+        and state.get("stage_coefficients") == []
+        and state.get("base_model_states") == {}
+        and has_valid_persisted_baseline(state)
+    )
+
 
 try:
     model_type = sys.argv[1]
@@ -448,7 +511,9 @@ try:
     with open(root_file, "rb") as handle:
         state = pickle.load(handle)
     members = iter_model_states(state.get("base_model_states"))
-    if members is None or len(members) == 0:
+    if members is None:
+        raise ValueError("ensemble has invalid base members")
+    if len(members) == 0 and not is_baseline_only_boosting(state, model_type):
         raise ValueError("ensemble has no base members")
     ordered = []
     for member_type, member_file, member_keras in sorted(members, key=lambda item: (item[0], str(item[1]))):

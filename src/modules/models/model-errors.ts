@@ -1,3 +1,20 @@
+import type { ModelType } from "./models.schema";
+
+export const MODEL_TRAINING_RUN_REQUIRED_CODE = "MODEL_TRAINING_RUN_REQUIRED";
+export const MODEL_RETRAINING_REQUIRED_CODE = "MODEL_RETRAINING_REQUIRED";
+
+export const buildModelRetrainingRequiredDetails = (
+  modelType: ModelType,
+  code = MODEL_RETRAINING_REQUIRED_CODE,
+) => ({
+  code,
+  required_action: "retrain" as const,
+  model_type: modelType,
+});
+
+export const buildMissingModelTrainingRunDetails = (modelType: ModelType) =>
+  buildModelRetrainingRequiredDetails(modelType, MODEL_TRAINING_RUN_REQUIRED_CODE);
+
 export class ModelValidationError extends Error {
   constructor(message: string, public details?: Record<string, unknown>) {
     super(message);
@@ -30,6 +47,29 @@ export class ModelServiceUnavailableError extends Error {
     super(message);
   }
 }
+
+/**
+ * The server may have committed even though the client never received the
+ * acknowledgement. Callers must preserve every artifact that the transaction
+ * could now reference and let an idempotent retry/reconciler determine the
+ * durable outcome.
+ */
+export class ModelCommitOutcomeUnknownError extends ModelServiceUnavailableError {
+  readonly retryable = true;
+
+  constructor(message = "数据库提交结果暂时无法确认，请重试以恢复最新状态", cause?: unknown) {
+    super(message, "MODEL_COMMIT_OUTCOME_UNKNOWN");
+    this.name = "ModelCommitOutcomeUnknownError";
+    if (cause !== undefined) {
+      (this as Error & { cause?: unknown }).cause = cause;
+    }
+  }
+}
+
+export const isModelCommitOutcomeUnknownError = (
+  error: unknown,
+): error is ModelCommitOutcomeUnknownError =>
+  error instanceof ModelCommitOutcomeUnknownError;
 
 export class ModelCapacityBusyError extends Error {
   readonly code = "MODEL_CAPACITY_BUSY";

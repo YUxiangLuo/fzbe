@@ -26,6 +26,7 @@ import {
   requireActiveModelTrainingRun,
 } from "./model-context";
 import { validateActiveRunAgainstSnapshot } from "./model-runtime-identity";
+import { issueProductionForecastEvidence } from "../experiments/production-forecast-evidence";
 
 const predictExperimentModelWithLease = async (
   modelType: ModelType,
@@ -153,6 +154,7 @@ const predictExperimentModelWithLease = async (
         requireStdDev: true,
         requireUpperErrorP99: true,
         requireCalibrationDiagnostics: true,
+        requireIntervalMetadata: true,
       },
     );
   } catch (error) {
@@ -177,6 +179,15 @@ const predictExperimentModelWithLease = async (
     status: "success",
     results: {
       predictions,
+      forecast_evidence: issueProductionForecastEvidence({
+        experiment_id: experimentId,
+        student_id: studentId,
+        model_type: modelType,
+        run_id: activeRun.run_id,
+        production_revision: preparationToken,
+        forecast_steps: forecastSteps,
+        forecasts: predictions,
+      }),
       ...metadata,
     },
   };

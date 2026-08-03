@@ -125,7 +125,7 @@ export const localizePredictValidationIssue = (issue: ZodIssue): string => {
 
   if (issue.code === "too_small") {
     if (field === "forecast_steps") {
-      return "预测步数必须大于等于 1";
+      return "预测步数必须大于等于 2";
     }
 
     const issueWithMinimum = issue as IssueWithMinimum;
