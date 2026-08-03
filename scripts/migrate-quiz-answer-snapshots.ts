@@ -1,20 +1,7 @@
 import mysql from "mysql2/promise";
+import { createMigrationConnection } from "./migration-database";
 
-const { DB_HOST, DB_USER, DB_PASSWORD, DB_DATABASE } = process.env;
-
-function requireEnv(name: string, value: string | undefined): string {
-  const normalized = value?.trim();
-  if (!normalized) throw new Error(`Missing required env var: ${name}`);
-  return normalized;
-}
-
-const connection = await mysql.createConnection({
-  host: requireEnv("DB_HOST", DB_HOST),
-  user: requireEnv("DB_USER", DB_USER),
-  password: DB_PASSWORD ?? "",
-  database: requireEnv("DB_DATABASE", DB_DATABASE),
-  multipleStatements: true,
-});
+const connection = await createMigrationConnection({ multipleStatements: true });
 
 interface AnswerBackfillRow extends mysql.RowDataPacket {
   answer_id: number;

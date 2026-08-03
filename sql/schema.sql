@@ -19,8 +19,12 @@ CREATE TABLE IF NOT EXISTS `users` (
   `full_name` VARCHAR(255) NOT NULL,
   `email` VARCHAR(255) NOT NULL UNIQUE,
   `phone_number` VARCHAR(50),
+  `phone_number_canonical` VARCHAR(50)
+    GENERATED ALWAYS AS (NULLIF(TRIM(`phone_number`), '')) STORED,
   `role` ENUM('Student', 'Teacher', 'Assistant', 'Admin') NOT NULL,
   `created_at` TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  UNIQUE KEY `users_phone_number_unique` (`phone_number`),
+  UNIQUE KEY `users_phone_number_canonical_unique` (`phone_number_canonical`),
   -- Performance optimization: fulltext index for user search
   FULLTEXT INDEX `ft_user_search` (`full_name`, `email`, `phone_number`)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
@@ -77,6 +81,8 @@ CREATE TABLE IF NOT EXISTS `class_assistants` (
 CREATE TABLE IF NOT EXISTS `experiment_status` (
   `experiment_id` INT AUTO_INCREMENT PRIMARY KEY,
   `student_id` INT NOT NULL,
+  -- A rejected official attempt may create exactly one fresh retry attempt.
+  `retry_of_experiment_id` INT DEFAULT NULL,
   `status` ENUM('Not Started', 'In Progress', 'Completed') DEFAULT 'Not Started',
 
   -- Default value is 0, indicating no steps have been completed yet
@@ -158,11 +164,12 @@ CREATE TABLE IF NOT EXISTS `experiment_status` (
 
   `production_plan_completed` BOOLEAN DEFAULT false,
   `production_forecast_periods` INT DEFAULT NULL,
-  `production_initial_inventory` FLOAT DEFAULT NULL,
+  `production_initial_inventory` DOUBLE DEFAULT NULL,
   `production_target_service_level` FLOAT DEFAULT NULL,
   `production_safety_stock_z_score` FLOAT DEFAULT NULL,
   `production_mps_table` JSON DEFAULT NULL,
   `production_forecast_results` JSON DEFAULT NULL,
+  `production_forecast_evidence` TEXT DEFAULT NULL,
   `production_capacity_mode` ENUM('scenario', 'auto', 'custom') DEFAULT NUll,
   `production_capacity_scenario` ENUM('tight', 'normal', 'abundant') DEFAULT NUll,
   `production_capacity` INT DEFAULT NULL,
@@ -173,6 +180,13 @@ CREATE TABLE IF NOT EXISTS `experiment_status` (
   `completion_time` TIMESTAMP NULL DEFAULT NULL,
 
   FOREIGN KEY (`student_id`) REFERENCES `users`(`user_id`) ON DELETE CASCADE,
+  CONSTRAINT `experiment_status_retry_parent_fk`
+    FOREIGN KEY (`retry_of_experiment_id`)
+    REFERENCES `experiment_status`(`experiment_id`)
+    -- Account deletion already cascades every attempt through student_id.  SET
+    -- NULL avoids InnoDB's finite recursive-cascade depth for long retry chains.
+    ON DELETE SET NULL,
+  UNIQUE KEY `experiment_status_retry_parent_unique` (`retry_of_experiment_id`),
   INDEX `idx_experiment_status_student` (`student_id`),
   
   -- Add constraint to ensure step values are valid
@@ -470,7 +484,9 @@ CREATE TABLE IF NOT EXISTS `experiment_reports` (
   UNIQUE KEY `student_experiment_unique` (`student_id`, `experiment_id`),
 
   -- Performance optimization: index for fetching latest reports
-  INDEX `idx_student_submitted` (`student_id`, `submitted_at` DESC, `report_id` DESC)
+  INDEX `idx_student_submitted` (`student_id`, `submitted_at` DESC, `report_id` DESC),
+  -- Supports bounded, repeatable reconciliation of historical rejected grades.
+  INDEX `idx_experiment_reports_status_report` (`status`, `report_id`)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
 CREATE TABLE IF NOT EXISTS `grade_weights` (
