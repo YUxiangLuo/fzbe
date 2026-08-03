@@ -3,7 +3,7 @@ import { zValidator } from "@hono/zod-validator";
 import { jwtAuth, requireAdmin } from "../../middleware";
 import {
   industryParamSchema, industryAndCompanyParamSchema, industryCompanyProductParamSchema,
-  datasetIdParamSchema, updateDatasetSchema,
+  datasetIdParamSchema, datasetMetadataSchema, updateDatasetSchema,
 } from "./datasets.schema";
 import {
   uploadDataset, getAllDatasets, getDatasetById, updateDataset, deleteDataset,
@@ -23,8 +23,16 @@ datasetsController.post("/api/v1/datasets", jwtAuth, requireAdmin, async (c) => 
 
     if (!(file instanceof File)) return c.json({ error: "需要 CSV 文件" }, 400);
     if (!dataName || typeof dataName !== "string") return c.json({ error: "数据集名称不能为空" }, 400);
+    if (description !== undefined && typeof description !== "string") {
+      return c.json({ error: "备注格式不正确" }, 400);
+    }
 
-    const result = await uploadDataset(file, dataName, typeof description === "string" ? description : undefined);
+    const metadata = datasetMetadataSchema.safeParse({ data_name: dataName, description });
+    if (!metadata.success) {
+      return c.json({ error: metadata.error.issues[0]?.message ?? "数据集信息格式不正确" }, 400);
+    }
+
+    const result = await uploadDataset(file, metadata.data.data_name, metadata.data.description);
 
     if ("error" in result) {
       const response: Record<string, unknown> = { error: result.error };
@@ -138,8 +146,16 @@ datasetsController.delete("/api/v1/datasets/:datasetId", jwtAuth, requireAdmin, 
   try {
     const { datasetId } = c.req.valid("param");
     const result = await deleteDataset(parseInt(datasetId, 10));
-    if ("error" in result) return c.json({ error: "数据集不存在" }, 404);
-    return c.json({ message: "数据集及所有相关文件删除成功" });
+    if ("error" in result) {
+      if (result.error === "not_found") return c.json({ error: "数据集不存在" }, 404);
+      return c.json({ error: "数据集文件无法安全清理，数据集未删除" }, 500);
+    }
+    return c.json({
+      message: result.cleanupPending
+        ? "数据集已删除；隔离文件将在后续清理"
+        : "数据集及所有相关文件删除成功",
+      cleanup_pending: result.cleanupPending,
+    });
   } catch (error) {
     return handleUnexpectedError(c, error, "删除数据集失败");
   }

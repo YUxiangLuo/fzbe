@@ -1,6 +1,6 @@
 import { Hono } from "hono";
 import { zValidator } from "@hono/zod-validator";
-import { jwtAuth, requireTeacher, requireAdmin } from "../../middleware";
+import { jwtAuth, requireRoles, requireAdmin } from "../../middleware";
 import {
   classIdParamSchema,
   teacherIdParamSchema,
@@ -31,7 +31,7 @@ async function parseTermFilter(rawTermId: string | undefined | null) {
   return { termId: result.termId };
 }
 
-classesController.post("/api/v1/classes", jwtAuth, requireTeacher, async (c) => {
+classesController.post("/api/v1/classes", jwtAuth, requireRoles("Teacher"), async (c) => {
   try {
     const payload = c.get("jwtPayload") as JwtPayload;
     const body = await c.req.parseBody();

@@ -1,4 +1,8 @@
 import path from "path";
+import { Buffer } from "node:buffer";
+import { randomUUID } from "node:crypto";
+
+export const FILESYSTEM_FILENAME_MAX_BYTES = 255;
 
 /**
  * File validation utilities for secure file uploads
@@ -190,15 +194,94 @@ export function sanitizeFilename(filename: string): string {
   return sanitized;
 }
 
+/** Keeps a filename within a filesystem component byte budget without
+ * splitting a Unicode code point, while preserving its validated extension. */
+export function fitFilenameToUtf8Bytes(filename: string, maxBytes: number): string {
+  if (!Number.isInteger(maxBytes) || maxBytes <= 0) {
+    throw new Error("Filename byte budget must be a positive integer");
+  }
+
+  const extension = path.extname(filename);
+  const extensionBytes = Buffer.byteLength(extension, "utf8");
+  if (extensionBytes >= maxBytes) {
+    throw new Error("Filename extension exceeds the filesystem byte budget");
+  }
+
+  const stem = path.basename(filename, extension);
+  const stemBudget = maxBytes - extensionBytes;
+  let boundedStem = "";
+  let usedBytes = 0;
+  for (const character of stem) {
+    const characterBytes = Buffer.byteLength(character, "utf8");
+    if (usedBytes + characterBytes > stemBudget) break;
+    boundedStem += character;
+    usedBytes += characterBytes;
+  }
+  if (!boundedStem) {
+    boundedStem = "file".slice(0, stemBudget);
+  }
+  return `${boundedStem}${extension}`;
+}
+
+function fitFilenameToCharacterCount(filename: string, maxCharacters: number): string {
+  if (!Number.isInteger(maxCharacters) || maxCharacters <= 0) {
+    throw new Error("Filename character budget must be a positive integer");
+  }
+  const extension = path.extname(filename);
+  const extensionCharacters = Array.from(extension).length;
+  if (extensionCharacters >= maxCharacters) {
+    throw new Error("Filename extension exceeds the storage path character budget");
+  }
+  const stemBudget = maxCharacters - extensionCharacters;
+  const boundedStem = Array.from(path.basename(filename, extension))
+    .slice(0, stemBudget)
+    .join("") || "file".slice(0, stemBudget);
+  return `${boundedStem}${extension}`;
+}
+
+export function fitFilenameToStoragePathLimits(
+  filename: string,
+  options: {
+    directory: string;
+    fixedPrefix?: string;
+    maxStoredPathCharacters?: number;
+  },
+): string {
+  const fixedPrefix = options.fixedPrefix ?? "";
+  if (fixedPrefix.includes("/") || fixedPrefix.includes("\\")) {
+    throw new Error("Stored filename prefix cannot contain path separators");
+  }
+  const maxStoredPathCharacters = options.maxStoredPathCharacters ?? 255;
+  const pathPrefix = `${path.resolve(options.directory)}${path.sep}${fixedPrefix}`;
+  const remainingCharacters = maxStoredPathCharacters - Array.from(pathPrefix).length;
+  const remainingComponentBytes = (
+    FILESYSTEM_FILENAME_MAX_BYTES - Buffer.byteLength(fixedPrefix, "utf8")
+  );
+
+  const byteBounded = fitFilenameToUtf8Bytes(filename, remainingComponentBytes);
+  const characterBounded = fitFilenameToCharacterCount(byteBounded, remainingCharacters);
+  return `${fixedPrefix}${characterBounded}`;
+}
+
 /**
  * Generates a unique, safe filename
  */
-export function generateUniqueFilename(originalFilename: string): string {
+export function generateUniqueFilename(
+  originalFilename: string,
+  options?: { directory: string; maxStoredPathCharacters?: number },
+): string {
   const sanitized = sanitizeFilename(originalFilename);
-  const ext = path.extname(sanitized);
-  const nameWithoutExt = path.basename(sanitized, ext);
   const timestamp = Date.now();
-  const random = Math.random().toString(36).substring(2, 8);
+  const prefix = `${timestamp}-${randomUUID()}-`;
+  const boundedFilename = options
+    ? fitFilenameToStoragePathLimits(sanitized, {
+      ...options,
+      fixedPrefix: prefix,
+    }).slice(prefix.length)
+    : fitFilenameToUtf8Bytes(
+      sanitized,
+      FILESYSTEM_FILENAME_MAX_BYTES - Buffer.byteLength(prefix, "utf8"),
+    );
 
-  return `${timestamp}-${random}-${nameWithoutExt}${ext}`;
+  return `${prefix}${boundedFilename}`;
 }

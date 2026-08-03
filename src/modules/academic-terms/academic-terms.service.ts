@@ -1,5 +1,6 @@
 import type { ResultSetHeader, RowDataPacket, Pool, PoolConnection } from "mysql2/promise";
-import { pool } from "../../config";
+import { env, pool } from "../../config";
+import { databaseDatetimeToIsoString } from "../../utils/database-datetime";
 import type { AcademicTermInput, UpdateAcademicTermInput } from "./academic-terms.schema";
 
 type Queryable = Pool | PoolConnection;
@@ -9,7 +10,7 @@ export interface AcademicTermRow extends RowDataPacket {
   academic_year: string;
   semester: 1 | 2;
   is_active: number | boolean;
-  created_at: Date;
+  created_at: Date | string;
   class_count?: number;
 }
 
@@ -19,7 +20,7 @@ export interface AcademicTerm {
   semester: 1 | 2;
   term_label: string;
   is_active: boolean;
-  created_at: Date;
+  created_at: string | null;
   class_count?: number;
 }
 
@@ -32,7 +33,7 @@ export const mapAcademicTermRow = (row: AcademicTermRow): AcademicTerm => ({
   semester: row.semester,
   term_label: formatAcademicTermLabel(row.academic_year, row.semester),
   is_active: Boolean(row.is_active),
-  created_at: row.created_at,
+  created_at: databaseDatetimeToIsoString(row.created_at, env.DB_TIMEZONE),
   ...(row.class_count !== undefined ? { class_count: Number(row.class_count) } : {}),
 });
 
