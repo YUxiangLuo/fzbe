@@ -3,7 +3,7 @@ import { mkdir, rm } from "node:fs/promises";
 import type { RowDataPacket, ResultSetHeader } from "mysql2";
 import { marked } from "marked";
 import puppeteer from "puppeteer-core";
-import { pool } from "../../config";
+import { env, pool } from "../../config";
 import { sanitizeHTML, HTMLSanitizationError } from "../../utils/html-sanitizer";
 import { CONTENT_LIMITS, CONCURRENCY_LIMITS, TIMEOUTS, PATHS } from "../../utils/constants";
 import { Semaphore } from "../../utils/semaphore";
@@ -13,9 +13,23 @@ import {
   buildExperimentFlowGradeValues,
   getReportSubmissionEligibilityError,
 } from "./report-submission-policy";
+import {
+  parseCompatibleProductionForecastResults,
+  validateCompletedProductionPlan,
+} from "../experiments/experiments.schema";
 import { cleanupExperimentModelArtifacts } from "../models/models.service";
+import {
+  ensureDatabaseManagedStorageRoot,
+  getDatabaseManagedStorageRoot,
+  isPathInsideRoot,
+  resolveStoredManagedPath,
+} from "../../utils/managed-storage";
+import { resolveExistingManagedFile } from "../../utils/managed-file";
+import { fitFilenameToStoragePathLimits } from "../../utils/file-validator";
+import { databaseDatetimeToIsoString } from "../../utils/database-datetime";
 
 const pdfSemaphore = new Semaphore(CONCURRENCY_LIMITS.MAX_CONCURRENT_PDF_JOBS);
+const reportsManagedRoot = path.resolve(import.meta.dir, "../../../uploads", "reports");
 
 export function getPdfQueueStats() {
   return {
@@ -53,9 +67,13 @@ interface ModelMetric {
 interface ExperimentRow extends RowDataPacket {
   experiment_id: number;
   student_id: number;
+  retry_of_experiment_id: number | null;
   status: string;
   current_step: number;
   highest_completed_step: number;
+  start_time: Date | string | null;
+  last_activity_at: Date | string | null;
+  completion_time: Date | string | null;
   selected_industry: string | null;
   selected_company: string | null;
   selected_product: string | null;
@@ -72,6 +90,7 @@ interface ExperimentRow extends RowDataPacket {
   production_target_service_level: number | null;
   production_safety_stock_z_score: number | null;
   production_forecast_results: unknown;
+  production_forecast_evidence: string | null;
   production_mps_table: unknown;
   production_capacity_mode: string | null;
   production_capacity_scenario: string | null;
@@ -124,13 +143,128 @@ function toPublicReportPath(filePath: string | null | undefined): string | null 
   return `reports/${path.basename(filePath)}`;
 }
 
-async function cleanupGeneratedReportPdf(pdfPath: string | null | undefined): Promise<void> {
+async function isStoredReportPdfAvailable(filePath: string | null | undefined): Promise<boolean> {
+  if (!filePath) return false;
+  return resolveExistingManagedFile({
+    storedPath: filePath,
+    managedRoot: reportsManagedRoot,
+    environment: env,
+    legacyFallbackDirectory: getDatabaseManagedStorageRoot(reportsManagedRoot, env),
+    enforceDisposableNamespace: true,
+  }).then(Boolean).catch(() => false);
+}
+
+async function buildLatestReportRecord(report: ReportRow) {
+  return {
+    ...report,
+    submitted_at: databaseDatetimeToIsoString(report.submitted_at, env.DB_TIMEZONE),
+    pdf_file_path: toPublicReportPath(report.pdf_file_path),
+    pdf_file_available: await isStoredReportPdfAvailable(report.pdf_file_path),
+  };
+}
+
+async function getRejectedParentReport(
+  studentId: number,
+  retryOfExperimentId: number | null,
+) {
+  if (retryOfExperimentId == null) return null;
+
+  const [[rejectedReport]] = await pool.query<ReportRow[]>(
+    `SELECT er.*
+       FROM experiment_reports er
+       JOIN experiment_status parent ON parent.experiment_id = er.experiment_id
+      WHERE er.experiment_id = ?
+        AND er.student_id = ?
+        AND parent.student_id = ?
+        AND er.status = 'rejected'
+      LIMIT 1`,
+    [retryOfExperimentId, studentId, studentId],
+  );
+  return rejectedReport ? buildLatestReportRecord(rejectedReport) : null;
+}
+
+async function resolveGeneratedReportCleanupPath(
+  pdfPath: string | null | undefined,
+  allowedRoot = reportsManagedRoot,
+): Promise<string | null> {
+  if (!pdfPath) return null;
+  const resolvedAllowedRoot = path.resolve(allowedRoot);
+  const databaseReportsRoot = getDatabaseManagedStorageRoot(reportsManagedRoot, env);
+  const isManagedProductionRoot = (
+    resolvedAllowedRoot === reportsManagedRoot
+    || resolvedAllowedRoot === databaseReportsRoot
+  );
+  let candidatePath: string;
+  if (path.isAbsolute(pdfPath) && isPathInsideRoot(pdfPath, resolvedAllowedRoot)) {
+    candidatePath = path.resolve(pdfPath);
+  } else if (isManagedProductionRoot) {
+    const resolved = await resolveStoredManagedPath({
+      storedPath: pdfPath,
+      managedRoot: reportsManagedRoot,
+      environment: env,
+      legacyFallbackDirectory: databaseReportsRoot,
+      enforceDisposableNamespace: true,
+    });
+    candidatePath = resolved.absolutePath;
+  } else {
+    throw new Error(`Report cleanup path is outside its generation root: ${pdfPath}`);
+  }
+
+  // Lexical containment is insufficient for destructive operations: an
+  // ancestor such as reports/linked may be a symlink to an external directory.
+  // Reuse the component-by-component regular-file validator before rm.
+  const existing = await resolveExistingManagedFile({
+    storedPath: candidatePath,
+    managedRoot: resolvedAllowedRoot,
+    environment: env,
+    legacyFallbackDirectory: resolvedAllowedRoot,
+    enforceDisposableNamespace: false,
+  });
+  return existing?.absolutePath ?? null;
+}
+
+export async function cleanupGeneratedReportPdf(
+  pdfPath: string | null | undefined,
+  allowedRoot = reportsManagedRoot,
+): Promise<void> {
   if (!pdfPath) return;
 
   try {
-    await rm(pdfPath, { force: true });
+    const cleanupPath = await resolveGeneratedReportCleanupPath(pdfPath, allowedRoot);
+    if (cleanupPath) await rm(cleanupPath, { force: true });
   } catch (error) {
     logger.warn({ err: error, pdfPath }, "清理报告 PDF 失败");
+  }
+}
+
+export async function cleanupReplacedReportPdf(
+  previousPdfPath: string,
+  allowedRoot: string,
+): Promise<void> {
+  try {
+    const cleanupPath = await resolveGeneratedReportCleanupPath(previousPdfPath, allowedRoot);
+    if (!cleanupPath) return;
+    const [survivingRows] = await pool.query<Array<RowDataPacket & { pdf_file_path: string | null }>>(
+      `SELECT pdf_file_path
+         FROM experiment_reports
+        WHERE pdf_file_path IS NOT NULL`,
+    );
+    for (const row of survivingRows) {
+      if (!row.pdf_file_path) continue;
+      // Exact equality is a safe fast path even if an old external value can
+      // no longer be resolved by the current deployment.
+      if (row.pdf_file_path === previousPdfPath) return;
+      const survivingPath = await resolveGeneratedReportCleanupPath(
+        row.pdf_file_path,
+        allowedRoot,
+      ).catch(() => null);
+      if (survivingPath === cleanupPath) return;
+    }
+    await rm(cleanupPath, { force: true });
+  } catch (error) {
+    // A failed reference scan must retain the old PDF. Deleting on uncertainty
+    // could break another legacy report which shares the same physical file.
+    logger.warn({ err: error, previousPdfPath }, "检查旧报告 PDF 引用失败，已保留文件");
   }
 }
 
@@ -221,10 +355,146 @@ export interface SubmitReportResult {
   pdf_path: string;
 }
 
+export interface SubmitReportOptions {
+  /** Override the PDF directory for isolated tests and maintenance jobs. */
+  reportsDir?: string;
+}
+
+type SubmitReportSuccess = {
+  data: SubmitReportResult;
+  isUpdate: boolean;
+};
+
+interface ReportCommitCandidate {
+  result: SubmitReportSuccess;
+  previousPdfPath: string | null;
+  expectedReportId: number;
+  pdfPath: string;
+}
+
+class AmbiguousReportCommitError extends Error {
+  constructor(
+    public readonly originalError: unknown,
+    public readonly candidate: ReportCommitCandidate,
+  ) {
+    super("Report transaction commit acknowledgement was not received");
+    this.name = "AmbiguousReportCommitError";
+  }
+}
+
+type ReportCommitProbeState = "committed" | "not-committed" | "unknown";
+
+async function probeAmbiguousReportCommit(
+  experimentId: number,
+  studentId: number,
+  candidate: ReportCommitCandidate,
+): Promise<ReportCommitProbeState> {
+  const connection = await pool.getConnection();
+  let phase: "active" | "commit-attempted" | "committed" = "active";
+  let disposed = false;
+  try {
+    await connection.query("SET TRANSACTION ISOLATION LEVEL READ COMMITTED");
+    await connection.beginTransaction();
+    await connection.query<RowDataPacket[]>(
+      "SELECT user_id FROM users WHERE user_id = ? LIMIT 1 FOR UPDATE",
+      [studentId],
+    );
+    const [[experiment]] = await connection.query<RowDataPacket[]>(
+      `SELECT experiment_id, student_id, status
+         FROM experiment_status
+        WHERE experiment_id = ? AND student_id = ?
+        LIMIT 1
+        FOR UPDATE`,
+      [experimentId, studentId],
+    );
+    const [[report]] = await connection.query<ReportRow[]>(
+      `SELECT report_id, experiment_id, student_id, pdf_file_path, status
+         FROM experiment_reports
+        WHERE experiment_id = ? AND student_id = ?
+        LIMIT 1
+        FOR UPDATE`,
+      [experimentId, studentId],
+    );
+
+    const observedState: ReportCommitProbeState = (() => {
+      const sameCommittedReport = (
+        Number(report?.report_id) === candidate.expectedReportId
+        && report?.pdf_file_path === candidate.pdfPath
+        && ["submitted", "graded", "rejected"].includes(String(report?.status))
+        && String(experiment?.status) === "Completed"
+      );
+      if (sameCommittedReport) return "committed";
+
+      // Absence, or the exact pre-transaction report version, proves this PDF
+      // was not committed. Any mixed/newer state is intentionally unknown: a
+      // concurrent resubmission or review may have advanced it before the
+      // locking read acquired its locks.
+      if (!report) return "not-committed";
+      if (
+        Number(report.report_id) === candidate.expectedReportId
+        && report.pdf_file_path === candidate.previousPdfPath
+        && report.pdf_file_path !== candidate.pdfPath
+      ) {
+        return "not-committed";
+      }
+      return "unknown";
+    })();
+
+    phase = "commit-attempted";
+    try {
+      await connection.commit();
+    } catch (commitError) {
+      // This transaction is read-only: the state was observed while holding
+      // all relevant row/gap locks, so losing the COMMIT acknowledgement does
+      // not invalidate that observation. The session itself is uncertain and
+      // must never be returned to the pool.
+      disposed = true;
+      try {
+        connection.destroy();
+      } catch {}
+      logger.warn(
+        { err: commitError, experimentId, studentId, observedState },
+        "报告提交探针 COMMIT 回执丢失，采用锁内观测结果",
+      );
+      return observedState;
+    }
+    phase = "committed";
+    disposed = true;
+    try {
+      connection.release();
+    } catch (releaseError) {
+      connection.destroy();
+      logger.warn({ err: releaseError }, "释放报告提交探针连接失败");
+    }
+
+    return observedState;
+  } catch (error) {
+    if (phase === "commit-attempted") {
+      disposed = true;
+      try {
+        connection.destroy();
+      } catch {}
+    } else {
+      try {
+        await connection.rollback();
+      } catch {
+        disposed = true;
+        try {
+          connection.destroy();
+        } catch {}
+      }
+    }
+    throw error;
+  } finally {
+    if (!disposed) connection.release();
+  }
+}
+
 export async function submitReport(
   experimentId: number,
   studentId: number,
   markdownContent: string,
+  options: SubmitReportOptions = {},
 ): Promise<{ error: string; status: 400 | 403 | 404 } | { data: SubmitReportResult; isUpdate: boolean }> {
   // 输入长度限制
   if (markdownContent.length > CONTENT_LIMITS.MARKDOWN_MAX_LENGTH) {
@@ -247,7 +517,25 @@ export async function submitReport(
     return { error: "权限不足：该实验不属于当前用户", status: 403 };
   }
 
-  const precheckEligibilityError = getReportSubmissionEligibilityError(precheckExperiment);
+  let allowCompletedWithoutReport = false;
+  if (precheckExperiment.status === "Completed") {
+    const [precheckReports] = await pool.query<RowDataPacket[]>(
+      `SELECT report_id
+         FROM experiment_reports
+        WHERE experiment_id = ? AND student_id = ?
+        LIMIT 1`,
+      [experimentId, studentId],
+    );
+    allowCompletedWithoutReport = precheckReports.length === 0;
+  }
+
+  const precheckEligibilityError = getReportSubmissionEligibilityError(
+    precheckExperiment,
+    {
+      allowCompletedWithoutReport,
+      allowLegacyV1Write: env.ALLOW_LEGACY_PRODUCTION_PLAN_WRITES,
+    },
+  );
   if (precheckEligibilityError) {
     return { error: precheckEligibilityError, status: 400 };
   }
@@ -255,10 +543,24 @@ export async function submitReport(
   const sanitizedReportContent = await markdownToSanitizedHtml(markdownContent);
   const htmlDocument = buildPdfDocument(sanitizedReportContent);
 
-  const reportsDir = path.resolve(import.meta.dir, "../../../uploads", "reports");
-  await mkdir(reportsDir, { recursive: true });
+  const reportsDir = options.reportsDir
+    ? path.resolve(options.reportsDir)
+    : await ensureDatabaseManagedStorageRoot(reportsManagedRoot, env);
+  if (options.reportsDir) {
+    // Isolated tests and maintenance callers supply their own trusted root;
+    // production storage always goes through the symlink-safe category helper.
+    await mkdir(reportsDir, { recursive: true });
+  }
 
-  const uniqueFilename = `report-exp${experimentId}-student${studentId}-${Date.now()}.pdf`;
+  // Date.now() alone is not a unique ownership boundary: two submissions for
+  // the same experiment can finish PDF generation in the same millisecond.
+  // If they shared a path, the losing transaction would clean up the winner's
+  // committed PDF. Keep the timestamp for operator readability, but give each
+  // request an unguessable, independently cleanable artifact.
+  const uniqueFilename = fitFilenameToStoragePathLimits("submission.pdf", {
+    directory: reportsDir,
+    fixedPrefix: `report-exp${experimentId}-student${studentId}-${Date.now()}-${crypto.randomUUID()}-`,
+  });
   const pdfPath = path.join(reportsDir, uniqueFilename);
 
   await pdfSemaphore.acquire(TIMEOUTS.PDF_QUEUE);
@@ -290,18 +592,47 @@ export async function submitReport(
     }
   } catch (error) {
     logger.error({ err: error, experimentId, studentId }, "PDF 生成失败");
-    await cleanupGeneratedReportPdf(pdfPath);
+    await cleanupGeneratedReportPdf(pdfPath, reportsDir);
     throw error;
   } finally {
     pdfSemaphore.release();
   }
 
+  const finalizeCommittedSubmission = (
+    result: SubmitReportSuccess,
+    previousPdfPath: string | null,
+  ) => {
+    if (previousPdfPath && previousPdfPath !== pdfPath) {
+      Promise.resolve().then(() => cleanupReplacedReportPdf(previousPdfPath, reportsDir));
+    }
+
+    // 异步清理该实验产生的所有模型训练文件，不阻塞响应
+    Promise.resolve().then(() => {
+      try {
+        cleanupExperimentModelArtifacts(experimentId, studentId);
+      } catch (error) {
+        logger.error({ err: error, experimentId, studentId }, "清理实验模型产物失败");
+      }
+    });
+    return result;
+  };
+
   try {
     const transactionResult = await withDeadlockRetry(async () => {
       const connection = await pool.getConnection();
+      let transactionPhase: "before-commit" | "commit-attempted" | "committed" = "before-commit";
+      let disposed = false;
       try {
         await connection.query("SET TRANSACTION ISOLATION LEVEL READ COMMITTED");
         await connection.beginTransaction();
+        // User is the common first lock for report submission, grading, retry,
+        // and user deletion. The explicit lock also acquires the FK parent
+        // before experiment/report rows, avoiding an implicit users lock late
+        // in INSERT ... experiment_reports.
+        await connection.query<RowDataPacket[]>(
+          "SELECT user_id FROM users WHERE user_id = ? LIMIT 1 FOR UPDATE",
+          [studentId],
+        );
 
         const [[experiment]] = await connection.query<ExperimentRow[]>(
           `SELECT * FROM experiment_status WHERE experiment_id = ? LIMIT 1 FOR UPDATE`,
@@ -318,20 +649,115 @@ export async function submitReport(
           return { result: { error: "权限不足：该实验不属于当前用户", status: 403 as const }, previousPdfPath: null };
         }
 
-        const eligibilityError = getReportSubmissionEligibilityError(experiment);
+        let existingReports: ReportRow[] | undefined;
+        if (experiment.status === "Completed") {
+          const [rows] = await connection.query<ReportRow[]>(
+            `SELECT report_id, pdf_file_path
+               FROM experiment_reports
+              WHERE experiment_id = ? AND student_id = ?
+              LIMIT 1
+              FOR UPDATE`,
+            [experimentId, studentId],
+          );
+          existingReports = rows;
+        }
+
+        const eligibilityError = getReportSubmissionEligibilityError(
+          experiment,
+          {
+            allowCompletedWithoutReport: existingReports?.length === 0,
+            allowLegacyV1Write: env.ALLOW_LEGACY_PRODUCTION_PLAN_WRITES,
+          },
+        );
         if (eligibilityError) {
           await connection.rollback();
           return { result: { error: eligibilityError, status: 400 as const }, previousPdfPath: null };
         }
 
-        const [existingReports] = await connection.query<ReportRow[]>(
-          `SELECT report_id, pdf_file_path
-             FROM experiment_reports
-            WHERE experiment_id = ? AND student_id = ?
-            LIMIT 1
-            FOR UPDATE`,
-          [experimentId, studentId],
+        const isCompletedRecovery = (
+          experiment.status === "Completed"
+          && existingReports?.length === 0
         );
+        // A completed row is immutable through the experiment APIs. If report
+        // creation was interrupted after that terminal write, validate it as
+        // the terminal snapshot it actually is; coercing it back to an active
+        // row creates a state that can neither be repaired nor submitted.
+        const productionPlanValidation = validateCompletedProductionPlan(
+          experiment,
+          { allowLegacyV1Write: env.ALLOW_LEGACY_PRODUCTION_PLAN_WRITES },
+        );
+        if (!productionPlanValidation.ok) {
+          await connection.rollback();
+          return {
+            result: {
+              error: productionPlanValidation.message,
+              status: 400 as const,
+            },
+            previousPdfPath: null,
+          };
+        }
+        const evidenceClaims = productionPlanValidation.ok
+          ? productionPlanValidation.evidenceClaims
+          : null;
+        const forecastVersion = parseCompatibleProductionForecastResults(
+          experiment.production_forecast_results,
+        )?.version;
+        const isLegacyTransitionPlan = (
+          experiment.status !== "Completed"
+          && env.ALLOW_LEGACY_PRODUCTION_PLAN_WRITES
+          && forecastVersion === "v1"
+        );
+        if (!evidenceClaims && !isCompletedRecovery && !isLegacyTransitionPlan) {
+          await connection.rollback();
+          return {
+            result: {
+              error: "生产预测凭证缺失或无效，请重新生成并保存生产计划后再提交报告。",
+              status: 400 as const,
+            },
+            previousPdfPath: null,
+          };
+        }
+        if (evidenceClaims) {
+          const [activeRunRows] = await connection.query<RowDataPacket[]>(
+            `SELECT run_id, production_revision
+               FROM model_training_runs
+              WHERE experiment_id = ?
+                AND student_id = ?
+                AND model_type = ?
+                AND is_active = TRUE
+              ORDER BY activated_at DESC
+              LIMIT 1
+              FOR UPDATE`,
+            [experimentId, studentId, evidenceClaims.model_type],
+          );
+          const activeRun = activeRunRows[0];
+          if (
+            !activeRun
+            || activeRun.run_id !== evidenceClaims.run_id
+            || activeRun.production_revision !== evidenceClaims.production_revision
+          ) {
+            await connection.rollback();
+            return {
+              result: {
+                error: "生产预测对应的模型版本已失效，请重新准备、预测并保存生产计划后再提交报告。",
+                status: 400 as const,
+              },
+              previousPdfPath: null,
+            };
+          }
+        }
+
+        if (!existingReports) {
+          const [rows] = await connection.query<ReportRow[]>(
+            `SELECT report_id, pdf_file_path
+               FROM experiment_reports
+              WHERE experiment_id = ? AND student_id = ?
+              LIMIT 1
+              FOR UPDATE`,
+            [experimentId, studentId],
+          );
+          existingReports = rows;
+        }
         const existingReport = existingReports[0];
         const previousPdfPath = existingReport?.pdf_file_path ?? null;
 
@@ -355,7 +781,9 @@ export async function submitReport(
           modelQualityScore = 50;
         }
 
-        const flowGradeValues = buildExperimentFlowGradeValues(experiment);
+        const flowGradeValues = buildExperimentFlowGradeValues(experiment, {
+          allowLegacyV1Write: env.ALLOW_LEGACY_PRODUCTION_PLAN_WRITES,
+        });
         const EXP_FLOW_GRADE_COLUMNS = Object.keys(flowGradeValues) as Array<keyof typeof flowGradeValues>;
         const GRADE_COLUMNS = [...EXP_FLOW_GRADE_COLUMNS, "model_quality"];
         const GRADE_UPDATE_SET = GRADE_COLUMNS.map((col) => `${col} = ?`).join(", ");
@@ -376,8 +804,6 @@ export async function submitReport(
           [experimentId, studentId],
         );
 
-        await connection.commit();
-
         let isUpdate = Boolean(existingReport);
         let reportId = existingReport?.report_id ?? reportResult.insertId;
         if (reportId === 0 && reportResult.affectedRows > 0) {
@@ -390,8 +816,11 @@ export async function submitReport(
             isUpdate = true;
           }
         }
+        if (!Number.isInteger(reportId) || reportId <= 0) {
+          throw new Error("报告事务无法确定已写入记录的 report_id");
+        }
 
-        return {
+        const candidate: ReportCommitCandidate = {
           result: {
             data: {
               message: isUpdate ? "报告更新成功" : "报告提交成功",
@@ -401,12 +830,54 @@ export async function submitReport(
             isUpdate,
           },
           previousPdfPath,
+          expectedReportId: reportId,
+          pdfPath,
+        };
+
+        transactionPhase = "commit-attempted";
+        try {
+          await connection.commit();
+        } catch (error) {
+          // The session is no longer trustworthy after a lost commit ACK.
+          // Destroying it also forces the server-side transaction to reach a
+          // terminal state before the fresh FOR UPDATE probe can proceed.
+          disposed = true;
+          try {
+            connection.destroy();
+          } catch {}
+          throw new AmbiguousReportCommitError(error, candidate);
+        }
+        transactionPhase = "committed";
+        return {
+          result: candidate.result,
+          previousPdfPath,
         };
       } catch (error) {
-        await connection.rollback().catch(() => {});
+        if (transactionPhase === "before-commit") {
+          try {
+            await connection.rollback();
+          } catch (rollbackError) {
+            disposed = true;
+            try {
+              connection.destroy();
+            } catch {}
+            throw new Error("报告事务回滚结果未知，拒绝自动重试", {
+              cause: { transactionError: error, rollbackError },
+            });
+          }
+        }
         throw error;
       } finally {
-        connection.release();
+        if (!disposed) {
+          try {
+            connection.release();
+          } catch (releaseError) {
+            try {
+              connection.destroy();
+            } catch {}
+            logger.warn({ err: releaseError }, "释放报告提交事务连接失败");
+          }
+        }
       }
     }, {
       maxAttempts: 4,
@@ -420,62 +891,105 @@ export async function submitReport(
     });
 
     if ("error" in transactionResult.result) {
-      await cleanupGeneratedReportPdf(pdfPath);
+      await cleanupGeneratedReportPdf(pdfPath, reportsDir);
       return transactionResult.result;
     }
 
-    if (transactionResult.previousPdfPath && transactionResult.previousPdfPath !== pdfPath) {
-      Promise.resolve().then(() => cleanupGeneratedReportPdf(transactionResult.previousPdfPath));
-    }
-
-    // 异步清理该实验产生的所有模型训练文件，不阻塞响应
-    Promise.resolve().then(() => {
-      try {
-        cleanupExperimentModelArtifacts(experimentId, studentId);
-      } catch (error) {
-        logger.error({ err: error, experimentId, studentId }, "清理实验模型产物失败");
-      }
-    });
-
-    return transactionResult.result;
+    return finalizeCommittedSubmission(
+      transactionResult.result,
+      transactionResult.previousPdfPath,
+    );
   } catch (error) {
-    await cleanupGeneratedReportPdf(pdfPath);
+    if (error instanceof AmbiguousReportCommitError) {
+      let probeState: ReportCommitProbeState = "unknown";
+      try {
+        probeState = await probeAmbiguousReportCommit(
+          experimentId,
+          studentId,
+          error.candidate,
+        );
+      } catch (probeError) {
+        logger.warn(
+          { err: probeError, experimentId, studentId, pdfPath },
+          "报告提交结果未知，保留新 PDF 等待后续核查",
+        );
+      }
+
+      if (probeState === "committed") {
+        return finalizeCommittedSubmission(
+          error.candidate.result,
+          error.candidate.previousPdfPath,
+        );
+      }
+      if (probeState === "not-committed") {
+        await cleanupGeneratedReportPdf(pdfPath, reportsDir);
+      } else {
+        logger.warn(
+          { experimentId, studentId, pdfPath },
+          "无法确认报告事务是否提交，保留新 PDF 以避免数据库悬空引用",
+        );
+      }
+      throw error.originalError;
+    }
+    await cleanupGeneratedReportPdf(pdfPath, reportsDir);
     throw error;
   }
 }
 
 export async function getLatestReportStatus(studentId: number) {
   const [[latestExperiment]] = await pool.query<ExperimentRow[]>(
-    `SELECT experiment_id, student_id, status, current_step, start_time, last_activity_at, completion_time
+    `SELECT experiment_id, student_id, retry_of_experiment_id, status, current_step, start_time, last_activity_at, completion_time
      FROM experiment_status WHERE student_id = ? ORDER BY experiment_id DESC LIMIT 1`,
     [studentId],
   );
 
   if (!latestExperiment) {
-    return { is_rejected: false, has_report: false };
+    return { is_rejected: false, has_report: false, redo_in_progress: false };
   }
+
+  const publicExperiment = {
+    ...latestExperiment,
+    start_time: databaseDatetimeToIsoString(latestExperiment.start_time, env.DB_TIMEZONE),
+    last_activity_at: databaseDatetimeToIsoString(
+      latestExperiment.last_activity_at,
+      env.DB_TIMEZONE,
+    ),
+    completion_time: databaseDatetimeToIsoString(
+      latestExperiment.completion_time,
+      env.DB_TIMEZONE,
+    ),
+  };
 
   const [[report]] = await pool.query<ReportRow[]>(
     `SELECT * FROM experiment_reports WHERE experiment_id = ? AND student_id = ?`,
     [latestExperiment.experiment_id, studentId],
+  );
+  // The immediate rejected parent remains relevant after resubmission: both
+  // students and reviewers need to compare the new report against the original
+  // correction requirements. It is therefore independent of the child report
+  // state; redo_in_progress below still means only "child has no report".
+  const rejectedReport = await getRejectedParentReport(
+    studentId,
+    latestExperiment.retry_of_experiment_id,
   );
 
   if (!report) {
     return {
       is_rejected: false,
       has_report: false,
-      experiment: latestExperiment,
+      redo_in_progress: rejectedReport !== null,
+      experiment: publicExperiment,
+      ...(rejectedReport ? { rejected_report: rejectedReport } : {}),
     };
   }
 
   return {
     is_rejected: report.status === "rejected",
     has_report: true,
-    experiment: latestExperiment,
-    report: {
-      ...report,
-      pdf_file_path: toPublicReportPath(report.pdf_file_path),
-    },
+    redo_in_progress: false,
+    experiment: publicExperiment,
+    report: await buildLatestReportRecord(report),
+    ...(rejectedReport ? { rejected_report: rejectedReport } : {}),
   };
 }
 

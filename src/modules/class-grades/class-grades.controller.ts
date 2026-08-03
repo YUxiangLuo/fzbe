@@ -36,6 +36,7 @@ classGradesController.put("/api/v1/reports/:reportId", jwtAuth, zValidator("para
     if ("error" in result) {
       if (result.error === "not_found") return c.json({ error: "报告不存在" }, 404);
       if (result.error === "forbidden") return c.json({ error: "权限不足" }, 403);
+      if (result.error === "status_conflict") return c.json({ error: "报告评阅内容已变化，请刷新后重试", current_status: result.current_status }, 409);
       return c.json({ error: "成绩记录不存在" }, 404);
     }
     return c.json(result.data);

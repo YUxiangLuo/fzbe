@@ -313,6 +313,30 @@ export async function submitAnswers(
       await connection.query("SET TRANSACTION ISOLATION LEVEL READ COMMITTED");
       await connection.beginTransaction();
 
+      // Keep the shared student-owned write graph on users ->
+      // experiment_status. quiz_answers has FKs to both parents, so relying on
+      // its implicit users lock after taking the experiment lock would invert
+      // report, event, model-run, retry, and account-deletion transactions.
+      const [[studentIdentity]] = await connection.query<RowDataPacket[]>(
+        `SELECT user_id, role
+           FROM users
+          WHERE user_id = ?
+          LIMIT 1
+          FOR UPDATE`,
+        [studentId],
+      );
+      if (!studentIdentity) {
+        await connection.rollback();
+        return { error: "学生账号不存在", status: 404 };
+      }
+      if (
+        Number(studentIdentity.user_id) !== studentId
+        || studentIdentity.role !== "Student"
+      ) {
+        await connection.rollback();
+        return { error: "权限不足：学生身份已变化", status: 403 };
+      }
+
       const [[experimentOwnership]] = await connection.query<ExperimentOwnerRow[]>(
         `SELECT student_id, status FROM experiment_status WHERE experiment_id = ? LIMIT 1 FOR UPDATE`,
         [experimentId],
