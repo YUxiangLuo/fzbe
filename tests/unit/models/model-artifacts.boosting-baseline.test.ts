@@ -1,13 +1,57 @@
-import { afterEach, describe, expect, test } from "bun:test";
+import { afterEach, describe, expect, mock, test } from "bun:test";
 import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
-import {
+import { ModelArtifactError } from "../../../src/modules/models/model-errors";
+
+const srcRoot = path.resolve(import.meta.dir, "../../../src");
+const PY_DIR = path.resolve(import.meta.dir, "../../../py");
+const pythonModulePath = path.join(srcRoot, "utils", "python.ts");
+const modelArtifactsModulePath = path.join(
+  srcRoot,
+  "modules",
+  "models",
+  "model-artifacts.ts",
+);
+const projectPythonCandidates = process.platform === "win32"
+  ? [
+    path.join(PY_DIR, "venv", "Scripts", "python.exe"),
+    path.join(PY_DIR, ".venv", "Scripts", "python.exe"),
+  ]
+  : [
+    path.join(PY_DIR, "venv", "bin", "python"),
+    path.join(PY_DIR, ".venv", "bin", "python"),
+  ];
+// These tests need only Python's standard-library pickle module. Injecting a
+// host interpreter keeps the unit gate independent of the production model
+// venv, while production code continues to require that controlled runtime.
+const fixturePythonExecutable = [
+  Bun.which("python3"),
+  Bun.which("python"),
+  ...projectPythonCandidates,
+].find((candidate): candidate is string => {
+  if (!candidate || !fs.existsSync(candidate)) return false;
+  try {
+    return Bun.spawnSync([candidate, "-c", "import pickle"]).exitCode === 0;
+  } catch {
+    // Windows Store aliases can exist without launching an interpreter.
+    return false;
+  }
+});
+
+if (!fixturePythonExecutable) {
+  throw new Error("A Python interpreter is required for artifact fixture tests");
+}
+
+mock.module(pythonModulePath, () => ({
+  PY_DIR,
+  resolvePythonExecutable: () => fixturePythonExecutable,
+}));
+
+const {
   computeEnsembleArtifactSha256,
   verifyBaseModelArtifactIntegrity,
-} from "../../../src/modules/models/model-artifacts";
-import { ModelArtifactError } from "../../../src/modules/models/model-errors";
-import { PY_DIR, resolvePythonExecutable } from "../../../src/utils/python";
+} = await import(`${modelArtifactsModulePath}?boosting-baseline-test`);
 
 const createdArtifacts: string[] = [];
 
@@ -19,7 +63,7 @@ const writePickleState = (state: Record<string, unknown>) => {
   );
   fs.mkdirSync(path.dirname(modelPath), { recursive: true });
   const completed = Bun.spawnSync([
-    resolvePythonExecutable(),
+    fixturePythonExecutable,
     "-c",
     [
       "import json",
