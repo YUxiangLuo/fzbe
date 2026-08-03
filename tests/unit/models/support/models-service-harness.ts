@@ -524,6 +524,11 @@ export const mockExperimentAndDatasetQueries = (
 
 export const setupModelsServiceTestHooks = () => {
   beforeEach(async () => {
+    // Git does not preserve the empty uploads/datasets directory in a clean
+    // checkout. Keep this shared fixture self-bootstrapping so the unit suite
+    // exercises the managed upload-root contract without depending on local
+    // runtime leftovers.
+    await actualFs.promises.mkdir(path.dirname(datasetCsvPath), { recursive: true });
     await writeFile(datasetCsvPath, modelDatasetCsv);
 
     poolQuery.mockReset();
@@ -597,7 +602,13 @@ export const setupModelsServiceTestHooks = () => {
   afterEach(async () => {
     jest.useRealTimers();
     (Bun as { spawn: typeof Bun.spawn }).spawn = originalSpawn;
-    await unlink(datasetCsvPath).catch(() => {});
+    try {
+      await unlink(datasetCsvPath);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
+        throw error;
+      }
+    }
   });
 
 };
