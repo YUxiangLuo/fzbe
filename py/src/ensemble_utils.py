@@ -6,6 +6,7 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import sys
 import tempfile
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -23,7 +24,7 @@ from serialization import dump_model, load_model
 from subprocess_utils import (
     extract_predictions_from_result,
     run_base_model_fit_subprocess,
-    run_base_model_predict_subprocess,
+    run_base_model_subprocess,
 )
 from uncertainty import format_predictions as format_uncertainty_predictions
 from dynamic_config import (
@@ -33,6 +34,26 @@ from dynamic_config import (
 )
 
 SUPPORTED_BASE_MODEL_TYPES = frozenset({"ma", "es", "arima", "lstm"})
+
+
+def warn_ignored_boosting_controls(args: Any) -> Optional[str]:
+    supplied = [
+        flag
+        for flag, attribute in (
+            ("--learning-rate", "learning_rate"),
+            ("--max-rounds", "max_rounds"),
+        )
+        if getattr(args, attribute, None) is not None
+    ]
+    if not supplied:
+        return None
+
+    message = (
+        "[DEPRECATED] Ignored Boosting compatibility options: "
+        f"{', '.join(supplied)}. Stage coefficients and round limits are derived from data."
+    )
+    print(message, file=sys.stderr, flush=True)
+    return message
 
 
 def validate_base_model_names(
@@ -115,13 +136,22 @@ def load_lstm_source_state(model_file: str, context: str) -> Dict[str, Any]:
 def build_lstm_params_from_source_state(
     parsed_data: ParsedData,
     source_model_state: Dict[str, Any],
-    fallback_params: Dict[str, Any],
 ) -> Dict[str, Any]:
-    target_feature = str(
-        source_model_state.get("target_key")
-        or fallback_params.get("lstm_target_feature")
-        or parsed_data.target_key
-    )
+    raw_target_feature = source_model_state.get("target_key")
+    if not isinstance(raw_target_feature, str) or not raw_target_feature.strip():
+        raise ValueError("Saved LSTM artifact is missing an explicit target field.")
+    target_feature = raw_target_feature.strip()
+    if target_feature not in parsed_data.df.columns:
+        raise ValueError(
+            f"Saved LSTM artifact target field is not present in the dataset: {target_feature}"
+        )
+
+    normalization = source_model_state.get("normalization")
+    if normalization not in {"minmax", "zscore"}:
+        raise ValueError(
+            "Saved LSTM artifact normalization must be 'minmax' or 'zscore'."
+        )
+
     raw_feature_keys = source_model_state.get("feature_keys")
     if not isinstance(raw_feature_keys, list) or any(
         not isinstance(feature_name, str) or not feature_name.strip()
@@ -131,8 +161,24 @@ def build_lstm_params_from_source_state(
     feature_keys = [
         feature_name.strip()
         for feature_name in raw_feature_keys
-        if feature_name.strip() != target_feature
     ]
+    if len(set(feature_keys)) != len(feature_keys):
+        raise ValueError("Saved LSTM artifact feature list contains duplicates.")
+    if target_feature in feature_keys:
+        raise ValueError(
+            "Saved LSTM artifact feature list must not repeat the target field."
+        )
+    missing_features = [
+        feature_name
+        for feature_name in feature_keys
+        if feature_name not in parsed_data.df.columns
+    ]
+    if missing_features:
+        raise ValueError(
+            "Saved LSTM artifact feature fields are not present in the dataset: "
+            + ", ".join(missing_features)
+        )
+
     raw_feature_types = source_model_state.get("feature_types")
     if isinstance(raw_feature_types, dict) and raw_feature_types:
         feature_types = {
@@ -140,6 +186,28 @@ def build_lstm_params_from_source_state(
             for key, value in raw_feature_types.items()
             if key == target_feature or key in feature_keys
         }
+        invalid_types = [
+            f"{feature_name}={feature_type!r}"
+            for feature_name, feature_type in feature_types.items()
+            if feature_type not in {"numeric", "categorical"}
+        ]
+        if invalid_types:
+            raise ValueError(
+                "Saved LSTM artifact has an invalid feature type: "
+                + ", ".join(invalid_types)
+            )
+        missing_types = [
+            feature_name
+            for feature_name in [target_feature, *feature_keys]
+            if feature_name not in feature_types
+        ]
+        if missing_types:
+            raise ValueError(
+                "Saved LSTM artifact is missing feature types for: "
+                + ", ".join(missing_types)
+            )
+        if feature_types[target_feature] != "numeric":
+            raise ValueError("Saved LSTM artifact target feature type must be numeric.")
     else:
         feature_types = infer_feature_types(
             parsed_data=parsed_data,
@@ -150,10 +218,7 @@ def build_lstm_params_from_source_state(
 
     params = {
         "feature_types": feature_types,
-        "normalization": source_model_state.get(
-            "normalization",
-            fallback_params.get("normalization", "minmax"),
-        ),
+        "normalization": normalization,
         "lstm_target_feature": target_feature,
         "lstm_features": json.dumps(feature_keys, ensure_ascii=False),
     }
@@ -277,33 +342,285 @@ def plan_ensemble_internal_holdout(
             f"{purpose.title()} holdout planning",
         )
 
-    def is_feasible(prefix_size: int, validation_size: int) -> bool:
-        try:
-            for model_name in models:
-                params = model_params.get(model_name, {})
-                if model_name == "ma" and prefix_size < int(params.get("window", 0)):
-                    return False
-                if model_name == "es" and prefix_size < 2:
-                    return False
-                if model_name == "arima":
-                    derive_arima_search_limit(prefix_size, int(params.get("d", 0)))
-                if model_name == "lstm":
-                    feature_count = estimate_lstm_encoded_feature_count(
-                        parsed_data,
-                        params,
-                        train_range.start,
-                        prefix_size,
-                    )
-                    derive_lstm_config(prefix_size, validation_size, feature_count)
-            return True
-        except (TypeError, ValueError):
-            return False
-
     return plan_internal_holdout(
         purpose,
         len(train_range),
         len(models),
-        is_feasible,
+        lambda prefix_size, validation_size: (
+            is_ensemble_member_holdout_feasible(
+                parsed_data,
+                train_range.start,
+                prefix_size,
+                validation_size,
+                models,
+                model_params,
+            )
+        ),
+    )
+
+
+def is_ensemble_member_holdout_feasible(
+    parsed_data: ParsedData,
+    train_start: int,
+    prefix_size: int,
+    holdout_size: int,
+    models_to_use: List[str],
+    model_params: Dict[str, Dict[str, Any]],
+) -> bool:
+    """Check every selected member against one exact chronological OOF fold."""
+    try:
+        for model_name in models_to_use:
+            params = model_params.get(model_name, {})
+            if model_name == "ma" and prefix_size < int(params.get("window", 0)):
+                return False
+            if model_name == "es" and prefix_size < 2:
+                return False
+            if model_name == "arima":
+                derive_arima_search_limit(prefix_size, int(params.get("d", 0)))
+            if model_name == "lstm":
+                feature_count = estimate_lstm_encoded_feature_count(
+                    parsed_data,
+                    params,
+                    train_start,
+                    prefix_size,
+                )
+                derive_lstm_config(prefix_size, holdout_size, feature_count)
+        return True
+    except (TypeError, ValueError):
+        return False
+
+
+def plan_ensemble_selection_calibration_split(
+    parsed_data: ParsedData,
+    train_range: range,
+    models_to_use: List[str],
+    model_params: Dict[str, Dict[str, Any]],
+    purpose: str,
+) -> Dict[str, Any]:
+    """Plan disjoint chronological selection and post-selection calibration sets.
+
+    The original internal holdout remains the selection set used to estimate
+    ensemble weights, stages, or meta-model parameters.  When the available
+    history can support it, a later tail is withheld from ensemble selection and
+    used to generate post-selection residuals before any full-history refit.  A
+    final refit may later absorb that tail, so these empirical ranges do not claim
+    nominal coverage.  If no feasible three-way split exists, the selection plan
+    is retained and calibration is explicitly marked unavailable; selection
+    residuals must never be relabelled as calibration residuals.
+    """
+    train_size = len(train_range)
+    desired_calibration_size = max(2, (train_size + 4) // 5)
+    maximum_calibration_size = max(0, train_size - 4)
+
+    for calibration_size in range(
+        min(desired_calibration_size, maximum_calibration_size),
+        1,
+        -1,
+    ):
+        pre_calibration_range = range(
+            train_range.start,
+            train_range.stop - calibration_size,
+        )
+        try:
+            selection_plan = plan_ensemble_internal_holdout(
+                parsed_data,
+                pre_calibration_range,
+                models_to_use,
+                model_params,
+                purpose,
+            )
+        except ValueError:
+            continue
+
+        selection_size = int(selection_plan["validation_size"])
+        prefix_size = int(selection_plan["prefix_size"])
+        stacking_oof: Dict[str, Any] = {}
+        if purpose == "stacking":
+            prefix_range = range(
+                train_range.start,
+                train_range.start + prefix_size,
+            )
+            selection_range = range(
+                prefix_range.stop,
+                prefix_range.stop + selection_size,
+            )
+            try:
+                folds = plan_feasible_expanding_window_oof_folds(
+                    parsed_data,
+                    prefix_range,
+                    selection_range,
+                    models_to_use,
+                    model_params,
+                    min_folds=3,
+                )
+            except ValueError:
+                continue
+            stacking_oof = {
+                "oof_strategy": "expanding_window_rolling_origin",
+                "oof_fold_count": len(folds),
+                "oof_folds": folds,
+            }
+        return {
+            **selection_plan,
+            **stacking_oof,
+            "train_size": train_size,
+            "prefix_size": prefix_size,
+            "selection_size": selection_size,
+            "validation_size": selection_size,
+            "calibration_size": calibration_size,
+            "desired_calibration_size": desired_calibration_size,
+            "selection_start_offset": prefix_size,
+            "calibration_start_offset": prefix_size + selection_size,
+            "calibration_available": True,
+            "calibration_strategy": "post_selection_holdout",
+            "teaching_small_sample": bool(
+                selection_plan["teaching_small_sample"]
+                or calibration_size < desired_calibration_size
+                or train_size < 20
+            ),
+        }
+
+    selection_plan = plan_ensemble_internal_holdout(
+        parsed_data,
+        train_range,
+        models_to_use,
+        model_params,
+        purpose,
+    )
+    selection_size = int(selection_plan["validation_size"])
+    prefix_size = int(selection_plan["prefix_size"])
+    stacking_oof = {}
+    if purpose == "stacking":
+        prefix_range = range(
+            train_range.start,
+            train_range.start + prefix_size,
+        )
+        selection_range = range(
+            prefix_range.stop,
+            prefix_range.stop + selection_size,
+        )
+        folds = plan_feasible_expanding_window_oof_folds(
+            parsed_data,
+            prefix_range,
+            selection_range,
+            models_to_use,
+            model_params,
+        )
+        stacking_oof = {
+            "oof_strategy": "expanding_window_rolling_origin",
+            "oof_fold_count": len(folds),
+            "oof_folds": folds,
+        }
+    return {
+        **selection_plan,
+        **stacking_oof,
+        "selection_size": selection_size,
+        "validation_size": selection_size,
+        "calibration_size": 0,
+        "desired_calibration_size": desired_calibration_size,
+        "selection_start_offset": prefix_size,
+        "calibration_start_offset": train_size,
+        "calibration_available": False,
+        "calibration_strategy": "fallback_no_post_selection_holdout",
+        "teaching_small_sample": True,
+    }
+
+
+def plan_expanding_window_oof_folds(
+    prefix_range: range,
+    selection_range: range,
+    max_folds: int = 3,
+) -> List[Dict[str, int]]:
+    """Partition a selection range into expanding-window rolling-origin folds."""
+    if not prefix_range or not selection_range:
+        raise ValueError("[VALIDATION] Rolling-origin OOF ranges must not be empty.")
+    if prefix_range.stop != selection_range.start:
+        raise ValueError(
+            "[VALIDATION] Rolling-origin OOF selection must immediately follow its prefix."
+        )
+    fold_limit = int(max_folds)
+    if fold_limit < 2:
+        raise ValueError("[VALIDATION] Rolling-origin OOF requires at least two folds.")
+
+    fold_count = min(fold_limit, len(selection_range))
+    if fold_count < 2:
+        raise ValueError(
+            "[VALIDATION] Rolling-origin OOF requires at least two selection rows."
+        )
+    base_size, remainder = divmod(len(selection_range), fold_count)
+    fold_sizes = [
+        base_size + (1 if fold_index < remainder else 0)
+        for fold_index in range(fold_count)
+    ]
+
+    folds: List[Dict[str, int]] = []
+    holdout_start = selection_range.start
+    for fold_index, fold_size in enumerate(fold_sizes):
+        holdout_stop = holdout_start + fold_size
+        folds.append(
+            {
+                "fold": fold_index + 1,
+                "train_start": prefix_range.start,
+                "train_end_exclusive": holdout_start,
+                "holdout_start": holdout_start,
+                "holdout_end_exclusive": holdout_stop,
+            }
+        )
+        holdout_start = holdout_stop
+    return folds
+
+
+def plan_feasible_expanding_window_oof_folds(
+    parsed_data: ParsedData,
+    prefix_range: range,
+    selection_range: range,
+    models_to_use: List[str],
+    model_params: Dict[str, Dict[str, Any]],
+    max_folds: int = 3,
+    min_folds: int = 2,
+) -> List[Dict[str, int]]:
+    """Use the most detailed OOF partition that every selected member can fit.
+
+    A three-fold partition can create one-row holdouts when the selection set is
+    small. For a direct multi-horizon LSTM, a one-row horizon may have a tighter
+    parameter budget than a two-row horizon. Falling back to two chronological
+    folds preserves out-of-fold coverage without rejecting an otherwise valid
+    Stacking training range.
+    """
+    candidate_count = min(int(max_folds), len(selection_range))
+    minimum_count = int(min_folds)
+    if candidate_count < 2 or minimum_count < 2:
+        # Reuse the canonical validation message for malformed ranges/options.
+        return plan_expanding_window_oof_folds(
+            prefix_range,
+            selection_range,
+            max_folds=max_folds,
+        )
+
+    for fold_count in range(candidate_count, minimum_count - 1, -1):
+        folds = plan_expanding_window_oof_folds(
+            prefix_range,
+            selection_range,
+            max_folds=fold_count,
+        )
+        if all(
+            is_ensemble_member_holdout_feasible(
+                parsed_data,
+                int(fold["train_start"]),
+                int(fold["train_end_exclusive"])
+                - int(fold["train_start"]),
+                int(fold["holdout_end_exclusive"])
+                - int(fold["holdout_start"]),
+                models_to_use,
+                model_params,
+            )
+            for fold in folds
+        ):
+            return folds
+
+    raise ValueError(
+        "[VALIDATION] No rolling-origin OOF split can fit every selected "
+        "Stacking member."
     )
 
 
@@ -454,17 +771,27 @@ def resolve_base_model_artifact_configs(
                 raise ValueError(
                     f"[VALIDATION] {context} MA source artifact is missing window."
                 )
-            fallback_params["window"] = _artifact_integer(
+            source_window = _artifact_integer(
                 source_state["window"], f"{context} MA window"
             )
+            if source_window < 2:
+                raise ValueError(
+                    f"[VALIDATION] {context} MA source artifact window must be >= 2."
+                )
+            fallback_params["window"] = source_window
         elif model_name == "es":
             if "alpha" not in source_state:
                 raise ValueError(
                     f"[VALIDATION] {context} ES source artifact is missing alpha."
                 )
-            fallback_params["alpha"] = _artifact_float(
+            source_alpha = _artifact_float(
                 source_state["alpha"], f"{context} ES alpha"
             )
+            if not (0 < source_alpha <= 1):
+                raise ValueError(
+                    f"[VALIDATION] {context} ES source artifact alpha must be in (0, 1]."
+                )
+            fallback_params["alpha"] = source_alpha
         elif model_name == "arima":
             artifact_d = source_state.get("d")
             if artifact_d is None:
@@ -474,19 +801,26 @@ def resolve_base_model_artifact_configs(
                 raise ValueError(
                     f"[VALIDATION] {context} ARIMA source artifact is missing d."
                 )
+            source_d = _artifact_integer(
+                artifact_d, f"{context} ARIMA d"
+            )
+            if source_d < 0:
+                raise ValueError(
+                    f"[VALIDATION] {context} ARIMA source artifact d must be >= 0."
+                )
             canonical_params[model_name] = {
-                "d": _artifact_integer(artifact_d, f"{context} ARIMA d")
+                "d": source_d,
             }
         else:
             try:
                 canonical_params[model_name] = build_lstm_params_from_source_state(
                     parsed_data,
                     source_state,
-                    fallback_params,
                 )
             except (KeyError, TypeError, ValueError) as exc:
                 raise ValueError(
-                    f"[VALIDATION] {context} LSTM source artifact has invalid training configuration."
+                    f"[VALIDATION] {context} LSTM source artifact has invalid "
+                    f"training configuration: {exc}"
                 ) from exc
 
         validated_files[model_name] = model_file
@@ -585,3 +919,74 @@ def fit_and_predict_from_source_model(
         return extract_predictions_from_result(fit_result)
     finally:
         remove_member_model_artifact(model_name, temp_model_file)
+
+
+def predict_member_on_chronological_holdout(
+    *,
+    model_name: str,
+    params: Dict[str, Any],
+    source_model_file: Optional[str],
+    numeric_data: List[Dict[str, Any]],
+    lstm_data: List[Dict[str, Any]],
+    train_range: range,
+    holdout_range: range,
+    timeout: int,
+) -> List[float]:
+    """Fit one member on a prefix and predict the immediately following holdout."""
+    if not train_range or not holdout_range:
+        raise ValueError("[VALIDATION] Ensemble member holdout ranges must not be empty.")
+    if train_range.stop != holdout_range.start:
+        raise ValueError(
+            "[VALIDATION] Ensemble member holdout must immediately follow its training prefix."
+        )
+
+    data = lstm_data if model_name == "lstm" else numeric_data
+    if (
+        source_model_file
+        and can_refit_source_artifact_for_internal_holdout(model_name)
+    ):
+        adjusted_source_model_file = source_model_file
+        temporary_source_model_file = None
+        try:
+            if model_name == "lstm":
+                source_model_state = load_lstm_source_state(
+                    source_model_file,
+                    "Saved ensemble LSTM base model",
+                )
+                (
+                    adjusted_source_model_file,
+                    temporary_source_model_file,
+                ) = prepare_lstm_source_model_for_requested_steps(
+                    source_model_file,
+                    source_model_state,
+                    requested_steps=len(holdout_range),
+                )
+            predictions = fit_and_predict_from_source_model(
+                model_name=model_name,
+                source_model_file=adjusted_source_model_file,
+                data=data,
+                train_start=train_range.start,
+                train_end=train_range.stop - 1,
+                forecast_steps=len(holdout_range),
+                timeout=timeout,
+            )
+        finally:
+            if (
+                temporary_source_model_file
+                and os.path.exists(temporary_source_model_file)
+            ):
+                os.remove(temporary_source_model_file)
+    else:
+        result = run_base_model_subprocess(
+            model_type=model_name,
+            data=data,
+            train_start=train_range.start,
+            train_end=train_range.stop - 1,
+            eval_start=holdout_range.start,
+            eval_end=holdout_range.stop - 1,
+            model_params=params.copy(),
+            timeout=timeout,
+        )
+        predictions = extract_predictions_from_result(result)
+
+    return normalize_demand_forecast(predictions).tolist()

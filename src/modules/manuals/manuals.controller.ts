@@ -1,7 +1,7 @@
 import { Hono } from "hono";
 import { zValidator } from "@hono/zod-validator";
 import { jwtAuth, requireAdmin } from "../../middleware";
-import { manualIdParamSchema, updateManualSchema } from "./manuals.schema";
+import { manualIdParamSchema, manualMetadataSchema, updateManualSchema } from "./manuals.schema";
 import {
   uploadManual,
   getAllManuals,
@@ -33,11 +33,22 @@ manualsController.post(
       if (!fileName || typeof fileName !== "string") {
         return c.json({ error: "必须提供文件名" }, 400);
       }
+      if (description !== undefined && typeof description !== "string") {
+        return c.json({ error: "备注格式不正确" }, 400);
+      }
+
+      const metadata = manualMetadataSchema.safeParse({
+        file_name: fileName,
+        description,
+      });
+      if (!metadata.success) {
+        return c.json({ error: metadata.error.issues[0]?.message ?? "手册信息格式不正确" }, 400);
+      }
 
       const result = await uploadManual({
         file,
-        fileName,
-        description: typeof description === "string" ? description : undefined,
+        fileName: metadata.data.file_name,
+        description: metadata.data.description,
         uploaderId: payload.sub,
       });
 
@@ -115,10 +126,18 @@ manualsController.delete(
       const result = await deleteManual(parseInt(manualId, 10));
 
       if ("error" in result) {
-        return c.json({ error: "手册不存在" }, 404);
+        if (result.error === "not_found") {
+          return c.json({ error: "手册不存在" }, 404);
+        }
+        return c.json({ error: "手册文件无法安全清理，手册未删除" }, 500);
       }
 
-      return c.json({ message: "手册删除成功" });
+      return c.json({
+        message: result.cleanupPending
+          ? "手册已删除；隔离文件将在后续清理"
+          : "手册及文件删除成功",
+        cleanup_pending: result.cleanupPending,
+      });
     } catch (error) {
       return handleUnexpectedError(c, error, "删除手册失败");
     }

@@ -3,7 +3,7 @@
 from typing import Any, Dict, Iterable, List
 
 
-MODEL_ALGORITHM_REVISION = 3
+MODEL_ALGORITHM_REVISION = 4
 
 
 def method_metadata(

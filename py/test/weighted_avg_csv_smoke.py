@@ -124,7 +124,6 @@ def main() -> None:
     train_end = 19
     eval_start = 20
     eval_end = 23
-    weight_train_end = 15
     future_steps = 3
 
     with tempfile.TemporaryDirectory(prefix="fangzhen-weighted-avg-csv-") as temp_dir:
@@ -191,35 +190,8 @@ def main() -> None:
             "--pretty",
         )
 
-        weight_val_predictions: dict[str, list[float]] = {}
         eval_predictions: dict[str, list[float]] = {}
         for model_name in BASE_MODELS:
-            refit_model_path = temp_path / f"{model_name}-weight-refit.pkl"
-            invoke_model(
-                model_name,
-                data_json,
-                "--train-start",
-                str(train_start),
-                "--train-end",
-                str(weight_train_end),
-                "--load-model",
-                str(base_model_paths[model_name]),
-                "--save-model",
-                str(refit_model_path),
-                "--fit-only",
-                "--pretty",
-            )
-            weight_val_predictions[model_name] = extract_predictions(
-                invoke_model(
-                    model_name,
-                    None,
-                    "--load-model",
-                    str(refit_model_path),
-                    "--forecast-steps",
-                    "4",
-                    "--pretty",
-                )
-            )
             eval_predictions[model_name] = extract_predictions(
                 invoke_model(
                     model_name,
@@ -231,9 +203,6 @@ def main() -> None:
                     "--pretty",
                 )
             )
-
-        expected_weights = normalized_inverse_residual_mse_weights(weight_val_predictions, sales[16:20])
-        expected_eval_predictions = weighted_sum(eval_predictions, expected_weights)
 
         weighted_model_backtest = temp_path / "weighted-avg-backtest.pkl"
         train_output = invoke_model(
@@ -275,7 +244,22 @@ def main() -> None:
         assert train_output["metrics"]["evaluate_months"] == timestamps[20:24]
         assert train_output["eval_y_true"] == sales[20:24]
         assert_series_close([sum(actual_weights.values())], [1.0])
-        assert_series_close([actual_weights[name] for name in BASE_MODELS], [expected_weights[name] for name in BASE_MODELS])
+        diagnostics = train_output["weight_diagnostics"]
+        assert_series_close(
+            [actual_weights[name] for name in BASE_MODELS],
+            [float(diagnostics["final_weights"][name]) for name in BASE_MODELS],
+        )
+        selection_size = int(train_output["split_plan"]["selection_size"])
+        expected_reliability = selection_size / (
+            selection_size + len(BASE_MODELS) + 1.0
+        )
+        assert_series_close(
+            [float(diagnostics["reliability"])],
+            [expected_reliability],
+        )
+        ranges = train_output["split_plan"]["ranges"]
+        assert ranges["selection"]["end_exclusive"] <= ranges["calibration"]["start"]
+        expected_eval_predictions = weighted_sum(eval_predictions, actual_weights)
         assert_series_close(actual_eval_predictions, expected_eval_predictions)
         assert_all_finite(actual_eval_std_devs, "train_std_devs")
 

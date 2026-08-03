@@ -1,11 +1,42 @@
+import path from "node:path";
 import type { RowDataPacket } from "mysql2/promise";
-import { pool } from "../../config";
+import { env, pool } from "../../config";
 import { CsvEncodingError, CsvRowLimitError, readCsvRows } from "../../utils/csv-processor";
+import {
+  getDatabaseManagedStorageRoot,
+  type ManagedStorageEnvironment,
+} from "../../utils/managed-storage";
+import { resolveExistingManagedFile } from "../../utils/managed-file";
 import { normalizeSalesValue, normalizeYearMonth } from "../datasets/dataset-values";
 import { ModelValidationError } from "./model-errors";
 
 interface SegmentRow extends RowDataPacket {
   file_path: string;
+}
+
+const datasetsManagedRoot = path.resolve(import.meta.dir, "../../../uploads/datasets");
+
+export async function resolveModelDatasetFilePath(
+  storedPath: string,
+  options: {
+    managedRoot?: string;
+    environment?: ManagedStorageEnvironment;
+  } = {},
+): Promise<string> {
+  const managedRoot = path.resolve(options.managedRoot ?? datasetsManagedRoot);
+  const environment = options.environment ?? env;
+  const databaseRoot = getDatabaseManagedStorageRoot(managedRoot, environment);
+  const resolved = await resolveExistingManagedFile({
+    storedPath,
+    managedRoot,
+    environment,
+    legacyFallbackDirectory: databaseRoot,
+    enforceDisposableNamespace: true,
+  });
+  if (!resolved) {
+    throw new Error("数据集分段文件不存在");
+  }
+  return resolved.absolutePath;
 }
 
 export async function loadDatasetFromDb(
@@ -23,7 +54,8 @@ export async function loadDatasetFromDb(
   }
 
   try {
-    const rows = await readCsvRows(segmentRows[0]!.file_path);
+    const datasetFilePath = await resolveModelDatasetFilePath(segmentRows[0]!.file_path);
+    const rows = await readCsvRows(datasetFilePath);
     return rows.map((row, index) => {
       const separateTime = normalizeYearMonth(row["年份"], row["月份"]);
       const combinedMonthMatch = String(row["月份"] ?? "").trim().match(/^(\d{4})-(0?[1-9]|1[0-2])$/);
@@ -55,9 +87,10 @@ export async function loadDatasetFromDb(
         : { ...normalizedRow, "月份": `${time.year}-${time.month}` };
     });
   } catch (error) {
+    if (error instanceof ModelValidationError) throw error;
     if (error instanceof CsvEncodingError || error instanceof CsvRowLimitError) {
       throw new ModelValidationError(error.message);
     }
-    throw error;
+    throw new ModelValidationError("数据集分段文件不可用");
   }
 }

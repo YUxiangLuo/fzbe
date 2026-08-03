@@ -45,6 +45,21 @@ components:
       properties:
         error:
           type: string
+        code:
+          type: string
+          description: 可供客户端稳定分支处理的机器可读错误码。
+        required_action:
+          type: string
+          enum: [prepare, retrain]
+          description: 当前操作无法原地重试时，客户端应引导用户执行的恢复动作。
+        model_type:
+          type: string
+          enum: [ma, es, arima, lstm, weighted_avg, boosting, stacking]
+          description: 恢复动作所针对的模型类型。
+        base_model:
+          type: string
+          enum: [ma, es, arima, lstm]
+          description: 融合模型错误中需要恢复的基础模型类型。
         details:
           type: object
           additionalProperties: true
@@ -68,6 +83,128 @@ components:
           additionalProperties: true
       additionalProperties: true
 
+    GradeReportConflictResponse:
+      type: object
+      required: [error, current_status]
+      properties:
+        error:
+          type: string
+        current_status:
+          type: string
+          enum: [submitted, graded, rejected]
+          description: 服务端锁定报告后读取到的权威状态；客户端应刷新后重新评阅。
+      additionalProperties: false
+
+    GradeReportSuccessResponse:
+      type: object
+      required: [data]
+      properties:
+        data:
+          type: object
+          required: [review_revision]
+          properties:
+            review_revision:
+              type: string
+              pattern: '^[a-f0-9]{64}$'
+              readOnly: true
+              description: 更新完成后的新评阅版本令牌；下一次修改必须原样回传。
+          additionalProperties: true
+      additionalProperties: false
+
+    ProductionPlanErrorResponse:
+      type: object
+      required: [error, code]
+      properties:
+        error:
+          type: string
+        code:
+          type: string
+          enum:
+            - PRODUCTION_PLAN_INVALID
+            - PRODUCTION_PLAN_MISMATCH
+            - PRODUCTION_FORECAST_LEGACY_REJECTED
+            - PRODUCTION_FORECAST_EVIDENCE_REQUIRED
+            - PRODUCTION_FORECAST_EVIDENCE_INVALID
+            - PRODUCTION_FORECAST_EVIDENCE_STALE
+      additionalProperties: false
+
+    ExperimentRetryConflictCurrent:
+      type: object
+      description: >-
+        REJECTED_REPORT_NOT_LATEST 冲突中用于恢复学生路由的权威实验快照。
+        这里只约束恢复流程实际依赖的字段；响应仍可携带完整实验状态。旧版已完成
+        实验可能保存 current_step >= 8，两个测验完成标志也可能缺失或为 null，
+        客户端须把缺失/null 规范化为 false 后再执行路由判断。
+      required:
+        - experiment_id
+        - student_id
+        - state_version
+        - status
+        - current_step
+        - highest_completed_step
+      properties:
+        experiment_id:
+          type: integer
+          minimum: 1
+        student_id:
+          type: integer
+          minimum: 1
+        retry_of_experiment_id:
+          type: integer
+          minimum: 1
+          nullable: true
+        state_version:
+          type: integer
+          minimum: 0
+        status:
+          type: string
+          enum: ['Not Started', 'In Progress', 'Completed']
+        current_step:
+          type: integer
+          minimum: 1
+          description: 新记录为 1-7；历史报告态可能为 8 或更大。
+        highest_completed_step:
+          type: integer
+          minimum: 0
+          maximum: 7
+        quiz_about_model_completed:
+          type: boolean
+          nullable: true
+          description: 兼容历史快照，可缺失或为 null；客户端按 false 处理。
+        quiz_about_plan_completed:
+          type: boolean
+          nullable: true
+          description: 兼容历史快照，可缺失或为 null；客户端按 false 处理。
+      additionalProperties: true
+
+    ExperimentRetryConflictResponse:
+      oneOf:
+        - type: object
+          required: [error, code, current]
+          properties:
+            error:
+              type: string
+            code:
+              type: string
+              enum: [REJECTED_REPORT_NOT_LATEST]
+            current:
+              $ref: '#/components/schemas/ExperimentRetryConflictCurrent'
+          additionalProperties: false
+        - type: object
+          required: [error, code]
+          properties:
+            error:
+              type: string
+            code:
+              type: string
+              enum:
+                - REPORT_NOT_REJECTED
+                - REJECTED_EXPERIMENT_NOT_COMPLETED
+                - INVALID_RETRY_LINEAGE
+          additionalProperties: false
+      discriminator:
+        propertyName: code
+
     DataEnvelope:
       type: object
       required: [data]
@@ -85,6 +222,22 @@ components:
           items:
             type: object
             additionalProperties: true
+
+    ManagedFileDeletionResponse:
+      type: object
+      required: [data]
+      additionalProperties: false
+      properties:
+        data:
+          type: object
+          required: [message, cleanup_pending]
+          additionalProperties: false
+          properties:
+            message:
+              type: string
+            cleanup_pending:
+              type: boolean
+              description: true 表示数据库删除已提交，隔离文件将由后台恢复任务继续清理。
 
     Pagination:
       type: object
@@ -186,9 +339,11 @@ components:
       properties:
         file_name:
           type: string
-          minLength: 1
+          minLength: 2
+          maxLength: 100
         description:
           type: string
+          maxLength: 200
         is_active:
           type: boolean
 
@@ -305,6 +460,307 @@ components:
         data:
           $ref: '#/components/schemas/SubmitReportResult'
 
+    LatestReportExperimentSummary:
+      type: object
+      required:
+        - experiment_id
+        - student_id
+        - retry_of_experiment_id
+        - status
+        - current_step
+        - start_time
+        - last_activity_at
+        - completion_time
+      properties:
+        experiment_id:
+          type: integer
+          minimum: 1
+        student_id:
+          type: integer
+          minimum: 1
+        retry_of_experiment_id:
+          type: integer
+          minimum: 1
+          nullable: true
+        status:
+          type: string
+          enum: ['Not Started', 'In Progress', 'Completed']
+        current_step:
+          type: integer
+          minimum: 1
+          maximum: 7
+        start_time:
+          type: string
+          format: date-time
+          nullable: true
+        last_activity_at:
+          type: string
+          format: date-time
+          nullable: true
+        completion_time:
+          type: string
+          format: date-time
+          nullable: true
+      additionalProperties: false
+
+    LatestReportRecord:
+      type: object
+      required:
+        - report_id
+        - experiment_id
+        - student_id
+        - status
+        - submitted_at
+        - pdf_file_path
+        - pdf_file_available
+      properties:
+        report_id:
+          type: integer
+          minimum: 1
+        experiment_id:
+          type: integer
+          minimum: 1
+        student_id:
+          type: integer
+          minimum: 1
+        report_content:
+          type: string
+          nullable: true
+        pdf_file_path:
+          type: string
+          nullable: true
+          description: 可通过鉴权文件接口访问的相对路径。
+        pdf_file_available:
+          type: boolean
+        status:
+          type: string
+          enum: [submitted, graded, rejected]
+        submitted_at:
+          type: string
+          format: date-time
+          nullable: true
+        grade:
+          type: number
+          minimum: 0
+          maximum: 100
+          nullable: true
+        feedback:
+          type: string
+          nullable: true
+        graded_by:
+          type: integer
+          minimum: 1
+          nullable: true
+      additionalProperties: true
+
+    LatestReportStatus:
+      type: object
+      required: [is_rejected, has_report, redo_in_progress]
+      description: >-
+        has_report 仅表示最新 attempt 是否已有报告。redo_in_progress=true 仅表示
+        重做 child 尚未提交报告。只要最新 attempt 是从已驳回父报告创建的重做，
+        rejected_report 都稳定返回父报告的驳回原因和归档 PDF；child 进入
+        submitted 或 graded 后仍与当前 report 同时返回。
+      properties:
+        is_rejected:
+          type: boolean
+          description: 最新 attempt 自身的报告是否已驳回。
+        has_report:
+          type: boolean
+        redo_in_progress:
+          type: boolean
+        experiment:
+          $ref: '#/components/schemas/LatestReportExperimentSummary'
+        report:
+          $ref: '#/components/schemas/LatestReportRecord'
+        rejected_report:
+          description: 最新 retry attempt 的直接父驳回报告只读归档摘要。
+          allOf:
+            - $ref: '#/components/schemas/LatestReportRecord'
+      additionalProperties: false
+
+    LatestReportStatusResponse:
+      type: object
+      description: 全局成功响应中间件会把最新报告状态包装在 data 字段内。
+      required: [data]
+      properties:
+        data:
+          $ref: '#/components/schemas/LatestReportStatus'
+      additionalProperties: false
+
+    ClassReportArchivedRejection:
+      type: object
+      required:
+        - report_id
+        - experiment_id
+        - status
+        - feedback
+        - grader_name
+        - submitted_at
+        - pdf_file_path
+        - pdf_file_available
+      properties:
+        report_id:
+          type: integer
+          minimum: 1
+        experiment_id:
+          type: integer
+          minimum: 1
+        status:
+          type: string
+          enum: [rejected]
+        feedback:
+          type: string
+          nullable: true
+        grader_name:
+          type: string
+          nullable: true
+        submitted_at:
+          type: string
+          format: date-time
+          nullable: true
+        pdf_file_path:
+          type: string
+          nullable: true
+        pdf_file_available:
+          type: boolean
+      additionalProperties: false
+
+    ClassReportRecord:
+      type: object
+      required:
+        - user_id
+        - username
+        - full_name
+        - report_id
+        - experiment_id
+        - retry_of_experiment_id
+        - status
+        - submitted_at
+        - pdf_file_path
+        - pdf_file_available
+        - grade
+        - feedback
+        - grader_name
+        - review_revision
+        - rejected_report
+        - experiment_grade
+      properties:
+        user_id:
+          type: integer
+          minimum: 1
+        username:
+          type: string
+        full_name:
+          type: string
+        report_id:
+          type: integer
+          minimum: 1
+          nullable: true
+          description: 最新 attempt 尚未提交报告时为 null；不会借用父驳回报告 ID。
+        experiment_id:
+          type: integer
+          minimum: 1
+          nullable: true
+        retry_of_experiment_id:
+          type: integer
+          minimum: 1
+          nullable: true
+        status:
+          type: string
+          enum: [submitted, graded, rejected, redo_in_progress]
+          nullable: true
+        submitted_at:
+          type: string
+          format: date-time
+          nullable: true
+        pdf_file_path:
+          type: string
+          nullable: true
+          description: 最新 attempt 当前报告的鉴权相对路径；重做尚未提交时为 null。
+        pdf_file_available:
+          type: boolean
+        grade:
+          type: number
+          minimum: 0
+          maximum: 100
+          nullable: true
+        feedback:
+          type: string
+          nullable: true
+        grader_name:
+          type: string
+          nullable: true
+        review_revision:
+          type: string
+          pattern: '^[a-f0-9]{64}$'
+          nullable: true
+          readOnly: true
+          description: >-
+            当前报告及可修改实验分项的 opaque 乐观并发令牌；report_id 为 null 时也为
+            null。评阅页面必须保留打开时的值并在写入时原样回传。
+        rejected_report:
+          type: object
+          nullable: true
+          description: >-
+            最新 attempt 为重做记录且其直接父报告已驳回时，始终返回父报告的
+            只读归档摘要；当前 child 已 submitted 或 graded 后仍保留。
+          allOf:
+            - $ref: '#/components/schemas/ClassReportArchivedRejection'
+        experiment_grade:
+          type: object
+          nullable: true
+          description: >-
+            最新 attempt 尚未提交报告时为 null；报告已提交后返回自动评阅证据及
+            可修改的实验分项。
+          properties:
+            exp_flow_demand_data_preparation:
+              type: number
+              nullable: true
+            exp_flow_demand_descriptive_stats:
+              type: number
+              nullable: true
+            exp_flow_demand_model_selection:
+              type: number
+              nullable: true
+            exp_flow_demand_generate_results:
+              type: number
+              nullable: true
+            exp_flow_production_inventory_calc:
+              type: number
+              nullable: true
+            exp_flow_production_service_level:
+              type: number
+              nullable: true
+            exp_flow_production_variable_calc:
+              type: number
+              nullable: true
+            exp_flow_production_plan_creation:
+              type: number
+              nullable: true
+            exp_flow_report_submission:
+              type: number
+              nullable: true
+            model_quality:
+              type: number
+              nullable: true
+          additionalProperties: false
+      additionalProperties: false
+
+    ClassReportArray:
+      type: array
+      items:
+        $ref: '#/components/schemas/ClassReportRecord'
+
+    ClassReportArrayResponse:
+      type: object
+      description: 全局成功响应中间件会把班级报告数组包装在 data 字段内。
+      required: [data]
+      properties:
+        data:
+          $ref: '#/components/schemas/ClassReportArray'
+      additionalProperties: false
+
     ModelTrainRequestBase:
       type: object
       description: |
@@ -348,10 +804,12 @@ components:
           type: integer
           minimum: 0
         lstmFeatures:
+          description: 最多 64 个附加输入特征；目标字段不计入上限。旧客户端可传逗号分隔字符串；字段名本身含逗号时必须使用 JSON 数组。
           oneOf:
             - type: string
               minLength: 1
             - type: array
+              maxItems: 64
               items:
                 type: string
                 minLength: 1
@@ -402,10 +860,12 @@ components:
           required: [lstmFeatures, lstmTargetFeature, lstmNormalization]
           properties:
             lstmFeatures:
+              description: 最多 64 个附加输入特征；目标字段不计入上限。空数组表示仅使用目标序列；字段名本身含逗号时必须使用 JSON 数组。
               oneOf:
                 - type: string
                   minLength: 1
                 - type: array
+                  maxItems: 64
                   items:
                     type: string
                     minLength: 1
@@ -443,11 +903,12 @@ components:
               description: 以逗号分隔的至少两个、不重复的基础模型，且包含 LSTM。
               pattern: '(^|,)\s*lstm\s*(,|$)'
             lstmFeatures:
-              description: 显式选择的 LSTM 外生特征；空数组表示仅使用目标序列，不会自动选择全部特征。
+              description: 显式选择的 LSTM 附加输入特征，最多 64 个（目标字段不计入上限）；空数组表示仅使用目标序列，不会自动选择全部特征；字段名本身含逗号时必须使用 JSON 数组。
               oneOf:
                 - type: string
                   minLength: 1
                 - type: array
+                  maxItems: 64
                   items:
                     type: string
                     minLength: 1
@@ -482,7 +943,7 @@ components:
           minimum: 1
         forecast_steps:
           type: integer
-          minimum: 1
+          minimum: 2
           maximum: 12
         preparation_token:
           type: string
@@ -497,7 +958,7 @@ components:
           minimum: 1
         forecast_steps:
           type: integer
-          minimum: 1
+          minimum: 2
           maximum: 12
 
     ProductionPredictionPoint:
@@ -509,6 +970,11 @@ components:
         - uncertainty_source
         - calibration_mean_error
         - calibration_count
+        - interval_lower
+        - interval_upper
+        - interval_level
+        - interval_kind
+        - coverage_claim
       properties:
         prediction:
           type: number
@@ -520,7 +986,7 @@ components:
         upper_error_p99:
           type: number
           minimum: 0
-          description: 生产容量场景使用的单侧 P99 误差偏移。
+          description: 单侧 P99 误差压力偏移，仅用于独立诊断；当前客户安全库存与产能公式不读取该字段。
         uncertainty_source:
           type: string
           enum: [model, empirical, fallback]
@@ -538,6 +1004,10 @@ components:
           minimum: 1
           nullable: true
           description: 与 calibration_mean_error 同时为 null，或同时提供有效校准诊断。
+        bias_diagnostic_source:
+          type: string
+          nullable: true
+          description: 平均偏差诊断的数据来源；ARIMA 使用 outer_selection_assessment，与模型原生区间来源分离。
         interval_lower:
           type: number
         interval_upper:
@@ -545,26 +1015,168 @@ components:
         interval_level:
           type: number
           enum: [0.95]
+          description: 区间构造水平；必须结合 interval_kind 与 coverage_claim 解释，不能单独视为覆盖保证。
         interval_kind:
           type: string
-          minLength: 1
+          enum:
+            - model_prediction_interval
+            - empirical_residual_quantile
+            - normal_approximation
+            - fallback_normal_approximation
+        coverage_claim:
+          type: string
+          enum: [model_nominal, none]
+          description: model_nominal 表示模型分布假设下的名义覆盖；none 表示不声明有限样本覆盖保证。
+      oneOf:
+        - title: 模型名义预测区间
+          properties:
+            interval_kind:
+              type: string
+              enum: [model_prediction_interval]
+            coverage_claim:
+              type: string
+              enum: [model_nominal]
+        - title: 不声明覆盖保证的区间
+          properties:
+            interval_kind:
+              type: string
+              enum:
+                - empirical_residual_quantile
+                - normal_approximation
+                - fallback_normal_approximation
+            coverage_claim:
+              type: string
+              enum: [none]
 
-    ProductionPredictionResults:
+    ProductionMpsRow:
       type: object
-      required: [predictions]
+      required:
+        - period
+        - period_label
+        - demand_forecast
+        - safety_stock
+        - planned_production
+        - beginning_inventory
+        - production_output
+        - ending_inventory
+        - stockout
+        - service_level
       properties:
-        predictions:
-          type: array
+        period:
+          type: integer
+          minimum: 1
+          maximum: 12
+        period_label:
+          type: string
+          minLength: 1
+        demand_forecast:
+          type: number
+          minimum: 0
+        safety_stock:
+          type: number
+          minimum: 0
+        planned_production:
+          type: number
+          minimum: 0
+        beginning_inventory:
+          type: number
+          minimum: 0
+        production_output:
+          type: number
+          minimum: 0
+        ending_inventory:
+          type: number
+          minimum: 0
+        stockout:
+          type: number
+          minimum: 0
+        service_level:
+          type: number
+          minimum: 0
+          maximum: 1
+      additionalProperties: false
+
+    LegacyProductionPredictionPoint:
+      type: object
+      description: |
+        仅用于读取已完成历史实验。旧版预测早于不确定性和区间元数据，
+        不得作为新建或更新实验的写入格式。
+      required: [prediction, std_dev]
+      properties:
+        prediction:
+          type: number
+          minimum: 0
+        std_dev:
+          type: number
+          minimum: 0
+        interval_lower:
+          type: number
+        interval_upper:
+          type: number
+        interval_level:
+          type: number
+        interval_kind:
+          type: string
+        coverage_claim:
+          type: string
+      not:
+        anyOf:
+          - properties:
+              interval_lower: {}
+            required: [interval_lower]
+          - properties:
+              interval_upper: {}
+            required: [interval_upper]
+          - properties:
+              interval_level: {}
+            required: [interval_level]
+          - properties:
+              interval_kind: {}
+            required: [interval_kind]
+          - properties:
+              coverage_claim: {}
+            required: [coverage_claim]
+      additionalProperties: true
+
+    CompatiblePersistedProductionForecastResults:
+      description: |
+        已完成历史实验可能返回整组旧版预测；当前实验返回整组新版预测。
+        同一数组不会混用两个版本，部分区间元数据也不会被返回。
+      oneOf:
+        - type: array
+          nullable: true
           minItems: 1
           maxItems: 12
           items:
+            $ref: '#/components/schemas/LegacyProductionPredictionPoint'
+        - type: array
+          maxItems: 12
+          items:
             $ref: '#/components/schemas/ProductionPredictionPoint'
+
+    ProductionPredictionResults:
+      type: object
+      required: [predictions, forecast_evidence]
+      properties:
+        predictions:
+          type: array
+          minItems: 2
+          maxItems: 12
+          items:
+            $ref: '#/components/schemas/ProductionPredictionPoint'
+        forecast_evidence:
+          type: string
+          minLength: 1
+          maxLength: 4096
+          description: 服务端签发的不可解析凭证；保存生产预测时原样写入 production_forecast_evidence。
         method_name:
           type: string
         forecast_strategy:
           type: string
         implementation_notes:
-          type: string
+          type: array
+          items:
+            type: string
 
     ModelPredictionResponsePayload:
       type: object
@@ -583,6 +1195,24 @@ components:
       properties:
         data:
           $ref: '#/components/schemas/ModelPredictionResponsePayload'
+
+    ModelObservabilityResponsePayload:
+      type: object
+      required: [models]
+      properties:
+        models:
+          type: object
+          additionalProperties:
+            type: object
+            additionalProperties: true
+
+    ModelObservabilityResponse:
+      type: object
+      description: 全局成功响应中间件会把模型可观测性 payload 包装在 data 字段内。
+      required: [data]
+      properties:
+        data:
+          $ref: '#/components/schemas/ModelObservabilityResponsePayload'
 
     GuidedTrainingSession:
       type: object
@@ -688,7 +1318,7 @@ components:
               format: uuid
             prepared_forecast_steps:
               type: integer
-              minimum: 1
+              minimum: 2
               maximum: 12
             reused_existing:
               type: boolean
@@ -820,13 +1450,36 @@ components:
       properties:
         data_name:
           type: string
-          minLength: 1
+          minLength: 2
+          maxLength: 100
         description:
           type: string
+          maxLength: 200
 
     ExperimentStateRecord:
       type: object
+      required:
+        - experiment_id
+        - student_id
+        - status
+        - current_step
+        - highest_completed_step
+        - state_version
       properties:
+        experiment_id:
+          type: integer
+          minimum: 1
+        student_id:
+          type: integer
+          minimum: 1
+        retry_of_experiment_id:
+          type: integer
+          minimum: 1
+          nullable: true
+          description: 被驳回后重做时指向唯一的父实验；首次实验为 null。
+        state_version:
+          type: integer
+          minimum: 0
         status:
           type: string
           enum: ['Not Started', 'In Progress', 'Completed']
@@ -1073,21 +1726,25 @@ components:
           type: number
           nullable: true
         production_mps_table:
-          oneOf:
+          description: 当前 v2 计划返回严格 MPS 行；已完成的 v1 历史快照可能返回旧版对象行。
+          anyOf:
             - type: array
-              items: {}
-            - type: object
-              additionalProperties: true
-            - type: string
               nullable: true
+              maxItems: 12
+              items:
+                $ref: '#/components/schemas/ProductionMpsRow'
+            - type: array
+              nullable: true
+              maxItems: 12
+              items:
+                type: object
+                additionalProperties: true
         production_forecast_results:
-          oneOf:
-            - type: array
-              items: {}
-            - type: object
-              additionalProperties: true
-            - type: string
-              nullable: true
+          $ref: '#/components/schemas/CompatiblePersistedProductionForecastResults'
+        production_forecast_evidence:
+          type: string
+          maxLength: 4096
+          nullable: true
         production_capacity_mode:
           type: string
           enum: [scenario, auto, custom]
@@ -1121,6 +1778,24 @@ components:
           minimum: 0
           nullable: true
       additionalProperties: true
+
+    ExperimentStateResponse:
+      type: object
+      required: [data]
+      properties:
+        data:
+          $ref: '#/components/schemas/ExperimentStateRecord'
+      additionalProperties: false
+
+    ExperimentStateArrayResponse:
+      type: object
+      required: [data]
+      properties:
+        data:
+          type: array
+          items:
+            $ref: '#/components/schemas/ExperimentStateRecord'
+      additionalProperties: false
 
     ExperimentStudentWritableFields:
       type: object
@@ -1224,7 +1899,8 @@ components:
           nullable: true
         production_forecast_periods:
           type: integer
-          minimum: 1
+          minimum: 2
+          maximum: 12
           nullable: true
         production_initial_inventory:
           type: number
@@ -1240,15 +1916,19 @@ components:
         production_mps_table:
           type: array
           nullable: true
+          maxItems: 12
           items:
-            type: object
-            additionalProperties: true
+            $ref: '#/components/schemas/ProductionMpsRow'
         production_forecast_results:
           type: array
           nullable: true
+          maxItems: 12
           items:
-            type: object
-            additionalProperties: true
+            $ref: '#/components/schemas/ProductionPredictionPoint'
+        production_forecast_evidence:
+          type: string
+          maxLength: 4096
+          nullable: true
         production_capacity_mode:
           type: string
           enum: [scenario, auto, custom]
@@ -1361,6 +2041,16 @@ components:
           items:
             type: string
 
+    ExperimentRetryRequest:
+      type: object
+      required: [rejected_report_id]
+      additionalProperties: false
+      properties:
+        rejected_report_id:
+          type: integer
+          minimum: 1
+          description: 属于当前学生且状态为 rejected 的最新正式报告 ID。
+
     ExperimentUpdateRequest:
       allOf:
         - $ref: '#/components/schemas/ExperimentStudentWritableFields'
@@ -1387,57 +2077,90 @@ components:
 
     GradeReportRequest:
       type: object
+      required: [expected_status, expected_review_revision]
+      description: >-
+        每次写入都必须通过 expected_status 和 expected_review_revision 声明评阅页面
+        打开时读取到的完整评阅快照。服务端锁定报告及实验成绩后重新计算并比较；
+        状态、报告得分、评语、评阅人或任一可修改实验分项发生变化都返回 409。
+        因此两个从 graded 打开的页面也不能静默互相覆盖，同时最新令牌仍允许显式
+        修订已评分记录。省略 status 时会对当前记录保存部分评阅草稿（分数、分项或
+        评语）并保持原状态；submitted 状态下的草稿分数不属于正式成绩。
+        status=graded 时 grade 必填；status=rejected 时 expected_status 必须为
+        submitted，feedback 必须为非空驳回原因，且不得携带 grade 或
+        experiment_grade。rejected 为终态；已评分记录不能通过此接口改为 rejected。
+        任何评阅都只允许作用于学生最新的正式实验，历史 attempt 返回 409。
       properties:
+        expected_status:
+          type: string
+          enum: [submitted, graded]
+          description: 评阅页面最近读取到的报告状态；与锁定后的当前状态不一致时返回 409。
+        expected_review_revision:
+          type: string
+          pattern: '^[a-f0-9]{64}$'
+          description: 评阅页面打开时读取到的 review_revision；与锁定后的完整评阅快照不一致时返回 409。
         grade:
           type: number
           minimum: 0
           maximum: 100
         feedback:
           type: string
+          description: 非驳回写入中，空白字符串会清除已有评语；驳回时必须为非空原因。
         status:
           type: string
           enum: [graded, rejected]
         experiment_grade:
           type: object
+          minProperties: 1
+          description: 各可选实验分项；传 null 表示清除该分项，省略表示保持原值。
           properties:
             exp_flow_demand_data_preparation:
               type: number
+              nullable: true
               minimum: 0
               maximum: 100
             exp_flow_demand_descriptive_stats:
               type: number
+              nullable: true
               minimum: 0
               maximum: 100
             exp_flow_demand_model_selection:
               type: number
+              nullable: true
               minimum: 0
               maximum: 100
             exp_flow_demand_generate_results:
               type: number
+              nullable: true
               minimum: 0
               maximum: 100
             exp_flow_production_inventory_calc:
               type: number
+              nullable: true
               minimum: 0
               maximum: 100
             exp_flow_production_service_level:
               type: number
+              nullable: true
               minimum: 0
               maximum: 100
             exp_flow_production_variable_calc:
               type: number
+              nullable: true
               minimum: 0
               maximum: 100
             exp_flow_production_plan_creation:
               type: number
+              nullable: true
               minimum: 0
               maximum: 100
             exp_flow_report_submission:
               type: number
+              nullable: true
               minimum: 0
               maximum: 100
             model_quality:
               type: number
+              nullable: true
               minimum: 0
               maximum: 100
 
@@ -1556,6 +2279,7 @@ components:
           format: email
         phone_number:
           type: string
+          pattern: '^\\d{6,15}$'
         class_ids:
           type: array
           minItems: 1
@@ -1572,7 +2296,8 @@ components:
           minLength: 1
         phone_number:
           type: string
-          minLength: 1
+          nullable: true
+          pattern: '^\\d{6,15}$'
         email:
           type: string
           format: email
@@ -1907,8 +2632,11 @@ paths:
                   format: binary
                 file_name:
                   type: string
+                  minLength: 2
+                  maxLength: 100
                 description:
                   type: string
+                  maxLength: 200
       responses:
         '201':
           description: 上传成功
@@ -2030,11 +2758,12 @@ paths:
         - $ref: '#/components/parameters/manualId'
       responses:
         '200':
-          description: 成功
+          description: >-
+            手册数据库记录已删除；cleanup_pending=true 时文件已安全隔离，后台任务将继续清理。
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/DataEnvelope'
+                $ref: '#/components/schemas/ManagedFileDeletionResponse'
         '403':
           description: 权限不足（仅 Admin）
           content:
@@ -2043,6 +2772,12 @@ paths:
                 $ref: '#/components/schemas/ErrorResponse'
         '404':
           description: 手册不存在
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '500':
+          description: 手册文件无法安全隔离，数据库删除未执行
           content:
             application/json:
               schema:
@@ -2379,13 +3114,48 @@ paths:
         - bearerAuth: []
       responses:
         '200':
-          description: 成功
+          description: 成功；重做中会同时返回最新子 attempt 和父驳回报告摘要
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/DataEnvelope'
+                $ref: '#/components/schemas/LatestReportStatusResponse'
         '403':
           description: 权限不足（仅 Student）
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /api/v1/models/experiments/{experimentId}/observability:
+    get:
+      tags: [Models]
+      summary: 获取活动模型版本的训练、校准和集成可观测元数据
+      operationId: getExperimentModelObservability
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/experimentId'
+      responses:
+        '200':
+          description: 成功；models 按后端模型类型索引，只返回当前活动训练版本
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ModelObservabilityResponse'
+        '400':
+          description: 实验 ID 无效
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '403':
+          description: 权限不足
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '404':
+          description: 实验不存在
           content:
             application/json:
               schema:
@@ -2590,7 +3360,7 @@ paths:
               schema:
                 $ref: '#/components/schemas/ProductionPreparationSessionResponse'
         '400':
-          description: 参数错误或模型尚未满足生产准备条件
+          description: 参数错误或模型尚未满足生产准备条件。缺少活动训练版本时返回 `code=MODEL_TRAINING_RUN_REQUIRED`；运行环境或数据版本失配时返回 `code=MODEL_RETRAINING_REQUIRED`。两者都带 `required_action=retrain` 和对应 `model_type`。
           content:
             application/json:
               schema:
@@ -2670,7 +3440,7 @@ paths:
               schema:
                 $ref: '#/components/schemas/ProductionPreparationSessionResponse'
         '400':
-          description: 参数、checkpoint receipt 或 Python 输入无效
+          description: 参数、checkpoint receipt 或 Python 输入无效；来源训练产物损坏时返回 `code=MODEL_ARTIFACT_INVALID`、`required_action=retrain` 和对应 `model_type`。
           content:
             application/json:
               schema:
@@ -2735,7 +3505,7 @@ paths:
               schema:
                 $ref: '#/components/schemas/ModelPredictionResponse'
         '400':
-          description: 参数错误
+          description: 参数错误；当前训练版本与数据或运行环境不再匹配时返回 `code=MODEL_RETRAINING_REQUIRED`、`required_action=retrain` 和对应 `model_type`。
           content:
             application/json:
               schema:
@@ -2782,7 +3552,7 @@ paths:
       tags: [Classes]
       summary: 创建班级
       operationId: createClass
-      description: Teacher/Admin
+      description: Teacher
       security:
         - bearerAuth: []
       requestBody:
@@ -2823,7 +3593,7 @@ paths:
               schema:
                 $ref: '#/components/schemas/ErrorResponse'
         '403':
-          description: 权限不足（仅 Teacher/Admin）
+          description: 权限不足（仅 Teacher）
           content:
             application/json:
               schema:
@@ -3366,8 +4136,11 @@ paths:
                   format: binary
                 data_name:
                   type: string
+                  minLength: 2
+                  maxLength: 100
                 description:
                   type: string
+                  maxLength: 200
       responses:
         '201':
           description: 上传成功
@@ -3614,6 +4387,12 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/ErrorResponse'
+        '500':
+          description: 数据集文件无法安全隔离，删除未执行
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
 
   /api/v1/students/me/experiment-runs/active:
     get:
@@ -3628,7 +4407,7 @@ paths:
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/DataEnvelope'
+                $ref: '#/components/schemas/ExperimentStateResponse'
         '403':
           description: 权限不足（仅 Student）
           content:
@@ -3661,7 +4440,7 @@ paths:
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/DataEnvelope'
+                $ref: '#/components/schemas/ExperimentStateResponse'
         '400':
           description: 参数错误
           content:
@@ -3670,6 +4449,12 @@ paths:
                 $ref: '#/components/schemas/ErrorResponse'
         '403':
           description: 权限不足（仅 Student）
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '409':
+          description: 已存在正式实验，不能通过普通入口创建另一条尝试
           content:
             application/json:
               schema:
@@ -3687,7 +4472,7 @@ paths:
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/DataEnvelopeArray'
+                $ref: '#/components/schemas/ExperimentStateArrayResponse'
         '403':
           description: 权限不足（仅 Student）
           content:
@@ -3730,6 +4515,63 @@ paths:
               schema:
                 $ref: '#/components/schemas/ErrorResponse'
 
+  /api/v1/students/me/experiment-runs/retry:
+    post:
+      tags: [Experiments]
+      summary: 从最新的已驳回报告创建完整重做实验
+      operationId: retryRejectedExperiment
+      description: >-
+        首次请求创建仅含默认值的新实验并返回 201；同一报告的重复或并发请求
+        只有在该子 attempt 仍是学生最新正式 attempt 且尚未生成报告时才幂等
+        返回 200；Completed 但尚无报告的 child 仍返回 200，以支持报告提交中断
+        恢复。child 一旦存在 submitted、graded 或 rejected 报告，或者已经存在
+        更新一代 attempt，旧父报告请求返回 409 和 current。
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ExperimentRetryRequest'
+      responses:
+        '200':
+          description: 已存在该报告对应且尚无报告的最新重做实验（含 Completed 无报告恢复态）
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ExperimentStateResponse'
+        '201':
+          description: 重做实验创建成功
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ExperimentStateResponse'
+        '400':
+          description: 请求参数错误
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '403':
+          description: 权限不足（仅 Student）
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '404':
+          description: 驳回报告不存在或不属于当前学生
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '409':
+          description: 报告未驳回、child 已有报告、不是最新正式尝试，或重做关联冲突
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ExperimentRetryConflictResponse'
+
   /api/v1/experiment-runs/{experimentId}:
     patch:
       tags: [Experiments]
@@ -3752,13 +4594,15 @@ paths:
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/DataEnvelope'
+                $ref: '#/components/schemas/ExperimentStateResponse'
         '400':
           description: 字段无效
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/ErrorResponse'
+                oneOf:
+                  - $ref: '#/components/schemas/ErrorResponse'
+                  - $ref: '#/components/schemas/ProductionPlanErrorResponse'
         '403':
           description: 权限不足
           content:
@@ -3830,11 +4674,16 @@ paths:
         - $ref: '#/components/parameters/classId'
       responses:
         '200':
-          description: 成功
+          description: >-
+            成功。报告状态可能为 submitted、graded、rejected，或服务端根据最新
+            retry attempt 合成的 redo_in_progress；后者表示旧报告已驳回且学生正在
+            完整重做，不等同于未提交。外层报告字段始终属于最新 attempt；只要它是
+            从已驳回父报告创建的重做，父归档就独立保留在 rejected_report 中，当前
+            报告进入 submitted 或 graded 后也不会移除。
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/DataEnvelopeArray'
+                $ref: '#/components/schemas/ClassReportArrayResponse'
         '403':
           description: 权限不足
           content:
@@ -3865,11 +4714,11 @@ paths:
               $ref: '#/components/schemas/GradeReportRequest'
       responses:
         '200':
-          description: 批改成功
+          description: 批改成功；响应包含下一次修改必须使用的新 review_revision
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/DataEnvelope'
+                $ref: '#/components/schemas/GradeReportSuccessResponse'
         '400':
           description: 参数错误
           content:
@@ -3888,6 +4737,12 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/ErrorResponse'
+        '409':
+          description: expected_status 或 expected_review_revision 已过期、报告已进入不允许当前操作的终态，或报告不属于最新实验 attempt
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/GradeReportConflictResponse'
 
   /api/v1/classes/{classId}/experiment-runs:
     get:
@@ -3998,7 +4853,10 @@ paths:
         - $ref: '#/components/parameters/classId'
       responses:
         '200':
-          description: 成功
+          description: >-
+            成功。report_status 可能包含 redo_in_progress；只有 graded 行的各项分数、
+            分项加权值和 final_score 属于正式成绩，其他状态统一返回 null（真实的
+            graded 零分仍返回 0）。
           content:
             application/json:
               schema:
@@ -4630,6 +5488,12 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/ErrorResponse'
+        '500':
+          description: 报告文件无法安全隔离，批量删除未执行
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
 
   /api/v1/students/unenrolled:
     get:
@@ -4672,7 +5536,6 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/ErrorResponse'
-
     put:
       tags: [Users]
       summary: 更新当前用户信息
@@ -4802,6 +5665,12 @@ paths:
                 $ref: '#/components/schemas/ErrorResponse'
         '404':
           description: 用户不存在
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '500':
+          description: 报告文件无法安全隔离，用户删除未执行
           content:
             application/json:
               schema:

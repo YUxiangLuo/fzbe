@@ -23,8 +23,6 @@ from data_utils import (
 )
 from ensemble_utils import (
     build_ensemble_subprocess_data,
-    can_refit_source_artifact_for_internal_holdout,
-    fit_and_predict_from_source_model,
     format_predictions,
     get_lstm_source_forecast_strategy,
     get_member_model_path,
@@ -33,7 +31,8 @@ from ensemble_utils import (
     parse_base_model_files_arg,
     parse_base_model_names,
     parse_feature_name_list,
-    plan_ensemble_internal_holdout,
+    plan_ensemble_selection_calibration_split,
+    predict_member_on_chronological_holdout,
     persist_member_model_artifact,
     prepare_lstm_source_model_for_requested_steps,
     require_explicit_lstm_feature_names,
@@ -53,14 +52,15 @@ from subprocess_utils import (
 from uncertainty import ensemble_growth_profile
 
 MODEL_TYPE = "stacking"
-METHOD_NAME = "时间顺序留出 Stacking 融合"
-FORECAST_STRATEGY = "holdout_nonnegative_least_squares"
+METHOD_NAME = "滚动起点折外预测 Stacking 融合"
+FORECAST_STRATEGY = "rolling_origin_oof_nonnegative_least_squares"
 IMPLEMENTATION_NOTES = [
     "教科书 Stacking 用基础模型预测作为二级特征，再训练元学习器组合预测。",
-    "本系统按时间顺序拆分，Level-1 至少保留基础模型数加 2 个点；若所有成员无法在剩余前缀上训练则直接给出数据不足，而不悄悄改变算法。",
-    "Level-0 只沿用用户选择的 MA 窗口、ES alpha、ARIMA d 与 LSTM 特征/归一化；ARIMA 阶数和 LSTM 隐藏参数按 Level-0 前缀重新推导，避免完整训练段信息泄漏。",
-    "元学习器使用无截距非负最小二乘（NNLS）；系数不再人为归一化，也不以逆误差加权冒充 Stacking。",
-    "实体销量成员预测和最终组合结果均截断到不小于 0。std_dev、95% 区间和生产用 99% 上侧误差仅用 Level-1 时间留出段的 actual-prediction 组合残差校准成员逐 horizon 的增长形状；经验分位数会保留稳定偏差，独立评估真实值不参与校准，信息不足时明确标记 fallback。",
+    "本系统按时间顺序拆分训练前缀、Level-1 选择集和选择后校准集；Level-1 至少保留基础模型数加 2 个点，样本不足时不会拿 Level-1 拟合残差冒充校准证据。",
+    "Level-1 特征来自最多 3 个扩展窗口滚动起点折：每一折只使用该折起点之前的数据拟合基础模型，因此每一行都是严格的时间顺序 OOF 预测。",
+    "Level-0 只沿用用户选择的 MA 窗口、ES alpha、ARIMA d 与 LSTM 特征/归一化；ARIMA 阶数和 LSTM 隐藏参数按各滚动前缀重新推导，避免更晚训练信息泄漏。",
+    "元学习器使用无截距非负最小二乘（NNLS）；当 OOF 成员矩阵高度共线或奇异时，自动加入按矩阵尺度确定的 L2 稳定项再做非负最小二乘。系数不人为归一化，也不以逆误差加权冒充 Stacking。",
+    "固定元学习器后，成员用包含 Level-1 的更长前缀重新拟合，并只在更晚的校准段产生不确定性残差；外层选择评估真实值不参与校准。实体销量成员预测和最终组合结果均截断到不小于 0。",
 ]
 
 
@@ -86,17 +86,67 @@ def _fit_meta_model(
         raise ValueError(
             "[VALIDATION] Stacking Level-1 requires at least model_count + 2 samples."
         )
-    coefficients, residual_norm = nnls(
-        np.asarray(X_meta_train, dtype=float),
-        np.asarray(y_meta_train, dtype=float),
+    matrix = np.asarray(X_meta_train, dtype=float)
+    target = np.asarray(y_meta_train, dtype=float)
+    condition_number = float(np.linalg.cond(matrix))
+    finite_condition_number: Optional[float] = (
+        condition_number if np.isfinite(condition_number) else None
     )
+    max_abs_correlation: Optional[float] = None
+    if n_models > 1:
+        standard_deviations = np.std(matrix, axis=0)
+        if np.any(standard_deviations <= np.finfo(float).eps):
+            max_abs_correlation = 1.0
+        else:
+            correlation = np.corrcoef(matrix, rowvar=False)
+            off_diagonal = np.abs(
+                correlation[np.triu_indices(n_models, k=1)]
+            )
+            if off_diagonal.size:
+                max_abs_correlation = float(np.max(off_diagonal))
+    requires_regularization = (
+        finite_condition_number is None
+        or finite_condition_number > 1e6
+        or (
+            max_abs_correlation is not None
+            and max_abs_correlation >= 0.995
+        )
+    )
+    regularization_strength = 0.0
+    strategy = "nonnegative_least_squares"
+    if requires_regularization:
+        column_scale = float(np.mean(np.sum(np.square(matrix), axis=0)))
+        regularization_strength = max(
+            np.finfo(float).eps,
+            column_scale * 1e-3,
+        )
+        coefficients, _ = nnls(
+            np.vstack([
+                matrix,
+                np.sqrt(regularization_strength) * np.eye(n_models),
+            ]),
+            np.concatenate([target, np.zeros(n_models, dtype=float)]),
+        )
+        residual_norm = float(np.linalg.norm(matrix @ coefficients - target))
+        strategy = "ridge_regularized_nonnegative_least_squares"
+    else:
+        coefficients, residual_norm = nnls(matrix, target)
+    recommended_min_oof_rows = max(20, 5 * n_models)
 
     return {
         "kind": "nnls",
-        "strategy": "nonnegative_least_squares",
+        "strategy": strategy,
         "model_names": list(model_names),
         "coefficients": coefficients.tolist(),
+        "coefficient_sum": float(np.sum(coefficients)),
         "residual_norm": float(residual_norm),
+        "oof_row_count": int(n_samples),
+        "recommended_min_oof_rows": recommended_min_oof_rows,
+        "teaching_demo": n_samples < recommended_min_oof_rows,
+        "condition_number": finite_condition_number,
+        "max_abs_member_correlation": max_abs_correlation,
+        "regularized": requires_regularization,
+        "regularization_strength": float(regularization_strength),
     }
 
 
@@ -273,7 +323,7 @@ def _validate_training_args(
                     f"[VALIDATION] LSTM feature columns not found in dataset: {missing_feature_names}"
                 )
 
-    plan_ensemble_internal_holdout(
+    plan_ensemble_selection_calibration_split(
         parsed_data,
         range(ts, te + 1),
         models_to_use,
@@ -329,11 +379,13 @@ def predict(
         uncertainty_state.get("reference_series") or [],
         steps,
         calibration_source=str(
-            uncertainty_state.get("calibration_source") or "level1_holdout"
+            uncertainty_state.get("calibration_source")
+            or "unavailable_post_selection_calibration"
         ),
     )
     summary.setdefault("calibration_source", str(
-        uncertainty_state.get("calibration_source") or "level1_holdout"
+        uncertainty_state.get("calibration_source")
+        or "unavailable_post_selection_calibration"
     ))
     return final_predictions.tolist(), profile, summary
 
@@ -349,14 +401,15 @@ def train_and_evaluate(
 ) -> Tuple[
     Dict[str, Any], Dict[str, Any], Any, List[float], List[float], List[float], Dict[str, Any]
 ]:
-    """Trains and evaluates the Stacking model using a time-ordered hold-out approach.
+    """Train Stacking with rolling-origin OOF selection and separate calibration.
 
     Teaching-practical Stacking Flow:
-    1. Dynamically split train_range into chronological level0_train and level1_train
-    2. Train base models on level0_train, predict on level1_train
-    3. Train meta-model on level1_train hold-out predictions
-    4. Retrain base models on full train_range
-    5. Evaluate on independent eval_range
+    1. Split train_range into a prefix, Level-1 selection, and later calibration
+    2. Generate every Level-1 row with expanding-window rolling-origin folds
+    3. Fit the NNLS meta-model on those chronological OOF rows
+    4. Freeze the meta-model and calibrate on a later, disjoint range
+    5. Retrain base models on full train_range
+    6. Assess the selected workflow on the outer selection-assessment eval_range
 
     Returns:
         metrics: Evaluation metrics dictionary
@@ -367,24 +420,56 @@ def train_and_evaluate(
         uncertainty_profile: Horizon-aware standard-deviation profile
     """
 
-    # === Step 1: Split train_range into level0 and level1 ===
-    # This prevents data leakage: meta-model trains on "unseen" level1 predictions
+    # === Step 1: Split selection from later uncertainty calibration ===
     train_len = len(train_range)
     if train_len < 8:
         raise ValueError("[VALIDATION] train_range too small for stacking (需要至少8个点，推荐≥12点)")
 
-    split_plan = plan_ensemble_internal_holdout(
+    split_plan = plan_ensemble_selection_calibration_split(
         parsed_data, train_range, models_to_use, model_params, "stacking"
     )
-    level0_split = int(split_plan["prefix_size"])
-
-    level0_train_range = range(train_range.start, train_range.start + level0_split)
-    level1_train_range = range(train_range.start + level0_split, train_range.stop)
+    prefix_size = int(split_plan["prefix_size"])
+    selection_size = int(split_plan["selection_size"])
+    calibration_size = int(split_plan["calibration_size"])
+    level0_prefix_range = range(
+        train_range.start,
+        train_range.start + prefix_size,
+    )
+    level1_selection_range = range(
+        level0_prefix_range.stop,
+        level0_prefix_range.stop + selection_size,
+    )
+    calibration_range = range(
+        level1_selection_range.stop,
+        level1_selection_range.stop + calibration_size,
+    )
+    oof_folds = [dict(fold) for fold in split_plan["oof_folds"]]
+    split_plan = {
+        **split_plan,
+        "oof_strategy": "expanding_window_rolling_origin",
+        "oof_fold_count": len(oof_folds),
+        "oof_folds": oof_folds,
+        "ranges": {
+            "prefix": {
+                "start": level0_prefix_range.start,
+                "end_exclusive": level0_prefix_range.stop,
+            },
+            "selection": {
+                "start": level1_selection_range.start,
+                "end_exclusive": level1_selection_range.stop,
+            },
+            "calibration": {
+                "start": calibration_range.start,
+                "end_exclusive": calibration_range.stop,
+            },
+        },
+    }
 
     print("[Stacking] 数据划分:", file=sys.stderr)
-    print(f"  Level-0 训练集: {level0_train_range} ({len(level0_train_range)} points)", file=sys.stderr)
-    print(f"  Level-1 训练集 (元模型): {level1_train_range} ({len(level1_train_range)} points)", file=sys.stderr)
-    print(f"  评估集: {eval_range} ({len(eval_range)} points)", file=sys.stderr)
+    print(f"  Level-0 初始前缀: {level0_prefix_range} ({len(level0_prefix_range)} points)", file=sys.stderr)
+    print(f"  Level-1 OOF 选择集: {level1_selection_range} ({len(level1_selection_range)} points)", file=sys.stderr)
+    print(f"  选择后校准集: {calibration_range} ({len(calibration_range)} points)", file=sys.stderr)
+    print(f"  外层选择评估集: {eval_range} ({len(eval_range)} points)", file=sys.stderr)
 
     # Non-LSTM base models keep numeric-only rows; LSTM can use categorical features.
     numeric_data_dicts, lstm_data_dicts = build_ensemble_subprocess_data(
@@ -393,69 +478,60 @@ def train_and_evaluate(
         model_params,
     )
 
-    # === Step 2: Phase 1 - Train base models on level0, predict on level1 ===
-    print("\n[Stacking Phase 1] 训练基础模型（level0）并生成level1预测", file=sys.stderr)
-    level1_predictions = []
-
     # Calculate dynamic timeout for LSTM models
     base_timeout = 600 if "lstm" in models_to_use else 120
 
-    for model_name in models_to_use:
-        params = model_params[model_name]
-        source_model_file = (base_model_files or {}).get(model_name)
-
-        print(f"  训练 {model_name} 在 level0，预测 level1...", file=sys.stderr)
-        if (
-            source_model_file
-            and can_refit_source_artifact_for_internal_holdout(model_name)
-        ):
-            adjusted_source_model_file = source_model_file
-            temp_source_model_file = None
-            try:
-                if model_name == "lstm":
-                    source_model_state = _load_lstm_source_state(
-                        source_model_file,
-                        "Saved Stacking LSTM base model",
-                    )
-                    adjusted_source_model_file, temp_source_model_file = _prepare_lstm_source_model_for_requested_steps(
-                        source_model_file,
-                        source_model_state,
-                        requested_steps=len(level1_train_range),
-                    )
-                y_pred_level1 = fit_and_predict_from_source_model(
-                    model_name=model_name,
-                    source_model_file=adjusted_source_model_file,
-                    data=lstm_data_dicts if model_name == "lstm" else numeric_data_dicts,
-                    train_start=level0_train_range.start,
-                    train_end=level0_train_range.stop - 1,
-                    forecast_steps=len(level1_train_range),
-                    timeout=base_timeout,
-                )
-            finally:
-                if temp_source_model_file and os.path.exists(temp_source_model_file):
-                    os.remove(temp_source_model_file)
-        else:
-            result = run_base_model_subprocess(
-                model_type=model_name,
-                data=lstm_data_dicts if model_name == "lstm" else numeric_data_dicts,
-                train_start=level0_train_range.start,
-                train_end=level0_train_range.stop - 1,
-                eval_start=level1_train_range.start,
-                eval_end=level1_train_range.stop - 1,
-                model_params=params.copy(),
+    # === Step 2: Generate Level-1 rows with multiple chronological origins ===
+    print("\n[Stacking Phase 1] 生成扩展窗口 rolling-origin OOF 特征", file=sys.stderr)
+    level1_predictions_by_model: Dict[str, List[float]] = {
+        model_name: [] for model_name in models_to_use
+    }
+    for fold in oof_folds:
+        fold_train_range = range(
+            int(fold["train_start"]),
+            int(fold["train_end_exclusive"]),
+        )
+        fold_holdout_range = range(
+            int(fold["holdout_start"]),
+            int(fold["holdout_end_exclusive"]),
+        )
+        print(
+            f"  OOF fold {fold['fold']}: train={fold_train_range}, "
+            f"holdout={fold_holdout_range}",
+            file=sys.stderr,
+        )
+        for model_name in models_to_use:
+            fold_predictions = predict_member_on_chronological_holdout(
+                model_name=model_name,
+                params=model_params[model_name],
+                source_model_file=(base_model_files or {}).get(model_name),
+                numeric_data=numeric_data_dicts,
+                lstm_data=lstm_data_dicts,
+                train_range=fold_train_range,
+                holdout_range=fold_holdout_range,
                 timeout=base_timeout,
             )
+            level1_predictions_by_model[model_name].extend(fold_predictions)
+            print(
+                f"    ✓ {model_name}: {len(fold_predictions)} 个 OOF 预测",
+                file=sys.stderr,
+            )
 
-            y_pred_level1 = extract_predictions_from_result(result)
-        level1_predictions.append(normalize_demand_forecast(y_pred_level1).tolist())
-        print(f"    ✓ 生成 {len(y_pred_level1)} 个level1预测", file=sys.stderr)
-
-    # === Step 3: Train meta-model on level1 predictions ===
-    print("\n[Stacking Phase 2] 训练元模型（在level1预测上）", file=sys.stderr)
-    X_meta_train = np.column_stack(level1_predictions)  # ✅ level1 的时间顺序留出预测
-    y_meta_train = parsed_data.y[level1_train_range]  # ✅ level1的标签
+    # === Step 3: Fit the meta-model on chronological OOF predictions ===
+    print("\n[Stacking Phase 2] 在 rolling-origin OOF 特征上训练元模型", file=sys.stderr)
+    X_meta_train = np.column_stack(
+        [level1_predictions_by_model[name] for name in models_to_use]
+    )
+    y_meta_train = parsed_data.y[level1_selection_range]
 
     meta_model = _fit_meta_model(X_meta_train, y_meta_train, models_to_use)
+    meta_model.update(
+        {
+            "training_strategy": "expanding_window_rolling_origin_oof",
+            "oof_fold_count": len(oof_folds),
+            "oof_row_count": int(X_meta_train.shape[0]),
+        }
+    )
 
     print(f"  ✓ 元模型训练完成 (输入维度: {X_meta_train.shape})", file=sys.stderr)
     if isinstance(meta_model, dict):
@@ -465,8 +541,42 @@ def train_and_evaluate(
         ):
             print(f"    {model_name}: coefficient={float(coefficient):.6f}", file=sys.stderr)
 
-    # === Step 4: Phase 2 - Retrain base models on full train_range ===
-    print("\n[Stacking Phase 3] 在完整训练集上重新训练基础模型", file=sys.stderr)
+    # === Step 4: Freeze the meta-model, then calibrate on later observations ===
+    calibration_residuals = np.asarray([], dtype=float)
+    calibration_source = "unavailable_post_selection_calibration"
+    if calibration_size > 0:
+        print("\n[Stacking Phase 3] 固定元模型并生成选择后校准预测", file=sys.stderr)
+        calibration_predictions: List[List[float]] = []
+        for model_name in models_to_use:
+            calibration_predictions.append(
+                predict_member_on_chronological_holdout(
+                    model_name=model_name,
+                    params=model_params[model_name],
+                    source_model_file=(base_model_files or {}).get(model_name),
+                    numeric_data=numeric_data_dicts,
+                    lstm_data=lstm_data_dicts,
+                    train_range=range(train_range.start, calibration_range.start),
+                    holdout_range=calibration_range,
+                    timeout=base_timeout,
+                )
+            )
+        X_meta_calibration = np.column_stack(calibration_predictions)
+        calibration_blend = normalize_demand_forecast(
+            _predict_with_meta_model(meta_model, X_meta_calibration)
+        )
+        calibration_residuals = (
+            parsed_data.y[calibration_range] - calibration_blend
+        )
+        calibration_source = "post_selection_calibration"
+    else:
+        print(
+            "\n[Stacking Phase 3] 样本不足，未复用 Level-1 OOF 拟合残差；"
+            "不确定性将回退到训练尺度",
+            file=sys.stderr,
+        )
+
+    # === Step 5: Retrain base models on full train_range ===
+    print("\n[Stacking Phase 4] 在完整训练集上重新训练基础模型", file=sys.stderr)
     eval_predictions = []
     full_uncertainty_profiles: Dict[str, List[float]] = {}
     base_model_states = {}
@@ -602,32 +712,26 @@ def train_and_evaluate(
         }
         print(f"    ✓ 生成 {len(y_pred_eval)} 个eval预测", file=sys.stderr)
 
-    # === Step 5: Final prediction and evaluation on eval_range ===
-    print("\n[Stacking Phase 4] 元模型最终预测和评估", file=sys.stderr)
+    # === Step 6: Assess the fixed workflow on the outer evaluation range ===
+    print("\n[Stacking Phase 5] 元模型外层选择评估", file=sys.stderr)
     X_meta_eval = np.column_stack(eval_predictions)  # ✅ eval_range的预测
-    y_pred_final = _predict_with_meta_model(meta_model, X_meta_eval)  # ✅ 元模型在独立测试集上预测
+    y_pred_final = _predict_with_meta_model(meta_model, X_meta_eval)
     y_pred_final = normalize_demand_forecast(y_pred_final)
-    y_true_final = parsed_data.y[eval_range]  # ✅ 真实标签
+    y_true_final = parsed_data.y[eval_range]
 
-    level1_blend = normalize_demand_forecast(
-        _predict_with_meta_model(meta_model, X_meta_train)
-    )
-    level1_residuals = y_meta_train - level1_blend
     coefficients = dict(zip(meta_model["model_names"], meta_model["coefficients"]))
     full_uncertainty_profile, uncertainty_summary = ensemble_growth_profile(
         full_uncertainty_profiles,
         coefficients,
-        level1_residuals,
+        calibration_residuals,
         parsed_data.y[train_range],
         eval_forecast_steps,
-        calibration_source="level1_holdout",
+        calibration_source=calibration_source,
     )
     uncertainty_profile = full_uncertainty_profile[
         eval_forecast_offset: eval_forecast_offset + len(eval_range)
     ]
-    uncertainty_summary.setdefault("calibration_source", "level1_holdout")
-
-    # ✅ 在独立的eval_range上计算指标
+    # This range is a selection assessment, not an untouched final test set.
     timestamps = parsed_data.timestamps
     metrics = {
         "rmse": rmse(y_true_final, y_pred_final),
@@ -643,8 +747,8 @@ def train_and_evaluate(
     training_details = {
         "split": split_plan,
         "uncertainty": {
-            "calibration_residuals": level1_residuals.tolist(),
-            "calibration_source": "level1_holdout",
+            "calibration_residuals": calibration_residuals.tolist(),
+            "calibration_source": calibration_source,
             "reference_series": parsed_data.y[train_range].tolist(),
             "profile": full_uncertainty_profile,
             "summary": uncertainty_summary,

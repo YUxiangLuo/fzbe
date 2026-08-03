@@ -3,7 +3,6 @@ from __future__ import annotations
 import json
 import math
 import unittest
-from pathlib import Path
 
 from py.deep_tests.support.harness import DATASETS
 from py.deep_tests.support.profiles import profile
@@ -24,6 +23,7 @@ class NormalHorizonConstantTests(unittest.TestCase):
                 self.assertAlmostEqual(-U.NORMAL_95 * scale, horizon["interval_lower_offset"], places=12)
                 self.assertAlmostEqual(U.NORMAL_95 * scale, horizon["interval_upper_offset"], places=12)
                 self.assertAlmostEqual(U.NORMAL_99 * scale, horizon["upper_error_p99"], places=12)
+                self.assertEqual(U.COVERAGE_CLAIM_NONE, horizon["coverage_claim"])
         with self.assertRaisesRegex(ValueError, r"\[MODEL\]"):
             U._normal_horizon(-1.0, source=U.UNCERTAINTY_MODEL, calibration_source="training")
 
@@ -94,6 +94,7 @@ class FormatPredictionsTests(unittest.TestCase):
             self.assertAlmostEqual(U.NORMAL_95 * std, upper_half, places=9)
             self.assertAlmostEqual(U.NORMAL_99 * std, point["upper_error_p99"], places=9)
             self.assertEqual(U.INTERVAL_LEVEL, point["interval_level"])
+            self.assertEqual(U.COVERAGE_CLAIM_NONE, point["coverage_claim"])
 
     @profile("fast")
     def test_structural_guards_reject_bad_shapes(self):
@@ -122,6 +123,38 @@ class ProfileForStepsTests(unittest.TestCase):
         bad_metadata = {"method": "x", "calibration_source": "y", "horizons": [{"missing": "fields"}]}
         extended, _ = U.profile_for_steps([5.0], 3, reference, bad_metadata)
         self.assertEqual(3, len(extended))
+
+    @profile("fast")
+    def test_saved_empirical_horizon_normalizes_legacy_bias_provenance(self):
+        horizon = U._empirical_horizon(
+            [1.0, -1.0, 2.0, -2.0],
+            calibration_source="post_selection_calibration",
+        )
+        horizon.pop("bias_diagnostic_source")
+
+        normalized = U._valid_saved_horizon(horizon)
+
+        self.assertIsNotNone(normalized)
+        self.assertEqual(
+            "post_selection_calibration",
+            normalized["bias_diagnostic_source"],
+        )
+        self.assertEqual(U.COVERAGE_CLAIM_NONE, normalized["coverage_claim"])
+
+    @profile("fast")
+    def test_saved_horizon_rejects_claimed_coverage_or_blank_bias_provenance(self):
+        horizon = U._empirical_horizon(
+            [1.0, -1.0, 2.0, -2.0],
+            calibration_source="post_selection_calibration",
+        )
+        self.assertIsNone(U._valid_saved_horizon({
+            **horizon,
+            "coverage_claim": "model_nominal",
+        }))
+        self.assertIsNone(U._valid_saved_horizon({
+            **horizon,
+            "bias_diagnostic_source": "",
+        }))
 
     @profile("fast")
     def test_nonpositive_steps_is_rejected(self):

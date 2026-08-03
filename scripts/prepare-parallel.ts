@@ -20,10 +20,16 @@ interface TableRow extends RowDataPacket {
   table_name: string;
 }
 
+interface ColumnRow extends RowDataPacket {
+  table_name: string;
+  column_name: string;
+}
+
 const REQUIRED_TABLES = [
   "users",
   "classes",
   "enrollments",
+  "class_assistants",
   "grade_weights",
   "question_bank",
   "experiment_manuals",
@@ -33,7 +39,246 @@ const REQUIRED_TABLES = [
   "experiment_grade",
   "experiment_step_events",
   "experiment_reports",
+  "model_guided_training_sessions",
+  "model_guided_training_step_attempts",
+  "model_training_runs",
+  "model_training_run_dependencies",
+  "model_production_preparation_sessions",
+  "model_production_preparation_step_attempts",
 ] as const;
+type RequiredTableName = (typeof REQUIRED_TABLES)[number];
+
+const REQUIRED_COLUMNS = {
+  users: ["user_id", "username", "full_name"],
+  classes: ["class_id"],
+  enrollments: ["student_id", "class_id"],
+  class_assistants: ["assistant_id", "class_id"],
+  grade_weights: ["class_id"],
+  question_bank: ["question_id"],
+  experiment_manuals: [
+    "manual_id",
+    "file_name",
+    "file_path",
+    "description",
+    "is_active",
+    "uploader_id",
+  ],
+  datasets: ["dataset_id", "data_name", "file_path", "description"],
+  dataset_segments: [
+    "dataset_id",
+    "industry_name",
+    "company_name",
+    "product_name",
+    "file_path",
+  ],
+  experiment_status: [
+    "experiment_id",
+    "student_id",
+    "status",
+    "highest_completed_step",
+    "current_step",
+    "state_version",
+    "total_active_duration_seconds",
+    "selected_industry",
+    "selected_company",
+    "selected_product",
+    "selected_base_models",
+    "selected_ensemble_models",
+    "data_window_train_start_index",
+    "data_window_train_end_index",
+    "data_window_evaluate_start_index",
+    "data_window_evaluate_end_index",
+    "moving_average_completed",
+    "moving_average_window",
+    "moving_average_metrics_rmse",
+    "moving_average_metrics_mae",
+    "moving_average_metrics_r2",
+    "exponential_smoothing_completed",
+    "exponential_smoothing_alpha",
+    "exponential_smoothing_metrics_rmse",
+    "exponential_smoothing_metrics_mae",
+    "exponential_smoothing_metrics_r2",
+    "arima_completed",
+    "arima_p",
+    "arima_d",
+    "arima_q",
+    "arima_metrics_rmse",
+    "arima_metrics_mae",
+    "arima_metrics_r2",
+    "arima_adf_stationarity",
+    "lstm_completed",
+    "lstm_normalization",
+    "lstm_features",
+    "lstm_target_field",
+    "lstm_metrics_rmse",
+    "lstm_metrics_mae",
+    "lstm_metrics_r2",
+    "ensemble_weighted_completed",
+    "ensemble_weighted_base_models",
+    "ensemble_weighted_metrics_rmse",
+    "ensemble_weighted_metrics_mae",
+    "ensemble_weighted_metrics_r2",
+    "ensemble_boosting_completed",
+    "ensemble_boosting_base_models",
+    "ensemble_boosting_metrics_rmse",
+    "ensemble_boosting_metrics_mae",
+    "ensemble_boosting_metrics_r2",
+    "ensemble_stacking_completed",
+    "ensemble_stacking_base_models",
+    "ensemble_stacking_metrics_rmse",
+    "ensemble_stacking_metrics_mae",
+    "ensemble_stacking_metrics_r2",
+    "selected_best_model",
+    "quiz_about_model_completed",
+    "quiz_about_plan_completed",
+    "production_plan_completed",
+    "production_forecast_periods",
+    "production_initial_inventory",
+    "production_target_service_level",
+    "production_safety_stock_z_score",
+    "production_forecast_results",
+    "production_forecast_evidence",
+    "production_mps_table",
+    "production_capacity_mode",
+    "production_capacity_scenario",
+    "production_capacity",
+    "production_custom_capacity",
+    "start_time",
+    "last_activity_at",
+  ],
+  experiment_grade: [
+    "experiment_id",
+    "student_id",
+    "exp_flow_demand_data_preparation",
+    "exp_flow_demand_descriptive_stats",
+    "exp_flow_demand_model_selection",
+    "exp_flow_demand_generate_results",
+    "exp_flow_production_inventory_calc",
+    "exp_flow_production_service_level",
+    "exp_flow_production_variable_calc",
+    "exp_flow_production_plan_creation",
+    "knowledge_test",
+    "model_quality",
+  ],
+  experiment_step_events: [
+    "experiment_id",
+    "student_id",
+    "step_order",
+    "event_type",
+    "event_timestamp",
+  ],
+  experiment_reports: ["experiment_id", "pdf_file_path"],
+  model_guided_training_sessions: [
+    "session_id",
+    "experiment_id",
+    "student_id",
+    "model_type",
+    "request_hash",
+    "dataset_revision",
+    "runtime_revision",
+    "request_payload",
+    "status",
+    "current_step_id",
+    "completed_step_ids",
+    "step_outputs",
+    "step_plan",
+    "result_payload",
+    "artifact_dir",
+    "protocol_version",
+    "committed_state_path",
+    "committed_state_sha256",
+    "active_attempt_id",
+    "error_message",
+    "superseded_reason",
+    "experiment_state_version",
+    "expires_at",
+  ],
+  model_guided_training_step_attempts: [
+    "attempt_id",
+    "session_id",
+    "step_id",
+    "status",
+    "input_state_path",
+    "input_state_sha256",
+    "candidate_state_path",
+    "candidate_state_sha256",
+    "receipt_path",
+    "output_payload",
+    "final_result_payload",
+    "error_message",
+    "run_count",
+    "lease_expires_at",
+  ],
+  model_training_runs: [
+    "run_id",
+    "session_id",
+    "experiment_id",
+    "student_id",
+    "model_type",
+    "request_hash",
+    "dataset_revision",
+    "runtime_revision",
+    "parameters",
+    "metrics",
+    "artifact_path",
+    "artifact_sha256",
+    "production_artifact_path",
+    "production_artifact_sha256",
+    "production_artifact_forecast_steps",
+    "production_revision",
+    "is_active",
+  ],
+  model_training_run_dependencies: [
+    "run_id",
+    "base_model_type",
+    "base_run_id",
+  ],
+  model_production_preparation_sessions: [
+    "session_id",
+    "experiment_id",
+    "student_id",
+    "run_id",
+    "model_type",
+    "request_hash",
+    "dataset_revision",
+    "runtime_revision",
+    "forecast_steps",
+    "status",
+    "current_step_id",
+    "completed_step_ids",
+    "step_plan",
+    "artifact_dir",
+    "candidate_model_path",
+    "protocol_version",
+    "committed_state_path",
+    "committed_state_sha256",
+    "active_attempt_id",
+    "observed_production_revision",
+    "production_revision",
+    "error_message",
+    "superseded_reason",
+    "expires_at",
+  ],
+  model_production_preparation_step_attempts: [
+    "attempt_id",
+    "session_id",
+    "step_id",
+    "status",
+    "input_state_path",
+    "input_state_sha256",
+    "candidate_state_path",
+    "candidate_state_sha256",
+    "receipt_path",
+    "output_payload",
+    "error_message",
+    "lease_expires_at",
+  ],
+} as const satisfies Record<RequiredTableName, readonly string[]>;
+
+const REQUIRED_COLUMN_COUNT = REQUIRED_TABLES.reduce(
+  (count, tableName) => count + REQUIRED_COLUMNS[tableName].length,
+  0,
+);
 const MIN_QUESTION_BANK_COUNT = 16;
 
 function hasForceFlag() {
@@ -109,6 +354,47 @@ async function hasParallelBaseReady() {
       );
       return false;
     }
+
+    const [columnRows] = await connection.query<ColumnRow[]>(
+      `SELECT table_name, column_name
+         FROM information_schema.columns
+        WHERE table_schema = DATABASE()
+          AND table_name IN (${REQUIRED_TABLES.map(() => "?").join(", ")})`,
+      [...REQUIRED_TABLES],
+    );
+    const existingColumns = new Set(
+      columnRows.map((row) => `${row.table_name}\0${row.column_name}`),
+    );
+    const missingColumnsByTable = new Map<RequiredTableName, string[]>();
+    for (const tableName of REQUIRED_TABLES) {
+      const missingColumns = REQUIRED_COLUMNS[tableName].filter(
+        (columnName) =>
+          !existingColumns.has(`${tableName}\0${columnName}`),
+      );
+      if (missingColumns.length > 0) {
+        missingColumnsByTable.set(tableName, [...missingColumns]);
+      }
+    }
+
+    if (missingColumnsByTable.size > 0) {
+      const missingColumnCount = [...missingColumnsByTable.values()].reduce(
+        (count, columns) => count + columns.length,
+        0,
+      );
+      console.log(
+        `[parallel-prepare] missing required columns (${missingColumnCount}):`,
+      );
+      for (const tableName of REQUIRED_TABLES) {
+        const missingColumns = missingColumnsByTable.get(tableName);
+        if (missingColumns) {
+          console.log(`  - ${tableName}: ${missingColumns.join(", ")}`);
+        }
+      }
+      return false;
+    }
+    console.log(
+      `[parallel-prepare] schema ready: ${REQUIRED_TABLES.length} tables, ${REQUIRED_COLUMN_COUNT} required columns`,
+    );
 
     const [userRows] = await connection.query<CountRow[]>(
       `SELECT COUNT(*) AS count

@@ -16,6 +16,7 @@ import {
   runGuidedTrainingStep,
   runProductionPreparationStep,
   predictExperimentModel,
+  getExperimentModelObservability,
   ModelValidationError,
   ModelNotFoundError,
   ModelAccessError,
@@ -59,6 +60,27 @@ const buildOperationDeadlinePayload = (
   timeout_ms: error.timeoutMs,
   retryable: error.retryable,
 });
+
+modelsController.get(
+  "/api/v1/models/experiments/:experimentId/observability",
+  jwtAuth,
+  requireStudent,
+  async (c) => {
+    const experimentId = Number(c.req.param("experimentId"));
+    if (!Number.isSafeInteger(experimentId) || experimentId <= 0) {
+      return c.json({ error: "实验 ID 无效" }, 400);
+    }
+    const payload = c.get("jwtPayload") as JwtPayload;
+    try {
+      return c.json(await getExperimentModelObservability(experimentId, payload.sub));
+    } catch (error: unknown) {
+      if (error instanceof ModelAccessError) {
+        return c.json({ error: error.message }, error.status);
+      }
+      return handleUnexpectedError(c, error, "读取模型可观测元数据失败");
+    }
+  },
+);
 
 modelsController.post(
   "/api/v1/models/:model_type/guided-training/sessions",

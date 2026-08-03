@@ -6,7 +6,10 @@ import type {
   RowDataPacket,
 } from "mysql2/promise";
 import { TIMEOUTS } from "../../utils/constants";
-import { ModelServiceUnavailableError } from "./model-errors";
+import {
+  ModelCommitOutcomeUnknownError,
+  ModelServiceUnavailableError,
+} from "./model-errors";
 
 /**
  * mysql2 has no default per-query or connection-acquire timeout. Model
@@ -159,4 +162,38 @@ export async function acquireConnectionWithTimeout(
     );
   });
   return wrapConnectionQueries(connection, queryTimeoutMs);
+}
+
+/**
+ * Bounds COMMIT and fails closed when its acknowledgement is lost. A COMMIT
+ * error cannot prove whether the server committed, so the dedicated connection
+ * is destroyed and must not be rolled back or returned to the pool.
+ */
+export async function commitConnectionWithOutcomeGuard(
+  connection: PoolConnection,
+  timeoutMs: number = TIMEOUTS.MODEL_DB_QUERY,
+): Promise<void> {
+  let destroyed = false;
+  const destroy = () => {
+    if (destroyed) return;
+    destroyed = true;
+    try {
+      connection.destroy();
+    } catch {
+      // The connection may already have been torn down by mysql2.
+    }
+  };
+  try {
+    const commitWork = connection.commit();
+    await raceWithTimeout(
+      commitWork,
+      timeoutMs,
+      () => new ModelCommitOutcomeUnknownError(),
+      destroy,
+    );
+  } catch (error) {
+    destroy();
+    if (error instanceof ModelCommitOutcomeUnknownError) throw error;
+    throw new ModelCommitOutcomeUnknownError(undefined, error);
+  }
 }

@@ -27,10 +27,10 @@ METHOD_NAME = "一次指数平滑"
 FORECAST_STRATEGY = "flat_simple_exponential_smoothing"
 IMPLEMENTATION_NOTES = [
     "本系统实现教科书中的一次指数平滑，平滑系数 alpha 满足 0 < alpha <= 1。",
-    "alpha 由用户指定且不会被优化；初始水平 l0 在固定 alpha 下通过最小化训练期一步预测 SSE 自动估计。",
+    "alpha 由用户指定且不会被优化；初始水平 l0 在固定 alpha 下通过最小化训练期一步预测 SSE 自动估计。结果同时展示所选 alpha 与两个参考 alpha 在训练尾部时间留出段上的误差，仅用于教学比较，不会替学生改选参数。",
     "一次指数平滑的多步未来销量预测为水平外推；趋势和季节性需要 Holt 或 Holt-Winters 扩展，本系统未在该模型中启用。",
     "在非负销量输入下，一次指数平滑的凸递推通常自然非负；本系统仍将最终销量点预测按 max(0, y_hat) 截断，并用截断后的值计算残差与指标。该后处理不属于教科书 SES 递推式。",
-    "std_dev 使用 ETS(A,N,N) 的逐步预测方差 sigma²[1+alpha²(h-1)]；sigma 来自训练期一步预测残差。95% 区间和生产用 99% 上侧误差则由带相同步长增长因子的 actual-prediction 经验残差分位数给出，样本不足时明确标记正态近似回退。",
+    "std_dev 使用 ETS(A,N,N) 的逐步预测方差 sigma²[1+alpha²(h-1)]；sigma 来自训练期一步预测残差。2.5%–97.5% 经验残差分位范围和生产用 99% 上侧压力偏移由带相同步长增长因子的 actual-prediction 经验残差分位数给出；该范围不声明 95% 覆盖保证，样本不足时明确标记正态近似回退。",
 ]
 
 # Type alias for input flexibility
@@ -122,6 +122,67 @@ def _training_residual_scale(model: Any, y_train: ArrayLike) -> float:
     if finite.size > 1:
         return float(np.std(finite, ddof=1))
     return _reference_scale(values)
+
+
+def build_alpha_comparison(
+    y_train: ArrayLike,
+    selected_alpha: float,
+) -> Dict[str, Any]:
+    """Compare three fixed alpha choices on a chronological training-tail holdout."""
+    values = np.asarray(y_train, dtype=float)
+    if values.size < 6:
+        return {
+            "scope": "unavailable_short_training_history",
+            "selected_alpha": float(selected_alpha),
+            "validation_count": 0,
+            "candidates": [],
+        }
+
+    validation_count = max(2, min(6, int(values.size // 4)))
+    fit_values = values[:-validation_count]
+    validation_values = values[-validation_count:]
+    selected_alpha = float(selected_alpha)
+    reference_alphas = (0.2, 0.5, 0.8)
+    matched_reference = next(
+        (
+            reference
+            for reference in reference_alphas
+            if np.isclose(selected_alpha, reference)
+        ),
+        None,
+    )
+    if matched_reference is None:
+        candidates = sorted([0.2, selected_alpha, 0.8])
+    else:
+        candidates = sorted([
+            selected_alpha if reference == matched_reference else reference
+            for reference in reference_alphas
+        ])
+    selected_index = candidates.index(selected_alpha)
+
+    rows = []
+    for index, candidate in enumerate(candidates):
+        candidate_model = _fit_textbook_ses(fit_values, candidate)
+        predictions = apply_prediction_domain(
+            candidate_model.forecast(validation_count),
+            DEMAND_PREDICTION_DOMAIN,
+        )
+        rows.append({
+            "alpha": float(candidate),
+            "selected": index == selected_index,
+            "rmse": rmse(validation_values, predictions),
+            "mae": mae(validation_values, predictions),
+        })
+    best = min(rows, key=lambda row: row["rmse"])
+    return {
+        "scope": "training_tail_chronological_holdout",
+        "selected_alpha": float(selected_alpha),
+        "fit_count": int(fit_values.size),
+        "validation_count": int(validation_count),
+        "candidates": rows,
+        "best_alpha_by_rmse": float(best["alpha"]),
+        "selection_policy": "diagnostic_only_user_choice_preserved",
+    }
 
 
 def train_and_evaluate(
@@ -404,6 +465,10 @@ def run(args) -> None:
             "eval_y_true": y_true,
             "predictions": predictions_with_std,
             "initial_level": float(model.params["initial_level"]),
+            "alpha_comparison": build_alpha_comparison(
+                np.asarray(y)[range(ts, te + 1)],
+                alpha,
+            ),
             "uncertainty_summary": uncertainty_summary,
         }
         attach_method_metadata(out, METHOD_NAME, FORECAST_STRATEGY, IMPLEMENTATION_NOTES)

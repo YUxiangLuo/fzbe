@@ -3,6 +3,7 @@ import {
   registerSchema,
   createTeacherSchema,
   createAssistantSingleSchema,
+  createAssistantSchema,
   updateUserSchema,
   changePasswordSchema,
   studentSelfRegisterSchema,
@@ -173,6 +174,50 @@ describe("User Schemas", () => {
       });
       expect(result.success).toBe(false);
     });
+
+    test("should normalize an optional blank phone instead of persisting whitespace", () => {
+      const result = createTeacherSchema.safeParse({
+        username: "prof_blank",
+        full_name: "Professor Blank",
+        phone: "   ",
+      });
+
+      expect(result.success).toBe(true);
+      if (result.success) expect(result.data.phone).toBeUndefined();
+    });
+  });
+
+  describe("createAssistantSchema", () => {
+    test("should trim valid phone numbers and normalize blanks to undefined", () => {
+      const base = {
+        username: "assistant01",
+        password: "password123",
+        full_name: "Assistant",
+        email: "assistant01@example.com",
+        class_ids: [1],
+      };
+
+      const trimmed = createAssistantSchema.safeParse({ ...base, phone_number: " 13800138000 " });
+      const blank = createAssistantSchema.safeParse({ ...base, phone_number: "   " });
+
+      expect(trimmed.success).toBe(true);
+      if (trimmed.success) expect(trimmed.data.phone_number).toBe("13800138000");
+      expect(blank.success).toBe(true);
+      if (blank.success) expect(blank.data.phone_number).toBeUndefined();
+    });
+
+    test("should reject non-numeric phone numbers", () => {
+      const result = createAssistantSchema.safeParse({
+        username: "assistant01",
+        password: "password123",
+        full_name: "Assistant",
+        email: "assistant01@example.com",
+        phone_number: "not-a-phone",
+        class_ids: [1],
+      });
+
+      expect(result.success).toBe(false);
+    });
   });
 
   describe("updateUserSchema", () => {
@@ -198,6 +243,20 @@ describe("User Schemas", () => {
         phone_number: "13800138000",
       });
       expect(result.success).toBe(true);
+    });
+
+    test("should turn a blank phone into an explicit clear operation", () => {
+      const result = updateUserSchema.safeParse({ phone_number: "   " });
+
+      expect(result.success).toBe(true);
+      if (result.success) expect(result.data.phone_number).toBeNull();
+    });
+
+    test("should accept null to clear a phone number", () => {
+      const result = updateUserSchema.safeParse({ phone_number: null });
+
+      expect(result.success).toBe(true);
+      if (result.success) expect(result.data.phone_number).toBeNull();
     });
   });
 

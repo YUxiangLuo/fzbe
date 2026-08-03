@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import path from "node:path";
+import { buildDatabasePoolOptions } from "../../../src/config/database-options";
 
 const projectRoot = path.resolve(import.meta.dir, "../../..");
 const CONFIG_ENV_NAMES = [
@@ -99,6 +100,26 @@ async function loadDatabaseOptionsSnapshot(
 }
 
 describe("database pool options", () => {
+  test("builds every database option from the supplied environment source", () => {
+    const options = buildDatabasePoolOptions({
+      DB_HOST: "e2e-db.internal",
+      DB_PORT: "4406",
+      DB_USER: "e2e-user",
+      DB_PASSWORD: "e2e-password",
+      DB_DATABASE: "fz_e2e_isolated",
+      DB_QUEUE_LIMIT: "7",
+    });
+
+    expect(options).toMatchObject({
+      host: "e2e-db.internal",
+      port: 4406,
+      user: "e2e-user",
+      password: "e2e-password",
+      database: "fz_e2e_isolated",
+      queueLimit: 7,
+    });
+  });
+
   test("defaults to bounded queueing without TLS when no production overrides are set", async () => {
     const options = await loadDatabaseOptionsSnapshot();
 

@@ -13,6 +13,7 @@ PY_ROOT = Path(__file__).resolve().parents[1]
 RUN_MODEL = PY_ROOT / "run_model.py"
 CSV_FIXTURE = Path(__file__).resolve().parent / "fixtures" / "core_models_smoke.csv"
 BASE_MODELS = ["ma", "es", "arima"]
+EXPECTED_POST_LINE_SEARCH_SHRINKAGE = {"enabled": False, "factor": 1.0}
 BASE_MODEL_TRAIN_ARGS = {
     "ma": ("--window", "3"),
     "es": ("--alpha", "0.4"),
@@ -119,7 +120,16 @@ def iter_stage_models(state: dict):
 
 
 def combine_stage_predictions(state: dict, forecast_steps: int) -> list[float]:
-    combined: list[float] | None = None
+    baseline = state["baseline"]
+    if baseline["kind"] == "mean":
+        combined = [float(baseline["training_mean"])] * forecast_steps
+    elif baseline["kind"] == "naive":
+        combined = [float(baseline["last_value"])] * forecast_steps
+    elif baseline["kind"] == "seasonal_naive":
+        tail = [float(value) for value in baseline["seasonal_tail"]]
+        combined = [tail[index % len(tail)] for index in range(forecast_steps)]
+    else:
+        raise AssertionError(f"unknown boosting baseline: {baseline}")
     for _stage_idx, model_name, coefficient, model_state in iter_stage_models(state):
         stage_predictions = extract_predictions(
             invoke_model(
@@ -133,14 +143,9 @@ def combine_stage_predictions(state: dict, forecast_steps: int) -> list[float]:
             )
         )
         weighted_predictions = [coefficient * prediction for prediction in stage_predictions]
-        if combined is None:
-            combined = weighted_predictions
-        else:
-            combined = [left + right for left, right in zip(combined, weighted_predictions)]
+        combined = [left + right for left, right in zip(combined, weighted_predictions)]
 
-    if combined is None:
-        raise AssertionError("boosting state produced no stages")
-    return combined
+    return [max(0.0, value) for value in combined]
 
 
 def main() -> None:
@@ -216,6 +221,15 @@ def main() -> None:
         assert train_output["metrics"]["evaluate_months"] == timestamps[20:24]
         assert train_output["eval_y_true"] == sales[20:24]
         assert train_output["search_summary"]["algorithm"] == "residual_boosting"
+        assert train_output["post_line_search_shrinkage"] == (
+            EXPECTED_POST_LINE_SEARCH_SHRINKAGE
+        )
+        assert train_output["search_summary"]["post_line_search_shrinkage"] == (
+            EXPECTED_POST_LINE_SEARCH_SHRINKAGE
+        )
+        assert train_state["post_line_search_shrinkage"] == (
+            EXPECTED_POST_LINE_SEARCH_SHRINKAGE
+        )
         assert len(train_output["model_chain"]) >= 1
         assert len(train_output["model_chain"]) == len(train_output["stage_coefficients"])
         assert all(
@@ -229,17 +243,6 @@ def main() -> None:
         assert first_stage_idx == 0
         assert math.isfinite(first_stage_coefficient) and first_stage_coefficient > 0.0
         assert Path(first_stage_model_state["model_file"]).exists()
-        original_base_predictions = extract_predictions(
-            invoke_model(
-                first_stage_model_name,
-                None,
-                "--load-model",
-                str(base_model_paths[first_stage_model_name]),
-                "--forecast-steps",
-                "4",
-                "--pretty",
-            )
-        )
         first_stage_saved_predictions = extract_predictions(
             invoke_model(
                 first_stage_model_name,
@@ -251,7 +254,7 @@ def main() -> None:
                 "--pretty",
             )
         )
-        assert_series_close(first_stage_saved_predictions, original_base_predictions)
+        assert_all_finite(first_stage_saved_predictions, "first_stage_saved_predictions")
 
         boosting_model_production = temp_path / "boosting-production.pkl"
         fit_output = invoke_model(
@@ -270,12 +273,18 @@ def main() -> None:
         )
         assert fit_output["mode"] == "boosting_fit_only"
         assert_method_metadata(fit_output, "boosting")
+        assert fit_output["post_line_search_shrinkage"] == (
+            EXPECTED_POST_LINE_SEARCH_SHRINKAGE
+        )
         assert fit_output["model_chain"] == train_output["model_chain"]
         assert fit_output["saved_model"] == str(boosting_model_production)
 
         production_state = load_pickled_state(boosting_model_production)
         assert production_state["model_chain"] == train_state["model_chain"]
         assert production_state["stage_coefficients"] == train_state["stage_coefficients"]
+        assert production_state["post_line_search_shrinkage"] == (
+            EXPECTED_POST_LINE_SEARCH_SHRINKAGE
+        )
         expected_future_predictions = combine_stage_predictions(production_state, forecast_steps=future_steps)
 
         predict_output_one = invoke_model(
@@ -303,6 +312,12 @@ def main() -> None:
         future_std_devs_two = extract_std_devs(predict_output_two)
         assert predict_output_one["mode"] == "boosting_loaded_predict"
         assert_method_metadata(predict_output_one, "boosting")
+        assert predict_output_one["post_line_search_shrinkage"] == (
+            EXPECTED_POST_LINE_SEARCH_SHRINKAGE
+        )
+        assert predict_output_two["post_line_search_shrinkage"] == (
+            EXPECTED_POST_LINE_SEARCH_SHRINKAGE
+        )
         assert predict_output_one["forecast_steps"] == future_steps
         assert_series_close(future_predictions_one, expected_future_predictions)
         assert_series_close(future_predictions_one, future_predictions_two)

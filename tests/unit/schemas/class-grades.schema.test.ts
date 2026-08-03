@@ -7,6 +7,8 @@ import {
   EXP_FLOW_FIELDS,
 } from "../../../src/modules/class-grades/class-grades.schema";
 
+const VALID_REVIEW_REVISION = "a".repeat(64);
+
 describe("Class Grades Schemas", () => {
   describe("classIdParamSchema", () => {
     test("should accept valid numeric string", () => {
@@ -33,49 +35,123 @@ describe("Class Grades Schemas", () => {
   });
 
   describe("gradeReportSchema", () => {
-    test("should accept grade only", () => {
-      const result = gradeReportSchema.safeParse({ grade: 85 });
+    test("should require the report status observed by the reviewer", () => {
+      expect(gradeReportSchema.safeParse({
+        expected_review_revision: VALID_REVIEW_REVISION,
+        grade: 85,
+      }).success).toBe(false);
+      expect(gradeReportSchema.safeParse({
+        expected_status: "submitted",
+        expected_review_revision: VALID_REVIEW_REVISION,
+      }).success).toBe(false);
+    });
+
+    test("should require a valid review revision", () => {
+      expect(gradeReportSchema.safeParse({
+        expected_status: "submitted",
+        grade: 85,
+      }).success).toBe(false);
+      expect(gradeReportSchema.safeParse({
+        expected_status: "submitted",
+        expected_review_revision: "not-a-revision",
+        grade: 85,
+      }).success).toBe(false);
+    });
+
+    test("should accept grade only after identifying the observed status", () => {
+      const result = gradeReportSchema.safeParse({
+        expected_status: "submitted",
+        expected_review_revision: VALID_REVIEW_REVISION,
+        grade: 85,
+      });
       expect(result.success).toBe(true);
     });
 
     test("should accept feedback only", () => {
-      const result = gradeReportSchema.safeParse({ feedback: "Good work!" });
+      const result = gradeReportSchema.safeParse({
+        expected_status: "submitted",
+        expected_review_revision: VALID_REVIEW_REVISION,
+        feedback: "Good work!",
+      });
       expect(result.success).toBe(true);
     });
 
     test("should reject graded status without score", () => {
-      const result = gradeReportSchema.safeParse({ status: "graded" });
+      const result = gradeReportSchema.safeParse({
+        expected_status: "submitted",
+        expected_review_revision: VALID_REVIEW_REVISION,
+        status: "graded",
+      });
       expect(result.success).toBe(false);
     });
 
-    test("should accept rejected status", () => {
-      const result = gradeReportSchema.safeParse({ status: "rejected" });
-      expect(result.success).toBe(true);
+    test("should reject rejected status without a reason", () => {
+      const result = gradeReportSchema.safeParse({
+        expected_status: "submitted",
+        expected_review_revision: VALID_REVIEW_REVISION,
+        status: "rejected",
+      });
+      expect(result.success).toBe(false);
     });
 
     test("should reject invalid status", () => {
-      const result = gradeReportSchema.safeParse({ status: "pending" });
+      const result = gradeReportSchema.safeParse({
+        expected_status: "submitted",
+        expected_review_revision: VALID_REVIEW_REVISION,
+        status: "pending",
+      });
+      expect(result.success).toBe(false);
+    });
+
+    test("should reject an invalid expected status", () => {
+      const result = gradeReportSchema.safeParse({
+        expected_status: "rejected",
+        expected_review_revision: VALID_REVIEW_REVISION,
+        feedback: "No mutation is allowed from a rejected report",
+      });
       expect(result.success).toBe(false);
     });
 
     test("should reject grade below 0", () => {
-      const result = gradeReportSchema.safeParse({ grade: -1 });
+      const result = gradeReportSchema.safeParse({
+        expected_status: "submitted",
+        expected_review_revision: VALID_REVIEW_REVISION,
+        grade: -1,
+      });
       expect(result.success).toBe(false);
     });
 
     test("should reject grade above 100", () => {
-      const result = gradeReportSchema.safeParse({ grade: 101 });
+      const result = gradeReportSchema.safeParse({
+        expected_status: "submitted",
+        expected_review_revision: VALID_REVIEW_REVISION,
+        grade: 101,
+      });
       expect(result.success).toBe(false);
     });
 
-    test("should accept experiment_grade fields", () => {
+    test("should keep the report grade non-nullable", () => {
       const result = gradeReportSchema.safeParse({
+        expected_status: "graded",
+        expected_review_revision: VALID_REVIEW_REVISION,
+        grade: null,
+      });
+      expect(result.success).toBe(false);
+    });
+
+    test("should accept numeric and null experiment_grade fields", () => {
+      const result = gradeReportSchema.safeParse({
+        expected_status: "graded",
+        expected_review_revision: VALID_REVIEW_REVISION,
         experiment_grade: {
           exp_flow_demand_data_preparation: 90,
-          model_quality: 85,
+          model_quality: null,
         },
       });
       expect(result.success).toBe(true);
+      if (result.success) {
+        expect(result.data.experiment_grade?.model_quality).toBeNull();
+      }
     });
 
     test("should reject empty object", () => {
@@ -85,6 +161,8 @@ describe("Class Grades Schemas", () => {
 
     test("should accept combined fields", () => {
       const result = gradeReportSchema.safeParse({
+        expected_status: "submitted",
+        expected_review_revision: VALID_REVIEW_REVISION,
         grade: 88,
         feedback: "Excellent analysis",
         status: "graded",
@@ -94,6 +172,8 @@ describe("Class Grades Schemas", () => {
 
     test("should trim empty feedback to null", () => {
       const result = gradeReportSchema.safeParse({
+        expected_status: "graded",
+        expected_review_revision: VALID_REVIEW_REVISION,
         grade: 80,
         feedback: "   ",
       });
@@ -105,6 +185,8 @@ describe("Class Grades Schemas", () => {
 
     test("should reject graded status without report grade", () => {
       const result = gradeReportSchema.safeParse({
+        expected_status: "submitted",
+        expected_review_revision: VALID_REVIEW_REVISION,
         status: "graded",
         feedback: "Only feedback",
         experiment_grade: {
@@ -116,10 +198,50 @@ describe("Class Grades Schemas", () => {
 
     test("should accept rejected status without report grade", () => {
       const result = gradeReportSchema.safeParse({
+        expected_status: "submitted",
+        expected_review_revision: VALID_REVIEW_REVISION,
         status: "rejected",
         feedback: "Need revision",
       });
       expect(result.success).toBe(true);
+    });
+
+    test("should reject a rejection claiming it was opened from graded", () => {
+      const result = gradeReportSchema.safeParse({
+        expected_status: "graded",
+        expected_review_revision: VALID_REVIEW_REVISION,
+        status: "rejected",
+        feedback: "A graded report cannot be rejected through this API",
+      });
+      expect(result.success).toBe(false);
+    });
+
+    test("should reject blank rejection reasons after trimming", () => {
+      const result = gradeReportSchema.safeParse({
+        expected_status: "submitted",
+        expected_review_revision: VALID_REVIEW_REVISION,
+        status: "rejected",
+        feedback: "   ",
+      });
+      expect(result.success).toBe(false);
+    });
+
+    test("should reject scores mixed into a rejection command", () => {
+      expect(gradeReportSchema.safeParse({
+        expected_status: "submitted",
+        expected_review_revision: VALID_REVIEW_REVISION,
+        status: "rejected",
+        feedback: "Need revision",
+        grade: 0,
+      }).success).toBe(false);
+
+      expect(gradeReportSchema.safeParse({
+        expected_status: "submitted",
+        expected_review_revision: VALID_REVIEW_REVISION,
+        status: "rejected",
+        feedback: "Need revision",
+        experiment_grade: { model_quality: null },
+      }).success).toBe(false);
     });
   });
 

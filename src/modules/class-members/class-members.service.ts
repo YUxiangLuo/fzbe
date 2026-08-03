@@ -1,6 +1,7 @@
 import type { RowDataPacket, ResultSetHeader, Pool, PoolConnection } from "mysql2/promise";
-import { pool } from "../../config";
+import { env, pool } from "../../config";
 import { hashPassword } from "../../utils/password";
+import { databaseDatetimeToIsoString } from "../../utils/database-datetime";
 import type { CreateStudentInput } from "./class-members.schema";
 
 interface ClassRow extends RowDataPacket {
@@ -17,7 +18,7 @@ interface UserRow extends RowDataPacket {
   email: string;
   phone_number: string | null;
   role: string;
-  created_at: Date;
+  created_at: Date | string;
 }
 
 interface EnrollmentRow extends RowDataPacket {
@@ -30,6 +31,11 @@ interface AssignmentRow extends RowDataPacket {
 }
 
 type Queryable = Pool | PoolConnection;
+
+const normalizeUserRow = (row: UserRow) => ({
+  ...row,
+  created_at: databaseDatetimeToIsoString(row.created_at, env.DB_TIMEZONE),
+});
 
 async function isAssistantAssignedToClass(db: Queryable, classId: number, assistantId: number): Promise<boolean> {
   const [[assignment]] = await db.query<AssignmentRow[]>(
@@ -97,7 +103,7 @@ export async function createStudentInClass(classId: number, userId: number, user
     );
 
     await connection.commit();
-    return { data: studentRows[0]! };
+    return { data: normalizeUserRow(studentRows[0]!) };
   } catch (error: unknown) {
     await connection.rollback();
     const err = error as { code?: string; message?: string };
@@ -179,7 +185,7 @@ export async function getClassStudents(classId: number, userId: number, userRole
     "SELECT u.user_id, u.username, u.full_name, u.email, u.phone_number, u.role, u.created_at FROM users u JOIN enrollments e ON u.user_id = e.student_id WHERE e.class_id = ? ORDER BY u.username ASC",
     [classId],
   );
-  return { data: students };
+  return { data: students.map(normalizeUserRow) };
 }
 
 export async function removeStudentFromClass(classId: number, studentId: number, userId: number, userRole: string) {

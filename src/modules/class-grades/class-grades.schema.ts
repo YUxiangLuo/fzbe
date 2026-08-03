@@ -25,18 +25,19 @@ export const EXP_FLOW_FIELDS = [
 export const EXPERIMENT_GRADE_FIELDS = [...EXP_FLOW_FIELDS, "model_quality"] as const;
 export const EXPERIMENT_GRADE_MUTABLE_FIELDS = [...EXPERIMENT_GRADE_FIELDS] as const;
 
-const createOptionalGradeValue = () =>
-  z.number().min(0, { message: "分数必须在 0 到 100 之间" }).max(100, { message: "分数必须在 0 到 100 之间" }).optional();
+const createGradeValue = () =>
+  z.number().min(0, { message: "分数必须在 0 到 100 之间" }).max(100, { message: "分数必须在 0 到 100 之间" });
 
-const optionalGradeValue = createOptionalGradeValue();
+const optionalGradeValue = createGradeValue().optional();
+const createOptionalExperimentGradeValue = () => createGradeValue().nullable().optional();
 const optionalFeedbackValue = z.string().transform((value) => { const trimmed = value.trim(); return trimmed.length ? trimmed : null; }).optional();
 const createOptionalWeightValue = () =>
   z.number().min(0, { message: "权重必须在 0 到 100 之间" }).max(100, { message: "权重必须在 0 到 100 之间" }).optional();
 
 const experimentGradeFieldSchemas = EXPERIMENT_GRADE_MUTABLE_FIELDS.reduce((acc, field) => {
-  acc[field] = createOptionalGradeValue();
+  acc[field] = createOptionalExperimentGradeValue();
   return acc;
-}, {} as Record<(typeof EXPERIMENT_GRADE_MUTABLE_FIELDS)[number], ReturnType<typeof createOptionalGradeValue>>);
+}, {} as Record<(typeof EXPERIMENT_GRADE_MUTABLE_FIELDS)[number], ReturnType<typeof createOptionalExperimentGradeValue>>);
 
 const experimentGradeUpdateSchema = z.object(experimentGradeFieldSchemas).superRefine((data, ctx) => {
   const hasValue = EXPERIMENT_GRADE_MUTABLE_FIELDS.some((field) => data[field] !== undefined);
@@ -44,6 +45,10 @@ const experimentGradeUpdateSchema = z.object(experimentGradeFieldSchemas).superR
 }).optional();
 
 export const gradeReportSchema = z.object({
+  expected_status: z.enum(["submitted", "graded"]),
+  expected_review_revision: z.string().regex(/^[a-f0-9]{64}$/, {
+    message: "expected_review_revision 必须是有效的评阅版本令牌",
+  }),
   grade: optionalGradeValue,
   feedback: optionalFeedbackValue,
   status: z.enum(["graded", "rejected"]).optional(),
@@ -57,6 +62,36 @@ export const gradeReportSchema = z.object({
       path: ["grade"],
       message: "标记为已评分时必须填写报告得分",
     });
+  }
+  if (data.status === "rejected") {
+    if (data.expected_status !== "submitted") {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ["expected_status"],
+        message: "驳回报告时 expected_status 必须为 submitted",
+      });
+    }
+    if (data.feedback === undefined || data.feedback === null) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ["feedback"],
+        message: "驳回报告时必须填写驳回原因",
+      });
+    }
+    if (data.grade !== undefined) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ["grade"],
+        message: "驳回报告时不能提交报告得分",
+      });
+    }
+    if (data.experiment_grade !== undefined) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ["experiment_grade"],
+        message: "驳回报告时不能修改实验成绩",
+      });
+    }
   }
 });
 

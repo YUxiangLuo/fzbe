@@ -26,15 +26,15 @@ from dynamic_config import derive_arima_search_limit
 from uncertainty import NORMAL_95, NORMAL_99
 
 MODEL_TYPE = "arima"
-METHOD_NAME = "ARIMA 自动定阶"
+METHOD_NAME = "ARIMA 逐步搜索定阶"
 FORECAST_STRATEGY = "arima_multi_step_forecast"
 IMPLEMENTATION_NOTES = [
     "教科书 ARIMA 通常通过平稳性检验、ACF/PACF 和信息准则定阶。",
     "本系统由用户根据 ADF 结果指定差分阶数 d；模型固定为非季节 ARIMA，并执行一次以 AICc 为目标的 stepwise 搜索来选择 p、q 和是否包含截距。",
     "p/q 搜索上限按差分后的有效样本量自动收紧；少于 6 个有效样本时拒绝拟合，不用不可靠结果冒充完整 ARIMA。",
-    "选中模型必须收敛；首次搜索结果未收敛时按完整规格将最大迭代数加倍重拟合一次，并记录 Ljung-Box 白噪声诊断。",
+    "候选模型必须收敛；AICc 排名靠前的规格会先按完整规格将最大迭代数加倍重拟合一次，仍不收敛时依次尝试下一名有效候选，并记录候选回退和 Ljung-Box 白噪声诊断。",
     "预测未来销量时使用拟合后的 ARIMA 模型直接生成多步 forecast；原始点预测可能为负，本系统将用于残差、指标和输出的销量点预测按 max(0, y_hat) 截断。该约束是业务后处理，不属于教科书 ARIMA。",
-    "默认 95% 预测区间仍由未截断的 ARIMA 预测分布计算；std_dev 按该分布的精确 95% 正态临界值由区间宽度反推，生产用 99% 上侧误差也由同一未截断分布计算。区间本身不是截断正态区间。",
+    "默认 95% 预测区间仍由未截断的 ARIMA 预测分布计算；std_dev 按该分布的精确 95% 正态临界值由区间宽度反推，99% 上侧误差压力诊断也由同一未截断分布计算。该诊断不参与客户安全库存公式，区间本身也不是截断正态区间。",
 ]
 
 
@@ -87,10 +87,12 @@ def _format_predictions(
             "calibration_source": "arima_forecast_distribution",
             "calibration_mean_error": numeric_mean_error,
             "calibration_count": numeric_count,
+            "bias_diagnostic_source": "outer_selection_assessment" if numeric_count is not None else None,
             "interval_lower": lower,
             "interval_upper": upper,
             "interval_level": 0.95,
             "interval_kind": "model_prediction_interval",
+            "coverage_claim": "model_nominal",
             "upper_error_p99": max(
                 0.0,
                 raw_distribution_mean + NORMAL_99 * std_dev - numeric_prediction,
@@ -120,6 +122,8 @@ def _run_auto_arima_search(
     max_p: int,
     max_q: int,
     criterion: str = "aicc",
+    *,
+    return_valid_fits: bool = False,
 ) -> Any:
     if d < 0:
         raise ValueError(f"[VALIDATION] ARIMA d must be >= 0, got {d}")
@@ -141,6 +145,7 @@ def _run_auto_arima_search(
             with_intercept="auto",
             maxiter=50,
             trace=False,
+            return_valid_fits=return_valid_fits,
         )
     except Exception as exc:
         raise ValueError(
@@ -222,6 +227,94 @@ def _ensure_converged(model: Any, y_train: np.ndarray, context: str) -> Tuple[An
             f"[MODEL] {context} did not converge after retrying the selected ARIMA specification."
         )
     return retried, True
+
+
+def _select_converged_auto_arima(
+    y_train: np.ndarray,
+    d: int,
+    max_p: int,
+    max_q: int,
+    context: str,
+    criterion: str = "aicc",
+) -> Tuple[Any, bool, Dict[str, Any]]:
+    """Select the best converged candidate instead of failing on rank one.
+
+    ``pmdarima`` considers a fit valid when its information criterion is
+    finite, even when the underlying optimizer reports non-convergence.  Ask
+    for the full AICc-sorted candidate list, retry each candidate once using
+    the existing convergence policy, and fall through to the next candidate
+    when a higher-ranked specification still cannot converge.
+    """
+    raw_candidates = _run_auto_arima_search(
+        y_train=y_train,
+        d=d,
+        max_p=max_p,
+        max_q=max_q,
+        criterion=criterion,
+        return_valid_fits=True,
+    )
+    candidates = (
+        list(raw_candidates)
+        if isinstance(raw_candidates, (list, tuple))
+        else [raw_candidates]
+    )
+    if not candidates:
+        raise ValueError(
+            f"[MODEL] {context} did not produce any finite {criterion.upper()} candidates."
+        )
+
+    skipped: List[Dict[str, Any]] = []
+    convergence_retried = False
+    for rank, candidate in enumerate(candidates, start=1):
+        candidate_spec = _model_spec(candidate)
+        was_converged = _is_converged(candidate)
+        try:
+            selected, retried = _ensure_converged(
+                candidate,
+                y_train,
+                f"{context} candidate rank {rank}",
+            )
+        except ValueError:
+            convergence_retried = convergence_retried or not was_converged
+            skipped.append(
+                {
+                    "rank": rank,
+                    "order": candidate_spec["order"],
+                    "with_intercept": candidate_spec["with_intercept"],
+                    "reason": "did_not_converge_after_retry",
+                }
+            )
+            log.warning(
+                "%s skipped non-converged %s candidate rank %s with order=%s",
+                context,
+                criterion.upper(),
+                rank,
+                candidate_spec["order"],
+            )
+            continue
+
+        convergence_retried = convergence_retried or retried
+        summary = {
+            "candidate_count": len(candidates),
+            "selected_rank": rank,
+            "skipped_candidates": skipped,
+            "fallback_used": rank > 1,
+        }
+        if rank > 1:
+            log.warning(
+                "%s selected converged %s candidate rank %s after skipping %s "
+                "higher-ranked non-converged candidate(s)",
+                context,
+                criterion.upper(),
+                rank,
+                len(skipped),
+            )
+        return selected, convergence_retried, summary
+
+    raise ValueError(
+        f"[MODEL] {context} did not converge for any of the "
+        f"{len(candidates)} finite {criterion.upper()} candidates."
+    )
 
 
 def _residual_diagnostics(model: Any, effective_train_size: int) -> Dict[str, Any]:
@@ -356,17 +449,17 @@ def train_and_evaluate(
                        f"Model may have limited predictive power. Consider simpler models.")
 
     log.info(f"Running auto_arima with AICc criterion: searching p in [0, {max_p}], q in [0, {max_q}], d={d}")
-    best_model = _run_auto_arima_search(
+    (
+        best_model,
+        convergence_retried,
+        candidate_selection,
+    ) = _select_converged_auto_arima(
         y_train=y_train,
         d=d,
         max_p=max_p,
         max_q=max_q,
+        context="Selected ARIMA model",
         criterion="aicc",
-    )
-    best_model, convergence_retried = _ensure_converged(
-        best_model,
-        y_train,
-        "Selected ARIMA model",
     )
     log.debug(f"AICc-optimized model found: order={best_model.order}, spec={_model_spec(best_model)}")
 
@@ -397,6 +490,7 @@ def train_and_evaluate(
         "bic": float(best_model.bic()),
         "convergence_retried": convergence_retried,
         "convergence_boundary_case": not _is_converged(best_model),
+        "candidate_selection": candidate_selection,
         "diagnostics": diagnostics,
     }
 

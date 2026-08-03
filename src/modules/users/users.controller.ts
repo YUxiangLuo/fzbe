@@ -287,6 +287,9 @@ usersController.delete("/api/v1/users/:userId", jwtAuth, zValidator("param", use
     if ("error" in result) {
       if (result.error === "self_delete") return c.json({ error: "管理员不能删除自己" }, 400);
       if (result.error === "not_found") return c.json({ error: "用户不存在" }, 404);
+      if (result.error === "file_cleanup_failed") {
+        return c.json({ error: "报告文件无法安全清理，用户未删除" }, 500);
+      }
     }
     return c.json({ message: "用户删除成功", cleanup: result.cleanup });
   } catch (error) { return handleUnexpectedError(c, error, "删除用户失败"); }
@@ -301,6 +304,9 @@ usersController.delete("/api/v1/users", jwtAuth, zValidator("json", bulkDeleteUs
     if ("error" in result) {
       if (result.error === "self_delete") return c.json({ error: "批量删除中不能包含当前管理员账户" }, 400);
       if (result.error === "not_found") return c.json({ error: "部分用户不存在", missingUserIds: result.missingUserIds }, 404);
+      if (result.error === "file_cleanup_failed") {
+        return c.json({ error: "部分报告文件无法安全清理，用户均未删除" }, 500);
+      }
     }
     return c.json({ message: "批量删除用户成功", deletedCount: result.deletedCount, cleanup: result.cleanup });
   } catch (error) { return handleUnexpectedError(c, error, "批量删除用户失败"); }

@@ -371,7 +371,7 @@ def run_bad_numeric_feature_guards() -> None:
     invoke_lstm_expect_failure(
         missing_numeric_json,
         *common_args,
-        expected_message="[DATA] LSTM numeric columns contain missing, non-numeric, or non-finite values",
+        expected_message="[DATA] Feature column '价格指数' contains non-finite values.",
         label="missing numeric feature guard",
     )
 
@@ -400,7 +400,10 @@ def run_bad_numeric_feature_guards() -> None:
         ",".join(OVERRIDE_FEATURE_KEYS),
         "--feature-types",
         json.dumps(OVERRIDE_FEATURE_TYPES, ensure_ascii=False),
-        expected_message="[DATA] LSTM numeric columns contain missing, non-numeric, or non-finite values",
+        expected_message=(
+            "[DATA] LSTM numeric columns contain missing, non-numeric, or non-finite values: "
+            "numeric_signal(rows=4)"
+        ),
         label="bad numeric override guard",
     )
 

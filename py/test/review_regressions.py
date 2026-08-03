@@ -32,6 +32,7 @@ from ensemble_utils import (  # noqa: E402
     parse_base_model_files_arg,
     parse_base_model_names,
     plan_ensemble_internal_holdout,
+    plan_ensemble_selection_calibration_split,
     persist_member_model_artifact,
     require_explicit_lstm_feature_names,
     resolve_base_model_artifact_configs,
@@ -366,6 +367,39 @@ def assert_internal_split_boundaries() -> None:
     assert stacking_plan["validation_size"] == 4
     assert derive_boosting_max_rounds(2, boosting_plan["validation_size"]) == 3
 
+    weighted_three_way = plan_ensemble_selection_calibration_split(
+        parsed_data,
+        range(0, 20),
+        ["ma", "es"],
+        params,
+        "weighted",
+    )
+    assert weighted_three_way["prefix_size"] == 12
+    assert weighted_three_way["selection_size"] == 4
+    assert weighted_three_way["calibration_size"] == 4
+    assert (
+        weighted_three_way["prefix_size"]
+        + weighted_three_way["selection_size"]
+        == weighted_three_way["calibration_start_offset"]
+    )
+    assert weighted_three_way["calibration_available"] is True
+
+    weighted_without_calibration = plan_ensemble_selection_calibration_split(
+        parsed_data,
+        range(0, 8),
+        ["ma", "es"],
+        {"ma": {"window": 5}, "es": {"alpha": 0.3}},
+        "weighted",
+    )
+    assert weighted_without_calibration["prefix_size"] == 5
+    assert weighted_without_calibration["selection_size"] == 3
+    assert weighted_without_calibration["calibration_size"] == 0
+    assert weighted_without_calibration["calibration_available"] is False
+    assert (
+        weighted_without_calibration["calibration_strategy"]
+        == "fallback_no_post_selection_holdout"
+    )
+
     shrunken_stacking = plan_internal_holdout(
         "stacking",
         30,
@@ -644,6 +678,8 @@ def assert_horizon_aware_uncertainty_profiles() -> None:
     assert math.isclose(arima_points[0]["std_dev"], 8.0 / (2.0 * NORMAL_95))
     assert arima_points[0]["uncertainty_source"] == "model"
     assert arima_points[0]["calibration_source"] == "arima_forecast_distribution"
+    assert arima_points[0]["bias_diagnostic_source"] == "outer_selection_assessment"
+    assert arima_points[0]["coverage_claim"] == "model_nominal"
     assert arima_points[0]["interval_lower"] == -3.0
     assert arima_points[0]["interval_upper"] == 5.0
     assert arima_points[0]["interval_level"] == 0.95
@@ -1141,9 +1177,10 @@ def assert_boosting_requests_signed_base_outputs() -> None:
 def assert_boosting_keeps_signed_corrections_end_to_end() -> None:
     from data_utils import load_data_from_json
 
+    target_values = [0.0, 0.0, 0.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0]
     records = [
-        {"月份": f"2026-{index + 1:02d}", "销售数量": 1.0}
-        for index in range(10)
+        {"月份": f"2026-{index + 1:02d}", "销售数量": target}
+        for index, target in enumerate(target_values)
     ]
     parsed_data = load_data_from_json(json.dumps(records, ensure_ascii=False))
     training_calls = iter((
@@ -1151,6 +1188,8 @@ def assert_boosting_keeps_signed_corrections_end_to_end() -> None:
         ("candidate-r0-es.pkl", np.asarray([10.0, -10.0, 10.0]), [1.0, 1.1, 1.2]),
         ("candidate-r1-ma.pkl", np.asarray([-1.0, 1.0, 0.0]), [1.0, 1.1, 1.2]),
         ("candidate-r1-es.pkl", np.asarray([10.0, -10.0, 10.0]), [1.0, 1.1, 1.2]),
+        ("calibration-r0-ma.pkl", np.asarray([2.0, 1.0]), [1.0, 1.1]),
+        ("calibration-r1-ma.pkl", np.asarray([-1.0, 1.0]), [1.0, 1.1]),
         ("final-r0-ma.pkl", np.asarray([2.0, 1.0]), [1.0, 1.1]),
         ("final-r1-ma.pkl", np.asarray([-1.0, 1.0]), [1.0, 1.1]),
     ))
@@ -1164,7 +1203,11 @@ def assert_boosting_keeps_signed_corrections_end_to_end() -> None:
         _parsed_data: object,
         train_range: range,
     ) -> np.ndarray:
-        if "r1" in model_file:
+        if "calibration-r0" in model_file:
+            pattern = [-1.0, -1.0, 0.0, 1.0, 1.0, 0.0]
+        elif "calibration-r1" in model_file:
+            pattern = [0.0, 0.0, -1.0, 0.0, 0.0, 1.0]
+        elif "r1" in model_file:
             pattern = [-1.0, 1.0, 0.0]
         elif "es" in model_file:
             pattern = [10.0, -10.0, 10.0]
@@ -1201,9 +1244,9 @@ def assert_boosting_keeps_signed_corrections_end_to_end() -> None:
             max_rounds=2,
         )
 
-    assert model_chain == ["es", "ma"]
-    assert np.allclose(stage_coefficients, [0.6, 0.3])
-    assert np.allclose(y_pred, [0.9, 0.9])
+    assert model_chain == ["ma", "ma"]
+    assert np.allclose(stage_coefficients, [0.025, 0.0125])
+    assert np.allclose(y_pred, [0.6625, 0.6625])
     assert len(uncertainty_profile) == 2
 
     saved_state = {
@@ -1212,6 +1255,7 @@ def assert_boosting_keeps_signed_corrections_end_to_end() -> None:
         "model_chain": model_chain,
         "stage_coefficients": stage_coefficients,
         "base_model_states": base_model_states,
+        "baseline": training_details["baseline"],
         "uncertainty": training_details["uncertainty"],
         "algorithm_revision": MODEL_ALGORITHM_REVISION,
     }
@@ -1233,18 +1277,20 @@ def assert_boosting_keeps_signed_corrections_end_to_end() -> None:
         ):
             production_prediction, _profile, _summary = boosting.predict(artifact_path, 1)
 
-    assert np.allclose(production_prediction, [0.6])
+    assert np.allclose(production_prediction, [0.65])
     assert all(call["allow_negative_predictions"] is True for call in prediction_calls)
 
 
 def assert_boosting_trim_uses_retained_prefix_residuals() -> None:
+    """Calibration starts from the selected chain and only survives a matching refit."""
+    target_values = [0.0, 0.0, 0.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0]
     records = [
-        {"月份": f"2026-{index + 1:02d}", "销售数量": 1.0}
-        for index in range(10)
+        {"月份": f"2026-{index + 1:02d}", "销售数量": target}
+        for index, target in enumerate(target_values)
     ]
     parsed_data = load_data_from_json(json.dumps(records, ensure_ascii=False))
-    expected_prefix_residuals = np.asarray([0.0, 1.0, 0.0])
-    full_selection_residuals = np.asarray([0.5, 0.5, 0.0])
+    expected_calibration_predictions = np.asarray([0.25, 0.25])
+    expected_calibration_residuals = np.asarray([0.75, 0.75])
 
     def fake_fitted(
         _model_name: str,
@@ -1253,7 +1299,7 @@ def assert_boosting_trim_uses_retained_prefix_residuals() -> None:
         train_range: range,
     ) -> np.ndarray:
         if "trim" in model_file:
-            pattern = [-1.0]
+            pattern = [1.0]
         elif "r1" in model_file:
             pattern = [-1.0, 1.0, 0.0]
         elif "es" in model_file:
@@ -1283,6 +1329,15 @@ def assert_boosting_trim_uses_retained_prefix_residuals() -> None:
         ),
         patch.object(boosting, "_compute_in_sample_fitted_predictions", side_effect=fake_fitted),
         patch.object(boosting, "remove_member_model_artifact"),
+        patch.object(
+            boosting,
+            "_refit_fixed_chain_for_holdout",
+            return_value=(
+                expected_calibration_predictions,
+                ["ma"],
+                [0.2],
+            ),
+        ) as regular_calibration_refit,
     ):
         regular_result = boosting.train_and_evaluate(
             parsed_data,
@@ -1294,16 +1349,18 @@ def assert_boosting_trim_uses_retained_prefix_residuals() -> None:
             max_rounds=2,
         )
 
-    assert regular_result[1] == ["es"]
+    assert regular_result[1] == ["ma"]
     regular_calibration = np.asarray(
         regular_result[8]["uncertainty"]["calibration_residuals"]
     )
-    assert np.allclose(regular_calibration, expected_prefix_residuals)
-    assert not np.allclose(regular_calibration, full_selection_residuals)
-    assert math.isclose(
-        regular_result[6][0],
-        float(np.std(expected_prefix_residuals, ddof=1)),
+    assert np.allclose(regular_calibration, expected_calibration_residuals)
+    assert regular_result[8]["uncertainty"]["calibration_source"] == (
+        "post_selection_calibration"
     )
+    regular_refit_args = regular_calibration_refit.call_args.args
+    assert regular_refit_args[1] == range(0, 6)
+    assert regular_refit_args[2] == range(6, 8)
+    assert regular_refit_args[3] == ["ma", "ma"]
 
     guided_training_calls = iter((
         ("guided-final-r0.pkl", np.asarray([2.0, 1.0]), [1.0, 1.1]),
@@ -1317,21 +1374,21 @@ def assert_boosting_trim_uses_retained_prefix_residuals() -> None:
             "models": ["ma", "es"],
             "model_params": {"ma": {"window": 2}, "es": {"alpha": 0.3}},
             "base_model_files": {},
-            "model_chain": ["es", "ma"],
-            "stage_coefficients": [0.1, 0.5],
-            "residual_val": full_selection_residuals.copy(),
-            "validation_residual_snapshots": [
-                np.asarray([1.0, 1.0, 1.0]),
-                expected_prefix_residuals.copy(),
-                full_selection_residuals.copy(),
-            ],
+            "model_chain": ["ma", "ma"],
+            "stage_coefficients": [0.6, 0.3],
+            "selection_baseline": {
+                "kind": "mean",
+                "seasonal_period": None,
+            },
             "search_summary": {"stages": []},
             "artifact_dir": artifact_dir,
             "split_plan": {
                 "purpose": "boosting",
-                "prefix_size": 5,
-                "validation_size": 3,
+                "prefix_size": 3,
+                "selection_size": 3,
+                "calibration_size": 2,
             },
+            "calibration_range": {"start": 6, "stop": 8},
         }
         with (
             patch.object(boosting, "_build_round_records", return_value=([], [])),
@@ -1342,6 +1399,15 @@ def assert_boosting_trim_uses_retained_prefix_residuals() -> None:
             ),
             patch.object(boosting, "_compute_in_sample_fitted_predictions", side_effect=fake_fitted),
             patch.object(boosting, "remove_member_model_artifact"),
+            patch.object(
+                boosting,
+                "_refit_fixed_chain_for_holdout",
+                return_value=(
+                    expected_calibration_predictions,
+                    ["ma"],
+                    [0.2],
+                ),
+            ) as guided_calibration_refit,
         ):
             guided_ensemble_model._run_boosting(
                 "retrain_chain", None, guided_state
@@ -1350,12 +1416,234 @@ def assert_boosting_trim_uses_retained_prefix_residuals() -> None:
                 "combine_evaluate", None, guided_state
             )
 
-    assert guided_state["model_chain"] == ["es"]
+    assert guided_state["model_chain"] == ["ma"]
     guided_calibration = np.asarray(
         guided_state["uncertainty"]["calibration_residuals"]
     )
-    assert np.allclose(guided_calibration, expected_prefix_residuals)
-    assert not np.allclose(guided_calibration, full_selection_residuals)
+    assert np.allclose(guided_calibration, expected_calibration_residuals)
+    assert guided_state["uncertainty"]["calibration_source"] == (
+        "post_selection_calibration"
+    )
+    guided_refit_args = guided_calibration_refit.call_args.args
+    assert guided_refit_args[1] == range(0, 6)
+    assert guided_refit_args[2] == range(6, 8)
+    assert guided_refit_args[3] == ["ma", "ma"]
+
+
+def _guided_boosting_baseline_state(parsed_data: Any) -> dict[str, Any]:
+    train_range = range(0, 8)
+    eval_range = range(8, 10)
+    baseline = boosting.fit_baseline_state_for_range(
+        parsed_data,
+        train_range,
+        "mean",
+        None,
+    )
+    return {
+        "parsed_data": parsed_data,
+        "train_range": {"start": train_range.start, "stop": train_range.stop},
+        "eval_range": {"start": eval_range.start, "stop": eval_range.stop},
+        "calibration_range": {"start": 6, "stop": 8},
+        "models": ["ma"],
+        "model_params": {"ma": {"window": 2}},
+        "model_chain": [],
+        "stage_coefficients": [],
+        "selection_coefficients": [],
+        "baseline": baseline,
+        "final_eval_preds": boosting.baseline_forecast_for_range(
+            parsed_data,
+            train_range,
+            eval_range,
+            "mean",
+            None,
+        ),
+        "eval_y_true": np.asarray(parsed_data.y[eval_range], dtype=float).tolist(),
+        "base_model_states": {},
+        "full_uncertainty_profiles": {},
+        "uncertainty_coefficients": {},
+        "search_summary": {"stages": []},
+        "split_plan": {
+            "purpose": "boosting",
+            "prefix_size": 3,
+            "selection_size": 3,
+            "calibration_size": 2,
+        },
+    }
+
+
+def assert_boosting_calibration_metadata_and_fail_closed() -> None:
+    parsed_data = load_data_from_json(
+        json.dumps(sample_records(10), ensure_ascii=False)
+    )
+    candidate_residuals, candidate_source, prepared = (
+        boosting._prepare_selected_chain_calibration(
+            parsed_data,
+            range(0, 8),
+            range(6, 8),
+            [],
+            {},
+            "mean",
+            None,
+        )
+    )
+    assert candidate_residuals.shape == (2,)
+    assert candidate_source == "post_selection_calibration"
+    assert prepared["requested_chain"] == []
+    assert prepared["retained_chain"] == []
+    assert prepared["matched_selection_structure"] is True
+    assert prepared["prepared_before_full_refit"] is True
+    assert prepared["preparation_mode"] == "before_full_refit"
+    assert prepared["selection_chain_frozen_before_calibration_labels"] is True
+    assert prepared["full_refit_includes_calibration_segment"] is True
+    assert prepared["final_refit_parameters_may_use_calibration_labels"] is True
+    assert prepared[
+        "final_refit_stage_coefficients_may_use_calibration_labels"
+    ] is False
+    assert prepared["coverage_claim"] == "none"
+
+    residuals, source, finalized = boosting._finalize_selected_chain_calibration(
+        candidate_residuals,
+        candidate_source,
+        prepared,
+        [],
+    )
+    assert np.array_equal(residuals, candidate_residuals)
+    assert source == "post_selection_calibration"
+    assert finalized["matched_final_structure"] is True
+
+    rejected_residuals, rejected_source, rejected = (
+        boosting._finalize_selected_chain_calibration(
+            candidate_residuals,
+            candidate_source,
+            prepared,
+            ["ma"],
+        )
+    )
+    assert rejected_residuals.size == 0
+    assert rejected_source == "unavailable_after_full_refit_chain_change"
+    assert rejected["matched_final_structure"] is False
+
+
+def assert_guided_boosting_calibration_checkpoint_recovery() -> None:
+    parsed_data = load_data_from_json(
+        json.dumps(sample_records(10), ensure_ascii=False)
+    )
+
+    missing_selection_state = _guided_boosting_baseline_state(parsed_data)
+    guided_ensemble_model._run_boosting(
+        "combine_evaluate",
+        None,
+        missing_selection_state,
+    )
+    assert missing_selection_state["uncertainty"]["calibration_residuals"] == []
+    assert missing_selection_state["uncertainty"]["calibration_source"] == (
+        "unavailable_missing_pre_refit_calibration"
+    )
+    missing_metadata = missing_selection_state["calibration_refit"]
+    assert missing_metadata["prepared_before_full_refit"] is False
+    assert missing_metadata["preparation_mode"] == (
+        "unavailable_missing_selection_chain"
+    )
+    assert missing_metadata["selection_chain_frozen_before_calibration_labels"] is False
+    assert missing_metadata["coverage_claim"] == "none"
+
+    recovered_state = _guided_boosting_baseline_state(parsed_data)
+    recovered_state["selection_model_chain"] = []
+    recovered_state["selection_baseline"] = {"kind": "mean", "seasonal_period": None}
+    guided_ensemble_model._run_boosting(
+        "combine_evaluate",
+        None,
+        recovered_state,
+    )
+    recovered_metadata = recovered_state["calibration_refit"]
+    assert recovered_state["uncertainty"]["calibration_source"] == (
+        "post_selection_calibration"
+    )
+    assert len(recovered_state["uncertainty"]["calibration_residuals"]) == 2
+    assert recovered_metadata["prepared_before_full_refit"] is False
+    assert recovered_metadata["preparation_mode"] == "recovered_after_full_refit"
+    assert recovered_metadata["selection_chain_frozen_before_calibration_labels"] is True
+    assert recovered_metadata["matched_final_structure"] is True
+
+    split_state = _guided_boosting_baseline_state(parsed_data)
+    split_state.update({
+        "model_chain": ["ma"],
+        "stage_coefficients": [0.5],
+        "selection_baseline": {"kind": "mean", "seasonal_period": None},
+    })
+    calibration_predictions = np.asarray([105.0, 106.0], dtype=float)
+    with tempfile.TemporaryDirectory(prefix="guided-boosting-checkpoint-") as temp_dir:
+        split_state["artifact_dir"] = temp_dir
+        with patch.object(
+            boosting,
+            "_refit_fixed_chain_for_holdout",
+            return_value=(calibration_predictions, ["ma"], [0.2]),
+        ):
+            guided_ensemble_model._run_boosting(
+                "initialize_refit",
+                None,
+                split_state,
+            )
+
+        first_checkpoint = os.path.join(temp_dir, "initialize.pkl")
+        guided_ensemble_model._save_state(first_checkpoint, split_state)
+        split_state = guided_ensemble_model._load_state(first_checkpoint)
+        assert split_state["calibration_refit"]["prepared_before_full_refit"] is True
+        assert split_state["calibration_refit"][
+            "final_refit_stage_coefficients_may_use_calibration_labels"
+        ] is True
+
+        def fitted_residuals(
+            _model_name: str,
+            _model_file: str,
+            round_data: Any,
+            train_range: range,
+        ) -> np.ndarray:
+            return np.asarray(round_data.y[train_range], dtype=float)
+
+        with (
+            patch.object(boosting, "_build_round_records", return_value=([], [])),
+            patch.object(
+                boosting,
+                "_train_stage_model",
+                return_value=(
+                    "checkpoint-ma.pkl",
+                    np.asarray([0.2, 0.3], dtype=float),
+                    [1.0, 1.1],
+                ),
+            ),
+            patch.object(
+                boosting,
+                "_compute_in_sample_fitted_predictions",
+                side_effect=fitted_residuals,
+            ),
+            patch.object(boosting, "remove_member_model_artifact"),
+        ):
+            refit_output = guided_ensemble_model._run_boosting(
+                "refit_stage_1_ma",
+                None,
+                split_state,
+            )
+        assert refit_output["action"] == "refit_stage"
+
+        second_checkpoint = os.path.join(temp_dir, "refit.pkl")
+        guided_ensemble_model._save_state(second_checkpoint, split_state)
+        split_state = guided_ensemble_model._load_state(second_checkpoint)
+        guided_ensemble_model._run_boosting(
+            "combine_evaluate",
+            None,
+            split_state,
+        )
+
+    assert split_state["model_chain"] == ["ma"]
+    assert split_state["uncertainty"]["calibration_source"] == (
+        "post_selection_calibration"
+    )
+    assert split_state["calibration_refit"]["preparation_mode"] == (
+        "before_full_refit"
+    )
+    assert split_state["calibration_refit"]["matched_final_structure"] is True
+    assert split_state["final_result"]["model_chain"] == ["ma"]
 
 
 def assert_subprocess_prediction_domains() -> None:
@@ -1794,6 +2082,8 @@ def main() -> None:
     assert_boosting_requests_signed_base_outputs()
     assert_boosting_keeps_signed_corrections_end_to_end()
     assert_boosting_trim_uses_retained_prefix_residuals()
+    assert_boosting_calibration_metadata_and_fail_closed()
+    assert_guided_boosting_calibration_checkpoint_recovery()
     assert_subprocess_prediction_domains()
     assert_loaded_ensemble_demand_semantics()
     assert_same_path_artifact_replay()

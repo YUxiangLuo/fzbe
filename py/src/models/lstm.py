@@ -39,14 +39,15 @@ MODEL_TYPE = "lstm"
 DIRECT_FORECAST_STRATEGY = "direct_multi_horizon"
 LEGACY_FORECAST_STRATEGY = "autoregressive"
 DEFAULT_PRODUCTION_FORECAST_HORIZON = 6
-METHOD_NAME = "LSTM 多变量销量预测"
+STANDARD_STABILITY_SEEDS = (42, 314, 2718)
+METHOD_NAME = "LSTM 历史多特征销量预测"
 DIRECT_IMPLEMENTATION_NOTES = [
     "教科书 LSTM 定义的是带遗忘门、输入门和输出门的循环神经网络单元。",
     "本系统仅用训练区间拟合数值缩放器和类别 One-Hot 编码器，再采用单层 LSTM 加线性 Dense 多步输出；look-back 在 2 到 12 之间，隐藏单元、批大小和训练预算由样本量、预测跨度及编码后维度共同确定。",
     "为了服务未来多期销量预测，新训练模型采用直接多步策略，一次输出完整预测 horizon，减少递归预测的误差累积；输入只包含预测起点之前最后 look_back 期的历史目标与历史特征，不读取未来特征值。",
-    "样本足够时使用带 horizon 隔离带的时间顺序验证集监控 val_loss；选择轮数的临时预处理器和网络容量都只依据验证起点之前可见的数据，随后在全部训练窗口重新推导最终容量并拟合预处理器和网络。小样本明确标记为教学演示并使用有限训练预算，不以训练 loss 冒充泛化早停。",
+    "样本足够时使用带 horizon 隔离带的时间顺序验证集监控 val_loss，并以 3 个固定随机种子重复训练记录内部验证稳定性；选择轮数的临时预处理器和网络容量都只依据验证起点之前可见的数据，最终模型沿用种子 42 的选定轮数，随后在全部训练窗口重新推导最终容量并拟合。小样本明确标记为教学演示并使用有限训练预算，不以训练 loss 冒充泛化早停。",
     "Dense 输出层本身不带非负约束；本系统将逆缩放后的最终销量点预测按 max(0, y_hat) 截断，并以截断值计算评估残差和指标。该业务后处理不是 LSTM 单元定义的一部分。",
-    "std_dev 优先来自时间顺序验证窗口中逆缩放、未做非负截断的逐输出 horizon 残差；95% 区间和生产用 99% 上侧误差取各 horizon 的 actual-prediction 经验残差分位数，因而保留稳定偏差。教学演示模式使用明确标记的一阶差分 sqrt(h) 正态近似回退。",
+    "std_dev 优先来自时间顺序验证窗口中逆缩放、未做非负截断的逐输出 horizon 残差；2.5%–97.5% 经验残差分位范围和生产用 99% 上侧压力偏移取各 horizon 的 actual-prediction 经验残差分位数，因而保留稳定偏差。该范围不声明 95% 覆盖保证；教学演示模式使用明确标记的一阶差分 sqrt(h) 正态近似回退。",
 ]
 AUTOREGRESSIVE_IMPLEMENTATION_NOTES = [
     "教科书 LSTM 定义的是带遗忘门、输入门和输出门的循环神经网络单元。",
@@ -54,7 +55,7 @@ AUTOREGRESSIVE_IMPLEMENTATION_NOTES = [
     "该一步递归路径仅用于兼容旧模型产物：后续步骤把预测目标滚入窗口，其他特征保持为最后观测值；当前新训练流程不会自动回退到此策略。",
     "训练中的 EarlyStopping 监控训练损失而非验证损失（教学数据过小，不再切分验证集），其作用是训练损失进入平台期即停止，并非教科书意义的验证集早停。",
     "Dense 输出层本身不带非负约束；兼容旧产物时也只把最终逆缩放销量点预测按 max(0, y_hat) 截断。Boosting 的内部残差学习会显式关闭该截断，以保留有符号残差。",
-    "兼容路径只读取产物中已经保存的不确定性信息；若无法覆盖请求跨度则使用明确标记的训练历史一阶差分 sqrt(h) 回退，不读取当前预测期真实值。",
+    "兼容路径只读取产物中已经保存的不确定性信息；若无法覆盖请求跨度则使用明确标记的训练历史一阶差分 sqrt(h) 回退，不读取当前预测期真实值。该回退范围使用 coverage_claim=none，不声明 95% 覆盖保证。",
 ]
 
 # Type alias for input flexibility
@@ -206,6 +207,50 @@ def _resolve_production_forecast_horizon(
 
 def _can_fit_direct_forecast(train_size: int, look_back: int, forecast_horizon: int) -> bool:
     return forecast_horizon > 0 and train_size >= look_back + forecast_horizon
+
+
+def _training_metadata(
+    derived_config: Dict[str, Any],
+    feature_keys: List[str],
+) -> Dict[str, Any]:
+    fields = (
+        "regime",
+        "look_back",
+        "units",
+        "parameter_count",
+        "parameter_budget",
+        "batch_size",
+        "max_epochs",
+        "epochs_ran",
+        "windows",
+        "validation_windows",
+        "purge_windows",
+        "selection_train_windows",
+    )
+    seed_stability = derived_config.get("seed_stability")
+    seed_runs = (
+        int(seed_stability.get("run_count", 0))
+        if isinstance(seed_stability, dict)
+        else 1
+    )
+    return {
+        **{
+            field: derived_config.get(field)
+            for field in fields
+            if derived_config.get(field) is not None
+        },
+        "feature_keys": list(feature_keys),
+        "feature_count": int(derived_config.get("feature_count", len(feature_keys) + 1)),
+        "raw_feature_count": len(feature_keys) + 1,
+        "random_seed": 42,
+        "seed_runs": seed_runs,
+        "seed_stability": seed_stability,
+        "stability_note": (
+            "single_seed_teaching_demo"
+            if derived_config.get("regime") == "teaching_demo"
+            else "three_seed_internal_validation_summary"
+        ),
+    }
 
 
 def _build_preprocessor(
@@ -480,6 +525,7 @@ def _fit_direct_model(
     from tensorflow.keras.callbacks import EarlyStopping
     from tensorflow.keras.models import Sequential
     from tensorflow.keras.optimizers import Adam
+    import tensorflow as tf
 
     df = parsed_data.df
     preprocessor, scaled_series = _build_preprocessor(parsed_data, feature_types, train_range, normalization)
@@ -570,41 +616,77 @@ def _fit_direct_model(
         config["validation_feature_count"] = int(validationX.shape[2])
         config["selection_units"] = int(selection_config["units"])
         config["selection_parameter_count"] = int(selection_config["parameter_count"])
-        selection_model = build_model(
-            int(validationX.shape[2]),
-            int(selection_config["units"]),
-        )
-        history = selection_model.fit(
-            validationX[:selection_count],
-            validationY[:selection_count],
-            validation_data=(validationX[validation_start:], validationY[validation_start:]),
-            epochs=int(selection_config["max_epochs"]),
-            batch_size=int(selection_config["batch_size"]),
-            verbose=0,
-            callbacks=[EarlyStopping(
-                monitor="val_loss",
-                patience=int(selection_config["patience"]),
-                restore_best_weights=True,
-            )],
-            shuffle=False,
-        )
-        validation_losses = history.history.get("val_loss", [])
-        if not validation_losses:
-            raise ValueError("[MODEL] LSTM validation training produced no val_loss history.")
-        epochs_ran = int(np.argmin(validation_losses)) + 1
-        validation_predictions_scaled = selection_model.predict(
-            validationX[validation_start:],
-            verbose=0,
-        )
-        validation_predictions = _inverse_transform_target_values(
-            validation_preprocessor,
-            validation_predictions_scaled,
-        ).reshape(validation_predictions_scaled.shape)
         validation_actuals = _inverse_transform_target_values(
             validation_preprocessor,
             validationY[validation_start:],
         ).reshape(validationY[validation_start:].shape)
-        validation_residuals = validation_actuals - validation_predictions
+        seed_runs = []
+        for seed in STANDARD_STABILITY_SEEDS:
+            tf.keras.utils.set_random_seed(seed)
+            _set_random_seed(seed)
+            selection_model = build_model(
+                int(validationX.shape[2]),
+                int(selection_config["units"]),
+            )
+            history = selection_model.fit(
+                validationX[:selection_count],
+                validationY[:selection_count],
+                validation_data=(validationX[validation_start:], validationY[validation_start:]),
+                epochs=int(selection_config["max_epochs"]),
+                batch_size=int(selection_config["batch_size"]),
+                verbose=0,
+                callbacks=[EarlyStopping(
+                    monitor="val_loss",
+                    patience=int(selection_config["patience"]),
+                    restore_best_weights=True,
+                )],
+                shuffle=False,
+            )
+            validation_losses = history.history.get("val_loss", [])
+            if not validation_losses:
+                raise ValueError("[MODEL] LSTM validation training produced no val_loss history.")
+            selected_epochs = int(np.argmin(validation_losses)) + 1
+            validation_predictions_scaled = selection_model.predict(
+                validationX[validation_start:],
+                verbose=0,
+            )
+            validation_predictions = _inverse_transform_target_values(
+                validation_preprocessor,
+                validation_predictions_scaled,
+            ).reshape(validation_predictions_scaled.shape)
+            run_residuals = validation_actuals - validation_predictions
+            run_summary = {
+                "seed": int(seed),
+                "epochs_ran": selected_epochs,
+                "best_validation_loss": float(np.min(validation_losses)),
+                "validation_rmse": float(np.sqrt(np.mean(np.square(run_residuals)))),
+                "validation_mae": float(np.mean(np.abs(run_residuals))),
+            }
+            seed_runs.append(run_summary)
+            if seed == 42:
+                epochs_ran = selected_epochs
+                validation_residuals = run_residuals
+
+        rmse_values = np.asarray(
+            [run["validation_rmse"] for run in seed_runs],
+            dtype=float,
+        )
+        mae_values = np.asarray(
+            [run["validation_mae"] for run in seed_runs],
+            dtype=float,
+        )
+        config["seed_stability"] = {
+            "scope": "internal_time_validation",
+            "run_count": len(seed_runs),
+            "seeds": [int(run["seed"]) for run in seed_runs],
+            "runs": seed_runs,
+            "validation_rmse_mean": float(np.mean(rmse_values)),
+            "validation_rmse_std": float(np.std(rmse_values)),
+            "validation_mae_mean": float(np.mean(mae_values)),
+            "validation_mae_std": float(np.std(mae_values)),
+        }
+        tf.keras.backend.clear_session()
+        tf.keras.utils.set_random_seed(42)
         _set_random_seed(42)
 
     model = build_model()
@@ -954,6 +1036,10 @@ def run(args) -> None:
             "saved_model": save_path,
             "forecast_horizon": fit_forecast_horizon,
             "training_regime": derived_config["regime"],
+            "training_metadata": _training_metadata(
+                derived_config,
+                parsed_data.feature_keys,
+            ),
             "uncertainty_summary": uncertainty_summary,
         }
         fit_predict_steps = int(getattr(args, "fit_predict_steps", 0) or 0)
@@ -1116,10 +1202,15 @@ def run(args) -> None:
             "mode": "lstm_train_eval",
             "data_points": parsed_data.n_obs,
             "target_key": parsed_data.target_key,
+            "feature_keys": parsed_data.feature_keys,
             "feature_types": feature_types,
             "normalization": normalization,
             "forecast_horizon": metrics.get("forecast_horizon"),
             "training_regime": derived_config["regime"],
+            "training_metadata": _training_metadata(
+                derived_config,
+                parsed_data.feature_keys,
+            ),
             "train_range": {"start_index": ts, "end_index": te},
             "evaluate_range": {"start_index": es, "end_index": ee},
             "metrics": metrics,

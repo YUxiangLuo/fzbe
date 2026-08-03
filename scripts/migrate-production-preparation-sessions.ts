@@ -1,18 +1,7 @@
-import mysql, { type RowDataPacket } from "mysql2/promise";
+import { type RowDataPacket } from "mysql2/promise";
+import { createMigrationConnection } from "./migration-database";
 
-const requireEnv = (name: string, value: string | undefined) => {
-  const normalized = value?.trim();
-  if (!normalized) throw new Error(`Missing required env var: ${name}`);
-  return normalized;
-};
-
-const connection = await mysql.createConnection({
-  host: requireEnv("DB_HOST", process.env.DB_HOST),
-  user: requireEnv("DB_USER", process.env.DB_USER),
-  password: process.env.DB_PASSWORD ?? "",
-  database: requireEnv("DB_DATABASE", process.env.DB_DATABASE),
-  charset: "utf8mb4",
-});
+const connection = await createMigrationConnection();
 
 const ensureColumn = async (tableName: string, columnName: string, definition: string) => {
   const [rows] = await connection.query<RowDataPacket[]>(

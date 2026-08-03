@@ -1,19 +1,48 @@
 import { z } from "zod";
 
+const normalizeOptionalPhone = (value: unknown): unknown => {
+  if (value === null || value === undefined) return undefined;
+  if (typeof value !== "string") return value;
+  const normalized = value.trim();
+  return normalized === "" ? undefined : normalized;
+};
+
+const normalizeNullablePhone = (value: unknown): unknown => {
+  if (value === null || value === undefined) return value;
+  if (typeof value !== "string") return value;
+  const normalized = value.trim();
+  return normalized === "" ? null : normalized;
+};
+
+const optionalPhoneNumberSchema = z.preprocess(
+  normalizeOptionalPhone,
+  z.string().regex(/^\d{6,15}$/, "手机号必须为6到15位数字").optional(),
+);
+
+const optionalChineseMobileSchema = z.preprocess(
+  normalizeOptionalPhone,
+  z.string().regex(/^1\d{10}$/, "手机号必须以1开头且为11位数字").optional(),
+);
+
+const nullablePhoneNumberSchema = z.preprocess(
+  normalizeNullablePhone,
+  z.string().regex(/^\d{6,15}$/, "手机号必须为6到15位数字").nullable().optional(),
+);
+
 export const registerSchema = z.object({
   username: z.string().min(3),
   password: z.string().min(6, { message: "密码长度至少为6位" }),
   full_name: z.string().min(1),
   email: z.string().email(),
   role: z.enum(["Student", "Teacher", "Assistant", "Admin"]).default("Student"),
-  phone_number: z.string().optional(),
+  phone_number: optionalPhoneNumberSchema,
 });
 
 export const createTeacherSchema = z.object({
   username: z.string().min(3),
   full_name: z.string().min(1),
   email: z.string().email().optional(),
-  phone: z.string().length(11, "手机号必须为11位").regex(/^1\d{10}$/, "手机号必须以1开头的11位数字").optional(),
+  phone: optionalChineseMobileSchema,
   password: z.string().min(6, "密码必须至少6位").optional(),
 });
 
@@ -21,7 +50,7 @@ export const createAssistantSingleSchema = z.object({
   username: z.string().min(3),
   full_name: z.string().min(1),
   email: z.string().email().optional(),
-  phone: z.string().length(11, "手机号必须为11位").regex(/^1\d{10}$/, "手机号必须以1开头的11位数字").optional(),
+  phone: optionalChineseMobileSchema,
   password: z.string().min(6, "密码必须至少6位").optional(),
 });
 
@@ -31,9 +60,9 @@ export const createAssistantSchema = registerSchema
 
 export const updateUserSchema = z.object({
   full_name: z.string().min(1).optional(),
-  phone_number: z.string().min(1).optional(),
+  phone_number: nullablePhoneNumberSchema,
   email: z.string().email("Invalid email format").optional(),
-}).refine((data) => data.full_name || data.phone_number || data.email, {
+}).refine((data) => Object.values(data).some((value) => value !== undefined), {
   message: "至少需要提供一个字段 (full_name, phone_number, 或 email)",
 });
 
@@ -95,7 +124,7 @@ export const teacherAssistantSelfRegisterSchema = z.object({
   password: z.string().min(6, "密码长度至少为6位"),
   name: z.string().min(1, "姓名不能为空").regex(/^[\u4e00-\u9fa5a-zA-Z\s]+$/, "姓名只能包含中文字符、英文字母和空格"),
   email: z.string().regex(/^[^\s@]+@[^\s@]+\.[^\s@]+$/, "无效的邮箱格式"),
-  phone: z.string().length(11, "手机号必须是11位数字").regex(/^\d{11}$/, "手机号只能包含数字"),
+  phone: z.string().trim().length(11, "手机号必须是11位数字").regex(/^\d{11}$/, "手机号只能包含数字"),
 });
 
 export type RegisterInput = z.infer<typeof registerSchema>;

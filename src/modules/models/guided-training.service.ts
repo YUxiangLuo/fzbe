@@ -1,9 +1,14 @@
 import crypto from "crypto";
 import fs from "fs";
 import path from "path";
+import type { RowDataPacket } from "mysql2/promise";
 import { pool } from "../../config";
 import logger from "../../utils/logger";
-import { queryWithTimeout } from "./model-db-guard";
+import {
+  acquireConnectionWithTimeout,
+  commitConnectionWithOutcomeGuard,
+  queryWithTimeout,
+} from "./model-db-guard";
 import type { ModelType, TrainInput } from "./models.schema";
 import {
   ModelAccessError,
@@ -11,6 +16,7 @@ import {
   ModelConflictError,
   ModelNotFoundError,
   ModelValidationError,
+  isModelCommitOutcomeUnknownError,
 } from "./model-errors";
 import {
   withModelOperationContext,
@@ -32,7 +38,6 @@ import {
   buildVersionedModelPath,
 } from "./model-runtime";
 import {
-  type GuidedModelType,
   type GuidedTrainingSessionPayload,
   type GuidedTrainingStatus,
 } from "./model-types";
@@ -54,6 +59,7 @@ import {
   isDuplicateModelSessionRequestError,
   isEnsembleModelType,
   isGuidedModelType,
+  lockStudentExperimentForModelWrite,
   parseJsonColumn,
   resolveGuidedStepTimeoutMs,
   validateMovingAverageWindow,
@@ -273,57 +279,87 @@ const createOrResumeGuidedTrainingSessionInternal = async (
   const completedStepIds: string[] = [];
   const stepPlan = buildGuidedTrainingStepPlan(modelType, canonicalBody);
   const currentStepId = getGuidedNextStepId(stepPlan, completedStepIds);
-  let insertAttempted = false;
+  let insertCommitted = false;
   try {
     operationContext.throwIfTerminated();
     fs.mkdirSync(artifactDir, { recursive: true });
     await writeGuidedDatasetSnapshot(artifactDir, datasetJson);
     operationContext.throwIfTerminated();
-    insertAttempted = true;
-    await queryWithTimeout(pool,
-      `INSERT INTO model_guided_training_sessions
-       (session_id,
-        experiment_id,
-        student_id,
-        model_type,
-        request_hash,
-        dataset_revision,
-        runtime_revision,
-        protocol_version,
-        request_payload,
-        status,
-        current_step_id,
-        completed_step_ids,
-        step_outputs,
-        step_plan,
-        result_payload,
-        artifact_dir,
-        expires_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'ready', ?, ?, ?, ?, NULL, ?, DATE_ADD(NOW(), INTERVAL 7 DAY))`,
-      [
-        sessionId,
+    const connection = await acquireConnectionWithTimeout(pool);
+    let transactionPhase: "before-commit" | "commit-attempted" | "committed" = "before-commit";
+    let disposed = false;
+    try {
+      await connection.beginTransaction();
+      await lockStudentExperimentForModelWrite(
+        connection,
         canonicalBody.experiment_id,
         studentId,
-        modelType,
-        requestHash,
-        datasetRevision,
-        runtimeRevision,
-        GUIDED_TRAINING_PROTOCOL_VERSION,
-        JSON.stringify(canonicalBody),
-        currentStepId,
-        JSON.stringify(completedStepIds),
-        JSON.stringify({}),
-        JSON.stringify(stepPlan),
-        artifactDir,
-      ],
-    );
+      );
+      operationContext.throwIfTerminated();
+      await connection.query<RowDataPacket[]>(
+        `INSERT INTO model_guided_training_sessions
+           (session_id,
+            experiment_id,
+            student_id,
+            model_type,
+            request_hash,
+            dataset_revision,
+            runtime_revision,
+            protocol_version,
+            request_payload,
+            status,
+            current_step_id,
+            completed_step_ids,
+            step_outputs,
+            step_plan,
+            result_payload,
+            artifact_dir,
+            expires_at)
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'ready', ?, ?, ?, ?, NULL, ?, DATE_ADD(NOW(), INTERVAL 7 DAY))`,
+        [
+          sessionId,
+          canonicalBody.experiment_id,
+          studentId,
+          modelType,
+          requestHash,
+          datasetRevision,
+          runtimeRevision,
+          GUIDED_TRAINING_PROTOCOL_VERSION,
+          JSON.stringify(canonicalBody),
+          currentStepId,
+          JSON.stringify(completedStepIds),
+          JSON.stringify({}),
+          JSON.stringify(stepPlan),
+          artifactDir,
+        ],
+      );
+      transactionPhase = "commit-attempted";
+      try {
+        await commitConnectionWithOutcomeGuard(connection);
+      } catch (error) {
+        // A lost COMMIT acknowledgement makes the INSERT outcome ambiguous.
+        // Never return this session to the pool or delete its artifact dir;
+        // the orphan/session reconciler can resolve either outcome safely.
+        disposed = true;
+        throw error;
+      }
+      transactionPhase = "committed";
+      insertCommitted = true;
+    } catch (error) {
+      if (transactionPhase === "before-commit") {
+        await connection.rollback().catch(() => {});
+      }
+      throw error;
+    } finally {
+      if (!disposed) connection.release();
+    }
     operationContext.throwIfTerminated();
   } catch (error) {
     if (!isDuplicateModelSessionRequestError(error)) {
-      // If no INSERT was sent, this directory cannot be referenced by a DB
-      // row. Once INSERT starts its outcome can be ambiguous on connection
-      // errors, so leave cleanup to the stale-artifact sweeper.
-      if (!insertAttempted) {
+      // A rolled-back transaction cannot reference this directory. Preserve it
+      // only after an acknowledged commit (for a post-commit deadline) or when
+      // the COMMIT outcome itself is unknown.
+      if (!insertCommitted && !isModelCommitOutcomeUnknownError(error)) {
         fs.rmSync(artifactDir, { recursive: true, force: true });
       }
       throw error;
@@ -724,7 +760,10 @@ export async function runGuidedTrainingStep(
             if (!updatedRow) throw new Error("分阶段训练会话已丢失");
             return buildGuidedTrainingSessionPayload(updatedRow);
           } catch (error) {
-            if (cleanupUncommittedArtifactPath) {
+            if (
+              cleanupUncommittedArtifactPath
+              && !isModelCommitOutcomeUnknownError(error)
+            ) {
               removeModelArtifactGroup(cleanupUncommittedArtifactPath);
             }
             throw error;
@@ -734,7 +773,11 @@ export async function runGuidedTrainingStep(
     });
   } catch (error) {
     const failedAttempt = activeAttemptRef.current;
-    if (!stepCommitted && failedAttempt) {
+    if (
+      !stepCommitted
+      && failedAttempt
+      && !isModelCommitOutcomeUnknownError(error)
+    ) {
       // Failure recording is best-effort and must never replace the original
       // model/deadline/lock error returned to the caller.
       await recordGuidedAttemptFailure(

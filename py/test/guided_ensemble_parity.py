@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import json
+import pickle
 import sys
 import tempfile
 from pathlib import Path
@@ -31,6 +32,7 @@ MODELS = ("ma", "es", "arima", "lstm")
 TRAIN_RANGE = (0, 27)
 EVAL_RANGE = (30, 32)
 TOLERANCE = 1e-5
+EXPECTED_POST_LINE_SEARCH_SHRINKAGE = {"enabled": False, "factor": 1.0}
 
 STEP_SEQUENCES = {
     "weighted_avg": [
@@ -234,9 +236,7 @@ def compare_results(
         ),
     }
 
-    expected_calibration_source = (
-        "level1_holdout" if model_type == "stacking" else "internal_validation"
-    )
+    expected_calibration_source = "post_selection_calibration"
     for label, result in (("regular", regular), ("guided", guided)):
         for index, point in enumerate(result["predictions"]):
             if point.get("calibration_source") != expected_calibration_source:
@@ -276,6 +276,19 @@ def compare_results(
         for key in ("model_chain", "stage_coefficients"):
             if regular[key] != guided[key]:
                 raise AssertionError(f"boosting.{key} differs")
+        for label, result in (("regular", regular), ("guided", guided)):
+            if result.get("post_line_search_shrinkage") != (
+                EXPECTED_POST_LINE_SEARCH_SHRINKAGE
+            ):
+                raise AssertionError(
+                    f"{label} boosting result omits the no-shrinkage policy"
+                )
+            if result.get("search_summary", {}).get(
+                "post_line_search_shrinkage"
+            ) != EXPECTED_POST_LINE_SEARCH_SHRINKAGE:
+                raise AssertionError(
+                    f"{label} boosting search summary omits the no-shrinkage policy"
+                )
 
     for label, delta in deltas.items():
         if delta > TOLERANCE:
@@ -297,6 +310,14 @@ def compare_loaded_predictions(model_type: str, regular_model: Path, guided_mode
             f"{label} {model_type} loaded prediction",
         )
         assert_calibration_diagnostics(result.get("predictions"), f"loaded {label} {model_type}")
+        if (
+            model_type == "boosting"
+            and result.get("post_line_search_shrinkage")
+            != EXPECTED_POST_LINE_SEARCH_SHRINKAGE
+        ):
+            raise AssertionError(
+                f"loaded {label} boosting output omits the no-shrinkage policy"
+            )
         predictions.append([point["prediction"] for point in result["predictions"]])
     return maximum_delta(predictions[0], predictions[1], f"loaded {model_type}.predictions")
 
@@ -382,6 +403,19 @@ def main() -> None:
                     )
             guided = train_guided(model_type, guided_args, temp_path)
             deltas = compare_results(model_type, regular, guided)
+            if model_type == "boosting":
+                for label, model_path in (
+                    ("regular", regular_model),
+                    ("guided", guided_model),
+                ):
+                    with model_path.open("rb") as handle:
+                        artifact = pickle.load(handle)
+                    if artifact.get("post_line_search_shrinkage") != (
+                        EXPECTED_POST_LINE_SEARCH_SHRINKAGE
+                    ):
+                        raise AssertionError(
+                            f"{label} boosting artifact omits the no-shrinkage policy"
+                        )
             loaded_delta = compare_loaded_predictions(model_type, regular_model, guided_model)
             if loaded_delta > TOLERANCE:
                 raise AssertionError(

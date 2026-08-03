@@ -263,7 +263,11 @@ def _assert_inherited_parameters(model_type: str, source: Path, production: Path
     }
     production_stages = list(boosting._iter_stage_models(production_state))
     if not production_stages:
-        raise AssertionError("Boosting production refit saved an empty chain")
+        if source_state.get("model_chain"):
+            raise AssertionError("Boosting production refit unexpectedly removed every stage")
+        if production_state.get("baseline", {}).get("kind") != source_state.get("baseline", {}).get("kind"):
+            raise AssertionError("Boosting baseline-only production refit changed the baseline kind")
+        return
     for stage, name, _coefficient, state in production_stages:
         expected = source_stages.get(int(stage))
         actual = (name, dict(state.get("params") or {}))
@@ -302,8 +306,13 @@ def _prepare_model(
         input_state=None,
     )
     work_items = receipt.get("output", {}).get("work_items")
-    if not isinstance(work_items, list) or not work_items:
+    if not isinstance(work_items, list):
         raise AssertionError(f"{model_type} initialize returned no work items")
+    if not work_items and (
+        model_type != "boosting"
+        or receipt.get("output", {}).get("direct_finalize") is not True
+    ):
+        raise AssertionError(f"{model_type} initialize returned an unsupported empty work plan")
 
     executed_steps: list[str] = []
     for attempt_index, item in enumerate(work_items, start=1):
@@ -385,6 +394,23 @@ def main() -> None:
                 source_paths[model_type],
                 temp_path,
             )
+        baseline_only_source = temp_path / "source-boosting-baseline-only.pkl"
+        baseline_only_state = _load_state(source_paths["boosting"])
+        baseline_only_state["model_chain"] = []
+        baseline_only_state["stage_coefficients"] = []
+        baseline_only_state["base_model_states"] = {}
+        with baseline_only_source.open("wb") as handle:
+            pickle.dump(baseline_only_state, handle, protocol=pickle.HIGHEST_PROTOCOL)
+        baseline_only_workspace = temp_path / "baseline-only"
+        baseline_only_workspace.mkdir()
+        summary["boosting_baseline_only"] = _prepare_model(
+            "boosting",
+            data_file,
+            baseline_only_source,
+            baseline_only_workspace,
+        )
+        if summary["boosting_baseline_only"]["work_items"]:
+            raise AssertionError("baseline-only Boosting unexpectedly scheduled refit work")
     print(json.dumps({"status": "ok", "models": summary}, ensure_ascii=False, indent=2))
 
 

@@ -21,6 +21,7 @@ import type { JwtPayload, UserRole } from "./types";
 import { authController } from "./modules/auth";
 import { toolsController } from "./modules/tools";
 import { manualsController } from "./modules/manuals";
+import { reconcileManualDeletionJournals } from "./modules/manuals/manuals.service";
 import { questionBankController } from "./modules/question-bank";
 import { quizzesController } from "./modules/quizzes";
 import { reportsController } from "./modules/reports";
@@ -41,10 +42,15 @@ import { ModelCapacityBusyError } from "./modules/models/model-errors";
 import { classesController } from "./modules/classes";
 import { classMembersController } from "./modules/class-members";
 import { datasetsController } from "./modules/datasets";
+import { reconcileDatasetDeletionJournals } from "./modules/datasets/datasets.service";
 import { experimentsController } from "./modules/experiments";
 import { classGradesController } from "./modules/class-grades";
-import { cleanupExpiredExportFiles } from "./modules/class-grades/class-grades.service";
+import {
+  cleanupExpiredExportFiles,
+  parseClassIdFromExportFilename,
+} from "./modules/class-grades/class-grades.service";
 import { usersController } from "./modules/users";
+import { reconcileReportDeletionJournals } from "./modules/users/users.service";
 import { academicTermsController } from "./modules/academic-terms";
 import { cleanupStaleUploadTempFiles } from "./utils/runtime-cleanup";
 import {
@@ -52,6 +58,10 @@ import {
   isRuntimeDiskCleanupTimerDisabled,
   shouldSkipGuidedTrainingCleanupForTrigger,
 } from "./utils/runtime-cleanup-config";
+import {
+  getDatabaseManagedStorageRoot,
+} from "./utils/managed-storage";
+import { resolveExistingManagedFile } from "./utils/managed-file";
 
 // --- Hono App Initialization ---
 const app = new Hono();
@@ -61,6 +71,11 @@ const exportsRoot = path.resolve(uploadsRoot, "exports");
 
 interface StudentOwnerRow extends RowDataPacket {
   student_id: number;
+  pdf_file_path: string;
+}
+
+interface DatasetFileRow extends RowDataPacket {
+  file_path: string;
 }
 
 interface ClassOwnerRow extends RowDataPacket {
@@ -75,6 +90,7 @@ interface AssignmentRow extends RowDataPacket {
 interface ManualAccessRow extends RowDataPacket {
   manual_id: number;
   is_active: number | boolean;
+  file_path: string;
 }
 
 interface ServerVariableRow extends RowDataPacket {
@@ -257,32 +273,77 @@ async function isAssistantOfStudent(studentId: number, assistantId: number): Pro
   return Boolean(row);
 }
 
-async function canAccessReportFile(filename: string, userId: number, role: UserRole): Promise<boolean> {
-  if (role === "Admin") return true;
-
-  const [rows] = await pool.query<StudentOwnerRow[]>(
-    `SELECT student_id
-       FROM experiment_reports
-      WHERE pdf_file_path LIKE ?
-      ORDER BY report_id DESC
-      LIMIT 1`,
-    [`%/${filename}`],
-  );
-  const ownerStudentId = rows[0]?.student_id;
-  if (!ownerStudentId) return false;
-
-  if (role === "Student") return ownerStudentId === userId;
-  if (role === "Teacher") return isTeacherOfStudent(ownerStudentId, userId);
-  if (role === "Assistant") return isAssistantOfStudent(ownerStudentId, userId);
-
-  return false;
+function escapeStoredPathBasename(filename: string): string {
+  return filename
+    .replaceAll("=", "==")
+    .replaceAll("%", "=%")
+    .replaceAll("_", "=_");
 }
 
-function parseClassIdFromExportFilename(filename: string): number | null {
-  const match = filename.match(/^class-(\d+)-[a-z-]+-\d+\.(zip|csv)$/);
-  if (!match?.[1]) return null;
-  const classId = Number(match[1]);
-  return Number.isInteger(classId) ? classId : null;
+async function resolveAccessibleReportFile(
+  filename: string,
+  userId: number,
+  role: UserRole,
+): Promise<{ authorized: boolean; absolutePath: string | null }> {
+  const [rows] = await pool.query<StudentOwnerRow[]>(
+    `SELECT student_id, pdf_file_path
+       FROM experiment_reports
+      WHERE pdf_file_path = ?
+         OR pdf_file_path LIKE ? ESCAPE '='
+      ORDER BY report_id DESC`,
+    [filename, `%/${escapeStoredPathBasename(filename)}`],
+  );
+  if (rows.length === 0) {
+    return { authorized: false, absolutePath: null };
+  }
+
+  let hasAuthorizedOwner = false;
+  for (const report of rows) {
+    if (!report.student_id || !report.pdf_file_path) continue;
+    const authorized = (
+      role === "Admin"
+      || (role === "Student" && report.student_id === userId)
+      || (role === "Teacher" && await isTeacherOfStudent(report.student_id, userId))
+      || (role === "Assistant" && await isAssistantOfStudent(report.student_id, userId))
+    );
+    if (!authorized) continue;
+    hasAuthorizedOwner = true;
+    const resolved = await resolveExistingManagedFile({
+      storedPath: report.pdf_file_path,
+      managedRoot: reportsRoot,
+      environment: env,
+      legacyFallbackDirectory: getDatabaseManagedStorageRoot(reportsRoot, env),
+      enforceDisposableNamespace: true,
+    }).catch(() => null);
+    if (resolved) {
+      return { authorized: true, absolutePath: resolved.absolutePath };
+    }
+  }
+  return { authorized: hasAuthorizedOwner, absolutePath: null };
+}
+
+async function resolveDatasetDownloadPath(filename: string): Promise<string | null> {
+  const [rows] = await pool.query<DatasetFileRow[]>(
+    `SELECT file_path
+       FROM datasets
+      WHERE file_path = ?
+         OR file_path LIKE ? ESCAPE '='
+      ORDER BY dataset_id DESC
+      LIMIT 1`,
+    [filename, `%/${escapeStoredPathBasename(filename)}`],
+  );
+  if (!rows[0]?.file_path) return null;
+  const resolved = await resolveExistingManagedFile({
+    storedPath: rows[0].file_path,
+    managedRoot: path.resolve(uploadsRoot, "datasets"),
+    environment: env,
+    legacyFallbackDirectory: getDatabaseManagedStorageRoot(
+      path.resolve(uploadsRoot, "datasets"),
+      env,
+    ),
+    enforceDisposableNamespace: true,
+  }).catch(() => null);
+  return resolved?.absolutePath ?? null;
 }
 
 async function canAccessExportFile(filename: string, userId: number, role: UserRole): Promise<boolean> {
@@ -310,21 +371,40 @@ async function canAccessExportFile(filename: string, userId: number, role: UserR
   return false;
 }
 
-async function checkManualFileAccess(filename: string, role: UserRole): Promise<"allowed" | "forbidden" | "not_found"> {
+async function resolveAccessibleManualFile(
+  filename: string,
+  role: UserRole,
+): Promise<{ access: "allowed" | "forbidden" | "not_found"; absolutePath: string | null }> {
   const [rows] = await pool.query<ManualAccessRow[]>(
-    `SELECT manual_id, is_active
+    `SELECT manual_id, is_active, file_path
        FROM experiment_manuals
-      WHERE file_path LIKE ?
-      ORDER BY manual_id DESC
-      LIMIT 1`,
-    [`%/${filename}`],
+      WHERE file_path = ?
+         OR file_path LIKE ? ESCAPE '='
+      ORDER BY manual_id DESC`,
+    [filename, `%/${escapeStoredPathBasename(filename)}`],
   );
 
-  const manual = rows[0];
-  if (!manual) return "not_found";
-
-  if (role === "Admin") return "allowed";
-  return manual.is_active ? "allowed" : "forbidden";
+  if (rows.length === 0) return { access: "not_found", absolutePath: null };
+  let hasAuthorizedManual = false;
+  const manualsRoot = path.resolve(uploadsRoot, "manuals");
+  for (const manual of rows) {
+    if (role !== "Admin" && !manual.is_active) continue;
+    hasAuthorizedManual = true;
+    const resolved = await resolveExistingManagedFile({
+      storedPath: manual.file_path,
+      managedRoot: manualsRoot,
+      environment: env,
+      legacyFallbackDirectory: getDatabaseManagedStorageRoot(manualsRoot, env),
+      enforceDisposableNamespace: true,
+    }).catch(() => null);
+    if (resolved) {
+      return { access: "allowed", absolutePath: resolved.absolutePath };
+    }
+  }
+  return {
+    access: hasAuthorizedManual ? "allowed" : "forbidden",
+    absolutePath: null,
+  };
 }
 
 const directFileResponsePathPattern = /^\/(?:manuals|datasets|reports|exports)\//;
@@ -571,12 +651,13 @@ app.get("/manuals/:filename", jwtAuth, async (c) => {
 
   if (!isSafeFilename(filename)) return c.json({ error: "无效的文件名" }, 400);
 
-  const access = await checkManualFileAccess(filename, payload.role);
-  if (access === "not_found") return c.json({ error: "文件不存在" }, 404);
-  if (access === "forbidden") return c.json({ error: "权限不足" }, 403);
+  const manual = await resolveAccessibleManualFile(filename, payload.role);
+  if (manual.access === "not_found") return c.json({ error: "文件不存在" }, 404);
+  if (manual.access === "forbidden") return c.json({ error: "权限不足" }, 403);
+  if (!manual.absolutePath) return c.json({ error: "文件不存在" }, 404);
 
   const response = await buildLocalFileResponse({
-    absolutePath: path.resolve(uploadsRoot, "manuals", filename),
+    absolutePath: manual.absolutePath,
     filename,
     disposition: "inline",
     fallbackContentType: "application/pdf",
@@ -594,8 +675,11 @@ app.get("/datasets/:filename", jwtAuth, async (c) => {
   const filename = c.req.param("filename");
   if (!isSafeFilename(filename)) return c.json({ error: "无效的文件名" }, 400);
 
+  const absolutePath = await resolveDatasetDownloadPath(filename);
+  if (!absolutePath) return c.json({ error: "文件不存在" }, 404);
+
   const response = await buildLocalFileResponse({
-    absolutePath: path.resolve(uploadsRoot, "datasets", filename),
+    absolutePath,
     filename,
     disposition: "attachment",
     fallbackContentType: "text/csv; charset=UTF-8",
@@ -611,11 +695,12 @@ app.get("/reports/:filename", jwtAuth, async (c) => {
 
   if (!isSafeFilename(filename)) return c.json({ error: "无效的文件名" }, 400);
 
-  const allowed = await canAccessReportFile(filename, payload.sub, payload.role);
-  if (!allowed) return c.json({ error: "权限不足" }, 403);
+  const access = await resolveAccessibleReportFile(filename, payload.sub, payload.role);
+  if (!access.authorized) return c.json({ error: "权限不足" }, 403);
+  if (!access.absolutePath) return c.json({ error: "文件不存在" }, 404);
 
   const response = await buildLocalFileResponse({
-    absolutePath: path.resolve(reportsRoot, filename),
+    absolutePath: access.absolutePath,
     filename,
     disposition: "inline",
     fallbackContentType: "application/pdf",
@@ -635,8 +720,17 @@ app.get("/exports/:filename", jwtAuth, async (c) => {
   const allowed = await canAccessExportFile(filename, payload.sub, payload.role);
   if (!allowed) return c.json({ error: "权限不足" }, 403);
 
+  const resolvedExport = await resolveExistingManagedFile({
+    storedPath: filename,
+    managedRoot: exportsRoot,
+    environment: env,
+    legacyFallbackDirectory: getDatabaseManagedStorageRoot(exportsRoot, env),
+    enforceDisposableNamespace: true,
+  }).catch(() => null);
+  if (!resolvedExport) return c.json({ error: "文件不存在" }, 404);
+
   const response = await buildLocalFileResponse({
-    absolutePath: path.resolve(exportsRoot, filename),
+    absolutePath: resolvedExport.absolutePath,
     filename,
     disposition: "attachment",
     fallbackContentType: "application/octet-stream",
@@ -751,7 +845,119 @@ const runCleanupStep = async <T>(
   }
 };
 
-export async function runRuntimeDiskCleanup(trigger = "manual") {
+interface RuntimeDiskCleanupOptions {
+  skipDeletionJournals?: boolean;
+}
+
+const assertDeletionJournalResult = (
+  name: string,
+  result: Awaited<ReturnType<typeof reconcileDatasetDeletionJournals>>,
+) => {
+  if (result.failedJournals > 0 || result.skippedJournals > 0) {
+    throw new Error(
+      `${name} reconciliation left unresolved journals (failed=${result.failedJournals}, skipped=${result.skippedJournals}): ${result.failedJournalNames.join(", ")}`,
+    );
+  }
+  return result;
+};
+
+async function reconcileDeletionJournalsStrictly() {
+  const datasetDeletionJournals = assertDeletionJournalResult(
+    "dataset deletion journal",
+    await reconcileDatasetDeletionJournals(),
+  );
+  const reportDeletionJournals = assertDeletionJournalResult(
+    "report deletion journal",
+    await reconcileReportDeletionJournals(),
+  );
+  const manualDeletionJournals = assertDeletionJournalResult(
+    "manual deletion journal",
+    await reconcileManualDeletionJournals(),
+  );
+  return { datasetDeletionJournals, reportDeletionJournals, manualDeletionJournals };
+}
+
+const STARTUP_DELETION_RECONCILIATION_ATTEMPTS = 3;
+
+export async function runStartupDeletionJournalReconciliation() {
+  let lastError: unknown;
+  for (let attempt = 1; attempt <= STARTUP_DELETION_RECONCILIATION_ATTEMPTS; attempt += 1) {
+    try {
+      return await reconcileDeletionJournalsStrictly();
+    } catch (error) {
+      lastError = error;
+      logger.warn(
+        {
+          attempt,
+          maxAttempts: STARTUP_DELETION_RECONCILIATION_ATTEMPTS,
+          err: error instanceof Error ? { message: error.message, stack: error.stack } : { message: String(error) },
+        },
+        "启动时恢复删除日志失败",
+      );
+      if (attempt < STARTUP_DELETION_RECONCILIATION_ATTEMPTS) {
+        await new Promise((resolve) => setTimeout(resolve, attempt * 100));
+      }
+    }
+  }
+  throw lastError instanceof Error
+    ? lastError
+    : new Error(`启动时恢复删除日志失败: ${String(lastError)}`);
+}
+
+export async function runRuntimeDiskCleanup(
+  trigger = "manual",
+  options: RuntimeDiskCleanupOptions = {},
+) {
+  // Durable transactions are recovery work, not retention work. Always settle
+  // them before another cleanup can remove or rewrite related artifacts.
+  const datasetDeletionJournals = options.skipDeletionJournals
+    ? null
+    : await runCleanupStep(
+      trigger,
+      "dataset-deletion-journals",
+      reconcileDatasetDeletionJournals,
+    );
+  const reportDeletionJournals = options.skipDeletionJournals
+    ? null
+    : await runCleanupStep(
+      trigger,
+      "report-deletion-journals",
+      reconcileReportDeletionJournals,
+    );
+  const manualDeletionJournals = options.skipDeletionJournals
+    ? null
+    : await runCleanupStep(
+      trigger,
+      "manual-deletion-journals",
+      reconcileManualDeletionJournals,
+    );
+  const deletionRecoveryComplete = options.skipDeletionJournals || (
+    datasetDeletionJournals !== null
+    && reportDeletionJournals !== null
+    && manualDeletionJournals !== null
+    && datasetDeletionJournals.failedJournals === 0
+    && datasetDeletionJournals.skippedJournals === 0
+    && reportDeletionJournals.failedJournals === 0
+    && reportDeletionJournals.skippedJournals === 0
+    && manualDeletionJournals.failedJournals === 0
+    && manualDeletionJournals.skippedJournals === 0
+  );
+  if (!deletionRecoveryComplete) {
+    logger.warn(
+      { trigger, datasetDeletionJournals, reportDeletionJournals, manualDeletionJournals },
+      "删除日志尚未完全恢复，本轮跳过后续保留期清理",
+    );
+    return {
+      guidedTraining: null,
+      productionPreparation: null,
+      exportFiles: null,
+      uploadTempFiles: null,
+      modelArtifacts: null,
+      datasetDeletionJournals,
+      reportDeletionJournals,
+      manualDeletionJournals,
+    };
+  }
   const guidedTraining = shouldSkipGuidedTrainingCleanupForTrigger(trigger)
     ? null
     : await runGuidedTrainingSessionCleanup(trigger);
@@ -770,6 +976,9 @@ export async function runRuntimeDiskCleanup(trigger = "manual") {
     exportFiles,
     uploadTempFiles,
     modelArtifacts,
+    datasetDeletionJournals,
+    reportDeletionJournals,
+    manualDeletionJournals,
   };
 }
 
@@ -889,7 +1098,11 @@ export async function runServerStartupPreflight() {
     process.exit(1);
   }
 
-  await runRuntimeDiskCleanup("startup");
+  // Startup is fail-closed: unlike the interval runner, a durable journal that
+  // remains unreadable after retries prevents the service from accepting new
+  // requests against an unresolved DB/filesystem state.
+  await runStartupDeletionJournalReconciliation();
+  await runRuntimeDiskCleanup("startup", { skipDeletionJournals: true });
   startRuntimeDiskCleanupSchedule();
 }
 

@@ -1,11 +1,13 @@
 import crypto from "crypto";
 import fs from "fs";
 import path from "path";
-import type { RowDataPacket } from "mysql2/promise";
+import type { PoolConnection, RowDataPacket } from "mysql2/promise";
 import { pool } from "../../config";
 import { queryWithTimeout } from "./model-db-guard";
 import type { ModelType, TrainInput } from "./models.schema";
 import {
+  buildMissingModelTrainingRunDetails,
+  buildModelRetrainingRequiredDetails,
   ModelAccessError,
   ModelNotFoundError,
   ModelValidationError,
@@ -39,6 +41,15 @@ import {
 interface ExperimentOwnershipRow extends RowDataPacket {
   student_id: number;
   status: string;
+}
+
+interface ExperimentReadAccessRow extends RowDataPacket {
+  student_id: number;
+}
+
+interface LockedStudentIdentityRow extends RowDataPacket {
+  user_id: number;
+  role: string;
 }
 
 export interface ExperimentModelContextRow extends ExperimentOwnershipRow {
@@ -76,6 +87,26 @@ export interface ExperimentTrainingConfig {
   data_window_evaluate_start_index: number;
   data_window_evaluate_end_index: number;
 }
+
+export async function assertExperimentModelReadAccess(experimentId: number, studentId: number) {
+  const [rows] = await queryWithTimeout<ExperimentReadAccessRow[]>(
+    pool,
+    `SELECT student_id
+       FROM experiment_status
+      WHERE experiment_id = ?
+      LIMIT 1`,
+    [experimentId],
+  );
+  const experiment = rows[0];
+  if (!experiment) {
+    throw new ModelAccessError("实验不存在", 404);
+  }
+  if (experiment.student_id !== studentId) {
+    throw new ModelAccessError("权限不足：该实验不属于当前用户", 403);
+  }
+  return experiment;
+}
+
 export async function assertExperimentModelAccess(experimentId: number, studentId: number) {
   const [rows] = await queryWithTimeout<ExperimentModelContextRow[]>(pool,
     `SELECT student_id,
@@ -125,6 +156,58 @@ export async function assertExperimentModelAccess(experimentId: number, studentI
   return experiment;
 }
 
+/**
+ * Locks the two FK parents shared by every student-owned model write.
+ *
+ * The order is deliberately users -> experiment_status. Session INSERTs have
+ * FKs to both parents; allowing InnoDB to discover those parents implicitly can
+ * take them in the opposite order and deadlock model commits, step events, or
+ * account deletion. Call this only from a short transaction immediately before
+ * the student-owned INSERT.
+ */
+export async function lockStudentExperimentForModelWrite(
+  connection: PoolConnection,
+  experimentId: number,
+  studentId: number,
+) {
+  const [studentRows] = await connection.query<LockedStudentIdentityRow[]>(
+    `SELECT user_id, role
+       FROM users
+      WHERE user_id = ?
+      LIMIT 1
+      FOR UPDATE`,
+    [studentId],
+  );
+  const student = studentRows[0];
+  if (
+    !student
+    || Number(student.user_id) !== studentId
+    || student.role !== "Student"
+  ) {
+    throw new ModelAccessError("学生账号不存在或身份已变化，请重新登录后重试", 403);
+  }
+
+  const [experimentRows] = await connection.query<ExperimentOwnershipRow[]>(
+    `SELECT student_id, status
+       FROM experiment_status
+      WHERE experiment_id = ?
+      LIMIT 1
+      FOR UPDATE`,
+    [experimentId],
+  );
+  const experiment = experimentRows[0];
+  if (!experiment) {
+    throw new ModelAccessError("实验不存在", 404);
+  }
+  if (Number(experiment.student_id) !== studentId) {
+    throw new ModelAccessError("权限不足：该实验不属于当前用户", 403);
+  }
+  if (experiment.status === "Completed") {
+    throw new ModelAccessError("已完成的实验不允许继续训练或预测模型", 400);
+  }
+  return experiment;
+}
+
 const hasDefinedValue = <T>(value: T | null | undefined): value is T => value !== null && value !== undefined;
 
 export const isBaseModelType = (modelType: ModelType): modelType is BaseModelType => {
@@ -144,6 +227,7 @@ export const requireActiveModelTrainingRun = async (
   if (!activeRun) {
     throw new ModelValidationError(
       `${modelType.toUpperCase()} 模型缺少可验证的训练版本，请重新训练该模型`,
+      buildMissingModelTrainingRunDetails(modelType),
     );
   }
   return activeRun;
@@ -293,7 +377,7 @@ export const resolveGuidedStepTimeoutMs = (
   body: TrainInput,
 ) => {
   if (!isEnsembleModelType(modelType) || !body.models) return TRAINING_TIMEOUT;
-  parseRequestedBaseModels(body.models);
+  const requestedModels = parseRequestedBaseModels(body.models);
   const memberMatch = /_(ma|es|arima|lstm)$/.exec(stepId);
   if (memberMatch) {
     const member = memberMatch[1] as BaseModelType;
@@ -301,6 +385,13 @@ export const resolveGuidedStepTimeoutMs = (
       MODEL_ORCHESTRATION_HARD_CAP,
       Math.max(TRAINING_TIMEOUT, BASE_MODEL_TIMEOUT_SECONDS[member] * 1000 + 30_000),
     );
+  }
+  if (
+    modelType === "boosting"
+    && requestedModels.includes("lstm")
+    && (stepId === "initialize_refit" || stepId === "combine_evaluate")
+  ) {
+    return MODEL_ORCHESTRATION_HARD_CAP;
   }
   // Protocol-v2 sessions are superseded before execution; this only keeps the
   // old aggregate id safely bounded during a rolling deployment.
@@ -552,20 +643,26 @@ const assertBaseModelReadyForProduction = (
   experiment: ExperimentModelContextRow,
   modelType: BaseModelType,
 ) => {
+  const requireRetraining = (message: string): never => {
+    throw new ModelValidationError(
+      message,
+      buildModelRetrainingRequiredDetails(modelType),
+    );
+  };
   switch (modelType) {
     case "ma":
       if (!normalizeBooleanFlag(experiment.moving_average_completed) || !hasDefinedValue(experiment.moving_average_window)) {
-        throw new ModelValidationError("移动平均基础模型尚未完成训练，无法准备生产预测模型");
+        requireRetraining("移动平均基础模型尚未完成训练，无法准备生产预测模型");
       }
       return;
     case "es":
       if (!normalizeBooleanFlag(experiment.exponential_smoothing_completed) || !hasDefinedValue(experiment.exponential_smoothing_alpha)) {
-        throw new ModelValidationError("指数平滑基础模型尚未完成训练，无法准备生产预测模型");
+        requireRetraining("指数平滑基础模型尚未完成训练，无法准备生产预测模型");
       }
       return;
     case "arima":
       if (!normalizeBooleanFlag(experiment.arima_completed) || !hasDefinedValue(experiment.arima_d)) {
-        throw new ModelValidationError("ARIMA 基础模型尚未完成训练，无法准备生产预测模型");
+        requireRetraining("ARIMA 基础模型尚未完成训练，无法准备生产预测模型");
       }
       return;
     case "lstm": {
@@ -575,7 +672,7 @@ const assertBaseModelReadyForProduction = (
         || !hasDefinedValue(experiment.lstm_target_field)
         || !hasDefinedValue(experiment.lstm_features)
       ) {
-        throw new ModelValidationError("LSTM 基础模型尚未完成训练，无法准备生产预测模型");
+        requireRetraining("LSTM 基础模型尚未完成训练，无法准备生产预测模型");
       }
       return;
     }
@@ -606,7 +703,10 @@ const assertEnsembleModelReadyForProduction = (
 
   const config = configs[modelType];
   if (!config.completed || config.baseModels.length < 2) {
-    throw new ModelValidationError(config.errorMessage);
+    throw new ModelValidationError(
+      config.errorMessage,
+      buildModelRetrainingRequiredDetails(modelType),
+    );
   }
 };
 

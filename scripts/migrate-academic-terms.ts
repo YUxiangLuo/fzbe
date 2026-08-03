@@ -1,27 +1,14 @@
 import mysql from "mysql2/promise";
-
-const { DB_HOST, DB_USER, DB_PASSWORD, DB_DATABASE } = process.env;
+import { createMigrationConnection } from "./migration-database";
 
 const backfillAcademicYear = process.env.ACADEMIC_TERM_BACKFILL_YEAR?.trim() || "2025-2026";
 const backfillSemester = Number(process.env.ACADEMIC_TERM_BACKFILL_SEMESTER || "2");
-
-function requireEnv(name: string, value: string | undefined): string {
-  const normalized = value?.trim();
-  if (!normalized) throw new Error(`Missing required env var: ${name}`);
-  return normalized;
-}
 
 if (backfillSemester !== 1 && backfillSemester !== 2) {
   throw new Error("ACADEMIC_TERM_BACKFILL_SEMESTER must be 1 or 2");
 }
 
-const connection = await mysql.createConnection({
-  host: requireEnv("DB_HOST", DB_HOST),
-  user: requireEnv("DB_USER", DB_USER),
-  password: DB_PASSWORD ?? "",
-  database: requireEnv("DB_DATABASE", DB_DATABASE),
-  multipleStatements: true,
-});
+const connection = await createMigrationConnection({ multipleStatements: true });
 
 async function hasColumn(tableName: string, columnName: string) {
   const [rows] = await connection.query<mysql.RowDataPacket[]>(

@@ -1,3 +1,5 @@
+import { parseDatabaseDatetime } from "../../utils/database-datetime";
+
 type ExperimentStatus = "Not Started" | "In Progress" | "Completed" | string;
 
 export interface ExperimentUpdateRowSnapshot {
@@ -24,6 +26,7 @@ export const MANAGED_EXPERIMENT_UPDATE_FIELDS = new Set([
   "state_version",
   "experiment_id",
   "student_id",
+  "retry_of_experiment_id",
   "status",
   "start_time",
   "completion_time",
@@ -63,17 +66,11 @@ export const MANAGED_EXPERIMENT_UPDATE_FIELDS = new Set([
   "ensemble_stacking_metrics_r2",
 ]);
 
-const toDate = (value: string | Date | null): Date | null => {
-  if (!value) return null;
-  if (value instanceof Date) return value;
-  const parsed = new Date(value);
-  return Number.isNaN(parsed.getTime()) ? null : parsed;
-};
-
 export const prepareStudentExperimentUpdate = (
   row: ExperimentUpdateRowSnapshot,
   sanitizedInput: Record<string, unknown>,
   now: Date = new Date(),
+  databaseTimezone?: string | null,
 ): StudentExperimentUpdatePreparationResult => {
   if (row.status === "Completed") {
     return { error: "completed" };
@@ -96,7 +93,8 @@ export const prepareStudentExperimentUpdate = (
     return { error: "invalid_highest_step" };
   }
 
-  const previousLast = toDate(row.last_activity_at) ?? toDate(row.start_time);
+  const previousLast = parseDatabaseDatetime(row.last_activity_at, databaseTimezone)
+    ?? parseDatabaseDatetime(row.start_time, databaseTimezone);
   nextData.last_activity_at = now;
 
   if (row.status === "Not Started") {

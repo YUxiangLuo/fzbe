@@ -34,7 +34,6 @@ from error_protocol import format_known_error
 from model_info import attach_method_metadata
 from serialization import dump_model, load_model
 from subprocess_utils import (
-    extract_predictions_from_result,
     extract_uncertainty_profile_from_result,
     run_base_model_fit_subprocess,
 )
@@ -49,6 +48,27 @@ ENSEMBLE_MODULES = {
     "boosting": boosting,
 }
 ALL_MODELS = {**BASE_MODULES, **ENSEMBLE_MODULES}
+
+
+def _load_validated_source_state(model_type: str, model_path: str) -> Dict[str, Any]:
+    """Load the top-level artifact through the owning model's contract.
+
+    Production preparation must not treat child-member validation as a
+    substitute for validating the container that owns the selected weights,
+    meta-model, Boosting chain, or baseline.  In particular, baseline-only
+    Boosting has no child refit that could reject an obsolete container.
+
+    LSTM's loader materializes its Keras sidecar for validation.  The sidecar
+    object is not part of the pickle artifact contract and must not be copied
+    into the resumable preparation checkpoint.
+    """
+    module = ALL_MODELS.get(model_type)
+    if module is None:
+        raise ValueError(f"[VALIDATION] Unknown production model type: {model_type}")
+    source_state = dict(module._load_state(model_path))
+    if model_type == "lstm":
+        source_state.pop("keras_model", None)
+    return source_state
 
 
 def _jsonable(value: Any) -> Any:
@@ -146,9 +166,10 @@ def _prepared_points(result: Dict[str, Any], steps: int) -> List[Dict[str, Any]]
 
 def _initialize(args, state: Dict[str, Any]) -> Dict[str, Any]:
     records = _read_records(args.data_file)
-    source_state = load_model(args.source_model)
-    if not isinstance(source_state, dict) or source_state.get("model_type") != args.model_type:
-        raise ValueError("[MODEL] Backtest artifact does not match production model type.")
+    source_state = _load_validated_source_state(
+        args.model_type,
+        args.source_model,
+    )
     state.update({
         "model_type": args.model_type,
         "records": records,
@@ -164,6 +185,7 @@ def _initialize(args, state: Dict[str, Any]) -> Dict[str, Any]:
         "member_states": {},
     })
 
+    direct_finalize = False
     if args.model_type in BASE_MODULES:
         work_items = [{"id": "fit_model", "model": args.model_type}]
     elif args.model_type in {"weighted_avg", "stacking"}:
@@ -172,6 +194,9 @@ def _initialize(args, state: Dict[str, Any]) -> Dict[str, Any]:
             raise ValueError("[MODEL] Ensemble artifact has no usable member list.")
         work_items = [{"id": f"fit_member_{name}", "model": name} for name in models]
     else:
+        state["post_line_search_shrinkage"] = (
+            boosting.get_post_line_search_shrinkage_metadata(source_state)
+        )
         stages = []
         for stage_idx, model_name, coefficient, member_state in boosting._iter_stage_models(source_state):
             stages.append({
@@ -181,21 +206,55 @@ def _initialize(args, state: Dict[str, Any]) -> Dict[str, Any]:
                 "source_model": member_state["model_file"],
                 "params": dict(member_state.get("params") or {}),
             })
-        if not stages:
-            raise ValueError("[MODEL] Boosting artifact has no usable model chain.")
         state["boosting_stages"] = stages
-        state["residual_train"] = np.asarray(
+        train_history = np.asarray(
             state["parsed_data"].y[range(state["train_start"], state["train_end"] + 1)],
             dtype=float,
         )
-        state["future_prediction"] = np.zeros(state["forecast_steps"], dtype=float)
+        source_baseline = boosting._get_baseline_state(source_state)
+        if source_baseline.get("kind") == "zero":
+            state["baseline"] = dict(source_baseline)
+            state["residual_train"] = train_history
+            state["future_prediction"] = np.zeros(
+                state["forecast_steps"],
+                dtype=float,
+            )
+            state["residual_chain"] = False
+        else:
+            baseline_kind = str(source_baseline["kind"])
+            baseline_period = source_baseline.get("seasonal_period")
+            train_range = range(state["train_start"], state["train_end"] + 1)
+            state["baseline"] = boosting.fit_baseline_state_for_range(
+                state["parsed_data"],
+                train_range,
+                baseline_kind,
+                baseline_period,
+            )
+            state["residual_train"] = (
+                train_history
+                - boosting.baseline_fitted_values_for_range(
+                    state["parsed_data"],
+                    train_range,
+                    baseline_kind,
+                    baseline_period,
+                )
+            )
+            state["future_prediction"] = boosting.forecast_from_baseline_state(
+                state["baseline"],
+                state["forecast_steps"],
+            )
+            state["residual_chain"] = True
         state["refit_stages"] = []
         state["boosting_refit_terminated"] = False
         work_items = [
             {"id": f"fit_stage_{item['stage'] + 1}_{item['model']}", "model": item["model"]}
             for item in stages
         ]
-    return {"work_items": work_items}
+        direct_finalize = not stages
+    result = {"work_items": work_items}
+    if direct_finalize:
+        result["direct_finalize"] = True
+    return result
 
 
 def _fit_base(args, state: Dict[str, Any]) -> Dict[str, Any]:
@@ -301,6 +360,7 @@ def _fit_boosting_stage(step_id: str, state: Dict[str, Any]) -> Dict[str, Any]:
     stage_predictions = boosting._apply_stage_output_semantics(
         stage_idx,
         np.asarray([point["prediction"] for point in points], dtype=float),
+        residual_target=bool(state.get("residual_chain")),
     )
     fitted = boosting._compute_in_sample_fitted_predictions(
         model_name,
@@ -308,14 +368,14 @@ def _fit_boosting_stage(step_id: str, state: Dict[str, Any]) -> Dict[str, Any]:
         round_data,
         train_range,
     )
-    fitted = boosting._apply_stage_output_semantics(stage_idx, fitted)
+    fitted = boosting._apply_stage_output_semantics(
+        stage_idx,
+        fitted,
+        residual_target=bool(state.get("residual_chain")),
+    )
     coefficient = float(boosting._nonnegative_line_search(residual_train, fitted))
     if coefficient <= np.finfo(float).eps:
         remove_member_model_artifact(model_name, destination)
-        if not state.get("refit_stages"):
-            raise ValueError(
-                "[MODEL] Boosting production refit produced no positive first stage."
-            )
         state["boosting_refit_terminated"] = True
         return {
             "stage": stage_idx + 1,
@@ -356,10 +416,17 @@ def _finalize(state: Dict[str, Any]) -> Dict[str, Any]:
 
     source_state = state["source_state"]
     uncertainty = dict(source_state.get("uncertainty") or {})
-    reference = uncertainty.get("reference_series") or state["parsed_data"].y[
+    reference = state["parsed_data"].y[
         range(state["train_start"], state["train_end"] + 1)
     ].tolist()
     residuals = uncertainty.get("calibration_residuals") or []
+    calibration_source = str(
+        uncertainty.get("calibration_source")
+        or "unavailable_post_selection_calibration"
+    )
+    calibration_invalidation_reason = uncertainty.get(
+        "calibration_invalidation_reason"
+    )
     module = ENSEMBLE_MODULES[model_type]
     if model_type == "weighted_avg":
         models = list(source_state["models"])
@@ -387,24 +454,32 @@ def _finalize(state: Dict[str, Any]) -> Dict[str, Any]:
         extra = {"models": models, "meta_model": source_state["meta_model"]}
     else:
         refit_stages = list(state.get("refit_stages") or [])
-        if not refit_stages:
-            raise ValueError("[MODEL] Boosting production refit produced no usable stages.")
         predictions = normalize_demand_forecast(state["future_prediction"])
-        coefficients = state["uncertainty_coefficients"]
-        residuals = np.asarray(state["residual_train"], dtype=float).tolist()
+        coefficients = dict(state.get("uncertainty_coefficients") or {})
+        refit_chain = [item["model"] for item in refit_stages]
+        source_chain = list(source_state.get("model_chain") or [])
+        if refit_chain != source_chain:
+            residuals = []
+            calibration_invalidation_reason = (
+                "unavailable_after_production_refit_chain_change"
+            )
+            calibration_source = "training_history"
+        boosting._add_baseline_uncertainty_member(
+            state["member_profiles"],
+            coefficients,
+            state["baseline"],
+            steps,
+            has_member_stages=bool(refit_chain),
+        )
         extra = {
-            "model_chain": [item["model"] for item in refit_stages],
+            "model_chain": refit_chain,
             "stage_coefficients": [item["coefficient"] for item in refit_stages],
             "boosting_variant": "residual",
+            "post_line_search_shrinkage": (
+                boosting.get_post_line_search_shrinkage_metadata(source_state)
+            ),
+            "baseline": state["baseline"],
         }
-
-    calibration_source = (
-        "production_full_refit_in_sample"
-        if model_type == "boosting"
-        else str(uncertainty.get("calibration_source") or (
-            "level1_holdout" if model_type == "stacking" else "internal_validation"
-        ))
-    )
     profile, summary = ensemble_growth_profile(
         state["member_profiles"],
         coefficients,
@@ -414,17 +489,25 @@ def _finalize(state: Dict[str, Any]) -> Dict[str, Any]:
         calibration_source=calibration_source,
     )
     prepared_predictions = module._format_predictions(predictions.tolist(), profile, summary)
+    artifact_uncertainty = {
+        **uncertainty,
+        "calibration_residuals": residuals,
+        "calibration_source": summary.get(
+            "calibration_source",
+            calibration_source,
+        ),
+        "profile": profile,
+        "summary": summary,
+    }
+    if calibration_invalidation_reason:
+        artifact_uncertainty["calibration_invalidation_reason"] = str(
+            calibration_invalidation_reason
+        )
     artifact_state = {
         "model_type": model_type,
         "base_model_states": state["member_states"],
         "split_plan": source_state.get("split_plan", {}),
-        "uncertainty": {
-            **uncertainty,
-            "calibration_residuals": residuals,
-            "calibration_source": summary.get("calibration_source", "internal_validation"),
-            "profile": profile,
-            "summary": summary,
-        },
+        "uncertainty": artifact_uncertainty,
         "prepared_predictions": prepared_predictions,
         "prepared_forecast_steps": steps,
         **extra,

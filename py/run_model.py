@@ -7,6 +7,7 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), 'src'
 
 # Import all model modules
 from models import arima, es, lstm, ma, stacking, weighted_avg, boosting
+from ensemble_utils import warn_ignored_boosting_controls
 from error_protocol import format_known_error
 
 MODEL_MODULES = {
@@ -87,6 +88,9 @@ def main():
 
     if args.model_type not in MODEL_MODULES:
         raise ValueError(f"Unknown model type: {args.model_type}")
+
+    if args.model_type == "boosting":
+        warn_ignored_boosting_controls(args)
 
     model_module = MODEL_MODULES[args.model_type]
     model_module.run(args)

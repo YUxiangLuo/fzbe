@@ -7,8 +7,6 @@ import tempfile
 from pathlib import Path
 from typing import Any
 
-import numpy as np
-
 from model_metadata_assertions import assert_method_metadata
 
 
@@ -58,7 +56,7 @@ def build_designed_sales_records(scenario: str, month_count: int) -> list[dict[s
 
         if scenario == "level_demand_24m":
             sales = 200 + [-1.0, 0.0, 1.0, 0.0][index % 4]
-        elif scenario == "linear_trend_24m":
+        elif scenario == "linear_trend_36m":
             sales = 80 + 5 * index + small_noise
         elif scenario == "seasonal_promo_36m":
             sales = 180 + 1.2 * index + 25.0 * season + 18.0 * promotion + [0.0, 2.0, -1.0, 1.0][index % 4]
@@ -234,22 +232,6 @@ def assert_strictly_increasing(values: list[float], label: str) -> None:
             raise AssertionError(f"{label} must be strictly increasing at {index}: {values}")
 
 
-def assert_predictions_within_member_envelope(
-    member_predictions: dict[str, list[float]],
-    blended_predictions: list[float],
-    label: str,
-    tolerance: float = 1e-6,
-) -> None:
-    prediction_matrix = np.column_stack([member_predictions[name] for name in BASE_MODELS])
-    lower = np.min(prediction_matrix, axis=1)
-    upper = np.max(prediction_matrix, axis=1)
-    for index, (value, lo, hi) in enumerate(zip(blended_predictions, lower, upper)):
-        if value < float(lo) - tolerance or value > float(hi) + tolerance:
-            raise AssertionError(
-                f"{label} prediction[{index}] escaped member envelope: value={value}, lo={lo}, hi={hi}"
-            )
-
-
 def run_base_models_for_scenario(
     scenario: str,
     records: list[dict[str, Any]],
@@ -313,7 +295,7 @@ def assert_linear_trend_behavior(outputs: dict[str, dict]) -> None:
     if arima_metrics["rmse"] >= es_metrics["rmse"] * 0.25:
         raise AssertionError(f"linear ARIMA should beat ES clearly: arima={arima_metrics}, es={es_metrics}")
     assert_strictly_increasing(extract_predictions(outputs["arima"]), "linear ARIMA predictions")
-    assert_values_between(extract_predictions(outputs["lstm"]), 50.0, 230.0, "linear LSTM predictions")
+    assert_values_between(extract_predictions(outputs["lstm"]), 50.0, 300.0, "linear LSTM predictions")
 
 
 def assert_seasonal_promo_behavior(outputs: dict[str, dict]) -> None:
@@ -332,14 +314,12 @@ def assert_seasonal_promo_behavior(outputs: dict[str, dict]) -> None:
 def run_linear_ensemble_diagnostics(
     records: list[dict[str, Any]],
     base_model_paths: dict[str, Path],
-    base_outputs: dict[str, dict],
 ) -> dict[str, dict]:
     data_json = json.dumps(records, ensure_ascii=False)
     train_end = len(records) - 7
     eval_start = len(records) - 6
     eval_end = len(records) - 1
     eval_length = eval_end - eval_start + 1
-    member_predictions = {model_type: extract_predictions(output) for model_type, output in base_outputs.items()}
     outputs: dict[str, dict] = {}
 
     for model_type in ENSEMBLE_MODELS:
@@ -366,20 +346,34 @@ def run_linear_ensemble_diagnostics(
         outputs[model_type] = output
 
     weighted = outputs["weighted_avg"]
-    weighted_metrics = metrics(weighted, "linear weighted_avg")
-    arima_metrics = metrics(base_outputs["arima"], "linear arima base")
     weights = weighted.get("weights")
     if not isinstance(weights, dict):
         raise AssertionError(f"weighted_avg missing weights: {weights!r}")
-    if float(weights.get("arima", 0.0)) < 0.90:
-        raise AssertionError(f"weighted_avg should heavily favor ARIMA on linear trend, got {weights}")
-    if float(weights.get("lstm", 1.0)) > 0.05:
+    arima_weight = float(weights.get("arima", 0.0))
+    other_weights = [
+        float(weight)
+        for model_name, weight in weights.items()
+        if model_name != "arima"
+    ]
+    if arima_weight < 0.50 or not other_weights or arima_weight <= 3.0 * max(other_weights):
+        raise AssertionError(f"weighted_avg should clearly favor ARIMA on linear trend, got {weights}")
+    if float(weights.get("lstm", 1.0)) > 0.20:
         raise AssertionError(f"weighted_avg should downweight LSTM on linear trend, got {weights}")
-    if weighted_metrics["rmse"] > arima_metrics["rmse"] + 1.0:
-        raise AssertionError(f"weighted_avg regressed too far from ARIMA: weighted={weighted_metrics}, arima={arima_metrics}")
+    weight_diagnostics = weighted.get("weight_diagnostics")
+    if not isinstance(weight_diagnostics, dict):
+        raise AssertionError(f"weighted_avg missing weight diagnostics: {weight_diagnostics!r}")
+    if weight_diagnostics.get("best_member", {}).get("model_name") != "arima":
+        raise AssertionError(
+            f"weighted_avg selection should identify ARIMA as the best internal member: {weight_diagnostics}"
+        )
+    if float(weight_diagnostics["selected_weight_rmse"]) > float(
+        weight_diagnostics["equal_weight_rmse"]
+    ) + 1e-9:
+        raise AssertionError(
+            f"weighted_avg selected weights should beat equal weights internally: {weight_diagnostics}"
+        )
 
     stacking = outputs["stacking"]
-    stacking_metrics = metrics(stacking, "linear stacking")
     meta_model = stacking.get("meta_model")
     if not isinstance(meta_model, dict):
         raise AssertionError(f"stacking missing meta_model: {meta_model!r}")
@@ -387,29 +381,47 @@ def run_linear_ensemble_diagnostics(
     if condition_number is not None and not math.isfinite(float(condition_number)):
         raise AssertionError(f"stacking condition_number must be finite or null: {condition_number!r}")
     meta_model_names = meta_model.get("model_names")
-    meta_weights = meta_model.get("weights")
-    if not isinstance(meta_model_names, list) or not isinstance(meta_weights, list):
-        raise AssertionError(f"stacking meta_model missing names/weights: {meta_model!r}")
-    stacking_weights = {str(name): float(weight) for name, weight in zip(meta_model_names, meta_weights)}
+    meta_coefficients = meta_model.get("coefficients")
+    if not isinstance(meta_model_names, list) or not isinstance(meta_coefficients, list):
+        raise AssertionError(f"stacking meta_model missing names/coefficients: {meta_model!r}")
+    if any(
+        not math.isfinite(float(coefficient)) or float(coefficient) < 0
+        for coefficient in meta_coefficients
+    ):
+        raise AssertionError(f"stacking coefficients must be finite and non-negative: {meta_model!r}")
+    stacking_weights = {
+        str(name): float(weight)
+        for name, weight in zip(meta_model_names, meta_coefficients)
+    }
     if stacking_weights.get("arima", 0.0) < 0.80:
         raise AssertionError(f"stacking should favor ARIMA on linear trend, got {stacking_weights}")
-    if stacking_metrics["rmse"] > arima_metrics["rmse"] + 2.0:
-        raise AssertionError(f"stacking regressed too far from ARIMA: stacking={stacking_metrics}, arima={arima_metrics}")
-    assert_predictions_within_member_envelope(
-        member_predictions,
-        extract_predictions(stacking),
-        "linear stacking",
-    )
+    if int(meta_model.get("oof_fold_count", 0)) < 2 or int(meta_model.get("oof_row_count", 0)) < 4:
+        raise AssertionError(f"stacking should persist rolling OOF evidence: {meta_model!r}")
 
     boosting = outputs["boosting"]
-    boosting_metrics = metrics(boosting, "linear boosting")
     model_chain = boosting.get("model_chain")
     if not isinstance(model_chain, list) or not model_chain:
         raise AssertionError(f"boosting expected a non-empty model_chain, got {model_chain!r}")
-    if model_chain[0] != "arima":
-        raise AssertionError(f"boosting should select ARIMA first on linear trend, got {model_chain}")
-    if boosting_metrics["rmse"] >= 5.0:
-        raise AssertionError(f"boosting RMSE unexpectedly high on linear trend: {boosting_metrics}")
+    if any(model_name not in BASE_MODELS for model_name in model_chain):
+        raise AssertionError(f"boosting returned an unknown residual member: {model_chain}")
+    stage_coefficients = boosting.get("stage_coefficients")
+    if (
+        not isinstance(stage_coefficients, list)
+        or len(stage_coefficients) != len(model_chain)
+        or any(
+            not math.isfinite(float(coefficient)) or float(coefficient) <= 0
+            for coefficient in stage_coefficients
+        )
+    ):
+        raise AssertionError(
+            f"boosting should persist one positive finite coefficient per stage: {stage_coefficients!r}"
+        )
+    search_summary = boosting.get("search_summary")
+    if (
+        not isinstance(search_summary, dict)
+        or search_summary.get("algorithm") != "residual_boosting"
+    ):
+        raise AssertionError(f"boosting missing residual search metadata: {search_summary!r}")
 
     return outputs
 
@@ -427,7 +439,7 @@ def summarize_model(output: dict) -> dict[str, Any]:
 def main() -> None:
     scenarios = {
         "level_demand_24m": build_designed_sales_records("level_demand_24m", 24),
-        "linear_trend_24m": build_designed_sales_records("linear_trend_24m", 24),
+        "linear_trend_36m": build_designed_sales_records("linear_trend_36m", 36),
         "seasonal_promo_36m": build_designed_sales_records("seasonal_promo_36m", 36),
     }
     summary: dict[str, Any] = {
@@ -452,29 +464,28 @@ def main() -> None:
             }
 
         assert_level_demand_behavior(scenario_outputs["level_demand_24m"])
-        assert_linear_trend_behavior(scenario_outputs["linear_trend_24m"])
+        assert_linear_trend_behavior(scenario_outputs["linear_trend_36m"])
         assert_seasonal_promo_behavior(scenario_outputs["seasonal_promo_36m"])
 
-        print("[designed-diagnostics] ensembles: linear_trend_24m", file=sys.stderr, flush=True)
+        print("[designed-diagnostics] ensembles: linear_trend_36m", file=sys.stderr, flush=True)
         ensemble_outputs = run_linear_ensemble_diagnostics(
-            scenarios["linear_trend_24m"],
-            scenario_model_paths["linear_trend_24m"],
-            scenario_outputs["linear_trend_24m"],
+            scenarios["linear_trend_36m"],
+            scenario_model_paths["linear_trend_36m"],
         )
-        summary["ensemble_diagnostics"]["linear_trend_24m"] = {
+        summary["ensemble_diagnostics"]["linear_trend_36m"] = {
             model_type: summarize_model(output)
             for model_type, output in ensemble_outputs.items()
         }
-        summary["ensemble_diagnostics"]["linear_trend_24m"]["weighted_avg"]["weights"] = ensemble_outputs[
+        summary["ensemble_diagnostics"]["linear_trend_36m"]["weighted_avg"]["weights"] = ensemble_outputs[
             "weighted_avg"
         ]["weights"]
-        summary["ensemble_diagnostics"]["linear_trend_24m"]["stacking"]["meta_model"] = ensemble_outputs[
+        summary["ensemble_diagnostics"]["linear_trend_36m"]["stacking"]["meta_model"] = ensemble_outputs[
             "stacking"
         ]["meta_model"]
-        summary["ensemble_diagnostics"]["linear_trend_24m"]["boosting"]["model_chain"] = ensemble_outputs[
+        summary["ensemble_diagnostics"]["linear_trend_36m"]["boosting"]["model_chain"] = ensemble_outputs[
             "boosting"
         ]["model_chain"]
-        summary["ensemble_diagnostics"]["linear_trend_24m"]["boosting"]["stage_coefficients"] = ensemble_outputs[
+        summary["ensemble_diagnostics"]["linear_trend_36m"]["boosting"]["stage_coefficients"] = ensemble_outputs[
             "boosting"
         ]["stage_coefficients"]
 

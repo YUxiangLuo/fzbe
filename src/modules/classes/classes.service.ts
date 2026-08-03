@@ -1,14 +1,16 @@
 import path from "path";
-import { unlink, mkdir } from "node:fs/promises";
+import { unlink } from "node:fs/promises";
 import type { RowDataPacket, ResultSetHeader } from "mysql2";
-import { pool } from "../../config";
+import { env, pool } from "../../config";
 import { validateFile, generateUniqueFilename, FileValidationError } from "../../utils/file-validator";
 import { logWarning } from "../../utils/error-handler";
 import { hashPassword } from "../../utils/password";
 import { USER_CONSTANTS, CSV_LIMITS } from "../../utils/constants";
 import { CsvEncodingError, parseCsvFileRows } from "../../utils/csv-processor";
+import { ensureDatabaseManagedStorageRoot } from "../../utils/managed-storage";
 import type { UpdateClassInput } from "./classes.schema";
 import { getAcademicTermById, getDefaultClassTermId } from "../academic-terms";
+import { databaseDatetimeToIsoString } from "../../utils/database-datetime";
 
 interface ClassRow extends RowDataPacket {
   class_id: number;
@@ -21,7 +23,7 @@ interface ClassRow extends RowDataPacket {
   is_current_term: number | boolean;
   teacher_id: number;
   teacher_name?: string;
-  created_at: Date;
+  created_at: Date | string;
 }
 
 interface UserRow extends RowDataPacket {
@@ -36,9 +38,8 @@ interface ClassAssistantRow extends UserRow {
   class_id: number;
 }
 
-interface ClassWithAssistants extends ClassRow {
-  assistants: UserRow[];
-}
+type ClassResponse = Omit<ClassRow, "created_at"> & { created_at: string | null };
+type ClassWithAssistants = ClassResponse & { assistants: UserRow[] };
 
 interface CountRow extends RowDataPacket {
   count: number;
@@ -49,11 +50,33 @@ interface AssignmentRow extends RowDataPacket {
   enrollment_id?: number;
 }
 
+interface StudentImportRecord {
+  row: number;
+  studentId: string;
+  fullName: string;
+  email: string;
+}
+
 const { STUDENT_ID_REGEX, MIN_NAME_LENGTH, MAX_NAME_LENGTH } = USER_CONSTANTS;
 
 const isValidStudentId = (value: string) => STUDENT_ID_REGEX.test(value);
 const isValidFullName = (value: string) =>
   value.length >= MIN_NAME_LENGTH && value.length <= MAX_NAME_LENGTH;
+
+function getDuplicateKeyName(error: unknown): string | null {
+  const duplicateError = error as { code?: string; message?: string };
+  if (duplicateError.code !== "ER_DUP_ENTRY") return null;
+  return duplicateError.message
+    ?.match(/for key '([^']+)'/i)?.[1]
+    ?.split(".")
+    .pop()
+    ?.toLowerCase() ?? null;
+}
+
+function getDuplicateEntryValue(error: unknown): string | null {
+  return (error as { message?: string }).message
+    ?.match(/Duplicate entry '([^']+)'/i)?.[1] ?? null;
+}
 
 const CLASS_SELECT_FRAGMENT = `
   SELECT c.*,
@@ -65,6 +88,11 @@ const CLASS_SELECT_FRAGMENT = `
     FROM classes c
     JOIN users u ON c.teacher_id = u.user_id
     JOIN academic_terms at ON at.term_id = c.term_id`;
+
+const normalizeClassRow = (row: ClassRow): ClassResponse => ({
+  ...row,
+  created_at: databaseDatetimeToIsoString(row.created_at, env.DB_TIMEZONE),
+});
 
 const appendTermFilter = (conditions: string[], values: unknown[], termId?: number) => {
   if (termId !== undefined) {
@@ -108,13 +136,13 @@ async function attachAssistantsToClasses(classRows: ClassRow[]): Promise<ClassWi
   }
 
   return classRows.map((classRow) => ({
-    ...classRow,
+    ...normalizeClassRow(classRow),
     assistants: assistantsByClassId.get(classRow.class_id) ?? [],
   }));
 }
 
 export interface CreateClassResult {
-  class: ClassRow;
+  class: ClassResponse;
   students_created: number;
   students_enrolled: number;
   students: { user_id: number; username: string; full_name: string; email: string }[];
@@ -128,6 +156,7 @@ export async function createClass(
   termId?: number,
 ): Promise<{ error: string; status: 400 | 409; details?: unknown } | { data: CreateClassResult }> {
   let tempCsvPath: string | null = null;
+  const studentRecords: StudentImportRecord[] = [];
 
   if (studentListFile) {
     try {
@@ -172,13 +201,14 @@ export async function createClass(
     const createdStudents: { user_id: number; username: string; full_name: string; email: string }[] = [];
 
     if (studentListFile) {
-      const tempDir = path.resolve(import.meta.dir, "../../../uploads", "temp");
-      await mkdir(tempDir, { recursive: true });
+      const tempDir = await ensureDatabaseManagedStorageRoot(
+        path.resolve(import.meta.dir, "../../../uploads", "temp"),
+        env,
+      );
       const uniqueFilename = generateUniqueFilename(studentListFile.name);
       tempCsvPath = path.join(tempDir, uniqueFilename);
       await Bun.write(tempCsvPath, studentListFile);
 
-      const studentRecords: { row: number; studentId: string; fullName: string; email: string }[] = [];
       const invalidRecords: { row: number; reason: string }[] = [];
       const seenStudentIds = new Set<string>();
       let rowNumber = 0;
@@ -220,14 +250,24 @@ export async function createClass(
 
       if (studentRecords.length > 0) {
         const studentIds = studentRecords.map((r) => r.studentId);
+        const studentEmails = studentRecords.map((r) => r.email);
         const [existingUsers] = await connection.query<UserRow[]>(
-          "SELECT username FROM users WHERE username IN (?)",
-          [studentIds],
+          "SELECT username, email FROM users WHERE username IN (?) OR email IN (?)",
+          [studentIds, studentEmails],
         );
 
         if (existingUsers.length > 0) {
           await connection.rollback();
-          return { error: "事务失败。以下学生已存在于数据库中。", status: 409, details: { existing_students: existingUsers.map((u) => u.username) } };
+          const existingUsernames = new Set(existingUsers.map((user) => user.username));
+          const existingEmails = new Set(existingUsers.map((user) => user.email));
+          const conflictingStudentIds = studentRecords
+            .filter((student) => existingUsernames.has(student.studentId) || existingEmails.has(student.email))
+            .map((student) => student.studentId);
+          return {
+            error: "事务失败。以下学生账号或邮箱已存在于数据库中。",
+            status: 409,
+            details: { existing_students: conflictingStudentIds },
+          };
         }
 
         const hashedPasswords = await Promise.all(
@@ -252,14 +292,19 @@ export async function createClass(
       }
     }
 
-    await connection.commit();
-
     const [newClassRows] = await connection.query<ClassRow[]>(
       `${CLASS_SELECT_FRAGMENT} WHERE c.class_id = ?`,
       [classId],
     );
+    const newClassRow = newClassRows[0];
+    if (!newClassRow) {
+      throw new Error("Created class could not be reloaded before commit");
+    }
+    const createdClass = normalizeClassRow(newClassRow);
 
-    return { data: { class: newClassRows[0]!, students_created: createdStudentsCount, students_enrolled: createdStudents.length, students: createdStudents } };
+    await connection.commit();
+
+    return { data: { class: createdClass, students_created: createdStudentsCount, students_enrolled: createdStudents.length, students: createdStudents } };
   } catch (error: unknown) {
     await connection.rollback();
     if (error instanceof CsvEncodingError) {
@@ -269,9 +314,25 @@ export async function createClass(
         details: { invalid_rows: [{ row: 0, reason: error.message }] },
       };
     }
-    const err = error as { code?: string };
-    if (err.code === "ER_DUP_ENTRY") {
-      return { error: "班级代码已存在", status: 409 };
+    const duplicateKey = getDuplicateKeyName(error);
+    if (duplicateKey) {
+      if (duplicateKey.includes("class_code")) {
+        return { error: "班级代码已存在", status: 409 };
+      }
+      if (duplicateKey.includes("username") || duplicateKey.includes("email")) {
+        const duplicateValue = getDuplicateEntryValue(error);
+        const conflictingStudentIds = duplicateValue
+          ? studentRecords
+              .filter((student) => student.studentId === duplicateValue || student.email === duplicateValue)
+              .map((student) => student.studentId)
+          : studentRecords.slice(0, 10).map((student) => student.studentId);
+        return {
+          error: "事务失败。以下学生账号或邮箱已存在于数据库中。",
+          status: 409,
+          details: { existing_students: conflictingStudentIds },
+        };
+      }
+      return { error: "创建班级时发生唯一字段冲突", status: 409 };
     }
     throw error;
   } finally {
@@ -292,7 +353,7 @@ export async function getAllClasses(termId?: number) {
     `${CLASS_SELECT_FRAGMENT}${whereClause} ORDER BY c.class_id ASC`,
     values,
   );
-  return rows;
+  return rows.map(normalizeClassRow);
 }
 
 export async function getClassById(classId: number, userId: number, userRole: string) {
@@ -300,8 +361,9 @@ export async function getClassById(classId: number, userId: number, userRole: st
     `${CLASS_SELECT_FRAGMENT} WHERE c.class_id = ?`,
     [classId],
   );
-  const classInfo = classRows[0];
-  if (!classInfo) return { error: "not_found" as const };
+  const classInfoRow = classRows[0];
+  if (!classInfoRow) return { error: "not_found" as const };
+  const classInfo = normalizeClassRow(classInfoRow);
 
   let isAllowed = false;
   if (userRole === "Admin" || userId === classInfo.teacher_id) {
@@ -374,7 +436,7 @@ export async function updateClass(classId: number, userId: number, userRole: str
     `${CLASS_SELECT_FRAGMENT} WHERE c.class_id = ?`,
     [classId],
   );
-  return { data: updatedRows[0]! };
+  return { data: normalizeClassRow(updatedRows[0]!) };
 }
 
 export async function deleteClass(classId: number, userId: number, userRole: string) {

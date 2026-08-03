@@ -79,7 +79,9 @@ test("kills surviving process-group members after the setsid leader exits", asyn
       label: "process-tree-test",
     });
 
-    expect(proc.exitCode).not.toBeNull();
+    // Bun may publish the convenience exitCode property one scheduler turn
+    // after the authoritative exited promise resolves under heavy load.
+    expect(Number.isInteger(await proc.exited)).toBe(true);
     expect(Date.now() - startedAt).toBeGreaterThanOrEqual(40);
     expect(processGroupExists(proc.pid)).toBe(false);
   } finally {

@@ -1,3 +1,6 @@
+import { randomUUID } from "node:crypto";
+import { copyFile, rm } from "node:fs/promises";
+import path from "node:path";
 import mysql from "mysql2/promise";
 import type { Connection, RowDataPacket } from "mysql2/promise";
 
@@ -17,6 +20,10 @@ interface UserSeed {
 
 interface CurrentTermRow extends RowDataPacket {
   term_id: number;
+}
+
+interface ReportFileRow extends RowDataPacket {
+  pdf_file_path: string | null;
 }
 
 interface GradeFixture {
@@ -84,6 +91,47 @@ const CLASS_IDS = {
   mixedState: 8612,
   linkedFlow: 8613,
 } as const;
+
+const MANAGED_REPORT_PREFIX = "e2e-teacher-multiclass-report-";
+
+export function buildMulticlassReportFixturePath(
+  templatePath: string,
+  runToken: string,
+  studentId: number,
+  experimentId: number,
+) {
+  if (!/^[a-zA-Z0-9-]+$/.test(runToken)) {
+    throw new Error("Multiclass report fixture run token contains unsafe characters");
+  }
+  if (!Number.isInteger(studentId) || studentId <= 0) {
+    throw new Error("Multiclass report fixture student id must be a positive integer");
+  }
+  if (!Number.isInteger(experimentId) || experimentId <= 0) {
+    throw new Error("Multiclass report fixture experiment id must be a positive integer");
+  }
+
+  const resolvedTemplatePath = path.resolve(templatePath);
+  return path.join(
+    path.dirname(resolvedTemplatePath),
+    `${MANAGED_REPORT_PREFIX}${runToken}-s${studentId}-e${experimentId}.pdf`,
+  );
+}
+
+export function isManagedMulticlassReportFixturePath(
+  candidatePath: string,
+  templatePath: string,
+) {
+  const resolvedCandidatePath = path.resolve(candidatePath);
+  const resolvedTemplatePath = path.resolve(templatePath);
+  if (resolvedCandidatePath === resolvedTemplatePath) {
+    // The template is an immutable seed input shared by repeated and parallel
+    // disposable-DB runs. Only per-run copies are managed cleanup artifacts.
+    return false;
+  }
+  return path.dirname(resolvedCandidatePath) === path.dirname(resolvedTemplatePath)
+    && path.basename(resolvedCandidatePath).startsWith(MANAGED_REPORT_PREFIX)
+    && path.extname(resolvedCandidatePath).toLowerCase() === ".pdf";
+}
 
 function requireEnv(name: string): string {
   const value = process.env[name]?.trim();
@@ -704,9 +752,20 @@ async function cleanupTargetData(conn: Connection) {
   const studentIds = STUDENTS.map((student) => student.userId);
   const classIds = CLASSES.map((classSeed) => classSeed.classId);
   const userIds = [TEACHER.userId, ASSISTANT.userId, ...studentIds];
+  let oldReportPaths: string[] = [];
 
   if (studentIds.length > 0) {
     const studentPlaceholders = studentIds.map(() => "?").join(", ");
+    const [reportRows] = await conn.query<ReportFileRow[]>(
+      `SELECT pdf_file_path
+         FROM experiment_reports
+        WHERE student_id IN (${studentPlaceholders})
+          AND pdf_file_path IS NOT NULL`,
+      studentIds,
+    );
+    oldReportPaths = reportRows
+      .map((row) => row.pdf_file_path)
+      .filter((reportPath): reportPath is string => Boolean(reportPath));
     await conn.query(
       `DELETE FROM quiz_answers WHERE student_id IN (${studentPlaceholders})`,
       studentIds,
@@ -755,6 +814,49 @@ async function cleanupTargetData(conn: Connection) {
       `DELETE FROM users WHERE user_id IN (${userPlaceholders})`,
       userIds,
     );
+  }
+
+  return oldReportPaths;
+}
+
+async function removeCreatedReportFiles(reportPaths: Iterable<string>) {
+  await Promise.all([...reportPaths].map(async (reportPath) => {
+    try {
+      await rm(reportPath, { force: true });
+    } catch (error) {
+      console.warn(`Failed to remove rolled-back report fixture ${reportPath}:`, error);
+    }
+  }));
+}
+
+async function removeUnreferencedManagedReportFiles(
+  conn: Connection,
+  oldReportPaths: Iterable<string>,
+  templatePath: string,
+  currentReportPaths: ReadonlySet<string>,
+) {
+  for (const oldReportPath of new Set(oldReportPaths)) {
+    const resolvedOldPath = path.resolve(oldReportPath);
+    if (
+      currentReportPaths.has(resolvedOldPath)
+      || !isManagedMulticlassReportFixturePath(resolvedOldPath, templatePath)
+    ) {
+      continue;
+    }
+
+    try {
+      const [references] = await conn.query<RowDataPacket[]>(
+        "SELECT 1 FROM experiment_reports WHERE pdf_file_path = ? LIMIT 1",
+        [oldReportPath],
+      );
+      if (references.length === 0) {
+        await rm(resolvedOldPath, { force: true });
+      }
+    } catch (error) {
+      // Fixture rows are already committed and usable.  A stale managed file is
+      // preferable to turning successful DB setup into a false-negative run.
+      console.warn(`Failed to clean stale report fixture ${resolvedOldPath}:`, error);
+    }
   }
 }
 
@@ -877,7 +979,9 @@ async function insertStepEvents(
 async function insertExperimentFixture(
   conn: Connection,
   student: StudentSeed,
-  reportPath: string,
+  reportTemplatePath: string,
+  runToken: string,
+  createdReportPaths: Set<string>,
 ) {
   if (!student.fixture) {
     return;
@@ -959,6 +1063,17 @@ async function insertExperimentFixture(
 
   if (fixture.report) {
     const report = fixture.report;
+    let reportPath: string | null = null;
+    if (report.useReportPdf) {
+      reportPath = buildMulticlassReportFixturePath(
+        reportTemplatePath,
+        runToken,
+        student.userId,
+        fixture.experimentId,
+      );
+      createdReportPaths.add(reportPath);
+      await copyFile(reportTemplatePath, reportPath);
+    }
     await conn.query(
       `INSERT INTO experiment_reports (
         experiment_id,
@@ -975,7 +1090,7 @@ async function insertExperimentFixture(
         fixture.experimentId,
         student.userId,
         report.content,
-        report.useReportPdf ? reportPath : null,
+        reportPath,
         report.status,
         report.submittedAt,
         report.grade,
@@ -991,7 +1106,11 @@ async function main() {
   const dbUser = requireEnv("DB_USER");
   const dbDatabase = requireEnv("DB_DATABASE");
   const dbPassword = process.env.DB_PASSWORD ?? "";
-  const reportPath = requireEnv("E2E_FIXTURE_REPORT_PATH");
+  const reportTemplatePath = path.resolve(requireEnv("E2E_FIXTURE_REPORT_PATH"));
+  const reportRunToken = randomUUID();
+  const createdReportPaths = new Set<string>();
+  let oldReportPaths: string[] = [];
+  let committed = false;
 
   const conn = await mysql.createConnection({
     host: dbHost,
@@ -1003,18 +1122,34 @@ async function main() {
 
   try {
     await conn.beginTransaction();
-    await cleanupTargetData(conn);
+    oldReportPaths = await cleanupTargetData(conn);
     await insertUsers(conn);
     await insertClasses(conn);
     await insertEnrollments(conn);
 
     for (const student of STUDENTS) {
-      await insertExperimentFixture(conn, student, reportPath);
+      await insertExperimentFixture(
+        conn,
+        student,
+        reportTemplatePath,
+        reportRunToken,
+        createdReportPaths,
+      );
     }
 
     await conn.commit();
+    committed = true;
+    await removeUnreferencedManagedReportFiles(
+      conn,
+      oldReportPaths,
+      reportTemplatePath,
+      createdReportPaths,
+    );
   } catch (error) {
-    await conn.rollback();
+    if (!committed) {
+      await conn.rollback();
+      await removeCreatedReportFiles(createdReportPaths);
+    }
     throw error;
   } finally {
     await conn.end();
@@ -1023,7 +1158,9 @@ async function main() {
   console.log("Seeded teacher multiclass e2e fixture data.");
 }
 
-main().catch((error) => {
-  console.error("Failed to seed teacher multiclass e2e fixture data:", error);
-  process.exit(1);
-});
+if (import.meta.main) {
+  main().catch((error) => {
+    console.error("Failed to seed teacher multiclass e2e fixture data:", error);
+    process.exit(1);
+  });
+}

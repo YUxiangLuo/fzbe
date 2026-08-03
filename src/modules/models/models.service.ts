@@ -3,6 +3,7 @@ export {
   ModelAccessError,
   ModelArtifactError,
   ModelCapacityBusyError,
+  ModelCommitOutcomeUnknownError,
   ModelConflictError,
   ModelNotFoundError,
   ModelOperationDeadlineError,
@@ -36,7 +37,11 @@ export {
 } from "./guided-training.service";
 export {
   createOrResumeProductionPreparationSession,
+  commitProductionPreparationIntermediateAttempt,
+  expandProductionPreparationPlan,
   getProductionPreparationSession,
+  installProductionPreparationAttempt,
+  recordProductionPreparationAttemptFailure,
   runProductionPreparationStep,
   type ProductionPreparationSessionPayload,
 } from "./production-preparation.service";
@@ -47,3 +52,4 @@ export {
   cleanupStaleModelArtifacts,
 } from "./model-cleanup.service";
 export { predictExperimentModel } from "./model-prediction.service";
+export { getExperimentModelObservability } from "./model-observability.service";

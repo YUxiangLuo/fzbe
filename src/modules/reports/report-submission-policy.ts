@@ -1,6 +1,13 @@
+import {
+  getCompletedProductionPlanValidationError,
+  type ProductionPlanValidationOptions,
+} from "../experiments/experiments.schema";
+
 type NullableValue = string | number | boolean | null | undefined;
 
 export interface ReportSubmissionExperimentSnapshot {
+  experiment_id: number;
+  student_id: number;
   status: string;
   highest_completed_step: number | null;
   selected_industry: string | null;
@@ -47,6 +54,7 @@ export interface ReportSubmissionExperimentSnapshot {
   production_target_service_level: number | null;
   production_safety_stock_z_score: number | null;
   production_forecast_results: unknown;
+  production_forecast_evidence: string | null;
   production_mps_table: unknown;
   production_capacity_mode: string | null;
   production_capacity_scenario: string | null;
@@ -77,28 +85,6 @@ const toBoolean = (value: NullableValue): boolean => {
 };
 
 const hasValue = (value: NullableValue): boolean => value !== null && value !== undefined && value !== "";
-
-const parseArray = (value: unknown): unknown[] => {
-  if (Array.isArray(value)) {
-    return value;
-  }
-
-  if (typeof value === "string") {
-    const trimmed = value.trim();
-    if (!trimmed) {
-      return [];
-    }
-
-    try {
-      const parsed = JSON.parse(trimmed);
-      return Array.isArray(parsed) ? parsed : [];
-    } catch {
-      return [];
-    }
-  }
-
-  return [];
-};
 
 const hasCompletedAnyModel = (experiment: ReportSubmissionExperimentSnapshot): boolean => {
   return [
@@ -153,10 +139,23 @@ const hasDataWindow = (experiment: ReportSubmissionExperimentSnapshot): boolean 
   ].every(hasValue);
 };
 
+const hasPersistedProductionPlanOutputs = (
+  experiment: ReportSubmissionExperimentSnapshot,
+  options: ProductionPlanValidationOptions = {},
+): boolean => {
+  return toBoolean(experiment.production_plan_completed)
+    && getCompletedProductionPlanValidationError({ ...experiment }, options) === null;
+};
+
+export interface ReportSubmissionPolicyOptions extends ProductionPlanValidationOptions {
+  allowCompletedWithoutReport?: boolean;
+}
+
 export const getReportSubmissionEligibilityError = (
   experiment: ReportSubmissionExperimentSnapshot,
+  options: ReportSubmissionPolicyOptions = {},
 ): string | null => {
-  if (experiment.status === "Completed") {
+  if (experiment.status === "Completed" && !options.allowCompletedWithoutReport) {
     return "该实验已提交报告，不能重复提交。";
   }
 
@@ -166,6 +165,10 @@ export const getReportSubmissionEligibilityError = (
 
   if (!toBoolean(experiment.production_plan_completed)) {
     return "请先完成生产计划后再提交报告。";
+  }
+
+  if (!hasPersistedProductionPlanOutputs(experiment, options)) {
+    return "生产计划数据不完整，请重新生成并保存生产计划后再提交报告。";
   }
 
   if (!toBoolean(experiment.quiz_about_model_completed)) {
@@ -189,13 +192,15 @@ export const getReportSubmissionEligibilityError = (
 
 export const buildExperimentFlowGradeValues = (
   experiment: ReportSubmissionExperimentSnapshot,
+  options: ProductionPlanValidationOptions = {},
 ): ExperimentFlowGradeValues => {
   const preparedDemandData = hasSelectionContext(experiment) && hasDataWindow(experiment);
   const generatedDemandResults = hasCompletedAnyModel(experiment) && hasAnyModelMetrics(experiment);
   const selectedModel = generatedDemandResults && hasValue(experiment.selected_best_model);
-  const hasForecastResults = parseArray(experiment.production_forecast_results).length > 0;
-  const hasMpsTable = parseArray(experiment.production_mps_table).length > 0;
-  const hasProductionPlan = toBoolean(experiment.production_plan_completed) && hasForecastResults && hasMpsTable;
+  const hasProductionPlan = (
+    toBoolean(experiment.production_plan_completed)
+    && hasPersistedProductionPlanOutputs(experiment, options)
+  );
   const hasInventoryInputs = hasValue(experiment.production_initial_inventory);
   const hasServiceLevelInputs = hasValue(experiment.production_target_service_level);
   const hasCapacityInputs = hasValue(experiment.production_capacity_mode)

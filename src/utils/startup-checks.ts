@@ -1,17 +1,25 @@
-import { accessSync, constants as fsConstants, existsSync, mkdirSync } from "node:fs";
+import { accessSync, constants as fsConstants, existsSync, lstatSync, mkdirSync } from "node:fs";
 import path from "node:path";
-import type { PoolConnection, RowDataPacket } from "mysql2/promise";
+import type { Pool, RowDataPacket } from "mysql2/promise";
 import puppeteer from "puppeteer-core";
-import { pool } from "../config";
+import { env, pool } from "../config";
 import { PATHS } from "./constants";
 import logger from "./logger";
 import { PY_DIR, resolvePythonExecutable } from "./python";
+import { ensureDatabaseManagedStorageRoot } from "./managed-storage";
 
 const DEFAULT_COMMAND_TIMEOUT_MS = 30_000;
 const STARTUP_CHECK_LOCK_NAME = `startup-check:${process.pid}`;
 
+interface StartupHealthCheckRow extends RowDataPacket {
+  ok?: number;
+  acquired?: 0 | 1 | null;
+  released?: 0 | 1 | null;
+}
+
 export interface StartupCheckDependencies {
   ensureExecutableFile: (filePath: string) => void;
+  ensureManagedStorageRoot: (managedRoot: string) => Promise<string>;
   ensureWritableDirectory: (dirPath: string) => void;
   fileExists: (filePath: string) => boolean;
   getChromiumPath: () => string;
@@ -26,6 +34,10 @@ export interface StartupCheckDependencies {
 
 function ensureWritableDirectory(dirPath: string) {
   mkdirSync(dirPath, { recursive: true });
+  const stats = lstatSync(dirPath);
+  if (!stats.isDirectory() || stats.isSymbolicLink()) {
+    throw new Error("目标路径不是可用的真实目录");
+  }
   accessSync(dirPath, fsConstants.R_OK | fsConstants.W_OK);
 }
 
@@ -109,8 +121,69 @@ async function probeChromiumRuntime({
   }
 }
 
+export async function probeStartupDatabaseRuntime(
+  dbPool: Pick<Pool, "getConnection"> = pool,
+): Promise<void> {
+  const connection = await dbPool.getConnection();
+  let lockState: "not-attempted" | "unknown" | "not-acquired" | "acquired" = "not-attempted";
+  let reusable = false;
+
+  try {
+    await connection.beginTransaction();
+
+    const [probeRows] = await connection.query<StartupHealthCheckRow[]>("SELECT 1 AS ok");
+    if (probeRows[0]?.ok !== 1) {
+      throw new Error("SELECT 1 探针返回异常结果");
+    }
+
+    lockState = "unknown";
+    const [lockRows] = await connection.query<StartupHealthCheckRow[]>(
+      "SELECT GET_LOCK(?, 0) AS acquired",
+      [STARTUP_CHECK_LOCK_NAME],
+    );
+    if (Number(lockRows[0]?.acquired) !== 1) {
+      lockState = "not-acquired";
+      throw new Error("无法获取数据库 advisory lock");
+    }
+    lockState = "acquired";
+  } finally {
+    try {
+      if (lockState === "unknown") {
+        throw new Error("数据库 advisory lock 获取结果未知");
+      }
+      if (lockState === "acquired") {
+        const [releaseRows] = await connection.query<StartupHealthCheckRow[]>(
+          "SELECT RELEASE_LOCK(?) AS released",
+          [STARTUP_CHECK_LOCK_NAME],
+        );
+        if (Number(releaseRows[0]?.released) !== 1) {
+          throw new Error("数据库 advisory lock 未确认释放");
+        }
+      }
+
+      await connection.rollback();
+      reusable = true;
+    } finally {
+      // A failed RELEASE_LOCK/ROLLBACK acknowledgement leaves either a named
+      // lock or transaction state uncertain. Closing the physical session is
+      // the only safe way to release both; never return it to the pool.
+      if (reusable) {
+        try {
+          connection.release();
+        } catch (error) {
+          connection.destroy();
+          throw error;
+        }
+      } else {
+        connection.destroy();
+      }
+    }
+  }
+}
+
 const defaultDependencies: StartupCheckDependencies = {
   ensureExecutableFile,
+  ensureManagedStorageRoot: (managedRoot) => ensureDatabaseManagedStorageRoot(managedRoot, env),
   ensureWritableDirectory,
   fileExists: existsSync,
   getChromiumPath: () => PATHS.CHROMIUM_PATH,
@@ -118,52 +191,7 @@ const defaultDependencies: StartupCheckDependencies = {
   logInfo: (message) => logger.info(message),
   logWarn: (message) => logger.warn({ check: "startup-environment" }, message),
   probeChromiumRuntime,
-  queryDatabase: async () => {
-    interface HealthCheckRow extends RowDataPacket {
-      ok?: number;
-      acquired?: 0 | 1 | null;
-    }
-
-    let connection: PoolConnection | null = null;
-    let lockAcquired = false;
-
-    try {
-      connection = await pool.getConnection();
-      await connection.beginTransaction();
-
-      const [probeRows] = await connection.query<HealthCheckRow[]>("SELECT 1 AS ok");
-      if (probeRows[0]?.ok !== 1) {
-        throw new Error("SELECT 1 探针返回异常结果");
-      }
-
-      const [lockRows] = await connection.query<HealthCheckRow[]>(
-        "SELECT GET_LOCK(?, 0) AS acquired",
-        [STARTUP_CHECK_LOCK_NAME],
-      );
-      if (lockRows[0]?.acquired !== 1) {
-        throw new Error("无法获取数据库 advisory lock");
-      }
-      lockAcquired = true;
-    } finally {
-      if (connection) {
-        if (lockAcquired) {
-          try {
-            await connection.query("SELECT RELEASE_LOCK(?)", [STARTUP_CHECK_LOCK_NAME]);
-          } catch (error) {
-            logger.warn({ check: "startup-environment", err: error }, "释放启动检查 advisory lock 失败");
-          }
-        }
-
-        try {
-          await connection.rollback();
-        } catch {
-          // Ignore rollback failures during health probing.
-        }
-
-        connection.release();
-      }
-    }
-  },
+  queryDatabase: probeStartupDatabaseRuntime,
   resolvePythonExecutable,
   runCommand,
 };
@@ -248,13 +276,9 @@ export async function runStartupEnvironmentChecks(
     }
   }
 
+  const uploadsRoot = path.resolve(import.meta.dir, "../../uploads");
   const requiredDirectories = [
-    path.resolve(import.meta.dir, "../../uploads"),
-    path.resolve(import.meta.dir, "../../uploads/manuals"),
-    path.resolve(import.meta.dir, "../../uploads/datasets"),
-    path.resolve(import.meta.dir, "../../uploads/reports"),
-    path.resolve(import.meta.dir, "../../uploads/exports"),
-    path.resolve(import.meta.dir, "../../uploads/temp"),
+    uploadsRoot,
     path.join(pyDir, "trained_models"),
   ];
 
@@ -263,6 +287,16 @@ export async function runStartupEnvironmentChecks(
       deps.ensureWritableDirectory(dirPath);
     } catch (error) {
       failures.push(`目录不可读写: ${dirPath} (${error instanceof Error ? error.message : String(error)})`);
+    }
+  }
+
+  for (const category of ["manuals", "datasets", "reports", "exports", "temp"]) {
+    const categoryRoot = path.join(uploadsRoot, category);
+    try {
+      const databaseRoot = await deps.ensureManagedStorageRoot(categoryRoot);
+      deps.ensureWritableDirectory(databaseRoot);
+    } catch (error) {
+      failures.push(`目录不可读写: ${categoryRoot} (${error instanceof Error ? error.message : String(error)})`);
     }
   }
 

@@ -82,6 +82,14 @@ def compute_expected_stacking_weights(
     level1_predictions: dict[str, list[float]],
     meta_target: np.ndarray,
 ) -> np.ndarray:
+    """Solve the meta-model independently of `_fit_meta_model`.
+
+    The end-to-end run cannot be checked this way any more: Level-1 rows now
+    come from internally planned rolling-origin folds, so reproducing the matrix
+    outside the model would mean reimplementing the fold planner. The solver
+    itself is still reproducible, and pinning it here keeps an independent
+    constraint on the coefficients the end-to-end assertions consume.
+    """
     meta_train = np.column_stack([level1_predictions[name] for name in model_names])
     coefficients, _ = nnls(meta_train, meta_target)
     return coefficients
@@ -154,10 +162,38 @@ def main() -> None:
         ["left", "right"],
     )
     assert singular_meta_model["kind"] == "nnls"
-    assert singular_meta_model["strategy"] == "nonnegative_least_squares"
+    assert singular_meta_model["strategy"] == "ridge_regularized_nonnegative_least_squares"
+    assert singular_meta_model["regularized"] is True
     assert singular_meta_model["coefficients"] == [0.0, 0.0]
     assert math.isfinite(float(singular_meta_model["residual_norm"]))
     json.dumps(singular_meta_model, allow_nan=False)
+
+    # A well-conditioned matrix must take the plain NNLS path and land on the
+    # same solution an independent solver finds. Without this the end-to-end
+    # weight assertions below are self-referential: they read the coefficients
+    # back out of the model's own output.
+    well_conditioned_level1 = {
+        "left": [1.0, 2.0, 3.0, 4.0, 5.0, 6.0],
+        "right": [2.0, 1.0, 4.0, 3.0, 6.0, 5.0],
+    }
+    well_conditioned_target = np.array([1.4, 1.8, 3.4, 3.8, 5.4, 5.8], dtype=float)
+    well_conditioned_meta_model = _fit_meta_model(
+        np.column_stack(
+            [well_conditioned_level1[name] for name in ("left", "right")]
+        ),
+        well_conditioned_target,
+        ["left", "right"],
+    )
+    assert well_conditioned_meta_model["strategy"] == "nonnegative_least_squares"
+    assert well_conditioned_meta_model["regularized"] is False
+    assert_series_close(
+        well_conditioned_meta_model["coefficients"],
+        compute_expected_stacking_weights(
+            ["left", "right"],
+            well_conditioned_level1,
+            well_conditioned_target,
+        ).tolist(),
+    )
 
     records = load_csv_records(CSV_FIXTURE)
     data_json = json.dumps(records, ensure_ascii=False)
@@ -167,7 +203,6 @@ def main() -> None:
     train_end = 19
     eval_start = 20
     eval_end = 23
-    level0_train_end = 14
     future_steps = 3
 
     with tempfile.TemporaryDirectory(prefix="fangzhen-stacking-csv-") as temp_dir:
@@ -187,35 +222,8 @@ def main() -> None:
             eval_end,
         )
 
-        level1_predictions: dict[str, list[float]] = {}
         eval_predictions: dict[str, list[float]] = {}
         for model_name in BASE_MODELS:
-            refit_model_path = temp_path / f"{model_name}-level1-refit.pkl"
-            invoke_model(
-                model_name,
-                data_json,
-                "--train-start",
-                str(train_start),
-                "--train-end",
-                str(level0_train_end),
-                "--load-model",
-                str(base_model_paths[model_name]),
-                "--save-model",
-                str(refit_model_path),
-                "--fit-only",
-                "--pretty",
-            )
-            level1_predictions[model_name] = extract_predictions(
-                invoke_model(
-                    model_name,
-                    None,
-                    "--load-model",
-                    str(refit_model_path),
-                    "--forecast-steps",
-                    "5",
-                    "--pretty",
-                )
-            )
             eval_predictions[model_name] = extract_predictions(
                 invoke_model(
                     model_name,
@@ -227,14 +235,6 @@ def main() -> None:
                     "--pretty",
                 )
             )
-
-        meta_target = np.array(sales[15:20], dtype=float)
-        expected_weights = compute_expected_stacking_weights(
-            BASE_MODELS,
-            level1_predictions,
-            meta_target,
-        )
-        expected_eval_predictions = blend_predictions(BASE_MODELS, eval_predictions, expected_weights)
 
         stacking_model_backtest = temp_path / "stacking-backtest.pkl"
         train_output = invoke_model(
@@ -274,8 +274,26 @@ def main() -> None:
         assert train_output["models"] == BASE_MODELS
         assert train_output["metrics"]["evaluate_months"] == timestamps[20:24]
         assert train_output["eval_y_true"] == sales[20:24]
-        assert train_output["meta_model"]["strategy"] == "nonnegative_least_squares"
-        assert_series_close(train_output["meta_model"]["coefficients"], expected_weights.tolist())
+        assert train_output["meta_model"]["strategy"] in {
+            "nonnegative_least_squares",
+            "ridge_regularized_nonnegative_least_squares",
+        }
+        expected_weights = np.asarray(
+            train_output["meta_model"]["coefficients"],
+            dtype=float,
+        )
+        assert len(expected_weights) == len(BASE_MODELS)
+        assert np.isfinite(expected_weights).all()
+        assert (expected_weights >= 0).all()
+        assert train_output["meta_model"]["oof_fold_count"] >= 2
+        assert train_output["meta_model"]["oof_row_count"] == train_output["split_plan"]["selection_size"]
+        ranges = train_output["split_plan"]["ranges"]
+        assert ranges["selection"]["end_exclusive"] <= ranges["calibration"]["start"]
+        expected_eval_predictions = blend_predictions(
+            BASE_MODELS,
+            eval_predictions,
+            expected_weights,
+        )
         assert_series_close(actual_eval_predictions, expected_eval_predictions)
         assert_all_finite(actual_eval_std_devs, "train_std_devs")
 
