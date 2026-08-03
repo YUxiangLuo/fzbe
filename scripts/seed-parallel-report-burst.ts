@@ -3,13 +3,20 @@ import {
   PARALLEL_DATASET,
   PARALLEL_MODEL_SELECTIONS,
   PARALLEL_STUDENT_USERNAMES,
+  acquireParallelSeedLock,
   assertParallelSeedSafety,
   buildModelArtifactPaths,
   cleanupLegacyStudentModelFiles,
   createDbConnection,
   formatSqlTimestamp,
   rmMany,
+  validateParallelManagedPaths,
 } from "./parallel-seed.shared";
+import {
+  buildCanonicalProductionPlanSnapshot,
+} from "./production-plan-fixture";
+import { buildProductionCapacityScenarios } from "../src/modules/experiments/experiments.schema";
+import { issueProductionForecastEvidence } from "../src/modules/experiments/production-forecast-evidence";
 
 interface StudentRow extends RowDataPacket {
   user_id: number;
@@ -20,6 +27,11 @@ interface ExistingExperimentAssetRow extends RowDataPacket {
   experiment_id: number;
   student_id: number;
   pdf_file_path: string | null;
+  artifact_path: string | null;
+  production_artifact_path: string | null;
+  preparation_artifact_dir: string | null;
+  candidate_model_path: string | null;
+  guided_artifact_dir: string | null;
 }
 
 interface SeededReportExperiment {
@@ -92,51 +104,25 @@ function buildStepEvents(experimentId: number, studentId: number, startTime: str
   return events;
 }
 
-function buildProductionForecastResults(index: number) {
-  return [
-    { period: 1, prediction: 126 + index, std_dev: 8 + index * 0.1 },
-    { period: 2, prediction: 132 + index, std_dev: 9 + index * 0.1 },
-  ];
-}
-
-function buildProductionMpsTable(index: number) {
-  const period1Demand = 126 + index;
-  const period2Demand = 132 + index;
-  const initialInventory = 120;
-  const plannedProduction = 140;
-  const safetyStock = 14 + index;
-  const period1EndingInventory =
-    initialInventory + plannedProduction - period1Demand;
-  const period2BeginningInventory = period1EndingInventory;
-  const period2EndingInventory =
-    period2BeginningInventory + plannedProduction - period2Demand;
-
-  return [
-    {
-      period: 1,
-      period_label: "第1期",
-      demand_forecast: period1Demand,
-      safety_stock: safetyStock,
-      planned_production: plannedProduction,
-      beginning_inventory: initialInventory,
-      production_output: plannedProduction,
-      ending_inventory: period1EndingInventory,
-      stockout: 0,
-      service_level: 1,
-    },
-    {
-      period: 2,
-      period_label: "第2期",
-      demand_forecast: period2Demand,
-      safety_stock: safetyStock,
-      planned_production: plannedProduction,
-      beginning_inventory: period2BeginningInventory,
-      production_output: plannedProduction,
-      ending_inventory: period2EndingInventory,
-      stockout: 0,
-      service_level: 1,
-    },
-  ];
+function buildProductionPlan(index: number) {
+  const points = Array.from({ length: 6 }, (_, periodIndex) => ({
+    prediction: 126 + index + periodIndex * 6,
+    std_dev: 8 + index * 0.1 + periodIndex * 0.5,
+  }));
+  const capacity = buildProductionCapacityScenarios(points, 1.65).normal;
+  return {
+    ...buildCanonicalProductionPlanSnapshot(
+      points,
+      {
+        initialInventory: 120,
+        targetServiceLevel: 0.95,
+        zScore: 1.65,
+        capacity,
+      },
+    ),
+    production_capacity_mode: "scenario" as const,
+    production_capacity_scenario: "normal" as const,
+  };
 }
 
 async function insertReportReadyExperiment(
@@ -150,6 +136,7 @@ async function insertReportReadyExperiment(
   const { startTime, lastActivityAt } = buildStageTimes(input.index);
   const productName =
     PARALLEL_DATASET.products[input.index % PARALLEL_DATASET.products.length]!;
+  const productionPlan = buildProductionPlan(input.index);
 
   const [experimentInsert] = await connection.query<ResultSetHeader>(
     `INSERT INTO experiment_status (
@@ -183,10 +170,12 @@ async function insertReportReadyExperiment(
       production_forecast_results,
       production_mps_table,
       production_capacity_mode,
+      production_capacity_scenario,
       production_capacity,
+      production_custom_capacity,
       start_time,
       last_activity_at
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     [
       input.studentId,
       "In Progress",
@@ -210,21 +199,71 @@ async function insertReportReadyExperiment(
       "ma",
       1,
       1,
-      1,
-      6,
-      120,
-      0.95,
-      1.65,
-      JSON.stringify(buildProductionForecastResults(input.index)),
-      JSON.stringify(buildProductionMpsTable(input.index)),
-      "auto",
-      140,
+      productionPlan.production_plan_completed,
+      productionPlan.production_forecast_periods,
+      productionPlan.production_initial_inventory,
+      productionPlan.production_target_service_level,
+      productionPlan.production_safety_stock_z_score,
+      JSON.stringify(productionPlan.production_forecast_results),
+      JSON.stringify(productionPlan.production_mps_table),
+      productionPlan.production_capacity_mode,
+      productionPlan.production_capacity_scenario,
+      productionPlan.production_capacity,
+      productionPlan.production_custom_capacity,
       startTime,
       lastActivityAt,
     ],
   );
 
   const experimentId = experimentInsert.insertId;
+  const runId = crypto.randomUUID();
+  const productionRevision = crypto.randomUUID();
+  const artifactPath = buildModelArtifactPaths(experimentId, input.studentId)[0]!;
+  await connection.query(
+    `INSERT INTO model_training_runs (
+      run_id,
+      experiment_id,
+      student_id,
+      model_type,
+      request_hash,
+      dataset_revision,
+      runtime_revision,
+      parameters,
+      metrics,
+      artifact_path,
+      production_artifact_forecast_steps,
+      production_revision,
+      is_active
+    ) VALUES (?, ?, ?, 'ma', ?, ?, ?, ?, ?, ?, ?, ?, TRUE)`,
+    [
+      runId,
+      experimentId,
+      input.studentId,
+      "0".repeat(64),
+      "1".repeat(64),
+      "2".repeat(64),
+      JSON.stringify({ fixture: "parallel-report-burst" }),
+      JSON.stringify({ rmse: 25 + input.index, mae: 18 + input.index, r2: 0.91 }),
+      artifactPath,
+      productionPlan.production_forecast_periods,
+      productionRevision,
+    ],
+  );
+  const forecastEvidence = issueProductionForecastEvidence({
+    experiment_id: experimentId,
+    student_id: input.studentId,
+    model_type: "ma",
+    run_id: runId,
+    production_revision: productionRevision,
+    forecast_steps: productionPlan.production_forecast_periods,
+    forecasts: productionPlan.production_forecast_results,
+  });
+  await connection.query(
+    `UPDATE experiment_status
+        SET production_forecast_evidence = ?
+      WHERE experiment_id = ? AND student_id = ?`,
+    [forecastEvidence, experimentId, input.studentId],
+  );
 
   await connection.query(
     `INSERT INTO experiment_grade (
@@ -279,8 +318,10 @@ async function main() {
 
   const usernames = selectedUsernames();
   const connection = await createDbConnection();
+  let releaseSeedLock: (() => Promise<void>) | null = null;
 
   try {
+    releaseSeedLock = await acquireParallelSeedLock(connection);
     const [studentRows] = await connection.query<StudentRow[]>(
       `SELECT user_id, username
          FROM users
@@ -301,12 +342,33 @@ async function main() {
     const studentIds = studentRows.map((row) => row.user_id);
 
     const [assetRows] = await connection.query<ExistingExperimentAssetRow[]>(
-      `SELECT e.experiment_id, e.student_id, r.pdf_file_path
+      `SELECT e.experiment_id,
+              e.student_id,
+              r.pdf_file_path,
+              runs.artifact_path,
+              runs.production_artifact_path,
+              preparation.artifact_dir AS preparation_artifact_dir,
+              preparation.candidate_model_path,
+              guided.artifact_dir AS guided_artifact_dir
          FROM experiment_status e
          LEFT JOIN experiment_reports r ON r.experiment_id = e.experiment_id
+         LEFT JOIN model_training_runs runs ON runs.experiment_id = e.experiment_id
+         LEFT JOIN model_production_preparation_sessions preparation
+           ON preparation.experiment_id = e.experiment_id
+         LEFT JOIN model_guided_training_sessions guided
+           ON guided.experiment_id = e.experiment_id
         WHERE e.student_id IN (${studentIds.map(() => "?").join(", ")})`,
       studentIds,
     );
+    const filesToDelete = await validateParallelManagedPaths(assetRows.flatMap((row) => [
+      row.pdf_file_path,
+      row.artifact_path,
+      row.production_artifact_path,
+      row.preparation_artifact_dir,
+      row.candidate_model_path,
+      row.guided_artifact_dir,
+      ...buildModelArtifactPaths(row.experiment_id, row.student_id),
+    ]));
 
     await connection.beginTransaction();
     await connection.query(
@@ -333,10 +395,6 @@ async function main() {
 
     await connection.commit();
 
-    const filesToDelete = assetRows.flatMap((row) => [
-      row.pdf_file_path,
-      ...buildModelArtifactPaths(row.experiment_id, row.student_id),
-    ]);
     await rmMany(filesToDelete);
     await Promise.all(studentIds.map((studentId) => cleanupLegacyStudentModelFiles(studentId)));
 
@@ -350,7 +408,11 @@ async function main() {
     await connection.rollback().catch(() => {});
     throw error;
   } finally {
-    await connection.end();
+    try {
+      await releaseSeedLock?.();
+    } finally {
+      await connection.end();
+    }
   }
 }
 

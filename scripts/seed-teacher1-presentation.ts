@@ -1,11 +1,16 @@
 import path from "path";
-import { mkdir } from "node:fs/promises";
 import type { RowDataPacket } from "mysql2/promise";
 import { buildMinimalPdf } from "./pdf-fixture";
 import {
   assertParallelSeedSafety,
   createDbConnection,
+  ensureReportsRoot,
 } from "./parallel-seed.shared";
+import {
+  buildCanonicalProductionForecasts,
+  buildCanonicalProductionMps,
+  type ProductionForecastSeed,
+} from "./production-plan-fixture";
 
 const STUDENT_ID_MIN = 20255001;
 const STUDENT_ID_MAX = 20255256;
@@ -21,12 +26,16 @@ interface ReportFixtureRow extends RowDataPacket {
   pdf_file_path: string | null;
 }
 
-function getTeacherPresentationSqlPath() {
-  return path.resolve(process.cwd(), "sql", "teacher1_presentation_data.sql");
+interface ProductionPlanFixtureRow extends RowDataPacket {
+  experiment_id: number;
+  production_forecast_results: unknown;
+  production_initial_inventory: number;
+  production_safety_stock_z_score: number;
+  production_capacity: number;
 }
 
-function getReportsRoot() {
-  return path.resolve(process.cwd(), "uploads", "reports");
+function getTeacherPresentationSqlPath() {
+  return path.resolve(process.cwd(), "sql", "teacher1_presentation_data.sql");
 }
 
 function getReportFileName(row: ReportFixtureRow) {
@@ -46,21 +55,102 @@ function buildReportPdf(row: ReportFixtureRow) {
   ]);
 }
 
+const parseForecastSeeds = (
+  value: unknown,
+  experimentId: number,
+): ProductionForecastSeed[] => {
+  let parsed = value;
+  if (typeof parsed === "string") {
+    try {
+      parsed = JSON.parse(parsed);
+    } catch {
+      throw new Error(
+        `Teacher presentation experiment ${experimentId} has malformed forecast JSON`,
+      );
+    }
+  }
+  if (!Array.isArray(parsed)) {
+    throw new Error(
+      `Teacher presentation experiment ${experimentId} has invalid forecast rows`,
+    );
+  }
+  return parsed.map((point, index) => {
+    if (!point || typeof point !== "object" || Array.isArray(point)) {
+      throw new Error(
+        `Teacher presentation experiment ${experimentId} forecast ${index + 1} is invalid`,
+      );
+    }
+    const record = point as Record<string, unknown>;
+    const prediction = Number(record.prediction);
+    const stdDev = Number(record.std_dev);
+    if (
+      !Number.isFinite(prediction)
+      || prediction < 0
+      || !Number.isFinite(stdDev)
+      || stdDev < 0
+    ) {
+      throw new Error(
+        `Teacher presentation experiment ${experimentId} forecast ${index + 1} is invalid`,
+      );
+    }
+    return { prediction, std_dev: stdDev };
+  });
+};
+
+async function upgradeTeacherProductionPlans(
+  connection: Awaited<ReturnType<typeof createDbConnection>>,
+) {
+  const [rows] = await connection.query<ProductionPlanFixtureRow[]>(
+    `SELECT experiment_id,
+            production_forecast_results,
+            production_initial_inventory,
+            production_safety_stock_z_score,
+            production_capacity
+       FROM experiment_status
+      WHERE student_id BETWEEN ? AND ?
+        AND production_plan_completed = true
+      ORDER BY experiment_id ASC`,
+    [STUDENT_ID_MIN, STUDENT_ID_MAX],
+  );
+
+  for (const row of rows) {
+    const forecasts = buildCanonicalProductionForecasts(
+      parseForecastSeeds(row.production_forecast_results, row.experiment_id),
+    );
+    const mpsTable = buildCanonicalProductionMps(forecasts, {
+      initialInventory: Number(row.production_initial_inventory),
+      zScore: Number(row.production_safety_stock_z_score),
+      capacity: Number(row.production_capacity),
+    });
+    await connection.query(
+      `UPDATE experiment_status
+          SET production_forecast_results = ?,
+              production_mps_table = ?
+        WHERE experiment_id = ?`,
+      [
+        JSON.stringify(forecasts),
+        JSON.stringify(mpsTable),
+        row.experiment_id,
+      ],
+    );
+  }
+  return rows.length;
+}
+
 async function main() {
   assertParallelSeedSafety({
     operationName: "Teacher1 presentation seed",
     commandExample: "bun run seed:teacher1:presentation --force",
   });
 
+  const reportsRoot = await ensureReportsRoot();
   const connection = await createDbConnection();
-  const reportsRoot = getReportsRoot();
 
   try {
     const sqlPath = getTeacherPresentationSqlPath();
     const sql = await Bun.file(sqlPath).text();
     await connection.query(sql);
-
-    await mkdir(reportsRoot, { recursive: true });
+    const upgradedPlanCount = await upgradeTeacherProductionPlans(connection);
 
     const [rows] = await connection.query<ReportFixtureRow[]>(
       `SELECT er.report_id,
@@ -89,7 +179,10 @@ async function main() {
       );
     }
 
-    console.log(`Seeded teacher1 presentation data and ${rows.length} report PDFs in ${reportsRoot}`);
+    console.log(
+      `Seeded teacher1 presentation data, upgraded ${upgradedPlanCount} production plans`
+      + ` and wrote ${rows.length} report PDFs in ${reportsRoot}`,
+    );
   } finally {
     await connection.end();
   }

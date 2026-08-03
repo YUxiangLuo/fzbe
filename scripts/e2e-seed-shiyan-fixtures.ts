@@ -2,6 +2,12 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import mysql from "mysql2/promise";
 import type { ResultSetHeader, RowDataPacket } from "mysql2/promise";
+import { assertE2eDatabaseResetAllowed } from "./test-database-reset-guard";
+import {
+  ensureDatasetsRoot,
+  rmMany,
+  validateParallelManagedPaths,
+} from "./parallel-seed.shared";
 
 type CsvRow = Record<string, string>;
 
@@ -26,6 +32,10 @@ interface DatasetCandidateRow extends RowDataPacket {
 
 interface ReportFileRow extends RowDataPacket {
   pdf_file_path: string | null;
+}
+
+interface SegmentFileRow extends RowDataPacket {
+  file_path: string | null;
 }
 
 const REQUIRED_ENV_KEYS = ["DB_HOST", "DB_USER", "DB_DATABASE"] as const;
@@ -146,16 +156,9 @@ async function cleanupStudentModelFiles(studentId: number) {
   }
 }
 
-async function rmMany(paths: Array<string | null | undefined>) {
-  await Promise.all(
-    paths
-      .filter((p): p is string => Boolean(p))
-      .map((p) => fs.rm(p, { recursive: true, force: true })),
-  );
-}
-
 async function main() {
   assertBaseEnv();
+  assertE2eDatabaseResetAllowed(process.env);
 
   const studentUsername =
     process.env.E2E_SHIYAN_STUDENT_USERNAME ?? DEFAULTS.studentUsername;
@@ -202,6 +205,7 @@ async function main() {
   let newSegmentsDir: string | null = null;
   let oldDatasetIds: number[] = [];
   let oldDatasetFiles: string[] = [];
+  let oldSegmentFiles: string[] = [];
   let oldReportPaths: string[] = [];
 
   try {
@@ -246,6 +250,30 @@ async function main() {
 
     if (oldDatasetIds.length > 0) {
       const placeholders = oldDatasetIds.map(() => "?").join(", ");
+      const [segmentRows] = await conn.query<SegmentFileRow[]>(
+        `SELECT file_path
+           FROM dataset_segments
+          WHERE dataset_id IN (${placeholders})`,
+        oldDatasetIds,
+      );
+      oldSegmentFiles = segmentRows
+        .map((row) => row.file_path)
+        .filter((p): p is string => Boolean(p));
+    }
+
+    const datasetsRoot = await ensureDatasetsRoot();
+    const oldDatasetDirs = oldDatasetIds.map((id) =>
+      path.resolve(datasetsRoot, String(id)),
+    );
+    await validateParallelManagedPaths([
+      ...oldDatasetFiles,
+      ...oldSegmentFiles,
+      ...oldReportPaths,
+      ...oldDatasetDirs,
+    ]);
+
+    if (oldDatasetIds.length > 0) {
+      const placeholders = oldDatasetIds.map(() => "?").join(", ");
       await conn.query(
         `DELETE FROM datasets WHERE dataset_id IN (${placeholders})`,
         oldDatasetIds,
@@ -258,15 +286,12 @@ async function main() {
     );
     const datasetId = insertResult.insertId;
 
-    const uploadsRoot = path.resolve(process.cwd(), "uploads");
-    const datasetsRoot = path.resolve(uploadsRoot, "datasets");
     newDatasetFilePath = path.resolve(
       datasetsRoot,
       `${datasetId}-${DEFAULTS.datasetFileLabel}`,
     );
     newSegmentsDir = path.resolve(datasetsRoot, String(datasetId), "segments");
 
-    await fs.mkdir(datasetsRoot, { recursive: true });
     await fs.mkdir(newSegmentsDir, { recursive: true });
 
     const primaryRows = buildProductRows(industry, company, unit, startYear, monthCount, {
@@ -340,10 +365,12 @@ async function main() {
 
     await conn.commit();
 
-    const oldDatasetDirs = oldDatasetIds.map((id) =>
-      path.resolve(process.cwd(), "uploads", "datasets", String(id)),
-    );
-    await rmMany([...oldDatasetFiles, ...oldReportPaths, ...oldDatasetDirs]);
+    await rmMany([
+      ...oldDatasetFiles,
+      ...oldSegmentFiles,
+      ...oldReportPaths,
+      ...oldDatasetDirs,
+    ]);
     await cleanupStudentModelFiles(studentId);
 
     console.log("Seeded shiyan e2e dataset fixture.");

@@ -1,4 +1,9 @@
+import crypto from "node:crypto";
+import path from "node:path";
+import { copyFile, mkdir, rename } from "node:fs/promises";
 import type { ResultSetHeader, RowDataPacket } from "mysql2/promise";
+import { getModelRuntimeRevision } from "../src/modules/models/model-runtime-identity";
+import { buildVersionedModelPath } from "../src/modules/models/model-runtime";
 import {
   assertParallelSeedSafety,
   PARALLEL_DATASET,
@@ -6,14 +11,21 @@ import {
   PARALLEL_SCENARIOS,
   PARALLEL_STUDENT_GROUPS,
   PARALLEL_STUDENT_USERNAMES,
+  acquireParallelSeedLock,
   cleanupLegacyStudentModelFiles,
   buildModelArtifactPaths,
   createDbConnection,
   formatSqlTimestamp,
   getCliPositionalArgs,
   rmMany,
+  validateParallelManagedPaths,
   type ParallelScenarioName,
 } from "./parallel-seed.shared";
+import {
+  disposeParallelMaTrainingTemplate,
+  prepareParallelMaTrainingTemplate,
+  type ParallelMaTrainingTemplate,
+} from "./parallel-model-run-fixture";
 
 interface StudentRow extends RowDataPacket {
   user_id: number;
@@ -25,6 +37,16 @@ interface ExistingExperimentAssetRow extends RowDataPacket {
   experiment_id: number;
   student_id: number;
   pdf_file_path: string | null;
+  artifact_path: string | null;
+  production_artifact_path: string | null;
+  preparation_artifact_dir: string | null;
+  candidate_model_path: string | null;
+  guided_artifact_dir: string | null;
+}
+
+interface DatasetSegmentRow extends RowDataPacket {
+  product_name: string;
+  file_path: string;
 }
 
 interface ScenarioSeedResult {
@@ -40,6 +62,7 @@ interface ExperimentInsertConfig {
   stage: "training" | "production";
   startTime: string;
   lastActivityAt: string;
+  maTemplate?: ParallelMaTrainingTemplate;
 }
 
 function parseScenarioName(): ParallelScenarioName {
@@ -139,6 +162,9 @@ async function insertScenarioExperiment(
   config: ExperimentInsertConfig,
 ): Promise<ScenarioSeedResult> {
   const isProduction = config.stage === "production";
+  if (isProduction && !config.maTemplate) {
+    throw new Error(`Missing MA training fixture for production-ready student ${config.username}`);
+  }
 
   const [experimentInsert] = await connection.query<ResultSetHeader>(
     `INSERT INTO experiment_status (
@@ -183,9 +209,9 @@ async function insertScenarioExperiment(
       PARALLEL_DATASET.evaluateEndIndex,
       isProduction,
       isProduction ? 3 : null,
-      isProduction ? 29.4 : null,
-      isProduction ? 22.1 : null,
-      isProduction ? 0.882 : null,
+      config.maTemplate?.metrics.rmse ?? null,
+      config.maTemplate?.metrics.mae ?? null,
+      config.maTemplate?.metrics.r2 ?? null,
       isProduction ? "ma" : null,
       isProduction,
       config.startTime,
@@ -239,15 +265,93 @@ async function insertScenarioExperiment(
   };
 }
 
+async function insertActiveParallelMaRun(
+  connection: Awaited<ReturnType<typeof createDbConnection>>,
+  input: {
+    experimentId: number;
+    studentId: number;
+    template: ParallelMaTrainingTemplate;
+    runtimeRevision: string;
+  },
+): Promise<string> {
+  const runId = crypto.randomUUID();
+  const artifactPath = buildVersionedModelPath(
+    input.experimentId,
+    input.studentId,
+    "ma",
+    runId,
+    "backtest",
+  );
+  const requestHash = crypto
+    .createHash("sha256")
+    .update(JSON.stringify({
+      fixture: "parallel-concurrency-production-ready-v1",
+      experimentId: input.experimentId,
+      studentId: input.studentId,
+      runId,
+      datasetRevision: input.template.datasetRevision,
+      runtimeRevision: input.runtimeRevision,
+      parameters: input.template.parameters,
+    }))
+    .digest("hex");
+  const stagingPath = `${artifactPath}.tmp-${crypto.randomUUID()}`;
+
+  try {
+    await mkdir(path.dirname(artifactPath), { recursive: true });
+    await copyFile(input.template.artifactPath, stagingPath);
+    await rename(stagingPath, artifactPath);
+    await connection.query(
+      `INSERT INTO model_training_runs (
+        run_id,
+        session_id,
+        experiment_id,
+        student_id,
+        model_type,
+        request_hash,
+        dataset_revision,
+        runtime_revision,
+        parameters,
+        metrics,
+        artifact_path,
+        artifact_sha256,
+        is_active
+      ) VALUES (?, NULL, ?, ?, 'ma', ?, ?, ?, ?, ?, ?, ?, true)`,
+      [
+        runId,
+        input.experimentId,
+        input.studentId,
+        requestHash,
+        input.template.datasetRevision,
+        input.runtimeRevision,
+        JSON.stringify(input.template.parameters),
+        JSON.stringify(input.template.metrics),
+        artifactPath,
+        input.template.artifactSha256,
+      ],
+    );
+    return artifactPath;
+  } catch (error) {
+    await rmMany([stagingPath, artifactPath]);
+    throw error;
+  }
+}
+
 async function main() {
   assertParallelSeedSafety({
     operationName: "Parallel scenario seed",
     commandExample: "bun run seed:parallel:scenario training-burst --force",
   });
   const scenario = parseScenarioName();
+  const scenarioGroups = buildScenarioGroups(scenario);
   const connection = await createDbConnection();
+  let releaseSeedLock: (() => Promise<void>) | null = null;
+  const maTemplates = new Map<string, ParallelMaTrainingTemplate>();
+  const createdArtifactPaths: string[] = [];
+  let transactionStarted = false;
+  let transactionCommitted = false;
 
   try {
+    releaseSeedLock = await acquireParallelSeedLock(connection);
     const [studentRows] = await connection.query<StudentRow[]>(
       `SELECT user_id, username, full_name
          FROM users
@@ -268,14 +372,78 @@ async function main() {
     const studentIds = studentRows.map((row) => row.user_id);
 
     const [assetRows] = await connection.query<ExistingExperimentAssetRow[]>(
-      `SELECT e.experiment_id, e.student_id, r.pdf_file_path
+      `SELECT e.experiment_id,
+              e.student_id,
+              r.pdf_file_path,
+              runs.artifact_path,
+              runs.production_artifact_path,
+              preparation.artifact_dir AS preparation_artifact_dir,
+              preparation.candidate_model_path,
+              guided.artifact_dir AS guided_artifact_dir
          FROM experiment_status e
          LEFT JOIN experiment_reports r ON r.experiment_id = e.experiment_id
+         LEFT JOIN model_training_runs runs ON runs.experiment_id = e.experiment_id
+         LEFT JOIN model_production_preparation_sessions preparation
+           ON preparation.experiment_id = e.experiment_id
+         LEFT JOIN model_guided_training_sessions guided
+           ON guided.experiment_id = e.experiment_id
         WHERE e.student_id IN (${studentIds.map(() => "?").join(", ")})`,
       studentIds,
     );
+    await validateParallelManagedPaths(assetRows.flatMap((row) => [
+      row.pdf_file_path,
+      row.artifact_path,
+      row.production_artifact_path,
+      row.preparation_artifact_dir,
+      row.candidate_model_path,
+      row.guided_artifact_dir,
+      ...buildModelArtifactPaths(row.experiment_id, row.student_id),
+    ]));
+
+    const requiredProducts = [
+      ...new Set(scenarioGroups.production.map((_, index) =>
+        PARALLEL_DATASET.products[index % PARALLEL_DATASET.products.length]!,
+      )),
+    ];
+    if (requiredProducts.length > 0) {
+      const [segmentRows] = await connection.query<DatasetSegmentRow[]>(
+        `SELECT product_name, file_path
+           FROM dataset_segments
+          WHERE industry_name = ?
+            AND company_name = ?
+            AND product_name IN (${requiredProducts.map(() => "?").join(", ")})`,
+        [
+          PARALLEL_DATASET.industry,
+          PARALLEL_DATASET.company,
+          ...requiredProducts,
+        ],
+      );
+      const segmentByProduct = new Map(
+        segmentRows.map((row) => [row.product_name, row.file_path]),
+      );
+      for (const productName of requiredProducts) {
+        const datasetFilePath = segmentByProduct.get(productName);
+        if (!datasetFilePath) {
+          throw new Error(
+            `Missing dataset segment for ${productName}. Run \`bun run seed:parallel:assets --force\` first.`,
+          );
+        }
+        maTemplates.set(productName, await prepareParallelMaTrainingTemplate({
+          datasetFilePath,
+          trainStartIndex: PARALLEL_DATASET.trainStartIndex,
+          trainEndIndex: PARALLEL_DATASET.trainEndIndex,
+          evaluateStartIndex: PARALLEL_DATASET.evaluateStartIndex,
+          evaluateEndIndex: PARALLEL_DATASET.evaluateEndIndex,
+          movingAverageWindow: 3,
+        }));
+      }
+    }
+    const runtimeRevision = requiredProducts.length > 0
+      ? getModelRuntimeRevision(true)
+      : null;
 
     await connection.beginTransaction();
+    transactionStarted = true;
     if (studentIds.length > 0) {
       await connection.query(
         `DELETE FROM experiment_status
@@ -284,7 +452,6 @@ async function main() {
       );
     }
 
-    const scenarioGroups = buildScenarioGroups(scenario);
     const seededResults: ScenarioSeedResult[] = [];
 
     for (const [index, username] of scenarioGroups.training.entries()) {
@@ -308,19 +475,39 @@ async function main() {
         throw new Error(`Missing student for username ${username}`);
       }
       const times = buildStageTimes(index + scenarioGroups.training.length);
-      seededResults.push(await insertScenarioExperiment(connection, {
+      const productName =
+        PARALLEL_DATASET.products[index % PARALLEL_DATASET.products.length]!;
+      const maTemplate = maTemplates.get(productName);
+      if (!maTemplate || !runtimeRevision) {
+        throw new Error(`Missing prepared MA model fixture for ${productName}`);
+      }
+      const result = await insertScenarioExperiment(connection, {
         studentId: student.user_id,
         username,
-        productName: PARALLEL_DATASET.products[index % PARALLEL_DATASET.products.length]!,
+        productName,
         stage: "production",
+        maTemplate,
         ...times,
+      });
+      seededResults.push(result);
+      createdArtifactPaths.push(await insertActiveParallelMaRun(connection, {
+        experimentId: result.experimentId,
+        studentId: student.user_id,
+        template: maTemplate,
+        runtimeRevision,
       }));
     }
 
     await connection.commit();
+    transactionCommitted = true;
 
     const filesToDelete = assetRows.flatMap((row) => [
       row.pdf_file_path,
+      row.artifact_path,
+      row.production_artifact_path,
+      row.preparation_artifact_dir,
+      row.candidate_model_path,
+      row.guided_artifact_dir,
       ...buildModelArtifactPaths(row.experiment_id, row.student_id),
     ]);
     await rmMany(filesToDelete);
@@ -337,10 +524,23 @@ async function main() {
       }
     }
   } catch (error) {
-    await connection.rollback().catch(() => {});
+    if (transactionStarted && !transactionCommitted) {
+      await connection.rollback().catch(() => {});
+      await rmMany(createdArtifactPaths);
+    }
     throw error;
   } finally {
-    await connection.end();
+    try {
+      await Promise.all(
+        [...maTemplates.values()].map(disposeParallelMaTrainingTemplate),
+      );
+    } finally {
+      try {
+        await releaseSeedLock?.();
+      } finally {
+        await connection.end();
+      }
+    }
   }
 }
 

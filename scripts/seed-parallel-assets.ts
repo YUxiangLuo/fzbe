@@ -3,14 +3,18 @@ import { mkdir } from "node:fs/promises";
 import type { ResultSetHeader, RowDataPacket } from "mysql2/promise";
 import { buildMinimalPdf } from "./pdf-fixture";
 import {
+  acquireParallelSeedLock,
   assertParallelSeedSafety,
   PARALLEL_DATASET,
   PARALLEL_USER_IDS,
   createDbConnection,
+  ensureDatasetsRoot,
+  ensureManualsRoot,
   getDatasetsRoot,
   getManualsRoot,
   rmMany,
   safeFileName,
+  validateParallelManagedPaths,
 } from "./parallel-seed.shared";
 
 type CsvRow = Record<string, string>;
@@ -153,12 +157,16 @@ async function main() {
   let createdManualPath: string | null = null;
   let createdDatasetPath: string | null = null;
   let createdSegmentsDir: string | null = null;
+  let releaseSeedLock: (() => Promise<void>) | null = null;
+  let transactionStarted = false;
+  let transactionCommitted = false;
 
   try {
-    await mkdir(getManualsRoot(), { recursive: true });
-    await mkdir(getDatasetsRoot(), { recursive: true });
+    releaseSeedLock = await acquireParallelSeedLock(connection);
+    await Promise.all([ensureManualsRoot(), ensureDatasetsRoot()]);
 
     await connection.beginTransaction();
+    transactionStarted = true;
 
     const [manualRows] = await connection.query<ManualCandidateRow[]>(
       `SELECT manual_id, file_path
@@ -167,13 +175,6 @@ async function main() {
       [PARALLEL_DATASET.manualDisplayName],
     );
     const oldManualPaths = manualRows.map((row) => row.file_path);
-    await connection.query("UPDATE experiment_manuals SET is_active = false");
-    if (manualRows.length > 0) {
-      await connection.query(
-        `DELETE FROM experiment_manuals WHERE manual_id IN (${manualRows.map(() => "?").join(", ")})`,
-        manualRows.map((row) => row.manual_id),
-      );
-    }
 
     const [datasetRows] = await connection.query<DatasetCandidateRow[]>(
       `SELECT DISTINCT d.dataset_id, d.file_path
@@ -194,6 +195,25 @@ async function main() {
         oldDatasetIds,
       );
       oldSegmentPaths = segmentRows.map((row) => row.file_path);
+    }
+    const oldDatasetDirs = oldDatasetIds.map((datasetIdValue) =>
+      path.resolve(getDatasetsRoot(), String(datasetIdValue)),
+    );
+    await validateParallelManagedPaths([
+      ...oldManualPaths,
+      ...oldDatasetPaths,
+      ...oldSegmentPaths,
+      ...oldDatasetDirs,
+    ]);
+
+    await connection.query("UPDATE experiment_manuals SET is_active = false");
+    if (manualRows.length > 0) {
+      await connection.query(
+        `DELETE FROM experiment_manuals WHERE manual_id IN (${manualRows.map(() => "?").join(", ")})`,
+        manualRows.map((row) => row.manual_id),
+      );
+    }
+    if (oldDatasetIds.length > 0) {
       await connection.query(
         `DELETE FROM datasets WHERE dataset_id IN (${oldDatasetIds.map(() => "?").join(", ")})`,
         oldDatasetIds,
@@ -320,10 +340,8 @@ async function main() {
     );
 
     await connection.commit();
+    transactionCommitted = true;
 
-    const oldDatasetDirs = oldDatasetIds.map((datasetIdValue) =>
-      path.resolve(getDatasetsRoot(), String(datasetIdValue)),
-    );
     await rmMany([
       ...oldManualPaths,
       ...oldDatasetPaths,
@@ -338,11 +356,17 @@ async function main() {
     console.log(`  products: ${PARALLEL_DATASET.products.join(", ")}`);
     console.log(`  months per product: ${PARALLEL_DATASET.monthCount}`);
   } catch (error) {
-    await connection.rollback().catch(() => {});
-    await rmMany([createdManualPath, createdDatasetPath, createdSegmentsDir]);
+    if (transactionStarted && !transactionCommitted) {
+      await connection.rollback().catch(() => {});
+      await rmMany([createdManualPath, createdDatasetPath, createdSegmentsDir]);
+    }
     throw error;
   } finally {
-    await connection.end();
+    try {
+      await releaseSeedLock?.();
+    } finally {
+      await connection.end();
+    }
   }
 }
 
