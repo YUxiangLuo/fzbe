@@ -4134,6 +4134,7 @@ paths:
                 file:
                   type: string
                   format: binary
+                  description: UTF-8 或 GB18030 CSV；最大 50MB、总计 100000 个数据行、1000 个行业/公司/产品组合，且每个组合最多 10000 行
                 data_name:
                   type: string
                   minLength: 2

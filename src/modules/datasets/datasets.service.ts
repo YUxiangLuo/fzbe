@@ -3,7 +3,14 @@ import { createHash, randomUUID } from "node:crypto";
 import { unlink, mkdir, rm, rmdir } from "node:fs/promises";
 import type { RowDataPacket, ResultSetHeader } from "mysql2/promise";
 import { env, pool } from "../../config";
-import { CsvEncodingError, CsvRowLimitError, parseCsvSegments, getCsvHeaders, readCsvRows } from "../../utils/csv-processor";
+import {
+  CsvEncodingError,
+  CsvRowLimitError,
+  parseCsvSegments,
+  getCsvHeaders,
+  readCsvRows,
+  type SegmentData,
+} from "../../utils/csv-processor";
 import {
   FileValidationError,
   fitFilenameToStoragePathLimits,
@@ -12,7 +19,7 @@ import {
   validateFile,
 } from "../../utils/file-validator";
 import { logWarning } from "../../utils/error-handler";
-import { FILE_SIZE_LIMITS } from "../../utils/constants";
+import { CSV_LIMITS, FILE_SIZE_LIMITS } from "../../utils/constants";
 import {
   classifyManagedDeletionOwnership,
   purgeStagedManagedPaths,
@@ -438,6 +445,23 @@ export function buildDatasetGenerationPaths(
   };
 }
 
+export function getDatasetStructureLimitError(
+  segmentsMap: ReadonlyMap<string, SegmentData>,
+): string | null {
+  if (segmentsMap.size > CSV_LIMITS.DATASET_UPLOAD_MAX_SEGMENTS) {
+    return `数据集行业/公司/产品组合数量不能超过 ${CSV_LIMITS.DATASET_UPLOAD_MAX_SEGMENTS}`;
+  }
+
+  for (const segment of segmentsMap.values()) {
+    if (segment.rows.length > CSV_LIMITS.DATASET_SEGMENT_MAX_ROWS) {
+      const identity = [segment.industryName, segment.companyName, segment.productName].join("/");
+      return `产品分段 "${identity}" 的数据行数不能超过 ${CSV_LIMITS.DATASET_SEGMENT_MAX_ROWS}`;
+    }
+  }
+
+  return null;
+}
+
 type DatasetUploadCommitProbe =
   | { state: "committed"; row: DatasetRow }
   | { state: "not-committed" }
@@ -575,6 +599,13 @@ export async function uploadDataset(file: File, dataName: string, description?: 
     }
 
     const segmentsMap = await parseCsvSegments(tempUploadPath);
+    const structureLimitError = getDatasetStructureLimitError(segmentsMap);
+    if (structureLimitError) {
+      return {
+        error: structureLimitError,
+        status: 400 as const,
+      };
+    }
 
     for (const [, segment] of segmentsMap.entries()) {
       const timePoints = new Set<string>();

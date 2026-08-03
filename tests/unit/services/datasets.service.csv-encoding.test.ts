@@ -29,11 +29,13 @@ mock.module(configModulePath, () => ({
 const {
   buildDatasetSegmentFilename,
   buildDatasetGenerationPaths,
+  getDatasetStructureLimitError,
   getProductFields,
   getProductSales,
   toCsvString,
 } = await import(freshDatasetsServiceModulePath);
 const { getCsvHeaders, readCsvRows } = await import("../../../src/utils/csv-processor");
+const { CSV_LIMITS } = await import("../../../src/utils/constants");
 
 const gbkDatasetCsv = Buffer.from([
   0xd0, 0xd0, 0xd2, 0xb5, 0xc3, 0xfb, 0xb3, 0xc6, 0x2c, 0xb9, 0xab, 0xcb,
@@ -112,6 +114,31 @@ describe("datasets service CSV encoding", () => {
         "备注\"字段": "包含\"引号\"和值,逗号",
       },
     ]);
+  });
+
+  test("keeps aggregate uploads and model-readable product segments independently bounded", () => {
+    const row = { "年份": "2024", "月份": "1", "销售数量": "100" };
+    const baseSegment = {
+      industryName: "制造业",
+      companyName: "样本企业",
+      productName: "样本产品",
+      rows: Array(CSV_LIMITS.DATASET_SEGMENT_MAX_ROWS).fill(row),
+    };
+
+    expect(getDatasetStructureLimitError(new Map([["valid", baseSegment]]))).toBeNull();
+    expect(getDatasetStructureLimitError(new Map([[
+      "oversized",
+      { ...baseSegment, rows: [...baseSegment.rows, row] },
+    ]]))).toContain(`数据行数不能超过 ${CSV_LIMITS.DATASET_SEGMENT_MAX_ROWS}`);
+
+    const tooManySegments = new Map(
+      Array.from(
+        { length: CSV_LIMITS.DATASET_UPLOAD_MAX_SEGMENTS + 1 },
+        (_, index) => [`segment-${index}`, { ...baseSegment, rows: [row] }] as const,
+      ),
+    );
+    expect(getDatasetStructureLimitError(tooManySegments))
+      .toContain(`组合数量不能超过 ${CSV_LIMITS.DATASET_UPLOAD_MAX_SEGMENTS}`);
   });
 
   test("gives distinct bounded names to different tuples and sanitize collisions", () => {

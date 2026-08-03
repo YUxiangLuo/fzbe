@@ -10,7 +10,9 @@ import {
   parseCsvSegments,
   parseCsvFileRows,
   processCsvFile,
+  readCsvRows,
 } from "../../../src/utils/csv-processor";
+import { CSV_LIMITS } from "../../../src/utils/constants";
 
 const gbkUserCsv = Buffer.from([
   0xd0, 0xd5, 0xc3, 0xfb, 0x2c, 0xca, 0xd6, 0xbb, 0xfa, 0xba, 0xc5, 0x0a,
@@ -99,5 +101,42 @@ describe("csv processor encoding", () => {
       { maxRows: 2 },
     )).rejects.toBeInstanceOf(CsvRowLimitError);
     expect(seenRows).toEqual(["1", "2"]);
+  });
+
+  test("allows a multi-product dataset upload above the single-segment row limit", async () => {
+    const rowCount = CSV_LIMITS.DATASET_SEGMENT_MAX_ROWS + 1;
+    const rows = Array.from(
+      { length: rowCount },
+      (_, index) => `制造业,样本企业,产品${Math.floor(index / 100)},2024,1,${index + 1},件`,
+    );
+    const filePath = await writeTempCsv([
+      "行业名称,公司名称,产品名称,年份,月份,销售数量,数量单位",
+      ...rows,
+      "",
+    ].join("\n"));
+
+    const segments = await parseCsvSegments(filePath);
+    const parsedRows = [...segments.values()].reduce(
+      (total, segment) => total + segment.rows.length,
+      0,
+    );
+
+    expect(parsedRows).toBe(rowCount);
+    expect(segments.size).toBe(Math.ceil(rowCount / 100));
+    await expect(readCsvRows(filePath)).rejects.toBeInstanceOf(CsvRowLimitError);
+  });
+
+  test("rejects an aggregate dataset upload above its configured row limit", async () => {
+    const filePath = await writeTempCsv([
+      "行业名称,公司名称,产品名称,年份,月份,销售数量,数量单位",
+      "制造业,样本企业,产品A,2024,1,100,件",
+      "制造业,样本企业,产品B,2024,1,200,件",
+      "制造业,样本企业,产品C,2024,1,300,件",
+      "",
+    ].join("\n"));
+
+    await expect(parseCsvSegments(filePath, { maxRows: 2 }))
+      .rejects.toBeInstanceOf(CsvRowLimitError);
+    expect(CSV_LIMITS.DATASET_UPLOAD_MAX_ROWS).toBe(100_000);
   });
 });

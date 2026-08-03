@@ -109,7 +109,9 @@ export async function parseCsvFileRows(
 
 export async function readCsvRows(filePath: string): Promise<Record<string, string>[]> {
   const rows: Record<string, string>[] = [];
-  await parseCsvFileRows(filePath, (row) => rows.push(row), { maxRows: CSV_LIMITS.MAX_ROWS });
+  await parseCsvFileRows(filePath, (row) => rows.push(row), {
+    maxRows: CSV_LIMITS.DATASET_SEGMENT_MAX_ROWS,
+  });
   return rows;
 }
 
@@ -125,7 +127,7 @@ export async function processCsvFile<T>(
 ): Promise<CsvValidationResult<T>> {
   const {
     validator,
-    maxRows = CSV_LIMITS.MAX_ROWS,
+    maxRows = CSV_LIMITS.DATASET_SEGMENT_MAX_ROWS,
     duplicateCheckField,
     existingValues,
   } = options;
@@ -178,15 +180,17 @@ export async function processCsvFile<T>(
 }
 
 /**
- * Parses a CSV file and groups its rows by a composite key (Industry|Company|Product).
- * This function reads the entire file into memory and returns a map where each entry
- * corresponds to a unique product segment.
+ * Parses an administrator dataset upload and groups its rows by a composite key
+ * (Industry|Company|Product). The aggregate upload limit is intentionally larger
+ * than the single-segment limit used by readCsvRows: one upload can contain many
+ * independently bounded model inputs.
  *
  * @param filePath The absolute path to the CSV file.
  * @returns A Promise that resolves to a Map<string, SegmentData>.
  */
 export async function parseCsvSegments(
   filePath: string,
+  options: { maxRows?: number } = {},
 ): Promise<Map<string, SegmentData>> {
   const segments = new Map<string, SegmentData>();
 
@@ -213,7 +217,7 @@ export async function parseCsvSegments(
     }
 
     segment.rows.push(row);
-  }, { maxRows: CSV_LIMITS.MAX_ROWS });
+  }, { maxRows: options.maxRows ?? CSV_LIMITS.DATASET_UPLOAD_MAX_ROWS });
 
   return segments;
 }

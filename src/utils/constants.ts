@@ -143,10 +143,14 @@ export const FILE_SIZE_LIMITS = {
 // CSV 解析限制
 // ============================================
 export const CSV_LIMITS = {
-  /** CSV 最大行数 */
-  MAX_ROWS: 10000,
+  /** 单个产品分段允许包含的最大数据行数 */
+  DATASET_SEGMENT_MAX_ROWS: 10_000,
+  /** 一个管理员数据集上传文件允许包含的总数据行数 */
+  DATASET_UPLOAD_MAX_ROWS: 100_000,
+  /** 单个数据集允许拆分出的最大行业/公司/产品组合数 */
+  DATASET_UPLOAD_MAX_SEGMENTS: 1_000,
   /** 批量导入学生最大行数 */
-  BATCH_IMPORT_MAX_ROWS: 1000,
+  BATCH_IMPORT_MAX_ROWS: 1_000,
 } as const;
 
 // ============================================
