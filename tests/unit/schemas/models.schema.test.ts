@@ -6,7 +6,28 @@ import {
   ALL_MODELS,
   isModelType,
   getTrainSchemaForModel,
+  MAX_LSTM_ADDITIONAL_FEATURES,
 } from "../../../src/modules/models/models.schema";
+
+const LSTM_FEATURE_LIMIT_MESSAGE =
+  `LSTM 附加输入特征最多可选择 ${MAX_LSTM_ADDITIONAL_FEATURES} 个（目标字段不计入上限），请减少所选特征后重试`;
+
+const buildLstmFeatureLimitPayload = (lstmFeatures: string[] | string) => ({
+  experiment_id: 12,
+  lstmFeatures,
+  lstmTargetFeature: "销售数量",
+  lstmNormalization: "minmax" as const,
+});
+
+const expectLstmFeatureLimitRejection = (result: ReturnType<ReturnType<typeof getTrainSchemaForModel>["safeParse"]>) => {
+  expect(result.success).toBe(false);
+  if (!result.success) {
+    expect(result.error.issues).toContainEqual(expect.objectContaining({
+      path: ["lstmFeatures"],
+      message: LSTM_FEATURE_LIMIT_MESSAGE,
+    }));
+  }
+};
 
 describe("Models Schemas", () => {
   describe("trainSchema", () => {
@@ -128,6 +149,47 @@ describe("Models Schemas", () => {
       }
     });
 
+    test("should accept 64 and reject 65 LSTM features for JSON arrays without splitting comma-containing names", () => {
+      const acceptedFeatures = [
+        "外部,指标",
+        ...Array.from(
+          { length: MAX_LSTM_ADDITIONAL_FEATURES - 1 },
+          (_, index) => `特征${index + 1}`,
+        ),
+      ];
+      const rejectedFeatures = [...acceptedFeatures, "超限特征"];
+
+      const accepted = getTrainSchemaForModel("lstm").safeParse(
+        buildLstmFeatureLimitPayload(acceptedFeatures),
+      );
+      expect(accepted.success).toBe(true);
+      if (accepted.success) {
+        expect(accepted.data.lstmFeatures).toBe(JSON.stringify(acceptedFeatures));
+      }
+
+      expectLstmFeatureLimitRejection(
+        getTrainSchemaForModel("lstm").safeParse(
+          buildLstmFeatureLimitPayload(rejectedFeatures),
+        ),
+      );
+    });
+
+    test("should accept 64 and reject 65 legacy comma-separated LSTM features", () => {
+      const acceptedFeatures = Array.from(
+        { length: MAX_LSTM_ADDITIONAL_FEATURES },
+        (_, index) => `旧特征${index + 1}`,
+      );
+
+      expect(getTrainSchemaForModel("lstm").safeParse(
+        buildLstmFeatureLimitPayload(acceptedFeatures.join(",")),
+      ).success).toBe(true);
+      expectLstmFeatureLimitRejection(
+        getTrainSchemaForModel("lstm").safeParse(
+          buildLstmFeatureLimitPayload([...acceptedFeatures, "超限特征"].join(",")),
+        ),
+      );
+    });
+
     test("should require model-specific params for weighted ensemble training", () => {
       const result = getTrainSchemaForModel("weighted_avg").safeParse({
         experiment_id: 12,
@@ -195,6 +257,29 @@ describe("Models Schemas", () => {
         }
       }
     });
+
+    test("should enforce the 64-feature LSTM boundary for all three ensemble schemas", () => {
+      const acceptedFeatures = [
+        "外部,指标",
+        ...Array.from(
+          { length: MAX_LSTM_ADDITIONAL_FEATURES - 1 },
+          (_, index) => `特征${index + 1}`,
+        ),
+      ];
+      const rejectedFeatures = [...acceptedFeatures, "超限特征"];
+
+      for (const modelType of ["weighted_avg", "stacking", "boosting"] as const) {
+        expect(getTrainSchemaForModel(modelType).safeParse({
+          ...buildLstmFeatureLimitPayload(JSON.stringify(acceptedFeatures)),
+          models: "ma,lstm",
+        }).success).toBe(true);
+
+        expectLstmFeatureLimitRejection(getTrainSchemaForModel(modelType).safeParse({
+          ...buildLstmFeatureLimitPayload(JSON.stringify(rejectedFeatures)),
+          models: "ma,lstm",
+        }));
+      }
+    });
   });
 
   describe("predictSchema", () => {
@@ -214,6 +299,18 @@ describe("Models Schemas", () => {
       });
 
       expect(result.success).toBe(true);
+    });
+
+    test("should enforce the persistable 2-12 period production horizon", () => {
+      const request = {
+        experiment_id: 12,
+        preparation_token: "123e4567-e89b-42d3-a456-426614174000",
+      };
+
+      expect(predictSchema.safeParse({ ...request, forecast_steps: 1 }).success).toBe(false);
+      expect(predictSchema.safeParse({ ...request, forecast_steps: 2 }).success).toBe(true);
+      expect(predictSchema.safeParse({ ...request, forecast_steps: 12 }).success).toBe(true);
+      expect(predictSchema.safeParse({ ...request, forecast_steps: 13 }).success).toBe(false);
     });
 
     test("should reject forecasts longer than the production horizon", () => {
@@ -240,6 +337,19 @@ describe("Models Schemas", () => {
       });
 
       expect(result.success).toBe(true);
+    });
+
+    test("should enforce the same 2-12 period horizon as prediction and plan persistence", () => {
+      const request = { experiment_id: 12 };
+
+      expect(prepareProductionSchema.safeParse({ ...request, forecast_steps: 1 }).success)
+        .toBe(false);
+      expect(prepareProductionSchema.safeParse({ ...request, forecast_steps: 2 }).success)
+        .toBe(true);
+      expect(prepareProductionSchema.safeParse({ ...request, forecast_steps: 12 }).success)
+        .toBe(true);
+      expect(prepareProductionSchema.safeParse({ ...request, forecast_steps: 13 }).success)
+        .toBe(false);
     });
   });
 

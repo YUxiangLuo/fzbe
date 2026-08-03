@@ -4,6 +4,7 @@ import {
   industryParamSchema,
   industryAndCompanyParamSchema,
   industryCompanyProductParamSchema,
+  datasetMetadataSchema,
   updateDatasetSchema,
 } from "../../../src/modules/datasets/datasets.schema";
 
@@ -108,6 +109,23 @@ describe("Datasets Schemas", () => {
     test("should accept empty object (no required fields)", () => {
       const result = updateDatasetSchema.safeParse({});
       expect(result.success).toBe(true);
+    });
+
+    test("should reject names and descriptions beyond the admin UI contract", () => {
+      expect(updateDatasetSchema.safeParse({ data_name: "x" }).success).toBe(false);
+      expect(updateDatasetSchema.safeParse({ data_name: "x".repeat(101) }).success).toBe(false);
+      expect(updateDatasetSchema.safeParse({ description: "x".repeat(201) }).success).toBe(false);
+    });
+
+    test("should trim valid upload metadata", () => {
+      const result = datasetMetadataSchema.safeParse({
+        data_name: "  销售数据  ",
+        description: "  备注  ",
+      });
+      expect(result.success).toBe(true);
+      if (result.success) {
+        expect(result.data).toEqual({ data_name: "销售数据", description: "备注" });
+      }
     });
   });
 });

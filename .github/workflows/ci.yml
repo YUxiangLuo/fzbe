@@ -24,9 +24,24 @@ jobs:
       DB_PORT: 3306
       DB_USER: fangzhen_ci
       DB_PASSWORD: fangzhen_ci
-      DB_DATABASE: fangzhen_ci
+      DB_DATABASE: fz_pr_ci
       JWT_SECRET: backend-ci-only-secret-at-least-32-characters
       CORS_ALLOWED_ORIGINS: http://localhost:4000
+    services:
+      mysql:
+        image: mysql:8.4
+        env:
+          MYSQL_DATABASE: fz_pr_ci
+          MYSQL_USER: fangzhen_ci
+          MYSQL_PASSWORD: fangzhen_ci
+          MYSQL_ROOT_PASSWORD: fangzhen_ci_root
+        ports:
+          - 3306:3306
+        options: >-
+          --health-cmd="mysqladmin ping -h localhost -ufangzhen_ci -pfangzhen_ci"
+          --health-interval=5s
+          --health-timeout=3s
+          --health-retries=20
 
     steps:
       - name: Check out repository
@@ -46,14 +61,22 @@ jobs:
       - name: Validate OpenAPI contract
         run: bun run lint:openapi
 
+      - name: Validate test inventory
+        run: bun run test:list
+
       - name: Run unit tests
         run: bun run test:unit
+
+      - name: Verify canonical phone migration against MySQL
+        env:
+          E2E_ALLOW_DB_RESET: "1"
+        run: bun run test:system:user-phone-canonical
 
       - name: Audit dependencies
         run: bun audit
 
   python-smoke:
-    name: Seven-model lifecycle and parity
+    name: Python deep gate and workflow suites
     runs-on: ubuntu-latest
     timeout-minutes: 40
     env:
@@ -81,53 +104,19 @@ jobs:
       - name: Install model dependencies
         run: ./py/install.sh --test
 
+      # Unused imports and locals are how dead Python accumulated unnoticed:
+      # a removed call site leaves the helper, its imports, and eventually a
+      # whole unreachable branch behind. F401/F841 catch the first step.
+      - name: Lint model layer for unused imports and locals
+        run: |
+          python -m pip install --disable-pip-version-check ruff
+          python -m ruff check --select F401,F811,F821,F841 \
+            py/src py/test py/deep_tests py/guided_model.py \
+            py/guided_ensemble_model.py py/run_model.py \
+            py/production_prepare_model.py
+
       - name: Run independent Python deep-test fast gate
         run: py/venv/bin/python py/deep_tests/run.py --profile fast
 
-      - name: Run metrics smoke test
-        run: py/venv/bin/python py/test/metrics_smoke.py
-
-      - name: Verify dataset numeric contract
-        run: py/venv/bin/python py/test/data_contract_smoke.py
-
-      - name: Run model review regression tests
-        run: py/venv/bin/python py/test/review_regressions.py
-
-      - name: Run moving-average smoke test
-        run: py/venv/bin/python py/test/ma_csv_smoke.py
-
-      - name: Run exponential-smoothing smoke test
-        run: py/venv/bin/python py/test/es_csv_smoke.py
-
-      - name: Run ARIMA smoke test
-        run: py/venv/bin/python py/test/arima_csv_smoke.py
-
-      - name: Run LSTM smoke test
-        run: py/venv/bin/python py/test/lstm_csv_smoke.py
-
-      - name: Run weighted-average smoke test
-        run: py/venv/bin/python py/test/weighted_avg_csv_smoke.py
-
-      - name: Run stacking smoke test
-        run: py/venv/bin/python py/test/stacking_csv_smoke.py
-
-      - name: Run boosting smoke test
-        run: py/venv/bin/python py/test/boosting_csv_smoke.py
-
-      - name: Run weighted-average with LSTM smoke test
-        run: py/venv/bin/python py/test/weighted_avg_lstm_csv_smoke.py
-
-      - name: Run stacking with LSTM smoke test
-        run: py/venv/bin/python py/test/stacking_lstm_csv_smoke.py
-
-      - name: Run boosting with LSTM smoke test
-        run: py/venv/bin/python py/test/boosting_lstm_csv_smoke.py
-
-      - name: Verify resumable production preparation including LSTM
-        run: py/venv/bin/python py/test/production_preparation_smoke.py
-
-      - name: Verify guided and standalone lifecycle parity
-        run: py/venv/bin/python py/test/guided_standalone_parity.py
-
-      - name: Verify guided and regular ensemble lifecycle parity
-        run: py/venv/bin/python py/test/guided_ensemble_parity.py
+      - name: Run contract, smoke, parity, and regression workflows
+        run: py/venv/bin/python py/test/run.py --profile ci

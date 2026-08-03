@@ -1,5 +1,9 @@
 import { describe, expect, mock, test } from "bun:test";
-import { runStartupEnvironmentChecks, type StartupCheckDependencies } from "../../../src/utils/startup-checks";
+import {
+  probeStartupDatabaseRuntime,
+  runStartupEnvironmentChecks,
+  type StartupCheckDependencies,
+} from "../../../src/utils/startup-checks";
 
 const createDeps = (): StartupCheckDependencies & {
   warnings: string[];
@@ -18,6 +22,7 @@ const createDeps = (): StartupCheckDependencies & {
     chromiumProbes,
     commands,
     ensureExecutableFile: mock(() => {}),
+    ensureManagedStorageRoot: mock(async (managedRoot: string) => managedRoot),
     ensureWritableDirectory: mock(() => {}),
     fileExists: mock(() => true),
     getChromiumPath: () => "/usr/bin/chromium",
@@ -40,6 +45,79 @@ const createDeps = (): StartupCheckDependencies & {
 };
 
 describe("startup environment checks", () => {
+  test("returns a healthy startup probe session only after lock release and rollback are acknowledged", async () => {
+    const release = mock(() => {});
+    const destroy = mock(() => {});
+    const rollback = mock(async () => {});
+    const query = mock(async (sql: string) => {
+      if (sql === "SELECT 1 AS ok") return [[{ ok: 1 }]];
+      if (sql.includes("GET_LOCK")) return [[{ acquired: 1 }]];
+      if (sql.includes("RELEASE_LOCK")) return [[{ released: 1 }]];
+      return [[]];
+    });
+    const connection = {
+      beginTransaction: mock(async () => {}),
+      query,
+      rollback,
+      release,
+      destroy,
+    };
+
+    await probeStartupDatabaseRuntime({
+      getConnection: mock(async () => connection),
+    } as never);
+
+    expect(rollback).toHaveBeenCalledTimes(1);
+    expect(release).toHaveBeenCalledTimes(1);
+    expect(destroy).not.toHaveBeenCalled();
+  });
+
+  test.each([
+    ["GET_LOCK acknowledgement loss", "get-lock-throws"],
+    ["release query failure", "release-throws"],
+    ["unconfirmed release", "release-zero"],
+    ["rollback acknowledgement loss", "rollback-throws"],
+    ["pool release failure", "pool-release-throws"],
+  ] as const)("destroys a startup probe session after %s", async (_label, failure) => {
+    const release = mock(() => {
+      if (failure === "pool-release-throws") throw new Error("pool release failed");
+    });
+    const destroy = mock(() => {});
+    const rollback = mock(async () => {
+      if (failure === "rollback-throws") throw new Error("rollback acknowledgement lost");
+    });
+    const query = mock(async (sql: string) => {
+      if (sql === "SELECT 1 AS ok") return [[{ ok: 1 }]];
+      if (sql.includes("GET_LOCK")) {
+        if (failure === "get-lock-throws") throw new Error("GET_LOCK acknowledgement lost");
+        return [[{ acquired: 1 }]];
+      }
+      if (sql.includes("RELEASE_LOCK")) {
+        if (failure === "release-throws") throw new Error("release acknowledgement lost");
+        return [[{ released: failure === "release-zero" ? 0 : 1 }]];
+      }
+      return [[]];
+    });
+    const connection = {
+      beginTransaction: mock(async () => {}),
+      query,
+      rollback,
+      release,
+      destroy,
+    };
+
+    await expect(probeStartupDatabaseRuntime({
+      getConnection: mock(async () => connection),
+    } as never)).rejects.toThrow();
+
+    if (failure === "pool-release-throws") {
+      expect(release).toHaveBeenCalledTimes(1);
+    } else {
+      expect(release).not.toHaveBeenCalled();
+    }
+    expect(destroy).toHaveBeenCalledTimes(1);
+  });
+
   test("runs lightweight runtime probes for Python and Chromium", async () => {
     const deps = createDeps();
 

@@ -21,12 +21,11 @@
     "noUncheckedIndexedAccess": true,
     "noImplicitOverride": true,
 
-    // Some stricter flags (disabled by default)
-    "noUnusedLocals": false,
-    "noUnusedParameters": false,
+    "noUnusedLocals": true,
+    "noUnusedParameters": true,
     "noPropertyAccessFromIndexSignature": false
   },
 
-  "include": ["src", "scripts"],
-  "exclude": ["tests", "node_modules", "dist"]
+  "include": ["src", "scripts", "tests/system"],
+  "exclude": ["tests/unit", "node_modules", "dist"]
 }

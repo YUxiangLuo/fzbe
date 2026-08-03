@@ -5,6 +5,7 @@ model_csv
 __pycache__
 /py/trained_models
 /py/guided_training
+/py/production_preparation
 venv
 *demo*
 uploads
