@@ -10,7 +10,10 @@ import {
   type ModelOperationLease,
 } from "./model-operation-lease";
 import { runPythonModel } from "./model-python-runner";
-import { normalizeDemandPredictionPoints } from "./model-results";
+import {
+  applyPlanningUncertaintyFloor,
+  normalizeDemandPredictionPoints,
+} from "./model-results";
 import { getActiveModelTrainingRun } from "./model-run-store";
 import { loadDatasetFromDb } from "./model-datasets";
 import {
@@ -168,6 +171,8 @@ const predictExperimentModelWithLease = async (
       { required_action: "prepare" },
     );
   }
+
+  predictions = applyPlanningUncertaintyFloor(predictions, activeRun.metrics);
 
   const metadata = Object.fromEntries(
     ["method_name", "forecast_strategy", "implementation_notes"]

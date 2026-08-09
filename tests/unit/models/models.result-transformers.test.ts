@@ -61,7 +61,7 @@ const modelsServiceModulePath = path.join(srcRoot, "modules", "models", "models.
 const freshModelsServiceModulePath = `${modelsServiceModulePath}?models-result-transformers-test`;
 
 const { transformTrainingResult } = await import(freshModelsServiceModulePath);
-const { normalizeDemandPredictionPoints } = await import(
+const { applyPlanningUncertaintyFloor, normalizeDemandPredictionPoints } = await import(
   `${path.join(srcRoot, "modules", "models", "model-results.ts")}?models-result-normalization-test`
 );
 
@@ -526,5 +526,56 @@ describe("production prediction calibration diagnostics", () => {
       interval_kind: "model_prediction_interval",
       coverage_claim: "model_nominal",
     });
+  });
+
+  test("floors under-dispersed production uncertainty after poor outer inclusion", () => {
+    const [adjusted] = applyPlanningUncertaintyFloor([{
+      prediction: 100,
+      std_dev: 0.1,
+      upper_error_p99: 0.25,
+      uncertainty_source: "empirical",
+      calibration_source: "post_selection_calibration",
+      calibration_mean_error: 2.9,
+      calibration_count: 6,
+      interval_lower: 99.9,
+      interval_upper: 100.1,
+      interval_level: 0.95,
+      interval_kind: "empirical_residual_quantile",
+      coverage_claim: "none",
+    }], {
+      rmse: 2.95,
+      interval_evaluation: {
+        count: 12,
+        observed_inclusion_rate: 0,
+        coverage_claim: "none",
+      },
+    });
+
+    expect(adjusted).toMatchObject({
+      prediction: 100,
+      std_dev: 2.95,
+      uncertainty_source: "fallback",
+      uncertainty_reason: "outer_evaluation_undercoverage_rmse_floor",
+      calibration_source: "outer_evaluation_rmse_floor",
+      interval_kind: "fallback_normal_approximation",
+      coverage_claim: "none",
+      calibration_mean_error: 2.9,
+      calibration_count: 6,
+    });
+    expect(adjusted?.interval_lower).toBeCloseTo(94.218106, 5);
+    expect(adjusted?.interval_upper).toBeCloseTo(105.781894, 5);
+    expect(adjusted?.upper_error_p99).toBeCloseTo(6.862726, 5);
+  });
+
+  test("does not floor calibrated or adequately including production intervals", () => {
+    const prediction = predictionPoint(100, 0.1);
+    expect(applyPlanningUncertaintyFloor([prediction], {
+      rmse: 3,
+      interval_evaluation: {
+        count: 12,
+        observed_inclusion_rate: 0.9,
+        coverage_claim: "none",
+      },
+    })[0]).toBe(prediction);
   });
 });

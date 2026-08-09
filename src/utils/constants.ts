@@ -320,8 +320,8 @@ export const USER_CONSTANTS = {
   MIN_NAME_LENGTH: 2,
   /** 最大姓名长度 */
   MAX_NAME_LENGTH: 64,
-  /** 最小密码长度 */
-  MIN_PASSWORD_LENGTH: 6,
+  /** 新密码最小长度；既有账号登录不受此策略变更影响。 */
+  MIN_PASSWORD_LENGTH: 8,
   /** bcrypt cost */
   BCRYPT_COST: 10,
 } as const;

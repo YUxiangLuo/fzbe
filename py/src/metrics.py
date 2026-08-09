@@ -5,7 +5,7 @@ Common evaluation metrics for time series forecasting models.
 Optimized with NumPy for vectorized calculations and improved numerical stability.
 """
 
-from typing import List, Union
+from typing import List, Optional, Union
 
 import numpy as np
 
@@ -66,7 +66,7 @@ def mae(y_true: ArrayLike, y_pred: ArrayLike) -> float:
     return float(np.mean(np.abs(y_true_arr - y_pred_arr)))
 
 
-def mape(y_true: ArrayLike, y_pred: ArrayLike) -> float:
+def mape(y_true: ArrayLike, y_pred: ArrayLike) -> Optional[float]:
     """
     Calculate Mean Absolute Percentage Error.
 
@@ -75,7 +75,9 @@ def mape(y_true: ArrayLike, y_pred: ArrayLike) -> float:
         y_pred: Predicted values (list or numpy array)
 
     Returns:
-        MAPE value in percentage, or NaN if input is empty
+        MAPE value in percentage, None when every actual value is zero, or NaN
+        if input is empty. Returning None prevents an undefined percentage from
+        being presented to students as a perfect 0% error.
     """
     _validate_inputs(y_true, y_pred)
     if len(y_true) == 0:
@@ -86,9 +88,14 @@ def mape(y_true: ArrayLike, y_pred: ArrayLike) -> float:
     )
     nonzero_actuals = np.abs(y_true_arr) > EPS
     if not np.any(nonzero_actuals):
-        return 0.0
+        return None
     diff = np.abs(y_true_arr[nonzero_actuals] - y_pred_arr[nonzero_actuals])
     return float(100.0 * np.mean(diff / np.abs(y_true_arr[nonzero_actuals])))
+
+
+def format_optional_metric(value: Optional[float], precision: int = 4) -> str:
+    """Format a nullable metric for logs without converting undefined to zero."""
+    return "N/A" if value is None else f"{value:.{precision}f}"
 
 
 def r2(y_true: ArrayLike, y_pred: ArrayLike) -> float:

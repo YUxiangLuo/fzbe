@@ -24,7 +24,8 @@ def main() -> None:
     assert_close(mape([100], [90]), 10.0)
     assert_close(mape([-100], [-90]), 10.0)
 
-    assert_close(mape([0], [1]), 0.0)
+    if mape([0], [1]) is not None:
+        raise AssertionError("MAPE must be undefined when every actual value is zero")
     assert_close(mape([0, 100], [50, 90]), 10.0)
     assert_close(r2([0, 0], [0, 0]), 1.0)
     assert_close(r2([0, 0], [1, 0]), 0.0)

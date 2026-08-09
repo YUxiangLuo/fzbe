@@ -25,7 +25,7 @@ def ses(values: Sequence[float], alpha: float, initial_level: float) -> float:
     return level
 
 
-def metrics(actual: Sequence[float], predicted: Sequence[float]) -> dict[str, float]:
+def metrics(actual: Sequence[float], predicted: Sequence[float]) -> dict[str, float | None]:
     if len(actual) != len(predicted) or not actual:
         raise ValueError("metric vectors must be non-empty and equal length")
     residuals = [float(a) - float(p) for a, p in zip(actual, predicted)]
@@ -33,7 +33,7 @@ def metrics(actual: Sequence[float], predicted: Sequence[float]) -> dict[str, fl
     mse = math.fsum(value * value for value in residuals) / n
     mae = math.fsum(abs(value) for value in residuals) / n
     nonzero = [(float(a), float(p)) for a, p in zip(actual, predicted) if abs(float(a)) > 1e-12]
-    mape = 100.0 * math.fsum(abs((a - p) / a) for a, p in nonzero) / len(nonzero) if nonzero else 0.0
+    mape = 100.0 * math.fsum(abs((a - p) / a) for a, p in nonzero) / len(nonzero) if nonzero else None
     mean = math.fsum(float(value) for value in actual) / n
     total = math.fsum((float(value) - mean) ** 2 for value in actual)
     r2 = 1.0 if total <= 1e-12 and mse <= 1e-12 else (0.0 if total <= 1e-12 else 1.0 - math.fsum(v * v for v in residuals) / total)

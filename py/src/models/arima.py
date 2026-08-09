@@ -19,7 +19,7 @@ from forecast_utils import (
 )
 from logger import log, get_log_contents
 from log_safety import summarize_cli_args
-from metrics import mae, mape, r2, rmse
+from metrics import format_optional_metric, mae, mape, r2, rmse
 from model_info import attach_method_metadata, ensure_state_metadata
 from serialization import dump_model, load_model
 from dynamic_config import derive_arima_search_limit
@@ -539,7 +539,11 @@ def train_and_evaluate(
         "evaluate_months": [timestamps[i] for i in eval_range] if timestamps else [],
     }
 
-    log.info(f"Evaluation metrics computed: RMSE={metrics['rmse']:.4f}, MAE={metrics['mae']:.4f}, MAPE={metrics['mape']:.4f}, R²={metrics['r2']:.4f}, AIC={metrics['aic']:.4f}, BIC={metrics['bic']:.4f}")
+    log.info(
+        f"Evaluation metrics computed: RMSE={metrics['rmse']:.4f}, "
+        f"MAE={metrics['mae']:.4f}, MAPE={format_optional_metric(metrics['mape'])}, "
+        f"R²={metrics['r2']:.4f}, AIC={metrics['aic']:.4f}, BIC={metrics['bic']:.4f}"
+    )
 
     return metrics, best_model, best_order, search_summary, y_true, y_pred.tolist(), conf_int.tolist()
 

@@ -330,12 +330,38 @@ export const trimBoostingRefitSteps = (
   ));
 };
 
+const replaceUndefinedMapeWithNull = (value: unknown): unknown => {
+  if (Array.isArray(value)) return value.map(replaceUndefinedMapeWithNull);
+  if (!isRecordValue(value)) return value;
+  return Object.fromEntries(Object.entries(value).map(([key, item]) => [
+    key,
+    // The former Python implementation used exactly 0 as the undefined-MAPE
+    // sentinel. Preserve any nonzero staged MAPE that may describe a different
+    // subset instead of erasing every metric with the same key.
+    key === "mape" && item === 0 ? null : replaceUndefinedMapeWithNull(item),
+  ]));
+};
+
+const resultMarksMapeUnavailable = (
+  result: GuidedTrainingSessionPayload["result"],
+): boolean => isRecordValue(result)
+  && isRecordValue(result.results)
+  && isRecordValue(result.results.metrics)
+  && result.results.metrics.mape === null;
+
 export const buildGuidedTrainingSessionPayload = (
   row: GuidedTrainingSessionRow,
 ): GuidedTrainingSessionPayload => {
   const completedStepIds = parseJsonColumn<string[]>(row.completed_step_ids, []);
-  const stepOutputs = parseJsonColumn<Record<string, unknown>>(row.step_outputs, {});
+  const rawStepOutputs = parseJsonColumn<Record<string, unknown>>(row.step_outputs, {});
   const result = parseJsonColumn<GuidedTrainingSessionPayload["result"]>(row.result_payload, null);
+  // Sessions completed before nullable MAPE was introduced can retain a raw
+  // Python `0` in staged outputs even though their canonical final metric is
+  // already null. Normalize reads so historical all-zero runs are not presented
+  // as a mathematically defined 0% MAPE.
+  const stepOutputs = resultMarksMapeUnavailable(result)
+    ? replaceUndefinedMapeWithNull(rawStepOutputs) as Record<string, unknown>
+    : rawStepOutputs;
   const stepPlan = getGuidedTrainingSteps(row);
   const nextStepId = getGuidedNextStepId(stepPlan, completedStepIds);
   const completedSet = new Set(completedStepIds);

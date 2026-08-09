@@ -118,7 +118,7 @@ usersController.post("/api/v1/users/teachers/batch", jwtAuth, async (c) => {
     const result = await batchCreateTeachers(file, password);
     if ("error" in result) {
       if (result.error === "invalid_password_type") return c.json({ error: "密码必须是字符串类型" }, 400);
-      if (result.error === "password_too_short") return c.json({ error: "统一密码必须至少6位" }, 400);
+      if (result.error === "password_policy_violation") return c.json({ error: "统一密码至少8位，且必须同时包含字母和数字" }, 400);
       if (result.error === "invalid_file_type") return c.json({ error: "仅支持上传 CSV 文件" }, 400);
       if (result.error === "file_too_large") return c.json({ error: "CSV 文件大小不能超过 5MB" }, 413);
       if (result.error === "invalid_rows") return c.json({ error: "CSV 文件包含无效记录", invalid_rows: result.invalid_rows }, 400);
@@ -140,7 +140,7 @@ usersController.post("/api/v1/users/assistants/batch", jwtAuth, async (c) => {
     const result = await batchCreateAssistants(file, password);
     if ("error" in result) {
       if (result.error === "invalid_password_type") return c.json({ error: "密码必须是字符串类型" }, 400);
-      if (result.error === "password_too_short") return c.json({ error: "统一密码必须至少6位" }, 400);
+      if (result.error === "password_policy_violation") return c.json({ error: "统一密码至少8位，且必须同时包含字母和数字" }, 400);
       if (result.error === "invalid_file_type") return c.json({ error: "仅支持上传 CSV 文件" }, 400);
       if (result.error === "file_too_large") return c.json({ error: "CSV 文件大小不能超过 5MB" }, 413);
       if (result.error === "invalid_rows") return c.json({ error: "CSV 文件包含无效记录", invalid_rows: result.invalid_rows }, 400);

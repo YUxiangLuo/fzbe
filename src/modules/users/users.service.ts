@@ -37,6 +37,7 @@ import {
 import type { CreateTeacherInput, CreateAssistantSingleInput, CreateAssistantInput, UpdateUserInput, ResetPasswordInput, UserSearchQuery, PaginationQuery } from "./users.schema";
 import { studentSelfRegisterSchema, teacherAssistantSelfRegisterSchema } from "./users.schema";
 import { databaseDatetimeToIsoString } from "../../utils/database-datetime";
+import { isPasswordPolicyCompliant } from "../../utils/password-policy";
 
 const { TEACHER_EMAIL_DOMAIN, ASSISTANT_EMAIL_DOMAIN, PHONE_REGEX, MIN_NAME_LENGTH } = USER_CONSTANTS;
 const BATCH_CSV_MIME_TYPES = new Set([
@@ -623,7 +624,7 @@ export async function batchCreateTeachers(file: File, password: unknown) {
   if (password !== undefined && password !== null && password !== "") {
     if (typeof password !== "string") return { error: "invalid_password_type" as const };
     const trimmed = password.trim();
-    if (trimmed.length < USER_CONSTANTS.MIN_PASSWORD_LENGTH) return { error: "password_too_short" as const };
+    if (!isPasswordPolicyCompliant(trimmed)) return { error: "password_policy_violation" as const };
     normalizedPassword = trimmed;
   }
 
@@ -719,7 +720,7 @@ export async function batchCreateAssistants(file: File, password: unknown) {
   if (password !== undefined && password !== null && password !== "") {
     if (typeof password !== "string") return { error: "invalid_password_type" as const };
     const trimmed = password.trim();
-    if (trimmed.length < USER_CONSTANTS.MIN_PASSWORD_LENGTH) return { error: "password_too_short" as const };
+    if (!isPasswordPolicyCompliant(trimmed)) return { error: "password_policy_violation" as const };
     normalizedPassword = trimmed;
   }
 

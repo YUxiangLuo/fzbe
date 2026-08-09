@@ -295,11 +295,14 @@ describe("models service guided training", () => {
         "evaluate_metrics",
         "save_artifact",
       ]),
-      step_outputs: JSON.stringify({ save_artifact: { metrics: { rmse: 1 } } }),
+      step_outputs: JSON.stringify({
+        evaluate_metrics: { metrics: { rmse: 1, mape: 0 } },
+        save_artifact: { metrics: { rmse: 1, mape: 12.5 } },
+      }),
       step_plan: JSON.stringify([]),
       result_payload: JSON.stringify({
         status: "success",
-        results: { metrics: { rmse: 1, mae: 1, r2: 0.9 } },
+        results: { metrics: { rmse: 1, mae: 1, mape: null, r2: 0.9 } },
       }),
     });
     const activeRun = buildActiveRun("ma", {
@@ -324,6 +327,12 @@ describe("models service guided training", () => {
     );
 
     expect(session.status).toBe("completed");
+    expect(session.step_outputs.evaluate_metrics).toEqual({
+      metrics: { rmse: 1, mape: null },
+    });
+    expect(session.step_outputs.save_artifact).toEqual({
+      metrics: { rmse: 1, mape: 12.5 },
+    });
     expect(poolQuery.mock.calls.some(([sql]) => String(sql).includes("SET status = 'superseded'"))).toBe(false);
     expect(copyFileSync).not.toHaveBeenCalled();
     expect(commitModelTrainingRun).not.toHaveBeenCalled();

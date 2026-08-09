@@ -187,7 +187,7 @@ function assertTrainingPayload(modelType: ModelType, payload: any) {
     throw new Error(`${modelType} training did not return success results: ${JSON.stringify(payload)}`);
   }
   const results = payload.results;
-  for (const metricKey of ["rmse", "mae", "mape", "r2"]) {
+  for (const metricKey of ["rmse", "mae", "r2"]) {
     assertFiniteNumber(results.metrics?.[metricKey], `${modelType}.metrics.${metricKey}`);
   }
   if (!Array.isArray(results.eval_y_true) || !Array.isArray(results.eval_predictions)) {
@@ -195,6 +195,17 @@ function assertTrainingPayload(modelType: ModelType, payload: any) {
   }
   if (results.eval_y_true.length !== 8 || results.eval_predictions.length !== 8) {
     throw new Error(`${modelType} training eval length mismatch`);
+  }
+  const mape = results.metrics?.mape;
+  const everyActualIsZero = results.eval_y_true.every(
+    (value: unknown) => typeof value === "number" && Math.abs(value) <= 1e-12,
+  );
+  if (everyActualIsZero) {
+    if (mape !== null) {
+      throw new Error(`${modelType}.metrics.mape must be null when every actual value is zero`);
+    }
+  } else {
+    assertFiniteNumber(mape, `${modelType}.metrics.mape`);
   }
   for (const [index, prediction] of results.eval_predictions.entries()) {
     assertFiniteNumber(prediction, `${modelType}.eval_predictions[${index}]`);

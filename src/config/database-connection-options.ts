@@ -37,6 +37,23 @@ const optionalPositiveIntegerEnv = z.preprocess((value) => {
   return value;
 }, z.coerce.number().int().positive().optional());
 
+const databaseTimezoneEnv = z.preprocess((value) => {
+  if (isUnsetEnvValue(value)) return "Z";
+  const normalized = String(value).trim();
+  return normalized.toUpperCase() === "Z" ? "Z" : normalized;
+}, z.string().refine((value) => {
+  if (value === "Z") return true;
+  const match = /^([+-])(\d{2}):(\d{2})$/.exec(value);
+  if (!match) return false;
+  const sign = match[1];
+  const hours = Number(match[2]);
+  const minutes = Number(match[3]);
+  return minutes <= 59
+    && hours <= 14
+    && !(hours === 14 && minutes !== 0)
+    && !(sign === "-" && hours === 14);
+}, "DB_TIMEZONE must be Z or a valid fixed offset such as +08:00"));
+
 const dbQueueLimitEnv = z.preprocess((value) => {
   if (isUnsetEnvValue(value)) return 100;
   return value;
@@ -55,7 +72,7 @@ export const databaseEnvironmentSchema = z.object({
   DB_DATABASE: z.string().min(1),
   DB_CONNECT_TIMEOUT_MS: optionalPositiveIntegerEnv,
   DB_QUEUE_LIMIT: dbQueueLimitEnv,
-  DB_TIMEZONE: optionalTrimmedStringEnv,
+  DB_TIMEZONE: databaseTimezoneEnv,
   DB_DATE_STRINGS: createBooleanEnv(false),
   DB_SSL_MODE: dbSslModeEnv,
   DB_SSL_CA_PATH: optionalTrimmedStringEnv,

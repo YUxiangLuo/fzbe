@@ -120,21 +120,21 @@ describe("database pool options", () => {
     });
   });
 
-  test("defaults to bounded queueing without TLS when no production overrides are set", async () => {
+  test("defaults to bounded queueing, UTC timestamps, and no TLS", async () => {
     const options = await loadDatabaseOptionsSnapshot();
 
     expect(options.host).toBe("127.0.0.1");
     expect(options.port).toBeUndefined();
     expect(options.queueLimit).toBe(100);
     expect(options.connectTimeout).toBeUndefined();
-    expect(options.timezone).toBeUndefined();
+    expect(options.timezone).toBe("Z");
     expect(options.dateStrings).toBeUndefined();
     expect(options.ssl).toBeUndefined();
     expect(options.enableKeepAlive).toBeTrue();
     expect(options.keepAliveInitialDelay).toBe(0);
   });
 
-  test("treats empty optional database environment values as unset", async () => {
+  test("treats empty optional database environment values as defaults", async () => {
     const options = await loadDatabaseOptionsSnapshot({
       DB_PORT: "",
       DB_CONNECT_TIMEOUT_MS: "",
@@ -149,7 +149,7 @@ describe("database pool options", () => {
     expect(options.port).toBeUndefined();
     expect(options.queueLimit).toBe(100);
     expect(options.connectTimeout).toBeUndefined();
-    expect(options.timezone).toBeUndefined();
+    expect(options.timezone).toBe("Z");
     expect(options.dateStrings).toBeUndefined();
     expect(options.ssl).toBeUndefined();
   });
@@ -183,6 +183,10 @@ describe("database pool options", () => {
 
     await expect(loadDatabaseOptionsSnapshot({ DB_QUEUE_LIMIT: "0" })).rejects.toThrow(
       "Missing or invalid environment variables: DB_QUEUE_LIMIT",
+    );
+
+    await expect(loadDatabaseOptionsSnapshot({ DB_TIMEZONE: "Asia/Shanghai" })).rejects.toThrow(
+      "Missing or invalid environment variables: DB_TIMEZONE",
     );
   });
 });

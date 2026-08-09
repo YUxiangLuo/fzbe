@@ -47,14 +47,16 @@ describe("User Schemas", () => {
       expect(result.success).toBe(false);
     });
 
-    test("should reject password shorter than 6 characters", () => {
-      const result = studentSelfRegisterSchema.safeParse({
-        username: "12345678",
-        password: "12345",
-        name: "Test",
-        email: "test@example.com",
-      });
-      expect(result.success).toBe(false);
+    test("should reject passwords that do not satisfy the shared policy", () => {
+      for (const password of ["Abc123", "12345678", "abcdefgh"]) {
+        const result = studentSelfRegisterSchema.safeParse({
+          username: "12345678",
+          password,
+          name: "Test",
+          email: "test@example.com",
+        });
+        expect(result.success).toBe(false);
+      }
     });
 
     test("should accept Chinese name", () => {
@@ -277,12 +279,14 @@ describe("User Schemas", () => {
       expect(result.success).toBe(false);
     });
 
-    test("should reject new password shorter than 6 characters", () => {
-      const result = changePasswordSchema.safeParse({
-        currentPassword: "oldpass123",
-        newPassword: "12345",
-      });
-      expect(result.success).toBe(false);
+    test("should reject a new password without both letters and numbers", () => {
+      for (const newPassword of ["Abc123", "12345678", "abcdefgh"]) {
+        const result = changePasswordSchema.safeParse({
+          currentPassword: "oldpass123",
+          newPassword,
+        });
+        expect(result.success).toBe(false);
+      }
     });
   });
 

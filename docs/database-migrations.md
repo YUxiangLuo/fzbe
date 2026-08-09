@@ -30,7 +30,14 @@ Migration connections use the same parsed database settings as the application,
 including `DB_PORT`, `DB_CONNECT_TIMEOUT_MS`, `DB_TIMEZONE`, `DB_DATE_STRINGS`,
 `DB_SSL_MODE`, `DB_SSL_CA_PATH`, and `DB_SSL_REJECT_UNAUTHORIZED`. The migration
 helper intentionally loads only database configuration, so deployment does not
-initialize the HTTP application or its connection pool.
+initialize the HTTP application or its connection pool. `DB_TIMEZONE` defaults
+to `Z` and accepts only `Z` or a fixed offset such as `+08:00`. Both migration
+connections and every pooled runtime connection execute `SET SESSION time_zone`
+before application SQL. Startup then verifies `@@session.time_zone` and the
+`NOW()`/`UTC_TIMESTAMP()` offset. This is required because mysql2's `timezone`
+option controls JavaScript Date conversion but does not by itself change the
+server session; relying on a MariaDB `SYSTEM` timezone would double-shift values
+written by `NOW()` or `CURRENT_TIMESTAMP`.
 
 `update.sh` serializes host-level deploys with `flock`, requires a clean worktree,
 and verifies that the active `fangzhen-be.service` uses this checkout as its

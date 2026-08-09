@@ -74,7 +74,7 @@ class MathematicalGoldenTests(unittest.TestCase):
             self.assertAlmostEqual(expected[name], function(actual, predicted), places=12)
         self.assertEqual(1.0, r2([3, 3], [3, 3]))
         self.assertEqual(0.0, r2([3, 3], [2, 2]))
-        self.assertEqual(0.0, mape([0, 0], [10, 20]))
+        self.assertIsNone(mape([0, 0], [10, 20]))
 
     @profile("fast")
     def test_weighted_stacking_and_boosting_goldens(self):

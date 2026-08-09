@@ -330,6 +330,73 @@ describe("models service prediction", () => {
     });
   });
 
+  test("applies the outer-RMSE planning floor before signing production forecasts", async () => {
+    const productionPath = path.join(mockedTrainedModelsRoot, "ma-undercovered-production.pkl");
+    useActiveRuns(buildActiveRun("ma", {
+      production_artifact_path: productionPath,
+      metrics: JSON.stringify({
+        rmse: 2.9501226415816624,
+        interval_evaluation: {
+          count: 12,
+          observed_inclusion_rate: 0,
+          coverage_claim: "none",
+        },
+      }),
+    }));
+    mockExperimentAndDatasetQueries();
+    existsSync.mockImplementation(() => true);
+    createReadStream.mockImplementation(() =>
+      Readable.from([modelDatasetCsv]) as unknown as ReturnType<typeof createReadStream>
+    );
+    const undercoveredPoint = {
+      prediction: 100,
+      std_dev: 0.1,
+      upper_error_p99: 0.25,
+      uncertainty_source: "empirical",
+      calibration_source: "post_selection_calibration",
+      calibration_mean_error: 2.9,
+      calibration_count: 12,
+      bias_diagnostic_source: "post_selection_calibration",
+      interval_lower: 99.9,
+      interval_upper: 100.1,
+      interval_level: 0.95,
+      interval_kind: "empirical_residual_quantile",
+      coverage_claim: "none",
+    };
+    spawnMock.mockImplementationOnce(() => createSpawnResult(JSON.stringify({
+      predictions: [
+        undercoveredPoint,
+        {
+          ...undercoveredPoint,
+          prediction: 102,
+          interval_lower: 101.9,
+          interval_upper: 102.1,
+        },
+      ],
+    })));
+
+    const result = await predictExperimentModel(
+      "ma",
+      20240002,
+      990002,
+      2,
+      preparationToken,
+    );
+
+    expect(result.results.predictions[0]).toMatchObject({
+      prediction: 100,
+      std_dev: 2.9501226415816624,
+      uncertainty_source: "fallback",
+      uncertainty_reason: "outer_evaluation_undercoverage_rmse_floor",
+      calibration_source: "outer_evaluation_rmse_floor",
+      interval_kind: "fallback_normal_approximation",
+      coverage_claim: "none",
+    });
+    expect(result.results.predictions[0]?.interval_lower).toBeCloseTo(94.217866, 5);
+    expect(result.results.predictions[0]?.interval_upper).toBeCloseTo(105.782134, 5);
+    expect(result.results.forecast_evidence).toEqual(expect.any(String));
+  });
+
   for (const invalidStdDev of invalidLegacyStdDevCases) {
     test(`invalidates checksummed production output with ${invalidStdDev.label} std_dev`, async () => {
       const productionPath = path.join(

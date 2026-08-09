@@ -1021,7 +1021,7 @@ components:
         std_dev:
           type: number
           minimum: 0
-          description: 客户安全库存公式使用的中心化误差标准差。
+          description: 安全库存公式使用的规划波动尺度。通常为中心化误差标准差；当至少 4 个外层观察点的区间纳入率低于 80% 时，不得低于该模型外层 RMSE，并以 fallback 来源明确标记。
         upper_error_p99:
           type: number
           minimum: 0
@@ -1466,7 +1466,9 @@ components:
           pattern: '^\\d{6,15}$'
         password:
           type: string
-          minLength: 6
+          minLength: 8
+          pattern: '^(?=.*[A-Za-z])(?=.*[0-9]).+$'
+          description: 必须同时包含字母和数字
 
     EnrollStudentRequest:
       type: object
@@ -2278,7 +2280,9 @@ components:
           pattern: '^1\\d{10}$'
         password:
           type: string
-          minLength: 6
+          minLength: 8
+          pattern: '^(?=.*[A-Za-z])(?=.*[0-9]).+$'
+          description: 必须同时包含字母和数字
 
     CreateTeacherRequest:
       type: object
@@ -2298,7 +2302,9 @@ components:
           pattern: '^1\\d{10}$'
         password:
           type: string
-          minLength: 6
+          minLength: 8
+          pattern: '^(?=.*[A-Za-z])(?=.*[0-9]).+$'
+          description: 必须同时包含字母和数字
 
     CreateAssistantWithClassesRequest:
       type: object
@@ -2309,7 +2315,9 @@ components:
           minLength: 3
         password:
           type: string
-          minLength: 6
+          minLength: 8
+          pattern: '^(?=.*[A-Za-z])(?=.*[0-9]).+$'
+          description: 必须同时包含字母和数字
         full_name:
           type: string
           minLength: 1
@@ -2350,7 +2358,9 @@ components:
           minLength: 1
         newPassword:
           type: string
-          minLength: 6
+          minLength: 8
+          pattern: '^(?=.*[A-Za-z])(?=.*[0-9]).+$'
+          description: 必须同时包含字母和数字
 
     AdminChangePasswordRequest:
       type: object
@@ -2358,17 +2368,23 @@ components:
       properties:
         newPassword:
           type: string
-          minLength: 6
+          minLength: 8
+          pattern: '^(?=.*[A-Za-z])(?=.*[0-9]).+$'
+          description: 必须同时包含字母和数字
 
     ResetPasswordRequest:
       type: object
       properties:
         newPassword:
           type: string
-          minLength: 6
+          minLength: 8
+          pattern: '^(?=.*[A-Za-z])(?=.*[0-9]).+$'
+          description: 必须同时包含字母和数字
         new_password:
           type: string
-          minLength: 6
+          minLength: 8
+          pattern: '^(?=.*[A-Za-z])(?=.*[0-9]).+$'
+          description: 必须同时包含字母和数字
           deprecated: true
 
   parameters:
@@ -5172,7 +5188,9 @@ paths:
                   type: string
                 password:
                   type: string
-                  minLength: 6
+                  minLength: 8
+                  pattern: '^(?=.*[A-Za-z])(?=.*[0-9]).+$'
+                  description: 必须同时包含字母和数字
                 name:
                   type: string
                 email:
@@ -5392,6 +5410,9 @@ paths:
                   format: binary
                 password:
                   type: string
+                  minLength: 8
+                  pattern: '^(?=.*[A-Za-z])(?=.*[0-9]).+$'
+                  description: 可选统一密码；提供时必须同时包含字母和数字
       responses:
         '201':
           description: 创建成功
@@ -5444,6 +5465,9 @@ paths:
                   format: binary
                 password:
                   type: string
+                  minLength: 8
+                  pattern: '^(?=.*[A-Za-z])(?=.*[0-9]).+$'
+                  description: 可选统一密码；提供时必须同时包含字母和数字
       responses:
         '201':
           description: 创建成功

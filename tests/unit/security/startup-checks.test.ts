@@ -50,7 +50,9 @@ describe("startup environment checks", () => {
     const destroy = mock(() => {});
     const rollback = mock(async () => {});
     const query = mock(async (sql: string) => {
-      if (sql === "SELECT 1 AS ok") return [[{ ok: 1 }]];
+      if (sql.includes("@@session.time_zone")) {
+        return [[{ ok: 1, session_time_zone: "+00:00", utc_offset_seconds: 0 }]];
+      }
       if (sql.includes("GET_LOCK")) return [[{ acquired: 1 }]];
       if (sql.includes("RELEASE_LOCK")) return [[{ released: 1 }]];
       return [[]];
@@ -72,6 +74,33 @@ describe("startup environment checks", () => {
     expect(destroy).not.toHaveBeenCalled();
   });
 
+  test("fails closed when the database wall clock is not aligned with DB_TIMEZONE", async () => {
+    const destroy = mock(() => {});
+    const release = mock(() => {});
+    const connection = {
+      beginTransaction: mock(async () => {}),
+      query: mock(async (sql: string) => {
+        if (sql.includes("@@session.time_zone")) {
+          return [[{
+            ok: 1,
+            session_time_zone: "SYSTEM",
+            utc_offset_seconds: 32_400,
+          }]];
+        }
+        return [[]];
+      }),
+      rollback: mock(async () => {}),
+      release,
+      destroy,
+    };
+
+    await expect(probeStartupDatabaseRuntime({
+      getConnection: mock(async () => connection),
+    } as never, "Z")).rejects.toThrow("数据库会话时区不一致");
+    expect(release).toHaveBeenCalledTimes(1);
+    expect(destroy).not.toHaveBeenCalled();
+  });
+
   test.each([
     ["GET_LOCK acknowledgement loss", "get-lock-throws"],
     ["release query failure", "release-throws"],
@@ -87,7 +116,9 @@ describe("startup environment checks", () => {
       if (failure === "rollback-throws") throw new Error("rollback acknowledgement lost");
     });
     const query = mock(async (sql: string) => {
-      if (sql === "SELECT 1 AS ok") return [[{ ok: 1 }]];
+      if (sql.includes("@@session.time_zone")) {
+        return [[{ ok: 1, session_time_zone: "+00:00", utc_offset_seconds: 0 }]];
+      }
       if (sql.includes("GET_LOCK")) {
         if (failure === "get-lock-throws") throw new Error("GET_LOCK acknowledgement lost");
         return [[{ acquired: 1 }]];

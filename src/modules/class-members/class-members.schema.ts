@@ -1,4 +1,8 @@
 import { z } from "zod";
+import {
+  isPasswordPolicyCompliant,
+  PASSWORD_POLICY_MESSAGE,
+} from "../../utils/password-policy";
 
 export const classIdParamSchema = z.object({
   classId: z.string().regex(/^\d+$/, "classId 必须是数字"),
@@ -24,7 +28,7 @@ export const createStudentSchema = z.object({
     .regex(/^[\u4e00-\u9fa5a-zA-Z\s]+$/, "姓名只能包含中文字符、英文字母和空格"),
   email: z.string().regex(/^[^\s@]+@[^\s@]+\.[^\s@]+$/, "无效的邮箱格式").optional(),
   phone_number: z.string().regex(/^\d{6,15}$/, "手机号应为 6-15 位数字").optional(),
-  password: z.string().min(6, "密码必须至少6位").optional(),
+  password: z.string().refine(isPasswordPolicyCompliant, PASSWORD_POLICY_MESSAGE).optional(),
 });
 
 export const addAssistantSchema = z.object({

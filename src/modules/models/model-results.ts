@@ -30,6 +30,10 @@ interface DemandPredictionNormalizationOptions {
 }
 
 const METRIC_EPSILON = 1e-12;
+const MIN_OUTER_INTERVAL_SAMPLE_COUNT = 4;
+const MIN_ACCEPTABLE_OUTER_INCLUSION_RATE = 0.8;
+const NORMAL_95 = 1.959963984540054;
+const NORMAL_99_ONE_SIDED = 2.3263478740408408;
 const INTERVAL_KINDS = [
   "model_prediction_interval",
   "empirical_residual_quantile",
@@ -291,6 +295,88 @@ const recomputeCanonicalMetrics = (
       : 1 - residualSumOfSquares / totalSumOfSquares,
     ...(intervalEvaluation ? { interval_evaluation: intervalEvaluation } : {}),
   };
+};
+
+const parseRecord = (value: unknown): Record<string, unknown> | null => {
+  if (typeof value === "string") {
+    try {
+      const parsed = JSON.parse(value) as unknown;
+      return parsed && typeof parsed === "object" && !Array.isArray(parsed)
+        ? parsed as Record<string, unknown>
+        : null;
+    } catch {
+      return null;
+    }
+  }
+  return value && typeof value === "object" && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : null;
+};
+
+/**
+ * A model selected by point RMSE must not carry a demonstrably under-dispersed
+ * outer interval directly into the safety-stock formula. When the descriptive
+ * outer replay has enough observations but includes less than 80% of actuals,
+ * use the selected model's outer RMSE as a conservative planning scale floor.
+ * The replacement remains explicitly non-guaranteed and is signed as part of
+ * the production forecast snapshot.
+ */
+export const applyPlanningUncertaintyFloor = (
+  predictions: PredictionPoint[],
+  rawMetrics: unknown,
+): PredictionPoint[] => {
+  const metrics = parseRecord(rawMetrics);
+  const intervalEvaluation = parseRecord(metrics?.interval_evaluation);
+  const rmse = metrics?.rmse;
+  const count = intervalEvaluation?.count;
+  const inclusionRate = intervalEvaluation?.observed_inclusion_rate;
+  const coverageClaim = intervalEvaluation?.coverage_claim;
+
+  if (
+    typeof rmse !== "number"
+    || !Number.isFinite(rmse)
+    || rmse <= METRIC_EPSILON
+    || typeof count !== "number"
+    || !Number.isInteger(count)
+    || count < MIN_OUTER_INTERVAL_SAMPLE_COUNT
+    || typeof inclusionRate !== "number"
+    || !Number.isFinite(inclusionRate)
+    || inclusionRate >= MIN_ACCEPTABLE_OUTER_INCLUSION_RATE
+    || coverageClaim !== "none"
+  ) {
+    return predictions;
+  }
+
+  return predictions.map((point) => {
+    if (
+      point.coverage_claim !== "none"
+      || typeof point.prediction !== "number"
+      || typeof point.std_dev !== "number"
+      || point.std_dev >= rmse
+    ) {
+      return point;
+    }
+
+    const planningScale = rmse;
+    const currentUpperErrorP99 = typeof point.upper_error_p99 === "number"
+      && Number.isFinite(point.upper_error_p99)
+      ? point.upper_error_p99
+      : 0;
+
+    return {
+      ...point,
+      std_dev: planningScale,
+      upper_error_p99: Math.max(currentUpperErrorP99, NORMAL_99_ONE_SIDED * planningScale),
+      uncertainty_source: "fallback",
+      uncertainty_reason: "outer_evaluation_undercoverage_rmse_floor",
+      calibration_source: "outer_evaluation_rmse_floor",
+      interval_lower: Math.max(0, point.prediction - NORMAL_95 * planningScale),
+      interval_upper: point.prediction + NORMAL_95 * planningScale,
+      interval_level: 0.95,
+      interval_kind: "fallback_normal_approximation",
+      coverage_claim: "none",
+    };
+  });
 };
 
 const normalizeNumericArray = (value: unknown): number[] | undefined => {

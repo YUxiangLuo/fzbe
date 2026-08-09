@@ -1,4 +1,13 @@
 import { z } from "zod";
+import {
+  isPasswordPolicyCompliant,
+  PASSWORD_POLICY_MESSAGE,
+} from "../../utils/password-policy";
+
+const newPasswordSchema = z.string().refine(
+  isPasswordPolicyCompliant,
+  PASSWORD_POLICY_MESSAGE,
+);
 
 const normalizeOptionalPhone = (value: unknown): unknown => {
   if (value === null || value === undefined) return undefined;
@@ -31,7 +40,7 @@ const nullablePhoneNumberSchema = z.preprocess(
 
 export const registerSchema = z.object({
   username: z.string().min(3),
-  password: z.string().min(6, { message: "密码长度至少为6位" }),
+  password: newPasswordSchema,
   full_name: z.string().min(1),
   email: z.string().email(),
   role: z.enum(["Student", "Teacher", "Assistant", "Admin"]).default("Student"),
@@ -43,7 +52,7 @@ export const createTeacherSchema = z.object({
   full_name: z.string().min(1),
   email: z.string().email().optional(),
   phone: optionalChineseMobileSchema,
-  password: z.string().min(6, "密码必须至少6位").optional(),
+  password: newPasswordSchema.optional(),
 });
 
 export const createAssistantSingleSchema = z.object({
@@ -51,7 +60,7 @@ export const createAssistantSingleSchema = z.object({
   full_name: z.string().min(1),
   email: z.string().email().optional(),
   phone: optionalChineseMobileSchema,
-  password: z.string().min(6, "密码必须至少6位").optional(),
+  password: newPasswordSchema.optional(),
 });
 
 export const createAssistantSchema = registerSchema
@@ -68,18 +77,18 @@ export const updateUserSchema = z.object({
 
 export const changePasswordSchema = z.object({
   currentPassword: z.string().min(1, { message: "当前密码不能为空" }),
-  newPassword: z.string().min(6, { message: "新密码长度至少为6位" }),
+  newPassword: newPasswordSchema,
 });
 
 export const adminChangePasswordSchema = z.object({
-  newPassword: z.string().min(6, { message: "新密码长度至少为6位" }),
+  newPassword: newPasswordSchema,
 });
 
 export const resetPasswordSchema = z
   .object({
-    newPassword: z.string().min(6, { message: "新密码长度至少为6位" }).optional(),
+    newPassword: newPasswordSchema.optional(),
     /** @deprecated Use `newPassword` instead. Kept for backward compatibility with older clients. */
-    new_password: z.string().min(6, { message: "新密码长度至少为6位" }).optional(),
+    new_password: newPasswordSchema.optional(),
   })
   .refine(
     ({ newPassword, new_password }) =>
@@ -114,14 +123,14 @@ export const roleParamSchema = z.object({
 
 export const studentSelfRegisterSchema = z.object({
   username: z.string().min(8, "学生用户名至少为8位数字").regex(/^\d+$/, "学生用户名只能包含数字"),
-  password: z.string().min(6, "密码长度至少为6位"),
+  password: newPasswordSchema,
   name: z.string().min(1, "姓名不能为空").regex(/^[\u4e00-\u9fa5a-zA-Z\s]+$/, "姓名只能包含中文字符、英文字母和空格"),
   email: z.string().regex(/^[^\s@]+@[^\s@]+\.[^\s@]+$/, "无效的邮箱格式"),
 });
 
 export const teacherAssistantSelfRegisterSchema = z.object({
   username: z.string().min(3, "用户名至少为3个字符").regex(/^[a-zA-Z0-9]+$/, "用户名只能包含字母和数字"),
-  password: z.string().min(6, "密码长度至少为6位"),
+  password: newPasswordSchema,
   name: z.string().min(1, "姓名不能为空").regex(/^[\u4e00-\u9fa5a-zA-Z\s]+$/, "姓名只能包含中文字符、英文字母和空格"),
   email: z.string().regex(/^[^\s@]+@[^\s@]+\.[^\s@]+$/, "无效的邮箱格式"),
   phone: z.string().trim().length(11, "手机号必须是11位数字").regex(/^\d{11}$/, "手机号只能包含数字"),
