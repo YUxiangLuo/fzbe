@@ -51,6 +51,9 @@ export function loadEnv(source: RuntimeEnvSource = process.env) {
 
   if (isProductionRuntime(source)) {
     assertProductionJwtSecret(result.data.JWT_SECRET);
+    if (source.E2E_SERVER?.trim() === "1") {
+      throw new Error("E2E_SERVER must not be enabled in production");
+    }
   }
   return result.data;
 }

@@ -7,14 +7,7 @@ import type { RowDataPacket } from "mysql2/promise";
 import { env, pool, connectionLimit } from "./config";
 import { jwtAuth, requireStudent } from "./middleware";
 import logger from "./utils/logger";
-import {
-  ADF_HTTP_TIMEOUT_BUDGETS,
-  CONCURRENCY_LIMITS,
-  DB_POOL_CONFIG,
-  MODEL_HTTP_TIMEOUT_BUDGETS,
-  PYTHON_RUNTIME_CONFIG,
-  TIMEOUTS,
-} from "./utils/constants";
+import { CONCURRENCY_LIMITS, DB_POOL_CONFIG } from "./utils/constants";
 import { runStartupEnvironmentChecks } from "./utils/startup-checks";
 import type { JwtPayload, UserRole } from "./types";
 // Import new modular controllers
@@ -25,7 +18,8 @@ import { reconcileManualDeletionJournals } from "./modules/manuals/manuals.servi
 import { questionBankController } from "./modules/question-bank";
 import { quizzesController } from "./modules/quizzes";
 import { reportsController } from "./modules/reports";
-import { getPdfQueueStats, holdPdfQueueSlotForTest } from "./modules/reports/reports.service";
+import { holdPdfQueueSlotForTest } from "./modules/reports/reports.service";
+import { runtimeController } from "./modules/runtime";
 import { modelsController } from "./modules/models";
 import {
   cleanupExpiredGuidedTrainingSessions,
@@ -33,11 +27,9 @@ import {
   cleanupStaleModelArtifacts,
 } from "./modules/models/models.service";
 import {
-  getModelOperationStats,
   withModelOperationContext,
   withModelOperationLease,
 } from "./modules/models/model-operation-lease";
-import { getModelLockStats } from "./modules/models/model-locks";
 import { ModelCapacityBusyError } from "./modules/models/model-errors";
 import { classesController } from "./modules/classes";
 import { classMembersController } from "./modules/class-members";
@@ -550,46 +542,6 @@ app.use("*", async (c, next) => {
     },
   );
 });
-app.get("/api/v1/runtime-info", (c) =>
-  c.json({
-    app: "fangzhen-be",
-    e2eServer: process.env.E2E_SERVER === "1",
-    database: env.DB_DATABASE,
-    port: env.PORT,
-    concurrency: {
-      systemParallelism: CONCURRENCY_LIMITS.SYSTEM_PARALLELISM,
-      maxConcurrentModelJobs: CONCURRENCY_LIMITS.MAX_CONCURRENT_MODEL_JOBS,
-      maxConcurrentPdfJobs: CONCURRENCY_LIMITS.MAX_CONCURRENT_PDF_JOBS,
-      dbConnectionLimit: connectionLimit,
-      dbLockConnections: DB_POOL_CONFIG.LOCK_CONNECTIONS,
-      dbQueryHeadroom: DB_POOL_CONFIG.QUERY_HEADROOM,
-      pythonModelProcessThreads: PYTHON_RUNTIME_CONFIG.MODEL_PROCESS_THREADS,
-      pythonTensorflowInterOpThreads: PYTHON_RUNTIME_CONFIG.TF_INTER_OP_THREADS,
-    },
-    timeouts: {
-      modelExecutionHardCapMs: TIMEOUTS.MODEL_EXECUTION_HARD_CAP,
-      modelSingleOperationMs: TIMEOUTS.MODEL_SINGLE_OPERATION,
-      modelSingleOperationMaxMs: TIMEOUTS.MODEL_SINGLE_OPERATION_MAX,
-      modelOperationCleanupBudgetMs: TIMEOUTS.MODEL_OPERATION_CLEANUP_BUDGET,
-      modelFailureRecordMs: TIMEOUTS.MODEL_FAILURE_RECORD,
-      modelNginxReadMs: MODEL_HTTP_TIMEOUT_BUDGETS.NGINX_READ,
-      modelBrowserRequestMs: MODEL_HTTP_TIMEOUT_BUDGETS.BROWSER_REQUEST,
-      modelLockConnectionAcquireMs: TIMEOUTS.MODEL_LOCK_CONNECTION_ACQUIRE,
-      modelLockQueryMs: TIMEOUTS.MODEL_LOCK_QUERY,
-      modelProcessTerminationGraceMs: TIMEOUTS.MODEL_PROCESS_TERMINATION_GRACE,
-      adfExecutionMs: TIMEOUTS.ADF,
-      adfOperationMs: TIMEOUTS.ADF_OPERATION,
-      adfOperationCleanupBudgetMs: TIMEOUTS.ADF_OPERATION_CLEANUP_BUDGET,
-      adfNginxReadMs: ADF_HTTP_TIMEOUT_BUDGETS.NGINX_READ,
-      modelTrainingMs: TIMEOUTS.MODEL_TRAINING,
-      modelPredictionMs: TIMEOUTS.MODEL_PREDICTION,
-      pdfQueueMs: TIMEOUTS.PDF_QUEUE,
-      pdfGenerationMs: TIMEOUTS.PDF_GENERATION,
-    },
-    modelOperations: getModelOperationStats(),
-    modelLocks: getModelLockStats(),
-    pdfQueue: getPdfQueueStats(),
-  }));
 
 if (process.env.E2E_SERVER === "1") {
   app.post(
@@ -748,6 +700,7 @@ app.route("/", manualsController);
 app.route("/", questionBankController);
 app.route("/", quizzesController);
 app.route("/", reportsController);
+app.route("/", runtimeController);
 app.route("/", modelsController);
 app.route("/", classesController);
 app.route("/", classMembersController);

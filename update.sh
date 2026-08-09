@@ -115,22 +115,33 @@ resolve_health_url() {
           ? `[${configuredHost}]`
           : configuredHost;
     const port = process.env.PORT?.trim() || "3001";
-    process.stdout.write(`http://${host}:${port}/api/v1/runtime-info`);
+    process.stdout.write(`http://${host}:${port}/api/v1/health`);
   '
 }
 
 wait_for_service_health() {
-  local health_url
+  local health_url legacy_health_url
   assert_deployment_environment_unchanged
   health_url="$(resolve_health_url)"
+  # The first release introducing /health must still be able to verify an
+  # automatic rollback to its predecessor, whose public readiness route was
+  # /runtime-info. Only permit that fallback after Git has returned to the
+  # pre-deployment commit; it must never mask a failed target activation.
+  legacy_health_url="${health_url%/health}/runtime-info"
   for _attempt in {1..30}; do
     if sudo systemctl is-active --quiet "$service_name" \
-      && curl --noproxy '*' --fail --silent --connect-timeout 1 --max-time 1 "$health_url" >/dev/null; then
+      && {
+        curl --noproxy '*' --fail --silent --connect-timeout 1 --max-time 1 "$health_url" >/dev/null \
+          || {
+            [[ "$(git rev-parse HEAD)" == "$current_commit" ]] \
+              && curl --noproxy '*' --fail --silent --connect-timeout 1 --max-time 1 "$legacy_health_url" >/dev/null
+          }
+      }; then
       return 0
     fi
     sleep 0.5
   done
-  echo "Backend health check did not become ready: $health_url" >&2
+  echo "Backend health check did not become ready: $health_url (legacy fallback: $legacy_health_url)" >&2
   return 1
 }
 

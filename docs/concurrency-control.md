@@ -210,7 +210,7 @@ PDF 使用独立的进程内 `Semaphore`，允许有界排队：
 
 ## 10. 运行时观测
 
-`GET /api/v1/runtime-info` 返回：
+管理员携带 JWT 调用 `GET /api/v1/runtime-info` 可查看：
 
 - 实际 CPU 并行度、模型/PDF 容量、DB pool 与 Python 线程配置；
 - operation、Python、锁和 PDF 超时；
@@ -253,4 +253,4 @@ cd ../fzfe
 bun run e2e:shiyan:concurrency:server
 ```
 
-并发基线现包含 100 个学生账号。套件先让 100 个已认证学生同时进入测试专用的完整 `slot + execution` lease，其中 50 个持有、50 个快速 429；全部响应后断言 `admission.active=0`、`admission.pending=0`、`activeLeases=0` 和 `modelLocks.active=0`。server profile 将登录 IP 限额提高到 1000，套件内部还会跨场景复用同一学生 token，避免容量阶段之后产生第 101 次登录。测试专用 hold 路由只在 `E2E_SERVER=1` 时注册；复用已有后端前会从 `runtime-info` 明确验证该标志，普通后端会被立即拒绝而不是运行到 404。真实发布验收还应覆盖浏览器断线后后端继续，以及错误、deadline 和锁丢失后所有资源计数归零。
+并发基线现包含 100 个学生账号。套件先让 100 个已认证学生同时进入测试专用的完整 `slot + execution` lease，其中 50 个持有、50 个快速 429；全部响应后断言 `admission.active=0`、`admission.pending=0`、`activeLeases=0` 和 `modelLocks.active=0`。server profile 将登录 IP 限额提高到 1000，套件内部还会跨场景复用同一学生 token，避免容量阶段之后产生第 101 次登录。测试专用 hold 路由只在 `E2E_SERVER=1` 时注册；测试进程会临时公开 `runtime-info`，复用已有后端前据此明确验证该标志，普通生产后端既不会注册 hold 路由，也只允许管理员读取运行详情。真实发布验收还应覆盖浏览器断线后后端继续，以及错误、deadline 和锁丢失后所有资源计数归零。

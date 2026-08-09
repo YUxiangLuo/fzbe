@@ -201,6 +201,8 @@ describe("database migration deployment path", () => {
     expect(update).toContain('git worktree add --detach "$release_dir" "$target_commit"');
     expect(update).toContain("assert_live_checkout_unchanged");
     expect(update).toContain("wait_for_service_health");
+    expect(update).toContain("/api/v1/health");
+    expect(update).toContain('[[ "$(git rev-parse HEAD)" == "$current_commit" ]]');
     expect(update).toContain('git reset --hard "$current_commit"');
     expect(update).not.toContain("git pull");
     expect(update).not.toContain("systemctl restart");

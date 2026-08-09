@@ -99,6 +99,7 @@ const ensureTestEnv = () => {
   process.env.DB_DATABASE ??= "test";
   process.env.JWT_SECRET = "test-jwt-secret";
   process.env.PORT ??= "3001";
+  delete process.env.E2E_SERVER;
 };
 
 let appPromise: Promise<AppLike> | null = null;
@@ -369,10 +370,84 @@ describe("app route smoke tests", () => {
     }
   });
 
-  test("runtime info exposes model and PDF concurrency observability", async () => {
+  test("exposes only a minimal public health response", async () => {
     const app = await getApp();
     const response = await app.fetch(
+      new Request("http://localhost/api/v1/health"),
+    );
+
+    expect(response.status).toBe(200);
+    await expect(response.json()).resolves.toEqual({
+      data: { app: "fangzhen-be", status: "ok" },
+    });
+  });
+
+  test("gives authenticated clients only the PDF timeout configuration they need", async () => {
+    const app = await getApp();
+    const unauthenticated = await app.fetch(
+      new Request("http://localhost/api/v1/client-config"),
+    );
+    expect(unauthenticated.status).toBe(401);
+
+    const token = await sign(
+      {
+        sub: 123,
+        role: "Student",
+        exp: Math.floor(Date.now() / 1000) + 3600,
+      },
+      "test-jwt-secret",
+    );
+    const response = await app.fetch(
+      new Request("http://localhost/api/v1/client-config", {
+        headers: { Authorization: `Bearer ${token}` },
+      }),
+    );
+
+    expect(response.status).toBe(200);
+    await expect(response.json()).resolves.toEqual({
+      data: {
+        reportSubmission: {
+          pdfQueueMs: 60_000,
+          pdfGenerationMs: 30_000,
+        },
+      },
+    });
+  });
+
+  test("restricts runtime concurrency observability to administrators", async () => {
+    const app = await getApp();
+    const unauthenticated = await app.fetch(
       new Request("http://localhost/api/v1/runtime-info"),
+    );
+    expect(unauthenticated.status).toBe(401);
+
+    const studentToken = await sign(
+      {
+        sub: 123,
+        role: "Student",
+        exp: Math.floor(Date.now() / 1000) + 3600,
+      },
+      "test-jwt-secret",
+    );
+    const forbidden = await app.fetch(
+      new Request("http://localhost/api/v1/runtime-info", {
+        headers: { Authorization: `Bearer ${studentToken}` },
+      }),
+    );
+    expect(forbidden.status).toBe(403);
+
+    const adminToken = await sign(
+      {
+        sub: 1,
+        role: "Admin",
+        exp: Math.floor(Date.now() / 1000) + 3600,
+      },
+      "test-jwt-secret",
+    );
+    const response = await app.fetch(
+      new Request("http://localhost/api/v1/runtime-info", {
+        headers: { Authorization: `Bearer ${adminToken}` },
+      }),
     );
 
     expect(response.status).toBe(200);

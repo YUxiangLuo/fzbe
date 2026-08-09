@@ -115,8 +115,8 @@ and canonical-phone audits with the legacy writer quiesced, fast-forward the
 live checkout, refresh its dependencies, and start the service. Immediately
 before stopping it rechecks that both `HEAD` and the worktree are unchanged, so
 manual changes made during a long migration cannot be overwritten. Readiness is
-confirmed through the public runtime-info endpoint rather than by trusting the
-initial `systemd` process state. A failure before that bounded stop window
+confirmed through the minimal public `/api/v1/health` endpoint rather than by trusting the
+initial `systemd` process state. Detailed `runtime-info` remains restricted to administrators in normal runtimes. A failure before that bounded stop window
 leaves the old service untouched. A quiesced-audit or other failure after
 stopping restores the previous commit, dependencies, and changed Python
 environment before restarting and health-checking the old release; rollback

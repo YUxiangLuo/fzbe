@@ -35,7 +35,7 @@ describe("runtime environment", () => {
     expect(parsed.ALLOW_LEGACY_PRODUCTION_PLAN_WRITES).toBe(true);
   });
 
-  test("requires only a strong JWT secret in production", () => {
+  test("requires a strong JWT secret in production", () => {
     const productionEnv = {
       ...baseEnv,
       NODE_ENV: "production",
@@ -48,5 +48,14 @@ describe("runtime environment", () => {
       ...productionEnv,
       JWT_SECRET: "production-jwt-secret-at-least-32-characters",
     }).JWT_SECRET).toBe("production-jwt-secret-at-least-32-characters");
+  });
+
+  test("rejects E2E-only routes in production", () => {
+    expect(() => loadEnv({
+      ...baseEnv,
+      NODE_ENV: "production",
+      JWT_SECRET: "production-jwt-secret-at-least-32-characters",
+      E2E_SERVER: "1",
+    })).toThrow("E2E_SERVER must not be enabled in production");
   });
 });

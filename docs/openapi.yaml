@@ -205,6 +205,45 @@ components:
       discriminator:
         propertyName: code
 
+    HealthResponse:
+      type: object
+      required: [data]
+      properties:
+        data:
+          type: object
+          required: [app, status]
+          properties:
+            app:
+              type: string
+              enum: [fangzhen-be]
+            status:
+              type: string
+              enum: [ok]
+          additionalProperties: false
+      additionalProperties: false
+
+    ClientConfigResponse:
+      type: object
+      required: [data]
+      properties:
+        data:
+          type: object
+          required: [reportSubmission]
+          properties:
+            reportSubmission:
+              type: object
+              required: [pdfQueueMs, pdfGenerationMs]
+              properties:
+                pdfQueueMs:
+                  type: integer
+                  minimum: 1
+                pdfGenerationMs:
+                  type: integer
+                  minimum: 1
+              additionalProperties: false
+          additionalProperties: false
+      additionalProperties: false
+
     DataEnvelope:
       type: object
       required: [data]
@@ -2507,13 +2546,51 @@ components:
         minLength: 1
 
 paths:
+  /api/v1/health:
+    get:
+      tags: [Runtime]
+      summary: 服务健康检查
+      operationId: getHealth
+      description: 仅返回应用标识和健康状态，不暴露数据库、容量或运行时配置。
+      security: []
+      responses:
+        '200':
+          description: 服务已就绪
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HealthResponse'
+
+  /api/v1/client-config:
+    get:
+      tags: [Runtime]
+      summary: 获取客户端运行配置
+      operationId: getClientConfig
+      description: 返回已认证客户端执行请求所需的非敏感配置；当前仅包含报告 PDF 排队和生成超时。
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: 成功
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ClientConfigResponse'
+        '401':
+          description: 未授权
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
   /api/v1/runtime-info:
     get:
       tags: [Runtime]
       summary: 获取后端运行时与并发配置
       operationId: getRuntimeInfo
-      description: 返回当前后端生效的数据库、模型/PDF 并发、超时和 PDF 队列瞬时状态，用于部署后核对与课堂监控。
-      security: []
+      description: 仅 Admin 可访问。返回当前后端生效的数据库、模型/PDF 并发、超时和 PDF 队列瞬时状态，用于部署核对与课堂监控。E2E_SERVER 测试进程会在凭据创建前临时公开同一路径，以校验一次性数据库和容量配置。
+      security:
+        - bearerAuth: []
       responses:
         '200':
           description: 成功
@@ -2521,6 +2598,18 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/DataEnvelope'
+        '401':
+          description: 未授权
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '403':
+          description: 权限不足（仅 Admin）
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
 
   /api/v1/sessions:
     post:
