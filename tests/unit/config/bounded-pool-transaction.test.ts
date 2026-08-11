@@ -58,6 +58,36 @@ describe("bounded pool transaction", () => {
     expect(fake.destroy).not.toHaveBeenCalled();
   });
 
+  test("destroys rather than releases when rollback acknowledgement is lost", async () => {
+    const fake = makeConnection();
+    fake.rollback.mockRejectedValueOnce(new Error("rollback acknowledgement lost"));
+    const source = { getConnection: mock(async () => fake.connection) };
+    const original = new Error("write failed");
+
+    await expect(withBoundedPoolTransaction(source, 100, async () => {
+      throw original;
+    })).rejects.toBe(original);
+
+    expect(fake.release).not.toHaveBeenCalled();
+    expect(fake.destroy).toHaveBeenCalledTimes(1);
+  });
+
+  test.each([
+    "beginTransaction",
+    "commit",
+  ] as const)("destroys rather than releases when %s acknowledgement is lost", async (method) => {
+    const fake = makeConnection();
+    fake[method].mockRejectedValueOnce(new Error(`${method} acknowledgement lost`));
+    const source = { getConnection: mock(async () => fake.connection) };
+
+    await expect(withBoundedPoolTransaction(source, 100, async () => "written"))
+      .rejects.toThrow("acknowledgement lost");
+
+    expect(fake.rollback).not.toHaveBeenCalled();
+    expect(fake.release).not.toHaveBeenCalled();
+    expect(fake.destroy).toHaveBeenCalledTimes(1);
+  });
+
   test("propagates pool acquisition errors without running transaction work", async () => {
     const original = new Error("pool unavailable");
     const source = { getConnection: mock(async () => { throw original; }) };
@@ -86,6 +116,27 @@ describe("bounded pool transaction", () => {
     expect(fake.beginTransaction).not.toHaveBeenCalled();
     expect(fake.release).toHaveBeenCalledTimes(1);
     expect(fake.destroy).not.toHaveBeenCalled();
+  });
+
+  test("destroys a late connection when returning it to the pool fails", async () => {
+    const fake = makeConnection();
+    fake.release.mockImplementationOnce(() => {
+      throw new Error("pool release failed");
+    });
+    let resolveConnection!: (connection: PoolConnection) => void;
+    const source = {
+      getConnection: mock(() => new Promise<PoolConnection>((resolve) => {
+        resolveConnection = resolve;
+      })),
+    };
+
+    const result = withBoundedPoolTransaction(source, 10, async () => undefined);
+    await expect(result).rejects.toBeInstanceOf(BoundedPoolTransactionTimeoutError);
+    resolveConnection(fake.connection);
+    await Bun.sleep(1);
+
+    expect(fake.release).toHaveBeenCalledTimes(1);
+    expect(fake.destroy).toHaveBeenCalledTimes(1);
   });
 
   test("destroys an acquired connection when transaction work exceeds the deadline", async () => {

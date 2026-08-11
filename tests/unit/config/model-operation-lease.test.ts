@@ -9,6 +9,7 @@ import {
   ModelOperationDeadlineError,
 } from "../../../src/modules/models/model-errors";
 import type { ModelExecutionLockHandle } from "../../../src/modules/models/model-execution-lock";
+import { getCurrentModelOperationSignal } from "../../../src/modules/models/model-operation-scope";
 import type { ModelType } from "../../../src/modules/models/models.schema";
 
 const events: string[] = [];
@@ -70,12 +71,14 @@ describe("model operation lease", () => {
         execution,
         async (lease) => {
           events.push("callback");
+          expect(getCurrentModelOperationSignal()).toBe(lease.terminationSignal);
           await lease.verifyOwned();
           return "ok";
         },
       ));
 
     expect(result).toBe("ok");
+    expect(getCurrentModelOperationSignal()).toBeUndefined();
     expect(events).toEqual([
       "acquire:execution:1:ma",
       "callback",

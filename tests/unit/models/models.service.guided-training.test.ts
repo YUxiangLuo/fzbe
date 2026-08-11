@@ -143,6 +143,53 @@ describe("models service guided training", () => {
     expect(connection.release).toHaveBeenCalledTimes(1);
   });
 
+  test("reads the newly inserted attempt before committing its lease", async () => {
+    const row = buildGuidedSessionRow({
+      status: "ready",
+      current_step_id: "prepare_data",
+      active_attempt_id: null,
+    });
+    const events: string[] = [];
+    const insertedAttempt = {
+      attempt_id: "guided-new-attempt",
+      session_id: row.session_id,
+      step_id: "prepare_data",
+      status: "running",
+      input_state_path: null,
+      input_state_sha256: null,
+      candidate_state_path: "/tmp/guided-new-attempt.pkl",
+      candidate_state_sha256: null,
+      receipt_path: "/tmp/guided-new-attempt.receipt.json",
+      output_payload: null,
+      final_result_payload: null,
+      error_message: null,
+      run_count: 1,
+      lease_expires_at: "2026-08-11 12:00:00",
+      lease_is_active: 1,
+    };
+    const connection = {
+      beginTransaction: mock(async () => undefined),
+      commit: mock(async () => { events.push("commit"); }),
+      rollback: mock(async () => undefined),
+      release: mock(() => undefined),
+      destroy: mock(() => undefined),
+      query: mock(async (sql: string) => {
+        if (sql.includes("FROM model_guided_training_sessions")) return [[row]];
+        if (sql.includes("FROM model_guided_training_step_attempts")) {
+          events.push("attempt-read");
+          return [[insertedAttempt]];
+        }
+        return [{ affectedRows: 1 }];
+      }),
+    };
+    poolGetConnection.mockResolvedValueOnce(connection as never);
+
+    const result = await beginGuidedStepAttempt(row as never, "prepare_data", 60_000);
+
+    expect(result.attempt).toEqual(insertedAttempt);
+    expect(events).toEqual(["attempt-read", "commit"]);
+  });
+
   test("blocks training for completed experiments before loading dataset data", async () => {
     poolQuery.mockResolvedValueOnce([
       [buildExperimentContextRow({ status: "Completed" })],

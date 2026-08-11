@@ -79,21 +79,43 @@ export function decodeCsvBuffer(buffer: Buffer | Uint8Array): string {
   throw new CsvEncodingError();
 }
 
-export async function readCsvText(filePath: string): Promise<string> {
-  const buffer = await readFile(filePath);
+export async function readCsvText(
+  filePath: string,
+  terminationSignal?: AbortSignal,
+): Promise<string> {
+  if (terminationSignal?.aborted) {
+    throw terminationSignal.reason instanceof Error
+      ? terminationSignal.reason
+      : new Error("CSV 读取已终止");
+  }
+  const buffer = await readFile(filePath, { signal: terminationSignal });
+  if (terminationSignal?.aborted) {
+    throw terminationSignal.reason instanceof Error
+      ? terminationSignal.reason
+      : new Error("CSV 读取已终止");
+  }
   return decodeCsvBuffer(buffer);
 }
 
 export async function parseCsvFileRows(
   filePath: string,
   onRow: (row: Record<string, string>) => void,
-  options: { maxRows?: number } = {},
+  options: { maxRows?: number; terminationSignal?: AbortSignal } = {},
 ): Promise<void> {
-  const csvText = await readCsvText(filePath);
+  const csvText = await readCsvText(filePath, options.terminationSignal);
 
   await new Promise<void>((resolve, reject) => {
     let rowCount = 0;
-    const parser = createCsvParser(csvText)
+    const parser = createCsvParser(csvText);
+    const abort = () => {
+      const reason = options.terminationSignal?.reason;
+      parser.destroy(reason instanceof Error ? reason : new Error("CSV 解析已终止"));
+    };
+    const settle = (callback: () => void) => {
+      options.terminationSignal?.removeEventListener("abort", abort);
+      callback();
+    };
+    parser
       .on("data", (row: Record<string, string>) => {
         rowCount += 1;
         if (options.maxRows && rowCount > options.maxRows) {
@@ -102,15 +124,21 @@ export async function parseCsvFileRows(
         }
         onRow(row);
       })
-      .on("end", resolve)
-      .on("error", reject);
+      .on("end", () => settle(resolve))
+      .on("error", (error) => settle(() => reject(error)));
+    options.terminationSignal?.addEventListener("abort", abort, { once: true });
+    if (options.terminationSignal?.aborted) abort();
   });
 }
 
-export async function readCsvRows(filePath: string): Promise<Record<string, string>[]> {
+export async function readCsvRows(
+  filePath: string,
+  terminationSignal?: AbortSignal,
+): Promise<Record<string, string>[]> {
   const rows: Record<string, string>[] = [];
   await parseCsvFileRows(filePath, (row) => rows.push(row), {
     maxRows: CSV_LIMITS.DATASET_SEGMENT_MAX_ROWS,
+    terminationSignal,
   });
   return rows;
 }

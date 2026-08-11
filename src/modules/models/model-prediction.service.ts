@@ -80,6 +80,7 @@ const predictExperimentModelWithLease = async (
     trainingConfig.selected_industry,
     trainingConfig.selected_company,
     trainingConfig.selected_product,
+    lease.terminationSignal,
   );
   validateActiveRunAgainstSnapshot(activeRun, JSON.stringify(allData));
 

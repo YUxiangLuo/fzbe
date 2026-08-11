@@ -3,11 +3,14 @@ import logger from "../utils/logger";
 import { CONCURRENCY_LIMITS, DB_POOL_CONFIG } from "../utils/constants";
 import { buildDatabasePoolOptions } from "./database-options";
 import { configureDatabasePoolSessions } from "./database-session";
+import { registerExplicitConnectionQueryPool } from "./database-pool-capabilities";
 
 export const connectionLimit = DB_POOL_CONFIG.CONNECTION_LIMIT;
 export const databasePoolOptions = buildDatabasePoolOptions();
 
-export const pool = mysql.createPool(databasePoolOptions);
+export const pool = registerExplicitConnectionQueryPool(
+  mysql.createPool(databasePoolOptions),
+);
 configureDatabasePoolSessions(
   pool,
   databasePoolOptions.timezone as string,

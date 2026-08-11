@@ -12,6 +12,7 @@ const {
   waitForAuxiliaryPythonProcess,
   cleanupExpiredGuidedTrainingSessions,
   cleanupExpiredProductionPreparationSessions,
+  cleanupExperimentModelArtifacts,
   cleanupStaleModelArtifacts,
   getModelRuntimeRevision,
   hashDatasetSnapshot,
@@ -90,9 +91,23 @@ describe("models service cleanup", () => {
     poolQuery.mockReset();
     poolQuery
       .mockResolvedValueOnce([[
-        { session_id: "expired-safe", artifact_dir: safeArtifactDir },
-        { session_id: "expired-unsafe", artifact_dir: unsafeArtifactDir },
+        {
+          session_id: "expired-safe",
+          experiment_id: 990002,
+          model_type: "ma",
+          artifact_dir: safeArtifactDir,
+          status: "failed",
+        },
+        {
+          session_id: "expired-unsafe",
+          experiment_id: 990003,
+          model_type: "ma",
+          artifact_dir: unsafeArtifactDir,
+          status: "failed",
+        },
       ]])
+      .mockResolvedValueOnce([{ affectedRows: 1 }])
+      .mockResolvedValueOnce([{ affectedRows: 1 }])
       .mockResolvedValueOnce([[]]);
 
     const result = await cleanupExpiredGuidedTrainingSessions({
@@ -110,11 +125,39 @@ describe("models service cleanup", () => {
       { recursive: true, force: true },
     );
     expect(String(poolQuery.mock.calls[0]?.[0])).toContain("expires_at <= ?");
-    expect(poolQuery.mock.calls[0]?.[1]).toEqual([now]);
-    expect(poolQuery.mock.calls[1]?.[1]).toEqual([
+    expect(String(poolQuery.mock.calls[0]?.[0])).toContain("attempts.lease_expires_at > ?");
+    expect(poolQuery.mock.calls[0]?.[1]).toEqual([now, now]);
+    expect(poolQuery.mock.calls[1]?.[1]).toEqual(["expired-safe", now, now]);
+    expect(poolQuery.mock.calls[2]?.[1]).toEqual(["expired-unsafe", now, now]);
+    expect(poolQuery.mock.calls[3]?.[1]).toEqual([
       "expired-safe",
       "expired-unsafe",
     ]);
+  });
+
+  test("skips an expired guided session while its experiment/model execution mutex is busy", async () => {
+    const artifactDir = "/tmp/fangzhen-py/guided_training/exp990002-student20240002-ma-running";
+    poolQuery.mockReset();
+    poolQuery.mockResolvedValueOnce([[
+      {
+        session_id: "expired-running",
+        experiment_id: 990002,
+        model_type: "ma",
+        artifact_dir: artifactDir,
+        status: "running",
+      },
+    ]]);
+    tryAcquireModelExecutionLock.mockReturnValueOnce(null);
+    readdirSync.mockReturnValueOnce([]);
+
+    const result = await cleanupExpiredGuidedTrainingSessions({
+      now: new Date("2026-07-05T00:00:00.000Z"),
+      limit: 50,
+    });
+
+    expect(result).toEqual({ deletedSessions: 0, deletedArtifactDirs: 0 });
+    expect(rmSync).not.toHaveBeenCalled();
+    expect(releaseModelExecutionLock).not.toHaveBeenCalled();
   });
 
   test("uses database time for guided session expiration in production cleanup", async () => {
@@ -132,9 +175,17 @@ describe("models service cleanup", () => {
     const artifactDir = "/tmp/fangzhen-py/guided_training/exp990002-student20240002-ma-stuck";
 
     poolQuery.mockReset();
-    poolQuery.mockResolvedValueOnce([[
-      { session_id: "expired-stuck", artifact_dir: artifactDir },
-    ]]);
+    poolQuery
+      .mockResolvedValueOnce([[
+        {
+          session_id: "expired-stuck",
+          experiment_id: 990002,
+          model_type: "ma",
+          artifact_dir: artifactDir,
+          status: "failed",
+        },
+      ]])
+      .mockResolvedValueOnce([{ affectedRows: 1 }]);
     rmSync.mockImplementationOnce(() => {
       throw new Error("permission denied");
     });
@@ -282,6 +333,16 @@ describe("models service cleanup", () => {
     expect(unlinkSync).not.toHaveBeenCalledWith(candidatePath);
   });
 
+  test("defers direct experiment artifact cleanup while a model is executing", () => {
+    tryAcquireModelExecutionLock.mockReturnValueOnce(null);
+
+    cleanupExperimentModelArtifacts(990002, 20240002);
+
+    expect(readdirSync).not.toHaveBeenCalled();
+    expect(unlinkSync).not.toHaveBeenCalled();
+    expect(releaseModelExecutionLock).not.toHaveBeenCalled();
+  });
+
   test("cleans stale model artifact groups for completed experiments", async () => {
     const trainedModelsDir = "/tmp/fangzhen-py/trained_models";
     const modelFile = "exp990002-student20240002-ma.pkl";
@@ -319,10 +380,64 @@ describe("models service cleanup", () => {
     expect(String(poolQuery.mock.calls[0]?.[0])).toContain("TIMESTAMPDIFF");
     expect(String(poolQuery.mock.calls[0]?.[0])).toContain("NOW()");
     expect(poolQuery.mock.calls[0]?.[1]).toEqual([
+      1,
       7 * 24 * 60 * 60,
       990002,
       20240002,
     ]);
+  });
+
+  test("recovers deferred report-time cleanup for a recent completed experiment", async () => {
+    const modelFile = "exp990005-student20240005-ma.pkl";
+    poolQuery.mockReset();
+    poolQuery.mockResolvedValueOnce([[{ can_delete: 1 }]]);
+    readdirSync.mockReturnValueOnce([modelFile]);
+    statSync.mockReturnValueOnce({
+      isDirectory: () => false,
+      isFile: () => true,
+      mtimeMs: new Date("2026-07-05T00:00:00.000Z").getTime(),
+    });
+
+    const result = await cleanupStaleModelArtifacts({
+      now: new Date("2026-07-05T00:00:01.000Z"),
+      maxAgeMs: 7 * 24 * 60 * 60 * 1000,
+    });
+
+    expect(result.deletedFiles).toBe(1);
+    expect(poolQuery.mock.calls[0]?.[1]).toEqual([
+      0,
+      7 * 24 * 60 * 60,
+      990005,
+      20240005,
+    ]);
+  });
+
+  test("does not delete a stale artifact group while any model for the experiment is executing", async () => {
+    const modelFile = "exp990004-student20240004-ma.pkl";
+    readdirSync.mockReturnValueOnce([modelFile]);
+    statSync.mockReturnValueOnce({
+      isDirectory: () => false,
+      isFile: () => true,
+      mtimeMs: new Date("2026-06-01T00:00:00.000Z").getTime(),
+    });
+    tryAcquireModelExecutionLock
+      .mockReturnValueOnce({ key: "990004:ma", token: Symbol("cleanup-ma") })
+      .mockReturnValueOnce(null);
+
+    const result = await cleanupStaleModelArtifacts({
+      now: new Date("2026-07-05T00:00:00.000Z"),
+      maxAgeMs: 7 * 24 * 60 * 60 * 1000,
+    });
+
+    expect(result).toEqual({
+      scannedGroups: 1,
+      deletedGroups: 0,
+      deletedFiles: 0,
+      failedFiles: 0,
+    });
+    expect(poolQuery).not.toHaveBeenCalled();
+    expect(unlinkSync).not.toHaveBeenCalled();
+    expect(releaseModelExecutionLock).toHaveBeenCalledTimes(1);
   });
 
   test("keeps stale model artifact groups when database time says the experiment is still active", async () => {
@@ -352,6 +467,7 @@ describe("models service cleanup", () => {
     expect(String(poolQuery.mock.calls[0]?.[0])).toContain("TIMESTAMPDIFF");
     expect(String(poolQuery.mock.calls[0]?.[0])).toContain("NOW()");
     expect(poolQuery.mock.calls[0]?.[1]).toEqual([
+      1,
       7 * 24 * 60 * 60,
       990003,
       20240003,

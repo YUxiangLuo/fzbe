@@ -103,6 +103,15 @@ describe("csv processor encoding", () => {
     expect(seenRows).toEqual(["1", "2"]);
   });
 
+  test("preserves the operation abort reason when dataset parsing is cancelled", async () => {
+    const filePath = await writeTempCsv("value\n1\n");
+    const controller = new AbortController();
+    const deadlineError = new Error("model operation deadline exceeded");
+    controller.abort(deadlineError);
+
+    await expect(readCsvRows(filePath, controller.signal)).rejects.toBe(deadlineError);
+  });
+
   test("allows a multi-product dataset upload above the single-segment row limit", async () => {
     const rowCount = CSV_LIMITS.DATASET_SEGMENT_MAX_ROWS + 1;
     const rows = Array.from(

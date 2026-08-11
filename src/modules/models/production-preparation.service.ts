@@ -329,6 +329,7 @@ const computeCurrentProductionPreparationIdentity = async (
     "experiment_id" | "model_type" | "forecast_steps"
   >,
   studentId: number,
+  terminationSignal?: AbortSignal,
 ): Promise<ProductionPreparationIdentity> => {
   const experiment = await assertExperimentModelAccess(row.experiment_id, studentId);
   assertModelReadyForProduction(experiment, row.model_type);
@@ -342,6 +343,7 @@ const computeCurrentProductionPreparationIdentity = async (
     trainingConfig.selected_industry,
     trainingConfig.selected_company,
     trainingConfig.selected_product,
+    terminationSignal,
   );
   const datasetJson = JSON.stringify(allData);
   const datasetRevision = hashDatasetSnapshot(datasetJson);
@@ -375,10 +377,15 @@ const assertProductionPreparationIdentityCurrent = async (
     | "runtime_revision"
   >,
   studentId: number,
+  terminationSignal?: AbortSignal,
 ): Promise<ProductionPreparationIdentity> => {
   let current: ProductionPreparationIdentity;
   try {
-    current = await computeCurrentProductionPreparationIdentity(row, studentId);
+    current = await computeCurrentProductionPreparationIdentity(
+      row,
+      studentId,
+      terminationSignal,
+    );
   } catch (error) {
     if (
       !(error instanceof ModelAccessError)
@@ -511,6 +518,7 @@ export async function createOrResumeProductionPreparationSession(
       trainingConfig.selected_industry,
       trainingConfig.selected_company,
       trainingConfig.selected_product,
+      operationContext.deadlineSignal,
     );
     operationContext.throwIfTerminated();
     const datasetJson = JSON.stringify(allData);
@@ -753,6 +761,7 @@ export async function getProductionPreparationSession(
 const validateProductionPreparationReceipt = async (
   result: Awaited<ReturnType<typeof runPythonProductionPreparationStep>>,
   attempt: ProductionPreparationAttemptRow,
+  terminationSignal?: AbortSignal,
 ) => {
   if (
     result.protocol_version !== PRODUCTION_PREPARATION_PROTOCOL_VERSION
@@ -767,14 +776,17 @@ const validateProductionPreparationReceipt = async (
     if (
       result.input_state_path !== attempt.input_state_path
       || result.input_state_sha256 !== attempt.input_state_sha256
-      || await hashFileContents(attempt.input_state_path) !== attempt.input_state_sha256
+      || await hashFileContents(attempt.input_state_path, terminationSignal) !== attempt.input_state_sha256
     ) {
       throw new ModelValidationError("生产准备步骤输入 checkpoint 摘要不匹配");
     }
   } else if (result.input_state_path != null || result.input_state_sha256 != null) {
     throw new ModelValidationError("生产准备初始化返回了意外的输入 checkpoint");
   }
-  const actualDigest = await hashFileContents(attempt.candidate_state_path);
+  const actualDigest = await hashFileContents(
+    attempt.candidate_state_path,
+    terminationSignal,
+  );
   if (actualDigest !== result.candidate_state_sha256) {
     throw new ModelValidationError("生产准备 checkpoint 摘要不匹配");
   }
@@ -1130,6 +1142,7 @@ export async function runProductionPreparationStep(
         let stepIdentity = await assertProductionPreparationIdentityCurrent(
           currentRow,
           studentId,
+          lease.terminationSignal,
         );
         const reusable = await getReusableProductionModelArtifactResult(
           modelType,
@@ -1153,6 +1166,7 @@ export async function runProductionPreparationStep(
         stepIdentity = await assertProductionPreparationIdentityCurrent(
           currentRow,
           studentId,
+          lease.terminationSignal,
         );
         const { activeRun } = stepIdentity;
 
@@ -1241,13 +1255,21 @@ export async function runProductionPreparationStep(
             timeoutMs,
             lease.terminationSignal,
           );
-          const receipt = await validateProductionPreparationReceipt(rawReceipt, attempt);
+          const receipt = await validateProductionPreparationReceipt(
+            rawReceipt,
+            attempt,
+            lease.terminationSignal,
+          );
           await verifyProductionSourceArtifactForRun(
             modelType,
             activeRun,
             lease.terminationSignal,
           );
-          await assertProductionPreparationIdentityCurrent(currentRow, studentId);
+          await assertProductionPreparationIdentityCurrent(
+            currentRow,
+            studentId,
+            lease.terminationSignal,
+          );
           await lease.verifyOwned();
           const nextCompleted = [...currentCompletedStepIds, stepId];
           let nextPlan = currentStepPlan;
@@ -1282,6 +1304,7 @@ export async function runProductionPreparationStep(
             const commitIdentity = await assertProductionPreparationIdentityCurrent(
               currentRow,
               studentId,
+              lease.terminationSignal,
             );
             await lease.verifyOwned();
             productionRevision = crypto.randomUUID();
@@ -1383,6 +1406,7 @@ const getReusableProductionModelArtifactResult = async (
     trainingConfig.selected_industry,
     trainingConfig.selected_company,
     trainingConfig.selected_product,
+    terminationSignal,
   );
   validateActiveRunAgainstSnapshot(activeRun, JSON.stringify(allData));
 

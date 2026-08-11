@@ -7,6 +7,7 @@ import {
   ModelConflictError,
   ModelOperationDeadlineError,
 } from "./model-errors";
+import { runWithModelOperationSignal } from "./model-operation-scope";
 import {
   releaseModelExecutionLock,
   tryAcquireModelExecutionLock,
@@ -145,7 +146,10 @@ export function createModelOperationLeaseManager(
     };
 
     try {
-      const result = await callback(context);
+      const result = await runWithModelOperationSignal(
+        controller.signal,
+        () => callback(context),
+      );
       context.throwIfTerminated();
       operationStats.completed += 1;
       operationLogger.info({ operation, durationMs: Date.now() - startedAt }, "模型操作完成");

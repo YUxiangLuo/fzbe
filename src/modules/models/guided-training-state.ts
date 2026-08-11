@@ -454,6 +454,7 @@ export const computeCurrentGuidedTrainingIdentity = async (
     trainingConfig.selected_industry,
     trainingConfig.selected_company,
     trainingConfig.selected_product,
+    options.terminationSignal,
   );
   const datasetRevision = hashDatasetSnapshot(JSON.stringify(allData));
   const runtimeRevision = getModelRuntimeRevision(true);
@@ -868,9 +869,12 @@ export const beginGuidedStepAttempt = async (
     if (Number((updateResult as { affectedRows?: number }).affectedRows ?? 0) !== 1) {
       throw new ModelConflictError("训练会话状态已变化", "GUIDED_STEP_IN_PROGRESS");
     }
-    await commitTransaction();
+    // Read the inserted row while the transaction still owns it. If a
+    // post-COMMIT read failed, the database would retain a live attempt lease
+    // even though Python never started, blocking retries until lease expiry.
     const attempt = await fetchGuidedAttempt(connection, attemptId);
     if (!attempt) throw new Error("创建训练步骤 attempt 失败");
+    await commitTransaction();
     return { attempt, receipt: null, recovered: false };
   } catch (error) {
     if (transactionPhase === "before-commit") {

@@ -128,6 +128,7 @@ const createOrResumeGuidedTrainingSessionInternal = async (
     trainingConfig.selected_industry,
     trainingConfig.selected_company,
     trainingConfig.selected_product,
+    terminationSignal,
   );
   operationContext.throwIfTerminated();
   if (

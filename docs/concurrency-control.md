@@ -75,7 +75,7 @@ TF_NUM_INTEROP_THREADS = 1
 execution mutex -> admission
 ```
 
-JavaScript 在同一个事件循环中同步完成 execution mutex 的 Map check-and-set，因此同一实验、同一模型的互斥不存在异步抢占窗口。token 校验保证迟到调用不能释放另一个调用的新锁。
+JavaScript 在同一个事件循环中同步完成 execution mutex 的 Map check-and-set，因此同一实验、同一模型的互斥不存在异步抢占窗口。token 校验保证迟到调用不能释放另一个调用的新锁。过期 session 和模型产物清理复用同一组 execution mutex：单 session 清理获取对应模型锁，整实验产物清理同步获取该实验全部模型锁；锁繁忙时跳过并留待下一轮，绝不删除正在被训练、准备或预测使用的文件。
 
 ### 4.1 各操作使用的资源
 
@@ -131,7 +131,7 @@ operation deadline + process termination grace + response reserve
 
 默认清理预算为 `5s + 6s = 11s`。ADF 为 `30s` Python 上限、`34s` operation 上限和 `45s` nginx 上限。
 
-普通 mysql2 查询无法通过 AbortSignal 取消，因此模型专用数据库 helper 仍对连接获取和查询设置上限；事务查询超时时销毁连接。
+普通 mysql2 查询无法原生通过 AbortSignal 取消，因此模型 operation signal 通过 AsyncLocalStorage 传播到数据库 helper；helper 显式借用连接，并对连接获取、查询、`BEGIN` 和 `ROLLBACK` 设置上限。operation 截止或查询/事务控制超时时会销毁对应连接，`COMMIT` 中止或超时则按结果未知 fail-closed。数据集查找也使用同一有界查询 helper，文件读取和 CSV 解析会响应 operation signal。
 
 ## 6. 客户端断线与 Python 进程
 

@@ -13,19 +13,21 @@ export class BoundedPoolTransactionTimeoutError extends Error {
   }
 }
 
-const safeRelease = (connection: PoolConnection) => {
-  try {
-    connection.release();
-  } catch {
-    // A late but otherwise healthy pool connection should be returned when possible.
-  }
-};
-
 const safeDestroy = (connection: PoolConnection) => {
   try {
     connection.destroy();
   } catch {
     // Destruction is best-effort; a timed-out transaction must never return to the pool.
+  }
+};
+
+const safeRelease = (connection: PoolConnection) => {
+  try {
+    connection.release();
+  } catch {
+    // If the pool refuses a late or otherwise healthy return, close the
+    // connection rather than silently leaking the pool slot.
+    safeDestroy(connection);
   }
 };
 
@@ -51,6 +53,8 @@ export async function withBoundedPoolTransaction<T>(
   const timeoutError = new BoundedPoolTransactionTimeoutError(timeoutMs);
   let connection: PoolConnection | null = null;
   let timedOut = false;
+  let connectionReusable = true;
+  let transactionPhase: "acquired" | "started" | "commit-attempted" | "committed" = "acquired";
 
   const operation = (async (): Promise<T> => {
     try {
@@ -65,25 +69,38 @@ export async function withBoundedPoolTransaction<T>(
       connection = acquiredConnection;
       await connection.beginTransaction();
       if (timedOut) throw timeoutError;
+      transactionPhase = "started";
 
       const result = await callback(connection);
       if (timedOut) throw timeoutError;
 
+      transactionPhase = "commit-attempted";
       await connection.commit();
       if (timedOut) throw timeoutError;
+      transactionPhase = "committed";
       return result;
     } catch (error) {
       if (connection && !timedOut) {
-        // Rollback is covered by the same outer timer. If rollback stalls, the
-        // timer destroys the connection and rejects the caller.
-        await connection.rollback().catch(() => {});
+        if (transactionPhase === "started") {
+          // Rollback is covered by the same outer timer. If it rejects or
+          // stalls, this connection is not safe to return to the pool.
+          try {
+            await connection.rollback();
+          } catch {
+            connectionReusable = false;
+          }
+        } else if (transactionPhase !== "committed") {
+          // BEGIN and COMMIT acknowledgement loss both leave transaction state
+          // ambiguous; destroying the session lets the server settle it.
+          connectionReusable = false;
+        }
       }
       throw error;
     } finally {
       if (connection) {
         const settledConnection = connection;
         connection = null;
-        if (timedOut) safeDestroy(settledConnection);
+        if (timedOut || !connectionReusable) safeDestroy(settledConnection);
         else safeRelease(settledConnection);
       }
     }
@@ -95,7 +112,11 @@ export async function withBoundedPoolTransaction<T>(
       if (settled) return;
       settled = true;
       timedOut = true;
-      if (connection) safeDestroy(connection);
+      if (connection) {
+        const timedOutConnection = connection;
+        connection = null;
+        safeDestroy(timedOutConnection);
+      }
       reject(timeoutError);
     }, timeoutMs);
     timer.unref?.();

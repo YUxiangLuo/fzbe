@@ -9,6 +9,7 @@ import {
 import { resolveExistingManagedFile } from "../../utils/managed-file";
 import { normalizeSalesValue, normalizeYearMonth } from "../datasets/dataset-values";
 import { ModelValidationError } from "./model-errors";
+import { queryWithTimeout } from "./model-db-guard";
 
 interface SegmentRow extends RowDataPacket {
   file_path: string;
@@ -43,19 +44,31 @@ export async function loadDatasetFromDb(
   industry: string,
   company: string,
   product: string,
+  terminationSignal?: AbortSignal,
 ): Promise<Record<string, unknown>[]> {
-  const [segmentRows] = await pool.query<SegmentRow[]>(
+  const throwIfTerminated = () => {
+    if (!terminationSignal?.aborted) return;
+    throw terminationSignal.reason instanceof Error
+      ? terminationSignal.reason
+      : new Error("模型数据加载已终止");
+  };
+
+  throwIfTerminated();
+  const [segmentRows] = await queryWithTimeout<SegmentRow[]>(pool,
     "SELECT file_path FROM dataset_segments WHERE industry_name = ? AND company_name = ? AND product_name = ? LIMIT 1",
     [industry, company, product],
   );
 
+  throwIfTerminated();
   if (segmentRows.length === 0) {
     throw new ModelValidationError("未找到数据集分段文件");
   }
 
   try {
     const datasetFilePath = await resolveModelDatasetFilePath(segmentRows[0]!.file_path);
-    const rows = await readCsvRows(datasetFilePath);
+    throwIfTerminated();
+    const rows = await readCsvRows(datasetFilePath, terminationSignal);
+    throwIfTerminated();
     return rows.map((row, index) => {
       const separateTime = normalizeYearMonth(row["年份"], row["月份"]);
       const combinedMonthMatch = String(row["月份"] ?? "").trim().match(/^(\d{4})-(0?[1-9]|1[0-2])$/);
@@ -87,6 +100,11 @@ export async function loadDatasetFromDb(
         : { ...normalizedRow, "月份": `${time.year}-${time.month}` };
     });
   } catch (error) {
+    if (terminationSignal?.aborted) {
+      throw terminationSignal.reason instanceof Error
+        ? terminationSignal.reason
+        : error;
+    }
     if (error instanceof ModelValidationError) throw error;
     if (error instanceof CsvEncodingError || error instanceof CsvRowLimitError) {
       throw new ModelValidationError(error.message);

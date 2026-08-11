@@ -1,9 +1,11 @@
 import { describe, expect, mock, test } from "bun:test";
+import { registerExplicitConnectionQueryPool } from "../../../src/config/database-pool-capabilities";
 import {
   acquireConnectionWithTimeout,
   commitConnectionWithOutcomeGuard,
   queryWithTimeout,
 } from "../../../src/modules/models/model-db-guard";
+import { runWithModelOperationSignal } from "../../../src/modules/models/model-operation-scope";
 
 const deferred = <T>() => {
   let resolve!: (value: T) => void;
@@ -33,6 +35,79 @@ describe("model-db-guard queryWithTimeout", () => {
     await expect(queryWithTimeout(pool, "SELECT SLEEP(9999)", undefined, 30))
       .rejects.toMatchObject({ code: "MODEL_DB_QUERY_TIMEOUT" });
   });
+
+  test("borrows and releases an explicit connection for real pool queries", async () => {
+    const connection = {
+      query: mock(async () => [[{ id: 1 }], []]),
+      execute: mock(async () => [[], []]),
+      beginTransaction: mock(async () => undefined),
+      commit: mock(async () => undefined),
+      rollback: mock(async () => undefined),
+      release: mock(() => undefined),
+      destroy: mock(() => undefined),
+    };
+    const pool = registerExplicitConnectionQueryPool({
+      query: mock(() => { throw new Error("hidden Pool#query must not be used"); }),
+      getConnection: mock(async () => connection),
+    });
+
+    const [rows] = await queryWithTimeout(pool, "SELECT 1", [7], 1_000);
+
+    expect(rows).toEqual([{ id: 1 }]);
+    expect(connection.query.mock.calls[0]).toEqual(["SELECT 1", [7]]);
+    expect(connection.release).toHaveBeenCalledTimes(1);
+  });
+
+  test("destroys the borrowed pool connection when the operation is aborted", async () => {
+    const controller = new AbortController();
+    const deadlineError = new Error("model operation deadline exceeded");
+    const connection = {
+      query: mock(() => deferred<unknown>().promise),
+      execute: mock(async () => [[], []]),
+      beginTransaction: mock(async () => undefined),
+      commit: mock(async () => undefined),
+      rollback: mock(async () => undefined),
+      release: mock(() => undefined),
+      destroy: mock(() => undefined),
+    };
+    const pool = registerExplicitConnectionQueryPool({
+      query: mock(() => { throw new Error("hidden Pool#query must not be used"); }),
+      getConnection: mock(async () => connection),
+    });
+
+    const query = runWithModelOperationSignal(
+      controller.signal,
+      () => queryWithTimeout(pool as never, "SELECT SLEEP(9999)", undefined, 1_000),
+    );
+    await Promise.resolve();
+    await Promise.resolve();
+    controller.abort(deadlineError);
+
+    await expect(query).rejects.toBe(deadlineError);
+    expect(connection.destroy).toHaveBeenCalledTimes(1);
+    expect(connection.release).not.toHaveBeenCalled();
+  });
+
+  test("destroys the borrowed pool connection when its query times out", async () => {
+    const connection = {
+      query: mock(() => deferred<unknown>().promise),
+      execute: mock(async () => [[], []]),
+      beginTransaction: mock(async () => undefined),
+      commit: mock(async () => undefined),
+      rollback: mock(async () => undefined),
+      release: mock(() => undefined),
+      destroy: mock(() => undefined),
+    };
+    const pool = registerExplicitConnectionQueryPool({
+      query: mock(() => { throw new Error("hidden Pool#query must not be used"); }),
+      getConnection: mock(async () => connection),
+    });
+
+    await expect(queryWithTimeout(pool as never, "SELECT SLEEP(9999)", undefined, 20))
+      .rejects.toMatchObject({ code: "MODEL_DB_QUERY_TIMEOUT" });
+    expect(connection.destroy).toHaveBeenCalledTimes(1);
+    expect(connection.release).not.toHaveBeenCalled();
+  });
 });
 
 describe("model-db-guard acquireConnectionWithTimeout", () => {
@@ -45,11 +120,49 @@ describe("model-db-guard acquireConnectionWithTimeout", () => {
     destroy: mock(() => undefined),
   });
 
+  test("aborts connection acquisition and releases the late connection", async () => {
+    const controller = new AbortController();
+    const deadlineError = new Error("model operation deadline exceeded");
+    const conn = fakeConnection();
+    const late = deferred<typeof conn>();
+    const pool = { getConnection: mock(() => late.promise) } as never;
+
+    const acquire = runWithModelOperationSignal(
+      controller.signal,
+      () => acquireConnectionWithTimeout(pool, 1_000, 1_000),
+    );
+    controller.abort(deadlineError);
+    await expect(acquire).rejects.toBe(deadlineError);
+
+    late.resolve(conn);
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(conn.release).toHaveBeenCalledTimes(1);
+  });
+
   test("rejects when the pool never yields a connection", async () => {
     const pool = { getConnection: mock(() => deferred().promise) } as never;
 
     await expect(acquireConnectionWithTimeout(pool, 30, 1_000))
       .rejects.toMatchObject({ code: "MODEL_DB_CONNECTION_TIMEOUT" });
+  });
+
+  test("destroys a late connection when returning it to the pool fails", async () => {
+    const conn = fakeConnection();
+    conn.release.mockImplementationOnce(() => {
+      throw new Error("pool release failed");
+    });
+    const late = deferred<typeof conn>();
+    const pool = { getConnection: mock(() => late.promise) } as never;
+
+    const acquire = acquireConnectionWithTimeout(pool, 20, 1_000);
+    await expect(acquire).rejects.toMatchObject({ code: "MODEL_DB_CONNECTION_TIMEOUT" });
+
+    late.resolve(conn);
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(conn.release).toHaveBeenCalledTimes(1);
+    expect(conn.destroy).toHaveBeenCalledTimes(1);
   });
 
   test("releases a connection that arrives after the acquire timeout", async () => {
@@ -64,6 +177,18 @@ describe("model-db-guard acquireConnectionWithTimeout", () => {
     await Promise.resolve();
     await Promise.resolve();
     expect(conn.release).toHaveBeenCalledTimes(1);
+  });
+
+  test("destroys a wrapped connection when a normal pool release fails", async () => {
+    const conn = fakeConnection();
+    conn.release.mockImplementationOnce(() => {
+      throw new Error("pool release failed");
+    });
+    const pool = { getConnection: mock(async () => conn) } as never;
+    const wrapped = await acquireConnectionWithTimeout(pool, 1_000, 1_000);
+
+    expect(() => wrapped.release()).not.toThrow();
+    expect(conn.destroy).toHaveBeenCalledTimes(1);
   });
 
   test("wraps queries with a timeout that destroys the connection, and passes other methods through", async () => {
@@ -81,6 +206,34 @@ describe("model-db-guard acquireConnectionWithTimeout", () => {
     await expect(wrapped.query("SELECT SLEEP(9999)")).rejects.toMatchObject({
       code: "MODEL_DB_QUERY_TIMEOUT",
     });
+    expect(conn.destroy).toHaveBeenCalledTimes(1);
+  });
+
+  test.each([
+    "beginTransaction",
+    "rollback",
+  ] as const)("bounds a hung %s and destroys the transaction connection", async (method) => {
+    const conn = fakeConnection();
+    conn[method] = mock(() => deferred<void>().promise);
+    const pool = { getConnection: mock(async () => conn) } as never;
+    const wrapped = await acquireConnectionWithTimeout(pool, 1_000, 20);
+
+    await expect(wrapped[method]()).rejects.toMatchObject({
+      code: "MODEL_DB_TRANSACTION_TIMEOUT",
+    });
+    expect(conn.destroy).toHaveBeenCalledTimes(1);
+  });
+
+  test.each([
+    "beginTransaction",
+    "rollback",
+  ] as const)("destroys the transaction connection when %s rejects", async (method) => {
+    const conn = fakeConnection();
+    conn[method].mockRejectedValueOnce(new Error(`${method} acknowledgement lost`));
+    const pool = { getConnection: mock(async () => conn) } as never;
+    const wrapped = await acquireConnectionWithTimeout(pool, 1_000, 1_000);
+
+    await expect(wrapped[method]()).rejects.toThrow("acknowledgement lost");
     expect(conn.destroy).toHaveBeenCalledTimes(1);
   });
 
