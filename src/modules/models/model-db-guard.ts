@@ -13,8 +13,8 @@ import {
 
 /**
  * mysql2 has no default per-query or connection-acquire timeout. Model
- * operations run these while holding an admission permit and advisory locks, so
- * a hung query or a starved pool would keep the concurrency slot occupied far
+ * operations run these while holding a process-local admission permit, so a
+ * hung query or a starved pool would keep the concurrency slot occupied far
  * past the operation deadline (the deadline AbortSignal cannot cancel an
  * in-flight mysql2 call). These helpers bound both with a JS-level race, so the
  * awaiting operation always settles and the lease releases. The race preserves

@@ -30,10 +30,6 @@ import {
   type StagedManagedPath,
 } from "../../utils/staged-file-deletion";
 import {
-  tryAcquireManagedDeletionLocks,
-  type ManagedDeletionLockLease,
-} from "../../utils/managed-deletion-lock";
-import {
   acquireManagedDeletionPermit,
   tryAcquireManagedDeletionPermit,
 } from "../../utils/managed-deletion-admission";
@@ -77,8 +73,6 @@ interface DatasetFileReferenceRow extends RowDataPacket {
 const uploadsRoot = path.resolve(import.meta.dir, "../../../uploads");
 const datasetsRoot = path.resolve(uploadsRoot, "datasets");
 const tempUploadsRoot = path.resolve(uploadsRoot, "temp");
-const DATASET_DELETION_LOCK_TIMEOUT_SECONDS = 10;
-
 const datasetStorageRoot = () => getDatabaseManagedStorageRoot(datasetsRoot, env);
 
 async function removeEmptyDatasetDirectories(
@@ -104,28 +98,6 @@ async function removeEmptyDatasetDirectories(
   for (const directory of [...candidateDirectories].sort((a, b) => b.length - a.length)) {
     await rmdir(directory).catch(() => {});
   }
-}
-
-const datasetDeletionLockIdentity = (datasetId: number) => ({
-  databaseName: env.DB_DATABASE,
-  kind: "dataset",
-  entityIds: [datasetId],
-  // Every deletion locks all other dataset/segment references. A stable lock
-  // prevents cross-process delete(A)/delete(B) from taking those rows in the
-  // opposite order while retaining the entity lock for stale-request safety.
-  includeGlobalLock: true,
-});
-
-async function releaseDatasetDeletionLock(
-  lease: ManagedDeletionLockLease,
-  context: Record<string, unknown>,
-) {
-  await lease.release().catch((error) => {
-    logWarning("Failed to release dataset deletion advisory lock", {
-      ...context,
-      error: error instanceof Error ? error.message : String(error),
-    });
-  });
 }
 
 async function purgeDeletedDatasetFiles(
@@ -811,22 +783,7 @@ export async function deleteDataset(datasetId: number) {
     return { error: "file_cleanup_failed" as const };
   }
 
-  const deletionLock = await tryAcquireManagedDeletionLocks(
-    pool,
-    datasetDeletionLockIdentity(datasetId),
-    DATASET_DELETION_LOCK_TIMEOUT_SECONDS,
-  ).catch((error) => {
-    deletionPermit.release();
-    throw error;
-  });
-  if (!deletionLock) {
-    deletionPermit.release();
-    logWarning("Timed out acquiring dataset deletion advisory lock", { datasetId });
-    return { error: "file_cleanup_failed" as const };
-  }
-
-  const connection = await pool.getConnection().catch(async (error) => {
-    await releaseDatasetDeletionLock(deletionLock, { datasetId });
+  const connection = await pool.getConnection().catch((error) => {
     deletionPermit.release();
     throw error;
   });
@@ -925,7 +882,7 @@ export async function deleteDataset(datasetId: number) {
           connection.destroy();
           released = true;
         }
-        // Keep the original entity advisory lock while the fresh DB probe and
+        // Keep the process-wide deletion permit while the fresh DB probe and
         // restore/purge run. Releasing it here would let a second delete commit
         // against a missing original path before an owner-present restore.
         const resolution = await reconcileAmbiguousDatasetCommit(datasetId, stagedPaths);
@@ -957,7 +914,6 @@ export async function deleteDataset(datasetId: number) {
     throw error;
   } finally {
     if (!released) connection.release();
-    await releaseDatasetDeletionLock(deletionLock, { datasetId });
     deletionPermit.release();
   }
 }
@@ -981,13 +937,6 @@ export async function reconcileDatasetDeletionJournals() {
     const result = await reconcileStagedDeletionJournals(storageRoot, async (journal) => {
       if (journal.metadata.databaseName !== env.DB_DATABASE) return "skip";
       const datasetId = datasetIdFromDeletionJournal(journal);
-      const deletionLock = await tryAcquireManagedDeletionLocks(
-        pool,
-        datasetDeletionLockIdentity(datasetId),
-        0,
-      );
-      if (!deletionLock) return "skip";
-
       let owner: Awaited<ReturnType<typeof probeDatasetOwnerWithLock>> | null = null;
       try {
         owner = await probeDatasetOwnerWithLock(datasetId);
@@ -1004,23 +953,12 @@ export async function reconcileDatasetDeletionJournals() {
             ? "restore" as const
             : "purge" as const,
           release: async () => {
-            try {
-              await lockedOwner.release();
-              if (!lockedOwner.exists) await removeEmptyDatasetDirectories(journal.entries);
-            } finally {
-              await releaseDatasetDeletionLock(deletionLock, {
-                operationId: journal.operationId,
-                datasetId,
-              });
-            }
+            await lockedOwner.release();
+            if (!lockedOwner.exists) await removeEmptyDatasetDirectories(journal.entries);
           },
         };
       } catch (error) {
         await owner?.release().catch(() => {});
-        await releaseDatasetDeletionLock(deletionLock, {
-          operationId: journal.operationId,
-          datasetId,
-        });
         throw error;
       }
     });

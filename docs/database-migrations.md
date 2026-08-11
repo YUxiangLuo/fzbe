@@ -40,8 +40,9 @@ server session; relying on a MariaDB `SYSTEM` timezone would double-shift values
 written by `NOW()` or `CURRENT_TIMESTAMP`.
 
 `update.sh` serializes host-level deploys with `flock`, requires a clean worktree,
-and verifies that the active `fangzhen-be.service` uses this checkout as its
-`WorkingDirectory` and this checkout's `.env` as its `EnvironmentFile`. It then
+and verifies that the active `fangzhen-be.service` uses `KillMode=control-group`,
+this checkout as its `WorkingDirectory`, and this checkout's `.env` as its
+`EnvironmentFile`. It then
 fetches and fast-forward-checks the target commit, creates a detached staging
 worktree, copies the validated `.env`, installs dependencies (and the Python
 environment when its inputs changed), and runs `actions.sh` there. Database
@@ -50,7 +51,8 @@ running.
 
 The service must have exactly one systemd `EnvironmentFile` and it must resolve
 to the project `.env`. Deployment-sensitive direct `Environment=` assignments
-(`DB_*`, `HOST`, `PORT`, `JWT*`, and `ALLOW_*`) are rejected. Staging migrations,
+(`DB_*`, `HOST`, `PORT`, `JWT*`, `ALLOW_*`, `NODE_ENV`, and `BUN_ENV`) are rejected;
+`.env` itself must select production mode and `127.0.0.1:3001`. Staging migrations,
 quiesced and post-activation reconciliation, and health-URL resolution run in
 isolated transient-service environments that explicitly load the verified
 `.env` and do not inherit the operator's shell; shell exports therefore cannot
@@ -117,7 +119,10 @@ instance has been retired. Do not combine a destructive or otherwise
 backward-incompatible contract step with the release that first introduces its
 replacement.
 
-Only after staging succeeds does the script stop the service, rerun the lineage
+Staging also imports the target release's environment and derived concurrency/
+timeout configuration under the verified snapshot, so invalid production secrets,
+removed settings, listener values, or budgets fail before downtime. Only after
+staging succeeds does the script stop the service, rerun the lineage
 and canonical-phone audits with the legacy writer quiesced, fast-forward the
 live checkout, refresh its dependencies, and start the service. Immediately
 before stopping it rechecks that both `HEAD` and the worktree are unchanged, so
@@ -262,8 +267,8 @@ Do not assign a relationship when the external evidence is inconclusive.
 Production forecast evidence is signed with a domain-separated HMAC key derived
 from `JWT_SECRET`. The fixed derivation domain keeps evidence signatures
 separate from authentication-token signatures while avoiding another deployment
-secret. Every backend instance only needs the same `JWT_SECRET`; there are no
-additional evidence-key environment variables to configure or rotate.
+secret. The single backend process needs no additional evidence-key environment
+variables to configure or rotate.
 
 Rotating `JWT_SECRET` invalidates evidence attached to production plans that
 have not yet been submitted. Affected users must run production prediction
@@ -274,10 +279,10 @@ available after a JWT rotation.
 For the least disruption, rotate `JWT_SECRET` outside active classroom sessions
 or notify users with pending plans that they will need to predict again.
 
-`ALLOW_LEGACY_PRODUCTION_PLAN_WRITES` is a separate rolling-deployment switch.
+`ALLOW_LEGACY_PRODUCTION_PLAN_WRITES` is a separate frontend-compatibility switch.
 It defaults to `false` and should remain off for fresh and normal deployments.
-Set it explicitly to `true` only for an intentional old-frontend/new-backend
-rolling window, then restore `false` as soon as every frontend uses the v2
-production-plan contract. When disabled, an active v1 write returns
+Set it explicitly to `true` only while already-open old frontend pages may call
+the newly restarted backend, then restore `false` as soon as every frontend uses
+the v2 production-plan contract. When disabled, an active v1 write returns
 `PRODUCTION_FORECAST_LEGACY_REJECTED` so the frontend can force a fresh
 prediction; immutable completed v1 history remains readable.

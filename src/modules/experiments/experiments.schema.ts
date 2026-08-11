@@ -373,8 +373,8 @@ const invalidProductionPlan = (
 
 export interface ProductionPlanValidationOptions {
   /**
-   * Temporary rolling-deploy bridge for the immediately previous browser
-   * contract. Completed v1 snapshots are independently grandfathered.
+   * Temporary compatibility bridge for already-open pages using the immediately
+   * previous browser contract. Completed v1 snapshots are independently grandfathered.
    */
   allowLegacyV1Write?: boolean;
 }

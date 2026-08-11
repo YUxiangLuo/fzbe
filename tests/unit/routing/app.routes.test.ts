@@ -453,6 +453,8 @@ describe("app route smoke tests", () => {
     expect(response.status).toBe(200);
     const payload = await response.json() as {
       data?: {
+        deploymentMode?: unknown;
+        coordinationScope?: unknown;
         e2eServer?: unknown;
         concurrency?: { maxConcurrentPdfJobs?: unknown };
         timeouts?: {
@@ -473,11 +475,15 @@ describe("app route smoke tests", () => {
           pdfGenerationMs?: unknown;
         };
         modelOperations?: Record<string, unknown>;
-        modelLocks?: Record<string, unknown>;
+        modelExecutionLocks?: Record<string, unknown>;
         pdfQueue?: Record<string, unknown>;
       };
     };
 
+    expect(payload.data).toMatchObject({
+      deploymentMode: "single_instance",
+      coordinationScope: "process",
+    });
     expect(typeof payload.data?.e2eServer).toBe("boolean");
 
     expect(payload.data?.pdfQueue).toEqual({
@@ -491,15 +497,15 @@ describe("app route smoke tests", () => {
       modelExecutionHardCapMs: 600_000,
       modelSingleOperationMs: 660_000,
       modelSingleOperationMaxMs: 660_000,
-      modelOperationCleanupBudgetMs: 15_000,
+      modelOperationCleanupBudgetMs: 11_000,
       modelFailureRecordMs: 2_000,
       modelNginxReadMs: 675_000,
       modelBrowserRequestMs: 690_000,
       modelTrainingMs: 300_000,
       modelPredictionMs: 60_000,
       adfExecutionMs: 30_000,
-      adfOperationMs: 32_000,
-      adfOperationCleanupBudgetMs: 13_000,
+      adfOperationMs: 34_000,
+      adfOperationCleanupBudgetMs: 11_000,
       adfNginxReadMs: 45_000,
     });
     expect(payload.data?.modelOperations).toMatchObject({
@@ -508,7 +514,10 @@ describe("app route smoke tests", () => {
         pending: 0,
       },
     });
-    expect(payload.data?.modelLocks).toMatchObject({ active: 0 });
+    expect(payload.data?.modelExecutionLocks).toMatchObject({
+      scope: "process",
+      active: 0,
+    });
   });
 
   test("disables Bun idle timeout only for the exact long-running model and ADF routes", async () => {

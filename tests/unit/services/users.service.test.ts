@@ -11,7 +11,6 @@ mock.restore();
 const srcRoot = path.resolve(import.meta.dir, "../../../src");
 const configModulePath = path.join(srcRoot, "config", "index.ts");
 const passwordModulePath = path.join(srcRoot, "utils", "password.ts");
-const deletionLockModulePath = path.join(srcRoot, "utils", "managed-deletion-lock.ts");
 const usersServiceModulePath = path.join(srcRoot, "modules", "users", "users.service.ts");
 const freshUsersServiceModulePath = `${usersServiceModulePath}?users-service-test`;
 const TEST_DATABASE = "fz_test_users_service";
@@ -57,12 +56,6 @@ const getConnection = mock(async () => ({
 const hashPassword = mock(async (_password: string) => "hashed-password");
 const shouldChangePassword = mock(async () => false);
 const verifyPassword = mock(async () => true);
-const advisoryRelease = mock(async () => {});
-const tryAcquireManagedDeletionLocks = mock(async () => ({
-  lockNames: ["unit-lock"],
-  release: advisoryRelease,
-}));
-
 mock.module(configModulePath, () => ({
   env: TEST_STORAGE_ENV,
   connectionLimit: 64,
@@ -76,10 +69,6 @@ mock.module(passwordModulePath, () => ({
   hashPassword,
   shouldChangePassword,
   verifyPassword,
-}));
-
-mock.module(deletionLockModulePath, () => ({
-  tryAcquireManagedDeletionLocks,
 }));
 
 const {
@@ -129,12 +118,6 @@ describe("users service duplicate-key handling", () => {
     connectionCommit.mockClear();
     connectionRollback.mockClear();
     connectionRelease.mockClear();
-    advisoryRelease.mockClear();
-    tryAcquireManagedDeletionLocks.mockReset();
-    tryAcquireManagedDeletionLocks.mockResolvedValue({
-      lockNames: ["unit-lock"],
-      release: advisoryRelease,
-    });
   });
 
   test("uses collision-resistant bounded names for same-millisecond batch uploads", () => {
@@ -674,7 +657,6 @@ describe("users service duplicate-key handling", () => {
           ? "experiment"
           : query.includes("FROM experiment_reports") ? "report" : "user"
       ))).toEqual(["user", "experiment", "report"]);
-      expect(advisoryRelease).toHaveBeenCalledTimes(1);
     } finally {
       await rm(reportPath, { force: true });
     }

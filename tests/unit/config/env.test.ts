@@ -11,7 +11,7 @@ const baseEnv = {
 };
 
 describe("runtime environment", () => {
-  test("defaults the rolling-upgrade compatibility window off", () => {
+  test("defaults the old-page compatibility window off", () => {
     const parsed = loadEnv(baseEnv);
 
     expect(parsed.ALLOW_LEGACY_PRODUCTION_PLAN_WRITES).toBe(false);
@@ -48,6 +48,31 @@ describe("runtime environment", () => {
       ...productionEnv,
       JWT_SECRET: "production-jwt-secret-at-least-32-characters",
     }).JWT_SECRET).toBe("production-jwt-secret-at-least-32-characters");
+  });
+
+  test("pins production to the one nginx-facing backend listener", () => {
+    const productionEnv = {
+      ...baseEnv,
+      NODE_ENV: "production",
+      JWT_SECRET: "production-jwt-secret-at-least-32-characters",
+    };
+
+    expect(() => loadEnv({ ...productionEnv, PORT: "3002" }))
+      .toThrow("127.0.0.1:3001");
+    expect(() => loadEnv({ ...productionEnv, HOST: "0.0.0.0" }))
+      .toThrow("127.0.0.1:3001");
+    expect(loadEnv({ ...productionEnv, PORT: "3001", HOST: "127.0.0.1" }).PORT)
+      .toBe(3001);
+  });
+
+  test("rejects removed advisory-lock-era settings in production", () => {
+    expect(() => loadEnv({
+      ...baseEnv,
+      NODE_ENV: "production",
+      JWT_SECRET: "production-jwt-secret-at-least-32-characters",
+      DB_QUERY_HEADROOM: "40",
+      MODEL_LOCK_QUERY_TIMEOUT_MS: "2000",
+    })).toThrow("MODEL_LOCK_QUERY_TIMEOUT_MS, DB_QUERY_HEADROOM");
   });
 
   test("rejects E2E-only routes in production", () => {

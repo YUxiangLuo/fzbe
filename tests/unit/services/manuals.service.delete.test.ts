@@ -10,7 +10,6 @@ const uploadsRoot = path.resolve(srcRoot, "../uploads");
 const manualsRoot = path.join(uploadsRoot, "manuals");
 const configModulePath = path.join(srcRoot, "config", "index.ts");
 const stagedDeletionModulePath = path.join(srcRoot, "utils", "staged-file-deletion.ts");
-const deletionLockModulePath = path.join(srcRoot, "utils", "managed-deletion-lock.ts");
 const serviceModulePath = `${path.join(srcRoot, "modules", "manuals", "manuals.service.ts")}?manual-delete-test`;
 const TEST_DATABASE = "manual_delete_test";
 const targetPath = path.join(manualsRoot, "manual-delete-target.pdf");
@@ -58,12 +57,6 @@ const reconcileStagedDeletionJournals = mock(async () => ({
   failedJournals: 0,
   failedJournalNames: [],
 }));
-const advisoryRelease = mock(async () => { lifecycle.push("advisory-release"); });
-const tryAcquireManagedDeletionLocks = mock(async () => ({
-  lockNames: ["manual-unit-lock"],
-  release: advisoryRelease,
-}));
-
 mock.module(configModulePath, () => ({
   env: {
     DB_DATABASE: TEST_DATABASE,
@@ -85,10 +78,6 @@ mock.module(stagedDeletionModulePath, () => ({
   restoreStagedManagedPaths,
   purgeStagedManagedPaths,
   reconcileStagedDeletionJournals,
-}));
-
-mock.module(deletionLockModulePath, () => ({
-  tryAcquireManagedDeletionLocks,
 }));
 
 const { deleteManual, reconcileManualDeletionJournals } = await import(serviceModulePath);
@@ -124,12 +113,6 @@ describe("manual deletion durable file transaction", () => {
       failedJournals: 0,
       failedJournalNames: [],
     });
-    tryAcquireManagedDeletionLocks.mockReset();
-    tryAcquireManagedDeletionLocks.mockResolvedValue({
-      lockNames: ["manual-unit-lock"],
-      release: advisoryRelease,
-    });
-    advisoryRelease.mockClear();
   });
 
   afterEach(async () => {
@@ -184,7 +167,6 @@ describe("manual deletion durable file transaction", () => {
     expect(primary.destroy).toHaveBeenCalledTimes(1);
     expect(primary.release).not.toHaveBeenCalled();
     expect(restoreStagedManagedPaths).toHaveBeenCalledWith([stagedEntry]);
-    expect(advisoryRelease).toHaveBeenCalledTimes(1);
   });
 
   test("does not stage a file still referenced by another manual", async () => {
@@ -216,7 +198,6 @@ describe("manual deletion durable file transaction", () => {
 
     expect(result).toEqual({ success: true, cleanupPending: true });
     expect(lifecycle.indexOf("primary-commit")).toBeLessThan(lifecycle.indexOf("purge"));
-    expect(lifecycle.indexOf("purge")).toBeLessThan(lifecycle.indexOf("advisory-release"));
   });
 
   test("still reports committed success when post-commit purge raises unexpectedly", async () => {
@@ -227,7 +208,6 @@ describe("manual deletion durable file transaction", () => {
     expect(result).toEqual({ success: true, cleanupPending: true });
     expect(primary.commit).toHaveBeenCalledTimes(1);
     expect(primary.rollback).not.toHaveBeenCalled();
-    expect(advisoryRelease).toHaveBeenCalledTimes(1);
   });
 
   test("treats lost COMMIT acknowledgement as success after a locked absent-owner probe", async () => {
@@ -248,7 +228,6 @@ describe("manual deletion durable file transaction", () => {
     expect(purgeStagedManagedPaths).toHaveBeenCalledWith([stagedEntry]);
     expect(lifecycle.indexOf("probe-begin")).toBeLessThan(lifecycle.indexOf("purge"));
     expect(lifecycle.indexOf("purge")).toBeLessThan(lifecycle.indexOf("probe-commit"));
-    expect(lifecycle.indexOf("probe-commit")).toBeLessThan(lifecycle.indexOf("advisory-release"));
   });
 
   test("restores and surfaces the original error when the owner still has the same canonical path", async () => {
@@ -343,6 +322,5 @@ describe("manual deletion durable file transaction", () => {
     expect(lifecycle.indexOf(`filesystem-${expectedAction}`)).toBeLessThan(
       lifecycle.indexOf("probe-commit"),
     );
-    expect(advisoryRelease).toHaveBeenCalledTimes(1);
   });
 });

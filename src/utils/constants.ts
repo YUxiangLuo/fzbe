@@ -36,7 +36,7 @@ function parseModelTimeoutEnv(name: string, fallbackMs: number): number {
 }
 
 /**
- * 模型 HTTP 超时必须保持：operation + 最坏终止/解锁 + 响应余量 <= nginx < browser。
+ * 模型 HTTP 超时必须保持：operation + 最坏进程终止 + 响应余量 <= nginx < browser。
  * nginx 和前端当前是静态部署配置，因此后端只允许缩短 operation deadline，
  * 不允许通过单个环境变量把它提高到传输层预算之外。
  */
@@ -46,7 +46,6 @@ export const MODEL_HTTP_TIMEOUT_BUDGETS = {
   BROWSER_REQUEST: 690_000,
   /** Includes the bounded failure-status write plus response serialization/network time. */
   RESPONSE_RESERVE: 6_000,
-  MAX_LOCK_RELEASE_QUERIES: 2,
 } as const;
 
 const ADF_EXECUTION_TIMEOUT_MS = 30_000;
@@ -55,18 +54,13 @@ const ADF_EXECUTION_TIMEOUT_MS = 30_000;
 export const ADF_HTTP_TIMEOUT_BUDGETS = {
   NGINX_READ: 45_000,
   RESPONSE_RESERVE: MODEL_HTTP_TIMEOUT_BUDGETS.RESPONSE_RESERVE,
-  MAX_LOCK_RELEASE_QUERIES: 1,
 } as const;
 
 /** Best-effort DB failure recording must fit inside the response reserve. */
 const MODEL_FAILURE_RECORD_TIMEOUT_MS = 2_000;
 
-const MODEL_LOCK_CONNECTION_ACQUIRE_TIMEOUT_MS =
-  parsePositiveIntegerEnv("MODEL_LOCK_CONNECTION_ACQUIRE_TIMEOUT_MS") ?? 2_000;
-const MODEL_LOCK_QUERY_TIMEOUT_MS =
-  parsePositiveIntegerEnv("MODEL_LOCK_QUERY_TIMEOUT_MS") ?? 2_000;
-// Business (non-lock) DB work runs while an admission permit + advisory locks are
-// held. mysql2 has no default per-query or acquire timeout, so a hung query or a
+// Business DB work runs while a process-local admission permit is held. mysql2
+// has no default per-query or acquire timeout, so a hung query or a
 // starved pool would keep the permit occupied far past the operation deadline.
 // These bound both so the permit is always released promptly. Generous relative
 // to the healthy sub-second query time, but far below the operation deadline.
@@ -78,14 +72,13 @@ const MODEL_PROCESS_TERMINATION_GRACE_MS =
   parsePositiveIntegerEnv("MODEL_PROCESS_TERMINATION_GRACE_MS") ?? 5_000;
 const ADF_OPERATION_CLEANUP_BUDGET_MS =
   MODEL_PROCESS_TERMINATION_GRACE_MS
-  + ADF_HTTP_TIMEOUT_BUDGETS.MAX_LOCK_RELEASE_QUERIES * MODEL_LOCK_QUERY_TIMEOUT_MS
   + ADF_HTTP_TIMEOUT_BUDGETS.RESPONSE_RESERVE;
 const ADF_SINGLE_OPERATION_MAX_MS =
   ADF_HTTP_TIMEOUT_BUDGETS.NGINX_READ - ADF_OPERATION_CLEANUP_BUDGET_MS;
 
 if (ADF_SINGLE_OPERATION_MAX_MS < ADF_EXECUTION_TIMEOUT_MS) {
   throw new Error(
-    "MODEL_PROCESS_TERMINATION_GRACE_MS and MODEL_LOCK_QUERY_TIMEOUT_MS leave less than "
+    "MODEL_PROCESS_TERMINATION_GRACE_MS leaves less than "
     + `${ADF_EXECUTION_TIMEOUT_MS}ms for ADF inside the `
     + `${ADF_HTTP_TIMEOUT_BUDGETS.NGINX_READ}ms nginx ADF-route budget`,
   );
@@ -93,7 +86,6 @@ if (ADF_SINGLE_OPERATION_MAX_MS < ADF_EXECUTION_TIMEOUT_MS) {
 
 const MODEL_OPERATION_CLEANUP_BUDGET_MS =
   MODEL_PROCESS_TERMINATION_GRACE_MS
-  + MODEL_HTTP_TIMEOUT_BUDGETS.MAX_LOCK_RELEASE_QUERIES * MODEL_LOCK_QUERY_TIMEOUT_MS
   + MODEL_HTTP_TIMEOUT_BUDGETS.RESPONSE_RESERVE;
 const MODEL_SINGLE_OPERATION_MAX_MS = Math.min(
   MODEL_HTTP_TIMEOUT_BUDGETS.OPERATION_DEADLINE_HARD_CAP,
@@ -102,7 +94,7 @@ const MODEL_SINGLE_OPERATION_MAX_MS = Math.min(
 
 if (MODEL_SINGLE_OPERATION_MAX_MS <= 0) {
   throw new Error(
-    "MODEL_PROCESS_TERMINATION_GRACE_MS and MODEL_LOCK_QUERY_TIMEOUT_MS exceed the nginx model-route cleanup budget",
+    "MODEL_PROCESS_TERMINATION_GRACE_MS exceeds the nginx model-route cleanup budget",
   );
 }
 
@@ -177,14 +169,10 @@ export const TIMEOUTS = {
   MODEL_SINGLE_OPERATION: MODEL_SINGLE_OPERATION_TIMEOUT_MS,
   /** 当前终止、解锁和 nginx 预算下允许的单次操作最大值。 */
   MODEL_SINGLE_OPERATION_MAX: MODEL_SINGLE_OPERATION_MAX_MS,
-  /** deadline 后为 Python 终止、两次锁释放和响应传输预留的总预算。 */
+  /** deadline 后为 Python 终止、进程内资源释放和响应传输预留的总预算。 */
   MODEL_OPERATION_CLEANUP_BUDGET: MODEL_OPERATION_CLEANUP_BUDGET_MS,
   /** lease 释放后记录模型失败状态的 best-effort 总时限。 */
   MODEL_FAILURE_RECORD: MODEL_FAILURE_RECORD_TIMEOUT_MS,
-  /** 从连接池获取 advisory-lock 专用连接的最长等待时间。 */
-  MODEL_LOCK_CONNECTION_ACQUIRE: MODEL_LOCK_CONNECTION_ACQUIRE_TIMEOUT_MS,
-  /** advisory-lock 获取、校验和释放 SQL 的最长执行时间。 */
-  MODEL_LOCK_QUERY: MODEL_LOCK_QUERY_TIMEOUT_MS,
   /** 持有并发额度期间业务查询的最长执行时间（超时即释放 lease）。 */
   MODEL_DB_QUERY: MODEL_DB_QUERY_TIMEOUT_MS,
   /** 持有并发额度期间从连接池获取业务连接的最长等待时间。 */
@@ -193,7 +181,7 @@ export const TIMEOUTS = {
   MODEL_PROCESS_TERMINATION_GRACE: MODEL_PROCESS_TERMINATION_GRACE_MS,
   /** ADF 从接收请求到进入清理前的总时限。 */
   ADF_OPERATION: Math.min(ADF_SINGLE_OPERATION_MAX_MS, MODEL_SINGLE_OPERATION_TIMEOUT_MS),
-  /** ADF deadline 后为 Python 终止、slot 释放和响应传输预留的预算。 */
+  /** ADF deadline 后为 Python 终止、admission 释放和响应传输预留的预算。 */
   ADF_OPERATION_CLEANUP_BUDGET: ADF_OPERATION_CLEANUP_BUDGET_MS,
   /** Python 模型训练超时 */
   MODEL_TRAINING: parseModelTimeoutEnv("MODEL_TRAINING_TIMEOUT_MS", 300000),
@@ -201,7 +189,7 @@ export const TIMEOUTS = {
   MODEL_PREDICTION: parseModelTimeoutEnv("MODEL_PREDICTION_TIMEOUT_MS", 60000),
   /** ADF 平稳性检测超时 */
   ADF: ADF_EXECUTION_TIMEOUT_MS,
-  /** PDF 生成超时（Puppeteer 执行） */
+  /** 单次 PDF 的 Puppeteer 启动、渲染、写入和关闭总预算 */
   PDF_GENERATION: parsePositiveIntegerEnv("PDF_GENERATION_TIMEOUT_MS") ?? 30000,
   /** PDF 生成排队等待超时 */
   PDF_QUEUE: parsePositiveIntegerEnv("PDF_QUEUE_TIMEOUT_MS") ?? 60000,
@@ -262,25 +250,20 @@ export const CLEANUP_RETENTION = {
 // 数据库连接池
 // ============================================
 /**
- * 连接池大小必须 > 2 × MAX_CONCURRENT_MODEL_JOBS，否则会死锁：
- * 每个模型任务持有 2 个连接（执行锁 + 槽位锁），训练/预测逻辑还需要
- * 额外连接执行数据库查询。若连接池耗尽，查询等待连接释放，但连接被锁
- * 占用、锁又要等训练完成——形成循环等待。
- *
- * QUERY_HEADROOM：除了锁连接，其他模块（auth、experiments、reports 等）
- * 也共享同一连接池。默认取 max(40, modelJobs/2)，50 模型并发时连接池为 140。
+ * A single Bun instance never pins database connections for model mutexes.
+ * The pool therefore serves only short queries/transactions. Keep a floor of
+ * 40 connections for classroom bursts and scale the default modestly with the
+ * process-local model capacity; explicit DB_CONNECTION_LIMIT may raise it.
  */
-const LOCK_CONNECTIONS = 2 * CONCURRENCY_LIMITS.MAX_CONCURRENT_MODEL_JOBS;
-const QUERY_HEADROOM =
-  parsePositiveIntegerEnv("DB_QUERY_HEADROOM") ??
-  Math.max(40, Math.ceil(CONCURRENCY_LIMITS.MAX_CONCURRENT_MODEL_JOBS / 2));
+const MIN_CONNECTION_LIMIT = Math.max(
+  40,
+  Math.ceil(CONCURRENCY_LIMITS.MAX_CONCURRENT_MODEL_JOBS / 2),
+);
 const CONNECTION_LIMIT =
-  parsePositiveIntegerEnv("DB_CONNECTION_LIMIT") ??
-  LOCK_CONNECTIONS + QUERY_HEADROOM;
+  parsePositiveIntegerEnv("DB_CONNECTION_LIMIT") ?? MIN_CONNECTION_LIMIT;
 
 export const DB_POOL_CONFIG = {
-  LOCK_CONNECTIONS,
-  QUERY_HEADROOM,
+  MIN_CONNECTION_LIMIT,
   CONNECTION_LIMIT,
 } as const;
 

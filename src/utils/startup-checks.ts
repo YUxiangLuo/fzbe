@@ -10,12 +10,9 @@ import { ensureDatabaseManagedStorageRoot } from "./managed-storage";
 import { resolveDatabaseSessionTimezone } from "../config/database-session";
 
 const DEFAULT_COMMAND_TIMEOUT_MS = 30_000;
-const STARTUP_CHECK_LOCK_NAME = `startup-check:${process.pid}`;
 
 interface StartupHealthCheckRow extends RowDataPacket {
   ok?: number;
-  acquired?: 0 | 1 | null;
-  released?: 0 | 1 | null;
   session_time_zone?: string;
   utc_offset_seconds?: number | string;
 }
@@ -129,12 +126,9 @@ export async function probeStartupDatabaseRuntime(
   databaseTimezone: string = env.DB_TIMEZONE,
 ): Promise<void> {
   const connection = await dbPool.getConnection();
-  let lockState: "not-attempted" | "unknown" | "not-acquired" | "acquired" = "not-attempted";
   let reusable = false;
 
   try {
-    await connection.beginTransaction();
-
     const [probeRows] = await connection.query<StartupHealthCheckRow[]>(
       `SELECT 1 AS ok,
               @@session.time_zone AS session_time_zone,
@@ -154,48 +148,17 @@ export async function probeStartupDatabaseRuntime(
         `数据库会话时区不一致: expected=${expectedTimezone.mysqlValue}, actual=${probe.session_time_zone ?? "unknown"}, offset_seconds=${String(probe.utc_offset_seconds ?? "unknown")}`,
       );
     }
-
-    lockState = "unknown";
-    const [lockRows] = await connection.query<StartupHealthCheckRow[]>(
-      "SELECT GET_LOCK(?, 0) AS acquired",
-      [STARTUP_CHECK_LOCK_NAME],
-    );
-    if (Number(lockRows[0]?.acquired) !== 1) {
-      lockState = "not-acquired";
-      throw new Error("无法获取数据库 advisory lock");
-    }
-    lockState = "acquired";
+    reusable = true;
   } finally {
-    try {
-      if (lockState === "unknown") {
-        throw new Error("数据库 advisory lock 获取结果未知");
-      }
-      if (lockState === "acquired") {
-        const [releaseRows] = await connection.query<StartupHealthCheckRow[]>(
-          "SELECT RELEASE_LOCK(?) AS released",
-          [STARTUP_CHECK_LOCK_NAME],
-        );
-        if (Number(releaseRows[0]?.released) !== 1) {
-          throw new Error("数据库 advisory lock 未确认释放");
-        }
-      }
-
-      await connection.rollback();
-      reusable = true;
-    } finally {
-      // A failed RELEASE_LOCK/ROLLBACK acknowledgement leaves either a named
-      // lock or transaction state uncertain. Closing the physical session is
-      // the only safe way to release both; never return it to the pool.
-      if (reusable) {
-        try {
-          connection.release();
-        } catch (error) {
-          connection.destroy();
-          throw error;
-        }
-      } else {
+    if (reusable) {
+      try {
+        connection.release();
+      } catch (error) {
         connection.destroy();
+        throw error;
       }
+    } else {
+      connection.destroy();
     }
   }
 }

@@ -22,10 +22,6 @@ import {
   type StagedManagedPath,
 } from "../../utils/staged-file-deletion";
 import {
-  tryAcquireManagedDeletionLocks,
-  type ManagedDeletionLockLease,
-} from "../../utils/managed-deletion-lock";
-import {
   acquireManagedDeletionPermit,
   tryAcquireManagedDeletionPermit,
 } from "../../utils/managed-deletion-admission";
@@ -47,19 +43,8 @@ const BATCH_CSV_MIME_TYPES = new Set([
 ]);
 const reportsRoot = path.resolve(import.meta.dir, "../../../uploads/reports");
 const tempUploadsRoot = path.resolve(import.meta.dir, "../../../uploads/temp");
-const USER_DELETION_LOCK_TIMEOUT_SECONDS = 10;
 
 const reportStorageRoot = () => getDatabaseManagedStorageRoot(reportsRoot, env);
-
-const userDeletionLockIdentity = (userIds: number[]) => ({
-  databaseName: env.DB_DATABASE,
-  kind: "user-deletion",
-  entityIds: userIds,
-  // Deletion locks the complete report reference set so shared PDF ownership
-  // can be decided atomically. Serialize those all-row FOR UPDATE scans across
-  // processes to prevent differently ordered user deletions from deadlocking.
-  includeGlobalLock: true,
-});
 
 export function buildBatchImportTempFilename(
   kind: "teachers" | "assistants",
@@ -71,18 +56,6 @@ export function buildBatchImportTempFilename(
     FILESYSTEM_FILENAME_MAX_BYTES - Buffer.byteLength(fixedPrefix, "utf8")
   );
   return `${fixedPrefix}${fitFilenameToUtf8Bytes(safeOriginalName, originalNameBudget)}`;
-}
-
-async function releaseUserDeletionLock(
-  lease: ManagedDeletionLockLease,
-  context: Record<string, unknown>,
-) {
-  await lease.release().catch((error) => {
-    logWarning("Failed to release user deletion advisory lock", {
-      ...context,
-      error: error instanceof Error ? error.message : String(error),
-    });
-  });
 }
 
 async function reconcileAmbiguousUserCommit(
@@ -969,22 +942,7 @@ export async function deleteUser(targetUserId: number, requesterId: number) {
     logWarning("Timed out waiting for managed deletion admission", { targetUserId });
     return { error: "file_cleanup_failed" as const };
   }
-  const deletionLock = await tryAcquireManagedDeletionLocks(
-    pool,
-    userDeletionLockIdentity([targetUserId]),
-    USER_DELETION_LOCK_TIMEOUT_SECONDS,
-  ).catch((error) => {
-    deletionPermit.release();
-    throw error;
-  });
-  if (!deletionLock) {
-    deletionPermit.release();
-    logWarning("Timed out acquiring user deletion advisory lock", { targetUserId });
-    return { error: "file_cleanup_failed" as const };
-  }
-
-  const connection = await pool.getConnection().catch(async (error) => {
-    await releaseUserDeletionLock(deletionLock, { targetUserId });
+  const connection = await pool.getConnection().catch((error) => {
     deletionPermit.release();
     throw error;
   });
@@ -1049,8 +1007,8 @@ export async function deleteUser(targetUserId: number, requesterId: number) {
           connection.destroy();
           released = true;
         }
-        // Keep the original per-user advisory locks through the fresh owner
-        // probe and filesystem resolution; see the dataset equivalent.
+        // Keep the process-wide deletion permit through the fresh owner probe
+        // and filesystem resolution; see the dataset equivalent.
         const resolution = await reconcileAmbiguousUserCommit(
           [targetUserId],
           stagedReportPaths,
@@ -1080,7 +1038,6 @@ export async function deleteUser(targetUserId: number, requesterId: number) {
     throw error;
   } finally {
     if (!released) connection.release();
-    await releaseUserDeletionLock(deletionLock, { targetUserId });
     deletionPermit.release();
   }
 }
@@ -1102,24 +1059,7 @@ export async function batchDeleteUsers(targetUserIds: number[], requesterId: num
     });
     return { error: "file_cleanup_failed" as const };
   }
-  const deletionLock = await tryAcquireManagedDeletionLocks(
-    pool,
-    userDeletionLockIdentity(uniqueTargetUserIds),
-    USER_DELETION_LOCK_TIMEOUT_SECONDS,
-  ).catch((error) => {
-    deletionPermit.release();
-    throw error;
-  });
-  if (!deletionLock) {
-    deletionPermit.release();
-    logWarning("Timed out acquiring bulk user deletion advisory locks", {
-      targetUserIds: uniqueTargetUserIds,
-    });
-    return { error: "file_cleanup_failed" as const };
-  }
-
-  const connection = await pool.getConnection().catch(async (error) => {
-    await releaseUserDeletionLock(deletionLock, { targetUserIds: uniqueTargetUserIds });
+  const connection = await pool.getConnection().catch((error) => {
     deletionPermit.release();
     throw error;
   });
@@ -1228,7 +1168,6 @@ export async function batchDeleteUsers(targetUserIds: number[], requesterId: num
     throw error;
   } finally {
     if (!released) connection.release();
-    await releaseUserDeletionLock(deletionLock, { targetUserIds: uniqueTargetUserIds });
     deletionPermit.release();
   }
 }
@@ -1256,13 +1195,6 @@ export async function reconcileReportDeletionJournals() {
     const result = await reconcileStagedDeletionJournals(storageRoot, async (journal) => {
       if (journal.metadata.databaseName !== env.DB_DATABASE) return "skip";
       const studentIds = studentIdsFromDeletionJournal(journal);
-      const deletionLock = await tryAcquireManagedDeletionLocks(
-        pool,
-        userDeletionLockIdentity(studentIds),
-        0,
-      );
-      if (!deletionLock) return "skip";
-
       let owner: Awaited<ReturnType<typeof probeUserOwnersWithLock>> | null = null;
       try {
         owner = await probeUserOwnersWithLock(studentIds);
@@ -1282,22 +1214,11 @@ export async function reconcileReportDeletionJournals() {
             ? "restore" as const
             : "purge" as const,
           release: async () => {
-            try {
-              await lockedOwner.release();
-            } finally {
-              await releaseUserDeletionLock(deletionLock, {
-                operationId: journal.operationId,
-                studentIds,
-              });
-            }
+            await lockedOwner.release();
           },
         };
       } catch (error) {
         await owner?.release().catch(() => {});
-        await releaseUserDeletionLock(deletionLock, {
-          operationId: journal.operationId,
-          studentIds,
-        });
         throw error;
       }
     });

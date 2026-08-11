@@ -186,13 +186,21 @@ describe("database migration deployment path", () => {
     expect(actions).not.toContain("run scripts/migrate-rejected-report-grades.ts");
     expect(update).toContain("set -euo pipefail");
     expect(update).toContain("flock -n 9");
+    expect(update).toContain("--property=KillMode --value");
+    expect(update).toContain('service_kill_mode" != "control-group"');
     expect(update).toContain("--property=WorkingDirectory");
     expect(update).toContain("--property=EnvironmentFiles");
     expect(update).toContain("--property=Environment --value");
     expect(update).toContain("deployment_environment_has_protected_override");
+    expect(update).toContain("assert_single_instance_production_environment");
+    expect(update).toContain("NODE_ENV=production");
+    expect(update).toContain("production binding must be exactly 127.0.0.1:3001");
+    expect(update).toContain("remove obsolete advisory-lock settings");
     expect(update).toContain("deployment_environment_files_match");
     expect(update).toContain("deployment_environment_snapshot");
     expect(update).toContain("run_bun_with_service_environment");
+    expect(update).toContain('await import(\"./src/config/env.ts\")');
+    expect(update).toContain('await import(\"./src/utils/constants.ts\")');
     expect(update.match(/run scripts\/migrate-experiment-retry-lineage\.ts/g))
       .toHaveLength(2);
     expect(update).not.toContain(
@@ -207,6 +215,9 @@ describe("database migration deployment path", () => {
     expect(update).not.toContain("git pull");
     expect(update).not.toContain("systemctl restart");
 
+    const targetEnvironmentValidation = update.indexOf(
+      'await import(\"./src/config/env.ts\")',
+    );
     const stagingActions = update.indexOf("./actions.sh");
     const markServiceStopped = update.indexOf("service_stopped=true", stagingActions);
     const stopService = update.indexOf('sudo systemctl stop "$service_name"', stagingActions);
@@ -235,7 +246,8 @@ describe("database migration deployment path", () => {
       "run scripts/migrate-rejected-report-grades.ts",
       activationComplete,
     );
-    expect(update.indexOf('cd "$release_dir"')).toBeLessThan(stagingActions);
+    expect(update.indexOf('cd "$release_dir"')).toBeLessThan(targetEnvironmentValidation);
+    expect(targetEnvironmentValidation).toBeLessThan(stagingActions);
     expect(stagingActions).toBeLessThan(stopService);
     expect(stagingActions).toBeLessThan(finalCleanCheck);
     expect(finalCleanCheck).toBeLessThan(stopService);

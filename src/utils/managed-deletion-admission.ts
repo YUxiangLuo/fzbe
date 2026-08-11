@@ -3,10 +3,9 @@ import { Semaphore, SemaphoreTimeoutError } from "./semaphore";
 const MANAGED_DELETION_CAPACITY = 1;
 export const MANAGED_DELETION_QUEUE_TIMEOUT_MS = 10_000;
 
-// Dataset and user deletion deliberately share one process-wide permit. Each
-// request owns a trusted advisory-lock session plus a transaction session, so
-// serial admission prevents low-frequency admin operations from exhausting
-// the pool while still leaving bulk deletion available as one transaction.
+// Dataset, manual, and user deletion deliberately share one process-wide
+// permit. The single-instance deployment contract makes this permit the global
+// filesystem-deletion mutex; database row locks still protect each transaction.
 const managedDeletionAdmission = new Semaphore(MANAGED_DELETION_CAPACITY);
 
 export interface ManagedDeletionPermit {

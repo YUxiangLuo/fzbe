@@ -549,21 +549,31 @@ if (process.env.E2E_SERVER === "1") {
     jwtAuth,
     requireStudent,
     async (c) => {
-      const body = await c.req.json().catch(() => ({})) as { hold_ms?: unknown };
+      const body = await c.req.json().catch(() => ({})) as {
+        hold_ms?: unknown;
+        experiment_id?: unknown;
+      };
       const holdMs = Number(body.hold_ms ?? 3_000);
       if (!Number.isInteger(holdMs) || holdMs <= 0 || holdMs > 30_000) {
         return c.json({ error: "hold_ms must be an integer between 1 and 30000" }, 400);
       }
       const payload = c.get("jwtPayload") as JwtPayload;
+      const executionExperimentId = body.experiment_id === undefined
+        ? payload.sub
+        : Number(body.experiment_id);
+      if (!Number.isSafeInteger(executionExperimentId) || executionExperimentId <= 0) {
+        return c.json({ error: "experiment_id must be a positive integer" }, 400);
+      }
 
       try {
         await withModelOperationContext("prediction", async (context) =>
           await withModelOperationLease(
             context,
             {
-              mode: "slot_and_execution",
-              experimentId: payload.sub,
-              modelType: "ma",
+              execution: {
+                experimentId: executionExperimentId,
+                modelType: "ma",
+              },
             },
             async (lease) => {
               await Bun.sleep(holdMs);
@@ -1004,18 +1014,17 @@ async function readDatabaseMaxConnections(): Promise<number | null> {
 }
 
 export async function runServerStartupPreflight() {
-  // ---- 启动校验：连接池容量 vs. 并发模型任务 ----
-  const minRequired = DB_POOL_CONFIG.LOCK_CONNECTIONS + DB_POOL_CONFIG.QUERY_HEADROOM;
+  // ---- 启动校验：单实例查询/事务连接池容量 ----
+  const minRequired = DB_POOL_CONFIG.MIN_CONNECTION_LIMIT;
   if (connectionLimit < minRequired) {
     logger.fatal(
       {
+        deploymentMode: "single_instance",
         connectionLimit,
         maxConcurrentModelJobs: CONCURRENCY_LIMITS.MAX_CONCURRENT_MODEL_JOBS,
-        lockConnections: DB_POOL_CONFIG.LOCK_CONNECTIONS,
-        queryHeadroom: DB_POOL_CONFIG.QUERY_HEADROOM,
         minRequired,
       },
-      "数据库连接池容量不足：connectionLimit 应至少为 2 × MAX_CONCURRENT_MODEL_JOBS + DB_QUERY_HEADROOM，否则并发训练时可能死锁或阻塞普通查询",
+      "数据库连接池容量不足：单实例课堂并发下 DB_CONNECTION_LIMIT 不能低于计算出的最小查询/事务容量",
     );
     process.exit(1);
   }
@@ -1060,8 +1069,6 @@ export async function runServerStartupPreflight() {
 }
 
 if (import.meta.main) {
-  await runServerStartupPreflight();
-
   process.on("unhandledRejection", (reason) => {
     try {
       logger.error(
@@ -1086,8 +1093,34 @@ if (import.meta.main) {
     setTimeout(() => process.exit(1), 1000);
   });
 
-  const server = Bun.serve(serverConfig);
-  logger.info(`Server listening on ${server.url.href}`);
+  // Bind before any database reconciliation or filesystem cleanup. A second
+  // process configured for the required listener fails here, before two online
+  // runtimes can touch process-coordinated state concurrently.
+  let applicationReady = false;
+  const server = Bun.serve({
+    ...serverConfig,
+    fetch(request, bunServer) {
+      if (!applicationReady) {
+        return new Response("Service startup in progress", {
+          status: 503,
+          headers: { "Retry-After": "1" },
+        });
+      }
+      return serverConfig.fetch(request, bunServer);
+    },
+  });
+
+  try {
+    await runServerStartupPreflight();
+    applicationReady = true;
+    logger.info(
+      { deploymentMode: "single_instance", coordinationScope: "process" },
+      `Server listening on ${server.url.href}`,
+    );
+  } catch (error) {
+    server.stop(true);
+    throw error;
+  }
 }
 
 export { app };

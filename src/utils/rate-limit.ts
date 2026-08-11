@@ -153,17 +153,18 @@ export function normalizeRateLimitToken(value: string | null | undefined): strin
 }
 
 export function getClientIp(c: Context): string {
-  const forwardedFor = c.req.header("x-forwarded-for")
+  const proxyVerifiedIp = c.req.header("x-real-ip")?.trim();
+  if (proxyVerifiedIp) {
+    return normalizeRateLimitToken(proxyVerifiedIp);
+  }
+
+  // Direct development/test traffic has no nginx-authenticated X-Real-IP.
+  // Prefer the right-most forwarding hop over a client-controlled first hop.
+  const forwardingHops = c.req.header("x-forwarded-for")
     ?.split(",")
     .map((part) => part.trim())
-    .find((part) => part.length > 0);
-
-  return normalizeRateLimitToken(
-    forwardedFor
-      ?? c.req.header("cf-connecting-ip")
-      ?? c.req.header("x-real-ip")
-      ?? "unknown",
-  );
+    .filter((part) => part.length > 0);
+  return normalizeRateLimitToken(forwardingHops?.at(-1) ?? "unknown");
 }
 
 export function applyRateLimitHeaders(c: Context, result: RateLimitCheckResult): void {

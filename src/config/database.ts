@@ -19,6 +19,7 @@ configureDatabasePoolSessions(
 
 logger.info(
   {
+    deploymentMode: "single_instance",
     connectionLimit,
     queueLimit: databasePoolOptions.queueLimit,
     connectTimeout: databasePoolOptions.connectTimeout,

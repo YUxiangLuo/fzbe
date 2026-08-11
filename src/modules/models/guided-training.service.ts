@@ -409,7 +409,7 @@ export async function createOrResumeGuidedTrainingSession(
   return await withModelOperationContext("guided_training_session", async (operationContext) => {
     return await withModelOperationLease(
       operationContext,
-      { mode: "slot_and_execution", experimentId: body.experiment_id, modelType },
+      { execution: { experimentId: body.experiment_id, modelType } },
       async (lease) => await createOrResumeGuidedTrainingSessionInternal(
         modelType,
         studentId,
@@ -488,7 +488,7 @@ export async function discardGuidedTrainingSession(
 
     return await withModelOperationLease(
       operationContext,
-      { mode: "execution_only", experimentId: row.experiment_id, modelType },
+      { execution: { experimentId: row.experiment_id, modelType } },
       async (lease) => {
         await lease.verifyOwned();
         const [result] = await queryWithTimeout(pool,
@@ -538,10 +538,10 @@ export async function runGuidedTrainingStep(
 
       return await withModelOperationLease(
         operationContext,
-        { mode: "slot_and_execution", experimentId: initialRow.experiment_id, modelType },
+        { execution: { experimentId: initialRow.experiment_id, modelType } },
         async (lease) => {
           // Another request may have completed this step after the initial
-          // metadata read but before this request acquired the advisory lock.
+          // metadata read but before this request acquired the process-local lock.
           // Re-read under the lock and use only this fresh row from here on.
           const row = await fetchGuidedTrainingSessionRow(sessionId);
           operationContext.throwIfTerminated();

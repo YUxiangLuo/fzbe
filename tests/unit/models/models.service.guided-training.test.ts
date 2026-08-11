@@ -67,11 +67,9 @@ const {
   backfillArtifactSha256ForRun,
   backfillProductionArtifactSha256ForRun,
   clearProductionArtifactForRun,
-  acquireModelExecutionLock,
-  acquireModelSlot,
+  tryAcquireModelExecutionLock,
   releaseModelExecutionLock,
-  releaseModelSlot,
-  verifyModelLockOwned,
+  verifyModelExecutionLockOwned,
   commitModelTrainingRun,
   buildExperimentTrainingRevision,
   buildModelTrainingRequestHash,
@@ -398,8 +396,7 @@ describe("models service guided training", () => {
     expect(artifactReadCount).toBe(0);
     expect(spawnMock).not.toHaveBeenCalled();
     expect(backfillArtifactSha256ForRun).not.toHaveBeenCalled();
-    expect(acquireModelSlot).not.toHaveBeenCalled();
-    expect(acquireModelExecutionLock).not.toHaveBeenCalled();
+    expect(tryAcquireModelExecutionLock).not.toHaveBeenCalled();
   });
 
   test("refreshes the experiment patch before reusing a completed guided session", async () => {
@@ -651,8 +648,7 @@ describe("models service guided training", () => {
         expect(session.session_id).not.toBe(oldSessionId);
         expect(session.next_step_id).toBeTruthy();
         expect(rmSync).toHaveBeenCalledWith(oldArtifactDir, { recursive: true, force: true });
-        expect(acquireModelSlot).toHaveBeenCalledTimes(1);
-        expect(acquireModelExecutionLock).toHaveBeenCalledTimes(1);
+        expect(tryAcquireModelExecutionLock).toHaveBeenCalledTimes(1);
 
         const queries = poolQuery.mock.calls.map(([sql]) => String(sql));
         const supersedeIndex = queries.findIndex((sql) => sql.includes("SET status = 'superseded'"));
@@ -928,7 +924,7 @@ describe("models service guided training", () => {
     expect(poolQuery.mock.calls.some(([sql]) =>
       String(sql).includes("SET status = 'superseded'"),
     )).toBe(true);
-    expect(acquireModelExecutionLock).toHaveBeenCalledTimes(1);
+    expect(tryAcquireModelExecutionLock).toHaveBeenCalledTimes(1);
     expect(releaseModelExecutionLock).toHaveBeenCalledTimes(1);
     expect(spawnMock).not.toHaveBeenCalled();
   });
@@ -980,7 +976,7 @@ describe("models service guided training", () => {
     expect(result.next_step_id).toBe("build_windows");
     expect(result.steps.find((step) => step.id === "prepare_data")?.status).toBe("completed");
     expect(result.step_outputs.prepare_data).toEqual({ prepared_rows: 18 });
-    expect(acquireModelExecutionLock).toHaveBeenCalledTimes(1);
+    expect(tryAcquireModelExecutionLock).toHaveBeenCalledTimes(1);
     expect(poolGetConnection).not.toHaveBeenCalled();
     expect(spawnMock).not.toHaveBeenCalled();
   });
@@ -1144,7 +1140,6 @@ describe("models service guided training", () => {
       expect(error).toMatchObject({ code: "GUIDED_SESSION_SUPERSEDED" });
       expect(datasetMutated).toBe(true);
       expect(commitModelTrainingRun).not.toHaveBeenCalled();
-      expect(acquireModelSlot).toHaveBeenCalledTimes(1);
       expect(spawnMock).not.toHaveBeenCalled();
       const failureSql = connection.query.mock.calls.map(([sql]) => String(sql));
       const attemptFailureSql = failureSql.find((sql) =>
@@ -1280,7 +1275,6 @@ describe("models service guided training", () => {
       expect(result.step_outputs.prepare_data).toEqual(receiptOutput);
       expect(poolGetConnection).toHaveBeenCalledTimes(2);
       expect(commitConnection.commit).toHaveBeenCalledTimes(1);
-      expect(acquireModelSlot).toHaveBeenCalledTimes(1);
       expect(spawnMock).not.toHaveBeenCalled();
     } finally {
       await unlink(candidatePath).catch(() => {});

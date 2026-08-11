@@ -30,6 +30,19 @@ import { databaseDatetimeToIsoString } from "../../utils/database-datetime";
 
 const pdfSemaphore = new Semaphore(CONCURRENCY_LIMITS.MAX_CONCURRENT_PDF_JOBS);
 const reportsManagedRoot = path.resolve(import.meta.dir, "../../../uploads", "reports");
+const PDF_BROWSER_CLOSE_GRACE_MS = 2_000;
+
+export class PdfGenerationTimeoutError extends Error {
+  readonly code = "PDF_GENERATION_TIMEOUT";
+
+  constructor(public readonly timeoutMs: number, cause?: unknown) {
+    super(`PDF generation timed out after ${timeoutMs}ms`);
+    this.name = "PdfGenerationTimeoutError";
+    if (cause !== undefined) {
+      (this as Error & { cause?: unknown }).cause = cause;
+    }
+  }
+}
 
 export function getPdfQueueStats() {
   return {
@@ -565,35 +578,107 @@ export async function submitReport(
 
   await pdfSemaphore.acquire(TIMEOUTS.PDF_QUEUE);
   try {
-    const browser = await puppeteer.launch({
-      executablePath: PATHS.CHROMIUM_PATH,
-      headless: true,
-      args: [
-        "--no-sandbox",
-        "--disable-setuid-sandbox",
-        "--disable-gpu",
-        "--disable-dev-shm-usage",
-      ],
+    let browser: Awaited<ReturnType<typeof puppeteer.launch>> | null = null;
+    let generationTimedOut = false;
+    const timeoutError = new PdfGenerationTimeoutError(TIMEOUTS.PDF_GENERATION);
+    const forceKillBrowser = (
+      target: Awaited<ReturnType<typeof puppeteer.launch>> | null,
+    ) => {
+      try {
+        target?.process?.()?.kill("SIGKILL");
+      } catch (error) {
+        logger.warn(
+          { err: error, experimentId, studentId },
+          "强制终止 PDF Chromium 进程时发生异常",
+        );
+      }
+    };
+
+    const generation = (async () => {
+      browser = await puppeteer.launch({
+        executablePath: PATHS.CHROMIUM_PATH,
+        headless: true,
+        timeout: TIMEOUTS.PDF_GENERATION,
+        args: [
+          "--no-sandbox",
+          "--disable-setuid-sandbox",
+          "--disable-gpu",
+          "--disable-dev-shm-usage",
+        ],
+      });
+
+      if (generationTimedOut) {
+        forceKillBrowser(browser);
+        throw timeoutError;
+      }
+
+      try {
+        const page = await browser.newPage();
+        await page.setExtraHTTPHeaders({ "Content-Security-Policy": "default-src 'none'; style-src 'unsafe-inline';" });
+        await page.setJavaScriptEnabled(false);
+        await page.setContent(htmlDocument, { waitUntil: "domcontentloaded", timeout: 10000 });
+        await page.pdf({
+          path: pdfPath,
+          format: "A4",
+          printBackground: true,
+          timeout: TIMEOUTS.PDF_GENERATION,
+        });
+      } finally {
+        const closingBrowser = browser;
+        const closeWork = closingBrowser.close();
+        const closeOutcome = closeWork.then(
+          () => true,
+          () => false,
+        );
+        let closeTimer: ReturnType<typeof setTimeout> | undefined;
+        const closeDeadline = new Promise<false>((resolve) => {
+          closeTimer = setTimeout(() => resolve(false), PDF_BROWSER_CLOSE_GRACE_MS);
+          closeTimer.unref?.();
+        });
+        try {
+          const closedGracefully = await Promise.race([closeOutcome, closeDeadline]);
+          if (!closedGracefully) {
+            forceKillBrowser(closingBrowser);
+          }
+        } finally {
+          if (closeTimer) clearTimeout(closeTimer);
+        }
+      }
+    })();
+    void generation.catch(() => {});
+
+    let generationTimer: ReturnType<typeof setTimeout> | undefined;
+    const generationDeadline = new Promise<never>((_, reject) => {
+      generationTimer = setTimeout(() => {
+        generationTimedOut = true;
+        forceKillBrowser(browser);
+        reject(timeoutError);
+      }, TIMEOUTS.PDF_GENERATION);
+      generationTimer.unref?.();
     });
 
     try {
-      const page = await browser.newPage();
-      await page.setExtraHTTPHeaders({ "Content-Security-Policy": "default-src 'none'; style-src 'unsafe-inline';" });
-      await page.setJavaScriptEnabled(false);
-      await page.setContent(htmlDocument, { waitUntil: "domcontentloaded", timeout: 10000 });
-      await page.pdf({
-        path: pdfPath,
-        format: "A4",
-        printBackground: true,
-        timeout: TIMEOUTS.PDF_GENERATION,
-      });
+      await Promise.race([generation, generationDeadline]);
+    } catch (error) {
+      if (error === timeoutError) {
+        await Promise.race([
+          generation.catch(() => {}),
+          Bun.sleep(PDF_BROWSER_CLOSE_GRACE_MS),
+        ]);
+      }
+      throw error;
     } finally {
-      await browser.close().catch(() => { /* browser may already be closed or crashed */ });
+      if (generationTimer) clearTimeout(generationTimer);
     }
   } catch (error) {
-    logger.error({ err: error, experimentId, studentId }, "PDF 生成失败");
+    const normalizedError = error instanceof PdfGenerationTimeoutError
+      ? error
+      : error instanceof Error && error.name === "TimeoutError"
+        ? new PdfGenerationTimeoutError(TIMEOUTS.PDF_GENERATION, error)
+        : error;
+    logger.error({ err: normalizedError, experimentId, studentId }, "PDF 生成失败");
     await cleanupGeneratedReportPdf(pdfPath, reportsDir);
-    throw error;
+    throw normalizedError;
   } finally {
     pdfSemaphore.release();
   }

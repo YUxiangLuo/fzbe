@@ -489,9 +489,9 @@ describe("models controller", () => {
     expect(predictExperimentModel).not.toHaveBeenCalled();
   });
 
-  test("returns 503 when lock ownership is lost", async () => {
+  test("returns 503 when process execution ownership is lost", async () => {
     runProductionPreparationStep.mockRejectedValueOnce(
-      new ModelServiceUnavailableError("数据库模型锁已失效", "MODEL_LOCK_LOST"),
+      new ModelServiceUnavailableError("进程内模型执行锁已失效", "MODEL_EXECUTION_LOCK_LOST"),
     );
     const response = await request(
       "/api/v1/models/ma/production-preparation/sessions/production-1/steps/initialize/run",
@@ -499,8 +499,8 @@ describe("models controller", () => {
     );
     expect(response.status).toBe(503);
     expect(await response.json()).toEqual({
-      error: "数据库模型锁已失效",
-      code: "MODEL_LOCK_LOST",
+      error: "进程内模型执行锁已失效",
+      code: "MODEL_EXECUTION_LOCK_LOST",
     });
   });
 

@@ -16,10 +16,6 @@ import {
   type StagedManagedPath,
 } from "../../utils/staged-file-deletion";
 import {
-  tryAcquireManagedDeletionLocks,
-  type ManagedDeletionLockLease,
-} from "../../utils/managed-deletion-lock";
-import {
   acquireManagedDeletionPermit,
 } from "../../utils/managed-deletion-admission";
 import {
@@ -35,18 +31,8 @@ type ManualFileRow = RowDataPacket & { manual_id: number; file_path: string };
 
 const uploadsRoot = path.resolve(import.meta.dir, "../../../uploads");
 const manualsRoot = path.resolve(uploadsRoot, "manuals");
-const MANUAL_DELETION_LOCK_TIMEOUT_SECONDS = 10;
 
 const manualStorageRoot = () => getDatabaseManagedStorageRoot(manualsRoot, env);
-
-const manualDeletionLockIdentity = (manualId: number) => ({
-  databaseName: env.DB_DATABASE,
-  kind: "manual",
-  entityIds: [manualId],
-  // Different manual rows may intentionally reference the same PDF. The
-  // kind-wide lock keeps those cross-ID decisions serialized across processes.
-  includeGlobalLock: true,
-});
 
 function canonicalPathFingerprint(absolutePath: string): string {
   return createHash("sha256").update(path.resolve(absolutePath)).digest("hex");
@@ -62,18 +48,6 @@ async function resolveManualFile(
     environment: env,
     legacyFallbackDirectory: manualStorageRoot(),
     enforceDisposableNamespace,
-  });
-}
-
-async function releaseManualDeletionLock(
-  lease: ManagedDeletionLockLease,
-  context: Record<string, unknown>,
-) {
-  await lease.release().catch((error) => {
-    logWarning("Failed to release manual deletion advisory lock", {
-      ...context,
-      error: error instanceof Error ? error.message : String(error),
-    });
   });
 }
 
@@ -346,22 +320,7 @@ export async function deleteManual(manualId: number) {
     return { error: "file_cleanup_failed" as const };
   }
 
-  const deletionLock = await tryAcquireManagedDeletionLocks(
-    pool,
-    manualDeletionLockIdentity(manualId),
-    MANUAL_DELETION_LOCK_TIMEOUT_SECONDS,
-  ).catch((error) => {
-    deletionPermit.release();
-    throw error;
-  });
-  if (!deletionLock) {
-    deletionPermit.release();
-    logWarning("Timed out acquiring manual deletion advisory lock", { manualId });
-    return { error: "file_cleanup_failed" as const };
-  }
-
-  const connection = await pool.getConnection().catch(async (error) => {
-    await releaseManualDeletionLock(deletionLock, { manualId });
+  const connection = await pool.getConnection().catch((error) => {
     deletionPermit.release();
     throw error;
   });
@@ -369,7 +328,6 @@ export async function deleteManual(manualId: number) {
   let targetFingerprint = "";
   let transactionPhase: "before-commit" | "commit-attempted" | "committed" = "before-commit";
   let released = false;
-  let deletionLockReleased = false;
 
   try {
     await connection.beginTransaction();
@@ -437,8 +395,8 @@ export async function deleteManual(manualId: number) {
     connection.release();
     released = true;
 
-    // Keep the named lock until the durable purge has completed so an
-    // interval reconciler cannot act on this operation mid-cleanup.
+    // Keep the process-wide deletion permit until the durable purge has
+    // completed so the interval reconciler cannot act mid-cleanup.
     let failedCleanupPaths: string[];
     try {
       failedCleanupPaths = await purgeStagedManagedPaths(stagedPaths);
@@ -500,10 +458,6 @@ export async function deleteManual(manualId: number) {
     throw error;
   } finally {
     if (!released) connection.release();
-    if (!deletionLockReleased) {
-      await releaseManualDeletionLock(deletionLock, { manualId });
-      deletionLockReleased = true;
-    }
     deletionPermit.release();
   }
 }
@@ -659,20 +613,7 @@ export async function reconcileManualDeletionJournals() {
       async (journal) => {
         if (journal.metadata.databaseName !== env.DB_DATABASE) return "skip";
         const metadata = parseManualJournalMetadata(journal);
-        const deletionLock = await tryAcquireManagedDeletionLocks(
-          pool,
-          manualDeletionLockIdentity(metadata.manualId),
-          0,
-        );
-        if (!deletionLock) return "skip";
-
-        const connection = await pool.getConnection().catch(async (error) => {
-          await releaseManualDeletionLock(deletionLock, {
-            operationId: journal.operationId,
-            manualId: metadata.manualId,
-          });
-          throw error;
-        });
+        const connection = await pool.getConnection();
         let released = false;
         try {
           await connection.beginTransaction();
@@ -699,11 +640,6 @@ export async function reconcileManualDeletionJournals() {
                 connection.release();
               } catch {
                 connection.destroy();
-              } finally {
-                await releaseManualDeletionLock(deletionLock, {
-                  operationId: journal.operationId,
-                  manualId: metadata.manualId,
-                });
               }
             },
           };
@@ -716,10 +652,6 @@ export async function reconcileManualDeletionJournals() {
           }
           if (!released) connection.release();
           released = true;
-          await releaseManualDeletionLock(deletionLock, {
-            operationId: journal.operationId,
-            manualId: metadata.manualId,
-          });
           throw error;
         }
       },

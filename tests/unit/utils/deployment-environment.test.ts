@@ -153,10 +153,12 @@ exec env -i "\${controlled_environment[@]}" "\${file_environment[@]}" "$@"
     expect(extraFileResult.stderr.toString()).toContain("Expected exactly one");
 
     for (const configuredEnvironment of [
-      "NODE_ENV=production DB_HOST=wrong-db",
-      'NODE_ENV=production "PORT=9000"',
+      "DB_HOST=wrong-db",
+      '"PORT=9000"',
       "JWT_SECRET=wrong-secret",
       "ALLOW_LEGACY_PRODUCTION_PLAN_WRITES=true",
+      "NODE_ENV=production",
+      '"BUN_ENV=development"',
     ]) {
       const result = runBash(
         `source "$1"
@@ -169,7 +171,7 @@ exec env -i "\${controlled_environment[@]}" "\${file_environment[@]}" "$@"
     const safeResult = runBash(
       `source "$1"
        deployment_environment_has_protected_override "$2"`,
-      [helperPath, "NODE_ENV=production LOG_LEVEL=info"],
+      [helperPath, "LOG_LEVEL=info"],
     );
     expect(safeResult.exitCode).not.toBe(0);
   });

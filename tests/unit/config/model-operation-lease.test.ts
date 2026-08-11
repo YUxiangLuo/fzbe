@@ -1,92 +1,73 @@
 import { beforeEach, describe, expect, mock, test } from "bun:test";
 import {
   createModelOperationLeaseManager,
-  type ModelOperationLockAdapter,
+  type ModelExecutionLockAdapter,
 } from "../../../src/modules/models/model-operation-lease";
 import {
   ModelCapacityBusyError,
   ModelConflictError,
   ModelOperationDeadlineError,
 } from "../../../src/modules/models/model-errors";
-import type { AdvisoryLockHandle } from "../../../src/modules/models/model-locks";
+import type { ModelExecutionLockHandle } from "../../../src/modules/models/model-execution-lock";
 import type { ModelType } from "../../../src/modules/models/models.schema";
 
 const events: string[] = [];
-let slotAvailable = true;
 let executionAvailable = true;
 let handleSequence = 0;
 
-const makeHandle = (prefix: string): AdvisoryLockHandle => ({
-  connection: {} as never,
-  name: `${prefix}-${++handleSequence}`,
-  ownerConnectionId: handleSequence,
-  signal: new AbortController().signal,
-  stopHeartbeat: () => {},
+const tryAcquire = mock((experimentId: number, modelType: ModelType) => {
+  events.push(`acquire:execution:${experimentId}:${modelType}`);
+  if (!executionAvailable) return null;
+  handleSequence += 1;
+  return {
+    key: `${experimentId}:${modelType}`,
+    token: Symbol(`execution-${handleSequence}`),
+  } satisfies ModelExecutionLockHandle;
 });
-
-const acquireModelSlot = mock(async (_signal?: AbortSignal) => {
-  events.push("acquire:slot");
-  return slotAvailable ? makeHandle("slot") : null;
-});
-const acquireModelExecutionLock = mock(async (
-  _experimentId: number,
-  _modelType: ModelType,
-  _signal?: AbortSignal,
-) => {
-  events.push("acquire:execution");
-  return executionAvailable ? makeHandle("execution") : null;
-});
-const releaseModelExecutionLock = mock(async (handle: AdvisoryLockHandle | null | undefined) => {
+const release = mock((handle: ModelExecutionLockHandle | null | undefined) => {
   if (handle) events.push("release:execution");
 });
-const releaseModelSlot = mock(async (handle: AdvisoryLockHandle | null | undefined) => {
-  if (handle) events.push("release:slot");
+const verifyOwned = mock((handle: ModelExecutionLockHandle | null | undefined) => {
+  if (handle) events.push("verify:execution");
 });
-const verifyModelLockOwned = mock(async () => undefined);
-const locks: ModelOperationLockAdapter = {
-  acquireModelSlot,
-  acquireModelExecutionLock,
-  releaseModelExecutionLock,
-  releaseModelSlot,
-  verifyModelLockOwned,
-  combineModelLockSignals: (...handles: Array<{ signal?: AbortSignal } | null>) => {
-    const signals = handles.map((handle) => handle?.signal).filter(Boolean) as AbortSignal[];
-    if (signals.length === 0) return undefined;
-    return signals.length === 1 ? signals[0] : AbortSignal.any(signals);
-  },
+const executionLocks: ModelExecutionLockAdapter = {
+  tryAcquire,
+  release,
+  verifyOwned,
 };
 
 const silentLogger = { info: () => {}, warn: () => {} };
 let manager = createModelOperationLeaseManager({
   capacity: 2,
   deadlineMs: 25,
-  locks,
+  executionLocks,
   logger: silentLogger,
 });
+
+const execution = {
+  execution: { experimentId: 1, modelType: "ma" as const },
+};
 
 describe("model operation lease", () => {
   beforeEach(() => {
     events.length = 0;
-    slotAvailable = true;
     executionAvailable = true;
     manager = createModelOperationLeaseManager({
       capacity: 2,
       deadlineMs: 25,
-      locks,
+      executionLocks,
       logger: silentLogger,
     });
-    acquireModelSlot.mockClear();
-    acquireModelExecutionLock.mockClear();
-    releaseModelExecutionLock.mockClear();
-    releaseModelSlot.mockClear();
-    verifyModelLockOwned.mockClear();
+    tryAcquire.mockClear();
+    release.mockClear();
+    verifyOwned.mockClear();
   });
 
-  test("uses slot-before-execution order and releases in reverse order", async () => {
+  test("acquires the process-local execution mutex inside admission and releases it first", async () => {
     const result = await manager.withModelOperationContext("prediction", async (context) =>
       await manager.withModelOperationLease(
         context,
-        { mode: "slot_and_execution", experimentId: 1, modelType: "ma" },
+        execution,
         async (lease) => {
           events.push("callback");
           await lease.verifyOwned();
@@ -96,38 +77,36 @@ describe("model operation lease", () => {
 
     expect(result).toBe("ok");
     expect(events).toEqual([
-      "acquire:slot",
-      "acquire:execution",
+      "acquire:execution:1:ma",
       "callback",
+      "verify:execution",
       "release:execution",
-      "release:slot",
     ]);
-    expect(manager.getModelOperationStats().admission.active).toBe(0);
+    expect(manager.getModelOperationStats().admission).toMatchObject({
+      scope: "process",
+      active: 0,
+      pending: 0,
+    });
   });
 
-  test("passes the operation deadline signal through both lock acquisitions", async () => {
-    await manager.withModelOperationContext("prediction", async (context) =>
-      await manager.withModelOperationLease(
-        context,
-        { mode: "slot_and_execution", experimentId: 1, modelType: "ma" },
-        async () => undefined,
-      ));
+  test("supports capacity-only operations without an execution mutex", async () => {
+    await manager.withModelOperationContext("adf", async (context) =>
+      await manager.withModelOperationLease(context, {}, async () => undefined));
 
-    const slotSignal = acquireModelSlot.mock.calls[0]?.[0];
-    const executionSignal = acquireModelExecutionLock.mock.calls[0]?.[2];
-    expect(slotSignal).toBeInstanceOf(AbortSignal);
-    expect(executionSignal).toBe(slotSignal);
+    expect(tryAcquire).not.toHaveBeenCalled();
+    expect(release).toHaveBeenCalledWith(null);
+    expect(manager.getModelOperationStats().admission.active).toBe(0);
   });
 
   test("releases every acquired resource when the callback fails", async () => {
     await expect(manager.withModelOperationContext("production_preparation", async (context) =>
       await manager.withModelOperationLease(
         context,
-        { mode: "slot_and_execution", experimentId: 1, modelType: "ma" },
+        execution,
         async () => { throw new Error("boom"); },
       ))).rejects.toThrow("boom");
 
-    expect(events.slice(-2)).toEqual(["release:execution", "release:slot"]);
+    expect(events.at(-1)).toBe("release:execution");
     expect(manager.getModelOperationStats().admission.active).toBe(0);
   });
 
@@ -135,7 +114,7 @@ describe("model operation lease", () => {
     const error = await manager.withModelOperationContext("prediction", async (context) =>
       await manager.withModelOperationLease(
         context,
-        { mode: "slot_and_execution", experimentId: 1, modelType: "ma" },
+        execution,
         async (lease) => await new Promise<never>((_, reject) => {
           lease.terminationSignal.addEventListener(
             "abort",
@@ -151,7 +130,7 @@ describe("model operation lease", () => {
       operation: "prediction",
       timeoutMs: 25,
     });
-    expect(events.slice(-2)).toEqual(["release:execution", "release:slot"]);
+    expect(events.at(-1)).toBe("release:execution");
     expect(manager.getModelOperationStats().admission.active).toBe(0);
   });
 
@@ -169,67 +148,52 @@ describe("model operation lease", () => {
     expect(error).toMatchObject({ operation: "adf", timeoutMs: 5 });
   });
 
-  test("deadline aborts lock acquisition and releases admission immediately", async () => {
-    acquireModelSlot.mockImplementationOnce(async (signal?: AbortSignal) =>
-      await new Promise<never>((_, reject) => {
-        signal?.addEventListener("abort", () => reject(signal.reason), { once: true });
-      }));
-
-    const error = await manager.withModelOperationContext("prediction", async (context) =>
-      await manager.withModelOperationLease(
-        context,
-        { mode: "slot_and_execution", experimentId: 1, modelType: "ma" },
-        async () => undefined,
-      )).catch((caught) => caught);
-
-    expect(error).toBeInstanceOf(ModelOperationDeadlineError);
-    expect(events).toEqual([]);
-    expect(releaseModelSlot).toHaveBeenCalledWith(null);
-    expect(manager.getModelOperationStats().admission.active).toBe(0);
-  });
-
-  test("rejects above-capacity work immediately without acquiring DB locks", async () => {
+  test("rejects above-capacity work immediately without touching execution locks", async () => {
     const releases: Array<() => void> = [];
-    const hold = () => manager.withModelOperationContext("prediction", async (context) =>
+    const hold = (experimentId: number) => manager.withModelOperationContext("prediction", async (context) =>
       await manager.withModelOperationLease(
         context,
-        { mode: "slot_and_execution", experimentId: 1, modelType: "ma" },
+        { execution: { experimentId, modelType: "ma" } },
         async () => await new Promise<void>((resolve) => releases.push(resolve)),
       ));
 
-    const first = hold();
-    const second = hold();
+    const first = hold(1);
+    const second = hold(2);
     while (releases.length < 2) await Bun.sleep(1);
-    const lockCallsBeforeRejection = acquireModelSlot.mock.calls.length;
+    const lockCallsBeforeRejection = tryAcquire.mock.calls.length;
 
     const rejected = await manager.withModelOperationContext("prediction", async (context) =>
       await manager.withModelOperationLease(
         context,
-        { mode: "slot_and_execution", experimentId: 2, modelType: "ma" },
+        { execution: { experimentId: 3, modelType: "ma" } },
         async () => undefined,
       )).catch((caught) => caught);
 
     expect(rejected).toBeInstanceOf(ModelCapacityBusyError);
-    expect(acquireModelSlot).toHaveBeenCalledTimes(lockCallsBeforeRejection);
-    expect(manager.getModelOperationStats().admission).toMatchObject({ capacity: 2, active: 2, pending: 0 });
+    expect(tryAcquire).toHaveBeenCalledTimes(lockCallsBeforeRejection);
+    expect(manager.getModelOperationStats().admission).toMatchObject({
+      capacity: 2,
+      active: 2,
+      pending: 0,
+    });
 
-    for (const release of releases) release();
+    for (const resolve of releases) resolve();
     await Promise.all([first, second]);
     expect(manager.getModelOperationStats().admission.active).toBe(0);
   });
 
-  test("releases slot and admission when the model execution lock is busy", async () => {
+  test("releases admission when the execution mutex is busy", async () => {
     executionAvailable = false;
     const error = await manager.withModelOperationContext("prediction", async (context) =>
       await manager.withModelOperationLease(
         context,
-        { mode: "slot_and_execution", experimentId: 1, modelType: "ma" },
+        execution,
         async () => undefined,
       )).catch((caught) => caught);
 
     expect(error).toBeInstanceOf(ModelConflictError);
     expect(error).toMatchObject({ code: "MODEL_BUSY" });
-    expect(events).toEqual(["acquire:slot", "acquire:execution", "release:slot"]);
+    expect(events).toEqual(["acquire:execution:1:ma"]);
     expect(manager.getModelOperationStats().admission.active).toBe(0);
   });
 });

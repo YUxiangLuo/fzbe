@@ -33,14 +33,17 @@ const redoStatus = {
   },
 };
 const getLatestReportStatus = mock(async () => redoStatus);
+const submitReport = mock(async () => ({
+  data: { message: "报告提交成功", report_id: 1, pdf_path: "reports/1.pdf" },
+  isUpdate: false,
+}));
+class PdfGenerationTimeoutError extends Error {}
 
 mock.module("../../../src/modules/reports/reports.service", () => ({
-  submitReport: mock(async () => ({
-    data: { message: "报告提交成功", report_id: 1, pdf_path: "reports/1.pdf" },
-    isUpdate: false,
-  })),
+  submitReport,
   getLatestReportStatus,
   HTMLSanitizationError: class HTMLSanitizationError extends Error {},
+  PdfGenerationTimeoutError,
 }));
 
 const { default: reportsController } = await import(
@@ -59,7 +62,29 @@ const authHeaders = async (role = "Student") => ({
 });
 
 describe("reports controller", () => {
-  beforeEach(() => getLatestReportStatus.mockClear());
+  beforeEach(() => {
+    getLatestReportStatus.mockClear();
+    submitReport.mockClear();
+    submitReport.mockResolvedValue({
+      data: { message: "报告提交成功", report_id: 1, pdf_path: "reports/1.pdf" },
+      isUpdate: false,
+    });
+  });
+
+  test("returns 504 when bounded PDF generation times out", async () => {
+    submitReport.mockRejectedValueOnce(new PdfGenerationTimeoutError());
+    const response = await app.request("/api/v1/experiment-runs/990022/report", {
+      method: "POST",
+      headers: {
+        ...await authHeaders(),
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({ report_content: "足够长的测试报告内容".repeat(20) }),
+    });
+
+    expect(response.status).toBe(504);
+    expect(await response.json()).toEqual({ error: "PDF 生成超时，请稍后重试" });
+  });
 
   test("returns stable rejection context for a redo in progress", async () => {
     const response = await app.request("/api/v1/my-latest-report-status", {

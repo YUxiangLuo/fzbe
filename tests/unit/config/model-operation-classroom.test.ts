@@ -1,49 +1,35 @@
 import { expect, mock, test } from "bun:test";
 import {
   createModelOperationLeaseManager,
-  type ModelOperationLockAdapter,
+  type ModelExecutionLockAdapter,
 } from "../../../src/modules/models/model-operation-lease";
 import { ModelCapacityBusyError } from "../../../src/modules/models/model-errors";
-import type { AdvisoryLockHandle } from "../../../src/modules/models/model-locks";
+import type { ModelExecutionLockHandle } from "../../../src/modules/models/model-execution-lock";
 
-let sequence = 0;
-const makeHandle = (prefix: string): AdvisoryLockHandle => ({
-  connection: {} as never,
-  name: `${prefix}-${++sequence}`,
-  ownerConnectionId: sequence,
-  signal: new AbortController().signal,
-  stopHeartbeat: () => {},
-});
-const acquireModelSlot = mock(async () => makeHandle("slot"));
-const acquireModelExecutionLock = mock(async () => makeHandle("execution"));
-const releaseModelExecutionLock = mock(async () => undefined);
-const releaseModelSlot = mock(async () => undefined);
-
-const locks: ModelOperationLockAdapter = {
-  acquireModelSlot,
-  acquireModelExecutionLock,
-  releaseModelExecutionLock,
-  releaseModelSlot,
-  verifyModelLockOwned: async () => undefined,
-  combineModelLockSignals: (...handles: Array<{ signal?: AbortSignal } | null>) => {
-    const signals = handles.map((handle) => handle?.signal).filter(Boolean) as AbortSignal[];
-    return signals.length === 1 ? signals[0] : AbortSignal.any(signals);
-  },
+const tryAcquire = mock((experimentId: number) => ({
+  key: `${experimentId}:ma`,
+  token: Symbol(String(experimentId)),
+}) satisfies ModelExecutionLockHandle);
+const release = mock(() => undefined);
+const executionLocks: ModelExecutionLockAdapter = {
+  tryAcquire,
+  release,
+  verifyOwned: () => undefined,
 };
 const manager = createModelOperationLeaseManager({
   capacity: 50,
   deadlineMs: 5_000,
-  locks,
+  executionLocks,
   logger: { info: () => {}, warn: () => {} },
 });
 
-test("64-core classroom: 100 simultaneous students admit 50 and fail-fast 50", async () => {
+test("single 64-core instance: 100 simultaneous students admit 50 and fail-fast 50", async () => {
   const releaseCallbacks: Array<() => void> = [];
   const startHeldOperation = (experimentId: number) =>
     manager.withModelOperationContext("prediction", async (context) =>
       await manager.withModelOperationLease(
         context,
-        { mode: "slot_and_execution", experimentId, modelType: "ma" },
+        { execution: { experimentId, modelType: "ma" } },
         async () => await new Promise<void>((resolve) => releaseCallbacks.push(resolve)),
       ));
 
@@ -56,18 +42,17 @@ test("64-core classroom: 100 simultaneous students admit 50 and fail-fast 50", a
   );
 
   expect(rejected.every((error) => error instanceof ModelCapacityBusyError)).toBe(true);
-  expect(acquireModelSlot).toHaveBeenCalledTimes(50);
-  expect(acquireModelExecutionLock).toHaveBeenCalledTimes(50);
+  expect(tryAcquire).toHaveBeenCalledTimes(50);
   expect(manager.getModelOperationStats().admission).toEqual({
+    scope: "process",
     capacity: 50,
     active: 50,
     pending: 0,
   });
 
-  for (const release of releaseCallbacks) release();
+  for (const resolve of releaseCallbacks) resolve();
   await Promise.all(admitted);
 
-  expect(releaseModelExecutionLock).toHaveBeenCalledTimes(50);
-  expect(releaseModelSlot).toHaveBeenCalledTimes(50);
+  expect(release).toHaveBeenCalledTimes(50);
   expect(manager.getModelOperationStats().admission.active).toBe(0);
 });

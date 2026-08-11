@@ -1097,10 +1097,11 @@ export async function runProductionPreparationStep(
 
     return await withModelOperationLease(
       operationContext,
-      { mode: "slot_and_execution", experimentId: initialRow.experiment_id, modelType },
+      { execution: { experimentId: initialRow.experiment_id, modelType } },
       async (lease) => {
-        // A second tab may have waited for the same advisory lock while the
-        // first request committed this step. Re-read under the lock so stale
+        // Another request may have completed this step after the initial read
+        // but before this request acquired the process-local execution lock.
+        // Re-read under the lock so stale
         // checkpoint pointers can never replay or overwrite a later step.
         const currentRow = await fetchProductionPreparationSession(sessionId);
         if (!currentRow || currentRow.model_type !== modelType || currentRow.student_id !== studentId) {

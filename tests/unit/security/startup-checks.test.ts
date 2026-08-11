@@ -45,22 +45,15 @@ const createDeps = (): StartupCheckDependencies & {
 };
 
 describe("startup environment checks", () => {
-  test("returns a healthy startup probe session only after lock release and rollback are acknowledged", async () => {
+  test("returns a healthy startup probe connection after validating its session", async () => {
     const release = mock(() => {});
     const destroy = mock(() => {});
-    const rollback = mock(async () => {});
-    const query = mock(async (sql: string) => {
-      if (sql.includes("@@session.time_zone")) {
-        return [[{ ok: 1, session_time_zone: "+00:00", utc_offset_seconds: 0 }]];
-      }
-      if (sql.includes("GET_LOCK")) return [[{ acquired: 1 }]];
-      if (sql.includes("RELEASE_LOCK")) return [[{ released: 1 }]];
-      return [[]];
-    });
     const connection = {
-      beginTransaction: mock(async () => {}),
-      query,
-      rollback,
+      query: mock(async () => [[{
+        ok: 1,
+        session_time_zone: "+00:00",
+        utc_offset_seconds: 0,
+      }]]),
       release,
       destroy,
     };
@@ -69,7 +62,6 @@ describe("startup environment checks", () => {
       getConnection: mock(async () => connection),
     } as never);
 
-    expect(rollback).toHaveBeenCalledTimes(1);
     expect(release).toHaveBeenCalledTimes(1);
     expect(destroy).not.toHaveBeenCalled();
   });
@@ -78,18 +70,11 @@ describe("startup environment checks", () => {
     const destroy = mock(() => {});
     const release = mock(() => {});
     const connection = {
-      beginTransaction: mock(async () => {}),
-      query: mock(async (sql: string) => {
-        if (sql.includes("@@session.time_zone")) {
-          return [[{
-            ok: 1,
-            session_time_zone: "SYSTEM",
-            utc_offset_seconds: 32_400,
-          }]];
-        }
-        return [[]];
-      }),
-      rollback: mock(async () => {}),
+      query: mock(async () => [[{
+        ok: 1,
+        session_time_zone: "SYSTEM",
+        utc_offset_seconds: 32_400,
+      }]]),
       release,
       destroy,
     };
@@ -97,55 +82,41 @@ describe("startup environment checks", () => {
     await expect(probeStartupDatabaseRuntime({
       getConnection: mock(async () => connection),
     } as never, "Z")).rejects.toThrow("数据库会话时区不一致");
-    expect(release).toHaveBeenCalledTimes(1);
-    expect(destroy).not.toHaveBeenCalled();
+    expect(release).not.toHaveBeenCalled();
+    expect(destroy).toHaveBeenCalledTimes(1);
   });
 
-  test.each([
-    ["GET_LOCK acknowledgement loss", "get-lock-throws"],
-    ["release query failure", "release-throws"],
-    ["unconfirmed release", "release-zero"],
-    ["rollback acknowledgement loss", "rollback-throws"],
-    ["pool release failure", "pool-release-throws"],
-  ] as const)("destroys a startup probe session after %s", async (_label, failure) => {
-    const release = mock(() => {
-      if (failure === "pool-release-throws") throw new Error("pool release failed");
-    });
+  test("destroys a startup probe connection after the health query fails", async () => {
     const destroy = mock(() => {});
-    const rollback = mock(async () => {
-      if (failure === "rollback-throws") throw new Error("rollback acknowledgement lost");
-    });
-    const query = mock(async (sql: string) => {
-      if (sql.includes("@@session.time_zone")) {
-        return [[{ ok: 1, session_time_zone: "+00:00", utc_offset_seconds: 0 }]];
-      }
-      if (sql.includes("GET_LOCK")) {
-        if (failure === "get-lock-throws") throw new Error("GET_LOCK acknowledgement lost");
-        return [[{ acquired: 1 }]];
-      }
-      if (sql.includes("RELEASE_LOCK")) {
-        if (failure === "release-throws") throw new Error("release acknowledgement lost");
-        return [[{ released: failure === "release-zero" ? 0 : 1 }]];
-      }
-      return [[]];
-    });
+    const release = mock(() => {});
     const connection = {
-      beginTransaction: mock(async () => {}),
-      query,
-      rollback,
+      query: mock(async () => { throw new Error("database unavailable"); }),
       release,
       destroy,
     };
 
     await expect(probeStartupDatabaseRuntime({
       getConnection: mock(async () => connection),
-    } as never)).rejects.toThrow();
+    } as never)).rejects.toThrow("database unavailable");
+    expect(release).not.toHaveBeenCalled();
+    expect(destroy).toHaveBeenCalledTimes(1);
+  });
 
-    if (failure === "pool-release-throws") {
-      expect(release).toHaveBeenCalledTimes(1);
-    } else {
-      expect(release).not.toHaveBeenCalled();
-    }
+  test("destroys a healthy probe connection when returning it to the pool fails", async () => {
+    const destroy = mock(() => {});
+    const connection = {
+      query: mock(async () => [[{
+        ok: 1,
+        session_time_zone: "+00:00",
+        utc_offset_seconds: 0,
+      }]]),
+      release: mock(() => { throw new Error("pool release failed"); }),
+      destroy,
+    };
+
+    await expect(probeStartupDatabaseRuntime({
+      getConnection: mock(async () => connection),
+    } as never)).rejects.toThrow("pool release failed");
     expect(destroy).toHaveBeenCalledTimes(1);
   });
 
@@ -193,10 +164,10 @@ describe("startup environment checks", () => {
   test("fails startup when the database runtime probe fails", async () => {
     const deps = createDeps();
     deps.queryDatabase = mock(async () => {
-      throw new Error("GET_LOCK permission denied");
+      throw new Error("database unavailable");
     });
 
     await expect(runStartupEnvironmentChecks(deps)).rejects.toThrow("启动环境检查失败");
-    expect(deps.warnings).toContain("数据库运行时检查失败: GET_LOCK permission denied");
+    expect(deps.warnings).toContain("数据库运行时检查失败: database unavailable");
   });
 });

@@ -6,7 +6,7 @@
 
 deployment_environment_has_protected_override() {
   local configured_environment="${1-}"
-  local protected_pattern='(^|[[:space:]"])(DB_[[:alnum:]_]*|HOST|PORT|JWT[[:alnum:]_]*|ALLOW_[[:alnum:]_]*)='
+  local protected_pattern='(^|[[:space:]"])(DB_[[:alnum:]_]*|HOST|PORT|JWT[[:alnum:]_]*|ALLOW_[[:alnum:]_]*|NODE_ENV|BUN_ENV)='
   [[ "$configured_environment" =~ $protected_pattern ]]
 }
 

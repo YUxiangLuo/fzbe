@@ -31,7 +31,7 @@ export const configModulePath = path.join(srcRoot, "config", "index.ts");
 export const pythonModulePath = path.join(srcRoot, "utils", "python.ts");
 export const modelRuntimeModulePath = path.join(srcRoot, "modules", "models", "model-runtime.ts");
 export const modelRunStoreModulePath = path.join(srcRoot, "modules", "models", "model-run-store.ts");
-export const modelLocksModulePath = path.join(srcRoot, "modules", "models", "model-locks.ts");
+export const modelExecutionLockModulePath = path.join(srcRoot, "modules", "models", "model-execution-lock.ts");
 export const modelsServiceModulePath = path.join(srcRoot, "modules", "models", "models.service.ts");
 // Model dataset reads intentionally reject absolute paths outside the managed
 // upload root. Keep the shared service fixture under that same root so these
@@ -197,19 +197,12 @@ export const backfillProductionArtifactSha256ForRun = mock(async (
 ) => true);
 export const clearProductionArtifactForRun = mock(async (_runId: string, _productionRevision: string) => true);
 export const originalSpawn = Bun.spawn;
-export const acquireModelExecutionLock = mock(async () => ({
-  name: "test-execution-lock",
-  connection: {},
-  signal: new AbortController().signal,
+export const tryAcquireModelExecutionLock = mock(() => ({
+  key: "test-execution-lock",
+  token: Symbol("test-execution-lock"),
 }));
-export const acquireModelSlot = mock(async () => ({
-  name: "test-slot-lock",
-  connection: {},
-  signal: new AbortController().signal,
-}));
-export const releaseModelExecutionLock = mock(async () => undefined);
-export const releaseModelSlot = mock(async () => undefined);
-export const verifyModelLockOwned = mock(async () => undefined);
+export const releaseModelExecutionLock = mock(() => undefined);
+export const verifyModelExecutionLockOwned = mock(() => undefined);
 
 mock.module(configModulePath, () => ({
   env: {
@@ -301,9 +294,6 @@ mock.module(modelRuntimeModulePath, () => ({
     candidateStatePath: path.join(artifactDir, "checkpoints", `${stepId}-${attemptId}.pkl`),
     receiptPath: path.join(artifactDir, "checkpoints", `${stepId}-${attemptId}.receipt.json`),
   }),
-  buildModelExecutionLockName: (experimentId: number, modelType: string) =>
-    `fangzhen-model:exp:${experimentId}:${modelType}`,
-  buildModelSlotLockName: (slot: number) => `fangzhen-model:slot:${slot}`,
 }));
 
 export const commitModelTrainingRun = mock(async ({ runId, sessionId }: { runId?: string; sessionId?: string }) => ({
@@ -329,15 +319,11 @@ mock.module(modelRunStoreModulePath, () => ({
   setProductionArtifactForRun,
 }));
 
-mock.module(modelLocksModulePath, () => ({
-  acquireModelExecutionLock,
-  acquireModelSlot,
+mock.module(modelExecutionLockModulePath, () => ({
+  tryAcquireModelExecutionLock,
   releaseModelExecutionLock,
-  releaseModelSlot,
-  verifyModelLockOwned,
-  getModelLockStats: () => ({}),
-  combineModelLockSignals: (...handles: Array<{ signal?: AbortSignal } | null | undefined>) =>
-    handles.find((handle) => handle?.signal)?.signal,
+  verifyModelExecutionLockOwned,
+  getModelExecutionLockStats: () => ({ scope: "process", active: 0 }),
 }));
 
 type ModelsServiceModule = typeof import(
@@ -573,11 +559,9 @@ export const setupModelsServiceTestHooks = () => {
       stateVersion: 1,
       reusedExistingRun: false,
     }));
-    acquireModelExecutionLock.mockClear();
-    acquireModelSlot.mockClear();
+    tryAcquireModelExecutionLock.mockClear();
     releaseModelExecutionLock.mockClear();
-    releaseModelSlot.mockClear();
-    verifyModelLockOwned.mockClear();
+    verifyModelExecutionLockOwned.mockClear();
 
     existsSync.mockReset();
     existsSync.mockReturnValue(false);

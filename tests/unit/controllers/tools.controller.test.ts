@@ -151,7 +151,7 @@ describe("tools controller", () => {
     });
   });
 
-  test("rejects oversized series before acquiring a model slot", async () => {
+  test("rejects oversized series before acquiring model capacity", async () => {
     const series = Array.from({ length: 5001 }, (_, index) => ({
       month: `2024-${index + 1}`,
       sales: index,

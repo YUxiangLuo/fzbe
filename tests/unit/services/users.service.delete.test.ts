@@ -8,7 +8,6 @@ const srcRoot = path.resolve(import.meta.dir, "../../../src");
 const configModulePath = path.join(srcRoot, "config", "index.ts");
 const passwordModulePath = path.join(srcRoot, "utils", "password.ts");
 const stagedDeletionModulePath = path.join(srcRoot, "utils", "staged-file-deletion.ts");
-const deletionLockModulePath = path.join(srcRoot, "utils", "managed-deletion-lock.ts");
 const serviceModulePath = `${path.join(srcRoot, "modules", "users", "users.service.ts")}?user-delete-test`;
 const TEST_DATABASE = "fz_test_user_delete";
 const reportsRoot = path.resolve(srcRoot, "../uploads/reports");
@@ -86,12 +85,6 @@ const classifyManagedDeletionOwnership = (
   const matches = entries.filter((entry) => referenceSet.has(entry.originalPath)).length;
   return matches === 0 ? "none" : matches === entries.length ? "all" : "partial";
 };
-const advisoryRelease = mock(async () => { lifecycle.push("advisory-release"); });
-const tryAcquireManagedDeletionLocks = mock(async () => ({
-  lockNames: ["unit-lock"],
-  release: advisoryRelease,
-}));
-
 mock.module(configModulePath, () => ({
   env: TEST_STORAGE_ENV,
   pool: { query: poolQuery, getConnection },
@@ -111,8 +104,6 @@ mock.module(stagedDeletionModulePath, () => ({
   purgeStagedManagedPaths,
   reconcileStagedDeletionJournals,
 }));
-
-mock.module(deletionLockModulePath, () => ({ tryAcquireManagedDeletionLocks }));
 
 const { deleteUser, batchDeleteUsers, reconcileReportDeletionJournals } = await import(serviceModulePath);
 
@@ -164,17 +155,11 @@ describe("user deletion report file transaction", () => {
       lifecycle.push("purge");
       return [];
     });
-    advisoryRelease.mockClear();
-    tryAcquireManagedDeletionLocks.mockReset();
-    tryAcquireManagedDeletionLocks.mockResolvedValue({
-      lockNames: ["unit-lock"],
-      release: advisoryRelease,
-    });
     reconcileStagedDeletionJournals.mockReset();
     reconcileStagedDeletionJournals.mockResolvedValue(successfulReconcileResult("skip"));
   });
 
-  test("locks user then experiment and report, commits, purges, and only then unlocks", async () => {
+  test("locks user then experiment and report, commits, then purges staged files", async () => {
     const result = await deleteUser(77, 1);
 
     expect(result).toEqual({
@@ -189,22 +174,11 @@ describe("user deletion report file transaction", () => {
         ? "experiment"
         : sql.includes("experiment_reports") ? "report" : "user"
     ))).toEqual(["user", "experiment", "report"]);
-    expect(tryAcquireManagedDeletionLocks).toHaveBeenCalledWith(
-      expect.anything(),
-      {
-        databaseName: TEST_DATABASE,
-        kind: "user-deletion",
-        entityIds: [77],
-        includeGlobalLock: true,
-      },
-      10,
-    );
     expect(lifecycle).toEqual([
       "stage",
       "commit",
       "transaction-release",
       "purge",
-      "advisory-release",
     ]);
   });
 
@@ -248,7 +222,6 @@ describe("user deletion report file transaction", () => {
       "commit",
       "transaction-release",
       "purge",
-      "advisory-release",
     ]);
   });
 
@@ -262,7 +235,7 @@ describe("user deletion report file transaction", () => {
     expect(commit).not.toHaveBeenCalled();
     expect(restoreStagedManagedPaths).not.toHaveBeenCalled();
     expect(purgeStagedManagedPaths).not.toHaveBeenCalled();
-    expect(lifecycle).toEqual(["rollback", "transaction-release", "advisory-release"]);
+    expect(lifecycle).toEqual(["rollback", "transaction-release"]);
   });
 
   test("restores staged reports when the database delete rolls back", async () => {
@@ -289,7 +262,6 @@ describe("user deletion report file transaction", () => {
       "rollback",
       "restore",
       "transaction-release",
-      "advisory-release",
     ]);
   });
 
@@ -316,7 +288,6 @@ describe("user deletion report file transaction", () => {
     expect(transactionDestroy).toHaveBeenCalledTimes(1);
     expect(transactionRelease).not.toHaveBeenCalled();
     expect(restoreStagedManagedPaths).toHaveBeenCalledWith([stagedEntry]);
-    expect(advisoryRelease).toHaveBeenCalledTimes(1);
   });
 
   test("turns a lost commit acknowledgement into success only after a fresh locking probe finds no owner", async () => {
@@ -351,7 +322,6 @@ describe("user deletion report file transaction", () => {
         ? "experiment"
         : sql.includes("experiment_reports") ? "report" : "user"))
       .toEqual(["user", "experiment", "report", "user", "experiment", "report"]);
-    expect(lifecycle.indexOf("purge")).toBeLessThan(lifecycle.indexOf("advisory-release"));
   });
 
   test("restores a committed deletion tombstone when a surviving report now shares its path", async () => {
@@ -377,7 +347,6 @@ describe("user deletion report file transaction", () => {
     expect(result).toEqual({ success: true, cleanup: {} });
     expect(restoreStagedManagedPaths).toHaveBeenCalledWith([stagedEntry]);
     expect(purgeStagedManagedPaths).not.toHaveBeenCalled();
-    expect(lifecycle.indexOf("restore")).toBeLessThan(lifecycle.indexOf("advisory-release"));
   });
 
   test("keeps ACK-loss user-deletion success when its post-probe purge raises", async () => {
@@ -407,7 +376,6 @@ describe("user deletion report file transaction", () => {
       cleanup: { removedReportFiles: 1, reportFileCleanupPending: 1 },
     });
     expect(transactionDestroy).toHaveBeenCalledTimes(1);
-    expect(lifecycle.indexOf("purge")).toBeLessThan(lifecycle.indexOf("advisory-release"));
   });
 
   test("destroys both ambiguous and probe sessions when the probe rollback acknowledgement is lost", async () => {
@@ -437,7 +405,6 @@ describe("user deletion report file transaction", () => {
     expect(transactionRelease).not.toHaveBeenCalled();
     expect(restoreStagedManagedPaths).not.toHaveBeenCalled();
     expect(purgeStagedManagedPaths).not.toHaveBeenCalled();
-    expect(advisoryRelease).toHaveBeenCalledTimes(1);
   });
 
   test("restores and surfaces the commit error when the fresh probe finds the same report owner", async () => {
@@ -462,7 +429,6 @@ describe("user deletion report file transaction", () => {
     expect(transactionDestroy).toHaveBeenCalledTimes(1);
     expect(restoreStagedManagedPaths).toHaveBeenCalledWith([stagedEntry]);
     expect(purgeStagedManagedPaths).not.toHaveBeenCalled();
-    expect(lifecycle.indexOf("restore")).toBeLessThan(lifecycle.indexOf("advisory-release"));
   });
 
   test("purges an old report generation but conservatively surfaces the commit error when the owner ID was reused", async () => {
@@ -494,7 +460,6 @@ describe("user deletion report file transaction", () => {
 
     expect(restoreStagedManagedPaths).not.toHaveBeenCalled();
     expect(purgeStagedManagedPaths).toHaveBeenCalledWith([stagedEntry]);
-    expect(lifecycle.indexOf("purge")).toBeLessThan(lifecycle.indexOf("advisory-release"));
   });
 
   test("retains every tombstone and surfaces the commit error when owner paths match only partially", async () => {
@@ -532,7 +497,6 @@ describe("user deletion report file transaction", () => {
 
     expect(restoreStagedManagedPaths).not.toHaveBeenCalled();
     expect(purgeStagedManagedPaths).not.toHaveBeenCalled();
-    expect(advisoryRelease).toHaveBeenCalledTimes(1);
   });
 
   test("uses surviving owner rows as the not-committed outcome when no report file was staged", async () => {
@@ -620,7 +584,6 @@ describe("user deletion report file transaction", () => {
 
     expect(restoreStagedManagedPaths).not.toHaveBeenCalled();
     expect(purgeStagedManagedPaths).not.toHaveBeenCalled();
-    expect(advisoryRelease).toHaveBeenCalledTimes(1);
   });
 
   test("returns batch-delete success after an ambiguous commit probe proves every owner absent", async () => {
@@ -696,18 +659,7 @@ describe("user deletion report file transaction", () => {
       "filesystem-action",
       "commit",
       "transaction-release",
-      "advisory-release",
     ]);
-    expect(tryAcquireManagedDeletionLocks).toHaveBeenCalledWith(
-      expect.anything(),
-      {
-        databaseName: TEST_DATABASE,
-        kind: "user-deletion",
-        entityIds: [77],
-        includeGlobalLock: true,
-      },
-      0,
-    );
   });
 
   test("purges an old-incarnation report journal when a reused user ID references another PDF", async () => {
@@ -750,8 +702,8 @@ describe("user deletion report file transaction", () => {
     expect(actualAction).toBe("purge");
   });
 
-  test("skips foreign-database and busy journals without touching their owner rows", async () => {
-    const actions: string[] = [];
+  test("skips foreign-database journals without touching their owner rows", async () => {
+    let action: string | undefined;
     reconcileStagedDeletionJournals.mockImplementationOnce(async (_root, resolver) => {
       const foreign = await resolver({
         version: 1,
@@ -760,30 +712,13 @@ describe("user deletion report file transaction", () => {
         metadata: { databaseName: "other_database", kind: "student-reports", entityIds: [77] },
         entries: [],
       });
-      actions.push(typeof foreign === "string" ? foreign : foreign.action);
-      tryAcquireManagedDeletionLocks.mockResolvedValueOnce(null);
-      const busy = await resolver({
-        version: 1,
-        operationId: "busy-op",
-        createdAt: new Date().toISOString(),
-        metadata: { databaseName: TEST_DATABASE, kind: "student-reports", entityIds: [77] },
-        entries: [],
-      });
-      actions.push(typeof busy === "string" ? busy : busy.action);
-      return {
-        scannedJournals: 2,
-        restoredJournals: 0,
-        purgedJournals: 0,
-        skippedJournals: 2,
-        failedJournals: 0,
-        failedJournalNames: [],
-      };
+      action = typeof foreign === "string" ? foreign : foreign.action;
+      return successfulReconcileResult("skip");
     });
 
     await reconcileReportDeletionJournals();
 
-    expect(actions).toEqual(["skip", "skip"]);
+    expect(action).toBe("skip");
     expect(poolQuery).not.toHaveBeenCalled();
-    expect(advisoryRelease).not.toHaveBeenCalled();
   });
 });

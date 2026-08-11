@@ -394,7 +394,7 @@ export const resolveGuidedStepTimeoutMs = (
     return MODEL_ORCHESTRATION_HARD_CAP;
   }
   // Protocol-v2 sessions are superseded before execution; this only keeps the
-  // old aggregate id safely bounded during a rolling deployment.
+  // old aggregate id safely bounded during a protocol-version transition.
   if (stepId === "retrain_chain") return MODEL_ORCHESTRATION_HARD_CAP;
   return TRAINING_TIMEOUT;
 };

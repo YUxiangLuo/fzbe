@@ -49,12 +49,12 @@ test("terminates and awaits the ADF subprocess even when killed pipes error", as
   (Bun as typeof Bun & { spawn: typeof Bun.spawn }).spawn = spawn as typeof Bun.spawn;
 
   const controller = new AbortController();
-  const lockLost = Object.assign(new Error("数据库模型锁已失效"), {
-    code: "MODEL_LOCK_LOST",
+  const operationAborted = Object.assign(new Error("模型操作已取消"), {
+    code: "MODEL_OPERATION_ABORTED",
   });
   const result = runAdf([{ month: "2025-01", sales: 100 }], controller.signal);
   while (spawn.mock.calls.length === 0) await Bun.sleep(1);
-  controller.abort(lockLost);
+  controller.abort(operationAborted);
 
   let settled = false;
   void result.finally(() => { settled = true; }).catch(() => {});
@@ -62,7 +62,7 @@ test("terminates and awaits the ADF subprocess even when killed pipes error", as
   expect(settled).toBe(false);
 
   resolveExit(137);
-  await expect(result).rejects.toBe(lockLost);
+  await expect(result).rejects.toBe(operationAborted);
   expect(proc.kill).toHaveBeenCalledWith("SIGTERM");
   expect(proc.exitCode).toBe(137);
 });

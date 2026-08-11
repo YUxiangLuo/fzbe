@@ -6,7 +6,6 @@ mock.restore();
 const srcRoot = path.resolve(import.meta.dir, "../../../src");
 const configModulePath = path.join(srcRoot, "config", "index.ts");
 const stagedDeletionModulePath = path.join(srcRoot, "utils", "staged-file-deletion.ts");
-const deletionLockModulePath = path.join(srcRoot, "utils", "managed-deletion-lock.ts");
 const serviceModulePath = `${path.join(srcRoot, "modules", "datasets", "datasets.service.ts")}?dataset-delete-test`;
 const TEST_DATABASE = "dataset_delete_test";
 
@@ -60,12 +59,6 @@ const classifyManagedDeletionOwnership = (
   const matches = entries.filter((entry) => referenceSet.has(entry.originalPath)).length;
   return matches === 0 ? "none" : matches === entries.length ? "all" : "partial";
 };
-const advisoryRelease = mock(async () => { lifecycle.push("advisory-release"); });
-const tryAcquireManagedDeletionLocks = mock(async () => ({
-  lockNames: ["unit-lock"],
-  release: advisoryRelease,
-}));
-
 mock.module(configModulePath, () => ({
   env: {
     DB_DATABASE: TEST_DATABASE,
@@ -85,10 +78,6 @@ mock.module(stagedDeletionModulePath, () => ({
   restoreStagedManagedPaths,
   purgeStagedManagedPaths,
   reconcileStagedDeletionJournals,
-}));
-
-mock.module(deletionLockModulePath, () => ({
-  tryAcquireManagedDeletionLocks,
 }));
 
 const { deleteDataset, reconcileDatasetDeletionJournals } = await import(serviceModulePath);
@@ -119,12 +108,6 @@ describe("deleteDataset file transaction", () => {
     });
     poolQuery.mockReset();
     poolQuery.mockResolvedValue([[]]);
-    advisoryRelease.mockClear();
-    tryAcquireManagedDeletionLocks.mockReset();
-    tryAcquireManagedDeletionLocks.mockResolvedValue({
-      lockNames: ["unit-lock"],
-      release: advisoryRelease,
-    });
     reconcileStagedDeletionJournals.mockReset();
     reconcileStagedDeletionJournals.mockResolvedValue({
       scannedJournals: 0,
@@ -155,7 +138,7 @@ describe("deleteDataset file transaction", () => {
     expect(stageManagedPathsForDeletion).toHaveBeenCalledTimes(1);
     expect(commit).toHaveBeenCalledTimes(1);
     expect(purgeStagedManagedPaths).toHaveBeenCalledWith([stagedEntry]);
-    expect(lifecycle).toEqual(["commit", "release", "purge", "advisory-release"]);
+    expect(lifecycle).toEqual(["commit", "release", "purge"]);
   });
 
   test("returns cleanupPending while retaining the durable journal for a retry", async () => {
@@ -167,7 +150,7 @@ describe("deleteDataset file transaction", () => {
     const result = await deleteDataset(7);
 
     expect(result).toEqual({ success: true, cleanupPending: true });
-    expect(lifecycle).toEqual(["commit", "release", "purge", "advisory-release"]);
+    expect(lifecycle).toEqual(["commit", "release", "purge"]);
   });
 
   test("does not turn a committed delete into an API failure when purge raises", async () => {
@@ -179,7 +162,7 @@ describe("deleteDataset file transaction", () => {
     const result = await deleteDataset(7);
 
     expect(result).toEqual({ success: true, cleanupPending: true });
-    expect(lifecycle).toEqual(["commit", "release", "purge", "advisory-release"]);
+    expect(lifecycle).toEqual(["commit", "release", "purge"]);
   });
 
   test("restores staged paths when the database delete fails", async () => {
@@ -212,7 +195,6 @@ describe("deleteDataset file transaction", () => {
     expect(destroy).toHaveBeenCalledTimes(1);
     expect(release).not.toHaveBeenCalled();
     expect(restoreStagedManagedPaths).toHaveBeenCalledWith([stagedEntry]);
-    expect(advisoryRelease).toHaveBeenCalledTimes(1);
   });
 
   test("treats a lost commit acknowledgement as success only after a fresh locking probe proves deletion", async () => {
@@ -233,7 +215,6 @@ describe("deleteDataset file transaction", () => {
     expect(rollback).not.toHaveBeenCalled();
     expect(restoreStagedManagedPaths).not.toHaveBeenCalled();
     expect(purgeStagedManagedPaths).toHaveBeenCalledWith([stagedEntry]);
-    expect(lifecycle.indexOf("purge")).toBeLessThan(lifecycle.indexOf("advisory-release"));
   });
 
   test("keeps ACK-loss deletion success when its post-probe purge raises", async () => {
@@ -256,7 +237,6 @@ describe("deleteDataset file transaction", () => {
     expect(result).toEqual({ success: true, cleanupPending: true });
     expect(destroy).toHaveBeenCalledTimes(1);
     expect(restoreStagedManagedPaths).not.toHaveBeenCalled();
-    expect(lifecycle.indexOf("purge")).toBeLessThan(lifecycle.indexOf("advisory-release"));
   });
 
   test("restores and reports the original commit error when the fresh probe finds the same owner paths", async () => {
@@ -277,7 +257,6 @@ describe("deleteDataset file transaction", () => {
     expect(destroy).toHaveBeenCalledTimes(1);
     expect(restoreStagedManagedPaths).toHaveBeenCalledWith([stagedEntry]);
     expect(purgeStagedManagedPaths).not.toHaveBeenCalled();
-    expect(lifecycle.indexOf("restore")).toBeLessThan(lifecycle.indexOf("advisory-release"));
   });
 
   test("retains staged evidence when the post-commit owner probe itself fails", async () => {
@@ -298,7 +277,6 @@ describe("deleteDataset file transaction", () => {
     expect(destroy).toHaveBeenCalledTimes(1);
     expect(restoreStagedManagedPaths).not.toHaveBeenCalled();
     expect(purgeStagedManagedPaths).not.toHaveBeenCalled();
-    expect(advisoryRelease).toHaveBeenCalledTimes(1);
   });
 
   test("destroys both ambiguous and probe sessions when the probe rollback acknowledgement is lost", async () => {
@@ -321,7 +299,6 @@ describe("deleteDataset file transaction", () => {
     expect(release).not.toHaveBeenCalled();
     expect(restoreStagedManagedPaths).not.toHaveBeenCalled();
     expect(purgeStagedManagedPaths).not.toHaveBeenCalled();
-    expect(advisoryRelease).toHaveBeenCalledTimes(1);
   });
 
   test.each([
@@ -366,17 +343,6 @@ describe("deleteDataset file transaction", () => {
     await reconcileDatasetDeletionJournals();
 
     expect(actualAction).toBe(expectedAction);
-    expect(tryAcquireManagedDeletionLocks).toHaveBeenCalledWith(
-      expect.anything(),
-      {
-        databaseName: TEST_DATABASE,
-        kind: "dataset",
-        entityIds: [7],
-        includeGlobalLock: true,
-      },
-      0,
-    );
-    expect(advisoryRelease).toHaveBeenCalledTimes(1);
   });
 
   test("purges an old-incarnation journal when a reused dataset ID references different paths", async () => {
@@ -442,7 +408,6 @@ describe("deleteDataset file transaction", () => {
     await reconcileDatasetDeletionJournals();
 
     expect(actualAction).toBe("skip");
-    expect(tryAcquireManagedDeletionLocks).not.toHaveBeenCalled();
     expect(poolQuery).not.toHaveBeenCalled();
   });
 });

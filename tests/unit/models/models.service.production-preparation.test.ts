@@ -73,11 +73,9 @@ const {
   backfillArtifactSha256ForRun,
   backfillProductionArtifactSha256ForRun,
   clearProductionArtifactForRun,
-  acquireModelExecutionLock,
-  acquireModelSlot,
+  tryAcquireModelExecutionLock,
   releaseModelExecutionLock,
-  releaseModelSlot,
-  verifyModelLockOwned,
+  verifyModelExecutionLockOwned,
   commitModelTrainingRun,
   buildExperimentTrainingRevision,
   buildModelTrainingRequestHash,
@@ -758,8 +756,7 @@ describe("models service production preparation", () => {
       session_status: "ready",
       next_step: { id: "initialize" },
     });
-    expect(acquireModelSlot).not.toHaveBeenCalled();
-    expect(acquireModelExecutionLock).not.toHaveBeenCalled();
+    expect(tryAcquireModelExecutionLock).not.toHaveBeenCalled();
     expect(spawnMock).not.toHaveBeenCalled();
   });
 
@@ -806,7 +803,6 @@ describe("models service production preparation", () => {
       next_step: { id: "fit_model", label: "重拟合生产模型" },
       error_message: null,
     });
-    expect(acquireModelSlot).not.toHaveBeenCalled();
     expect(spawnMock).not.toHaveBeenCalled();
   });
 
@@ -851,8 +847,7 @@ describe("models service production preparation", () => {
     ).rejects.toMatchObject({
       code: "PRODUCTION_PREPARATION_STEP_CONFLICT",
     });
-    expect(acquireModelSlot).not.toHaveBeenCalled();
-    expect(acquireModelExecutionLock).not.toHaveBeenCalled();
+    expect(tryAcquireModelExecutionLock).not.toHaveBeenCalled();
     expect(spawnMock).not.toHaveBeenCalled();
   });
 

@@ -63,11 +63,9 @@ const {
   backfillArtifactSha256ForRun,
   backfillProductionArtifactSha256ForRun,
   clearProductionArtifactForRun,
-  acquireModelExecutionLock,
-  acquireModelSlot,
+  tryAcquireModelExecutionLock,
   releaseModelExecutionLock,
-  releaseModelSlot,
-  verifyModelLockOwned,
+  verifyModelExecutionLockOwned,
   commitModelTrainingRun,
   buildExperimentTrainingRevision,
   buildModelTrainingRequestHash,
@@ -208,15 +206,15 @@ describe("models service runtime and artifacts", () => {
       kill,
     };
     const controller = new AbortController();
-    const lockLost = Object.assign(new Error("数据库模型锁已失效"), {
-      code: "MODEL_LOCK_LOST",
+    const operationAborted = Object.assign(new Error("模型操作已取消"), {
+      code: "MODEL_OPERATION_ABORTED",
     });
 
     const result = waitForAuxiliaryPythonProcess(proc, "校验融合模型产物", {
       terminationSignal: controller.signal,
       terminationGraceMs: 100,
     });
-    controller.abort(lockLost);
+    controller.abort(operationAborted);
     let settled = false;
     void result.finally(() => { settled = true; }).catch(() => {});
     await Bun.sleep(1);
@@ -224,11 +222,11 @@ describe("models service runtime and artifacts", () => {
 
     exitCode = 143;
     resolveExit(exitCode);
-    await expect(result).rejects.toBe(lockLost);
+    await expect(result).rejects.toBe(operationAborted);
     expect(kill).toHaveBeenCalledWith("SIGTERM");
   });
 
-  test("terminates an in-flight Python process when the model lock signal is lost", async () => {
+  test("terminates an in-flight Python process when the operation signal aborts", async () => {
     existsSync.mockImplementation((filePath: string) => filePath.endsWith("/run_model.py"));
     let stdoutController!: ReadableStreamDefaultController<Uint8Array>;
     let stderrController!: ReadableStreamDefaultController<Uint8Array>;
@@ -256,16 +254,16 @@ describe("models service runtime and artifacts", () => {
       }),
     };
     spawnMock.mockImplementationOnce(() => proc);
-    const lockSignal = new AbortController();
-    const lockLostError = Object.assign(new Error("数据库模型锁已失效"), {
-      code: "MODEL_LOCK_LOST",
+    const operationSignal = new AbortController();
+    const operationAbortError = Object.assign(new Error("模型操作已取消"), {
+      code: "MODEL_OPERATION_ABORTED",
     });
 
-    const execution = runPythonModel("ma", { data: "[]" }, undefined, undefined, lockSignal.signal);
+    const execution = runPythonModel("ma", { data: "[]" }, undefined, undefined, operationSignal.signal);
     await Promise.resolve();
-    lockSignal.abort(lockLostError);
+    operationSignal.abort(operationAbortError);
 
-    await expect(execution).rejects.toBe(lockLostError);
+    await expect(execution).rejects.toBe(operationAbortError);
     expect(proc.kill).toHaveBeenCalledWith("SIGTERM");
   });
 

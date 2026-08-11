@@ -72,9 +72,8 @@ export type ManagedDeletionReconcileAction = "restore" | "purge" | "skip";
 export interface ManagedDeletionReconcileResolution {
   action: ManagedDeletionReconcileAction;
   /**
-   * Optional lease release hook. Reconciliation keeps this lease until the
-   * filesystem action is complete, which lets callers hold a cross-process
-   * advisory lock across both the database decision and restore/purge.
+   * Optional database-row lease release hook. Reconciliation keeps the row
+   * locks until the filesystem restore/purge decision has completed.
    */
   release?: () => Promise<void>;
 }

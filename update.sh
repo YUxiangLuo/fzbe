@@ -14,6 +14,11 @@ if ! flock -n 9; then
 fi
 
 service_name="fangzhen-be.service"
+service_kill_mode="$(systemctl show "$service_name" --property=KillMode --value)"
+if [[ "$service_kill_mode" != "control-group" ]]; then
+  echo "Deployment aborted: $service_name KillMode must be control-group so Bun and all Python/Chromium children stop together." >&2
+  exit 1
+fi
 service_working_directory="$(systemctl show "$service_name" --property=WorkingDirectory --value)"
 if [[ ! -d "$service_working_directory" ]]; then
   echo "Deployment aborted: $service_name WorkingDirectory does not exist: $service_working_directory" >&2
@@ -49,7 +54,7 @@ fi
 service_direct_environment="$(systemctl show "$service_name" --property=Environment --value)"
 if deployment_environment_has_protected_override "$service_direct_environment"; then
   echo "Deployment aborted: $service_name has a deployment-sensitive Environment= override." >&2
-  echo "Put DB_*, HOST, PORT, JWT*, and ALLOW_* values only in $project_root/.env." >&2
+  echo "Put DB_*, HOST, PORT, JWT*, ALLOW_*, NODE_ENV, and BUN_ENV values only in $project_root/.env." >&2
   exit 1
 fi
 
@@ -100,6 +105,34 @@ assert_deployment_environment_unchanged() {
     echo "No activation or restart will use an environment that was not staged and migrated." >&2
     return 1
   fi
+}
+
+assert_single_instance_production_environment() {
+  # JavaScript template literals are evaluated by Bun, not by this shell.
+  # shellcheck disable=SC2016
+  run_bun_with_service_environment "$deployment_environment_snapshot" "$project_root" -e '
+    const modes = [process.env.NODE_ENV, process.env.BUN_ENV]
+      .map((value) => String(value ?? "").trim().toLowerCase());
+    if (!modes.includes("production")) {
+      console.error("Deployment aborted: NODE_ENV=production (or BUN_ENV=production) must be set in .env.");
+      process.exit(1);
+    }
+    const removedNames = [
+      "MODEL_LOCK_CONNECTION_ACQUIRE_TIMEOUT_MS",
+      "MODEL_LOCK_QUERY_TIMEOUT_MS",
+      "DB_QUERY_HEADROOM",
+    ].filter((name) => process.env[name]?.trim());
+    if (removedNames.length > 0) {
+      console.error(`Deployment aborted: remove obsolete advisory-lock settings: ${removedNames.join(", ")}.`);
+      process.exit(1);
+    }
+    const host = process.env.HOST?.trim() || "127.0.0.1";
+    const port = process.env.PORT?.trim() || "3001";
+    if (host !== "127.0.0.1" || port !== "3001") {
+      console.error(`Deployment aborted: production binding must be exactly 127.0.0.1:3001, got ${host}:${port}.`);
+      process.exit(1);
+    }
+  '
 }
 
 resolve_health_url() {
@@ -209,6 +242,7 @@ trap recover_and_cleanup EXIT
 git worktree add --detach "$release_dir" "$target_commit"
 cp -p -- "$project_root/.env" "$deployment_environment_snapshot"
 assert_deployment_environment_unchanged
+assert_single_instance_production_environment
 
 if ! git diff --quiet "$current_commit" "$target_commit" -- py/requirements.txt py/install.sh; then
   python_environment_changed=true
@@ -221,6 +255,12 @@ echo "===========PREPARE BACKEND RELEASE============"
   if [[ "$python_environment_changed" == true ]]; then
     ./py/install.sh
   fi
+  # Validate the target release's production environment and derived runtime
+  # budgets before the live service enters the stop window.
+  run_bun_with_service_environment \
+    "$deployment_environment_snapshot" \
+    "$release_dir" \
+    -e 'await import("./src/config/env.ts"); await import("./src/utils/constants.ts");'
   ./actions.sh
 )
 

@@ -212,7 +212,7 @@ export async function predictExperimentModel(
 
     return await withModelOperationLease(
       operationContext,
-      { mode: "slot_and_execution", experimentId, modelType },
+      { execution: { experimentId, modelType } },
       async (lease) => await predictExperimentModelWithLease(
         modelType,
         studentId,

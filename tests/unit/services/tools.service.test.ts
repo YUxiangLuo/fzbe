@@ -44,10 +44,10 @@ test("passes the internal lease termination signal to ADF", async () => {
   const series = [{ month: "2025-01", sales: 100 }];
   await performAdfTest(series);
 
-  expect(withModelOperationContext).toHaveBeenCalledWith("adf", expect.any(Function), 32_000);
+  expect(withModelOperationContext).toHaveBeenCalledWith("adf", expect.any(Function), 34_000);
   expect(withModelOperationLease).toHaveBeenCalledWith(
     expect.anything(),
-    { mode: "slot_only" },
+    {},
     expect.any(Function),
   );
   expect(runAdf).toHaveBeenCalledWith(series, terminationController.signal);

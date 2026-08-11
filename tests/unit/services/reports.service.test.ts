@@ -54,9 +54,12 @@ const page = {
   setContent: mock(async () => {}),
   pdf: pagePdf,
 };
+const browserProcessKill = mock((_signal: NodeJS.Signals) => true);
+const browserProcess = { kill: browserProcessKill };
 const browser = {
   newPage: mock(async () => page),
   close: mock(async () => {}),
+  process: mock(() => browserProcess),
 };
 const launch = mock(async () => browser);
 
@@ -106,6 +109,7 @@ const {
   submitReport: submitReportService,
   cleanupReplacedReportPdf,
   getLatestReportStatus,
+  PdfGenerationTimeoutError,
 } = await import(freshReportsServiceModulePath);
 
 const submitReport = (
@@ -341,7 +345,10 @@ describe("reports service", () => {
     launch.mockReset();
     launch.mockResolvedValue(browser);
     browser.newPage.mockClear();
-    browser.close.mockClear();
+    browser.close.mockReset();
+    browser.close.mockResolvedValue(undefined);
+    browser.process.mockClear();
+    browserProcessKill.mockClear();
     page.setExtraHTTPHeaders.mockClear();
     page.setJavaScriptEnabled.mockClear();
     page.setContent.mockClear();
@@ -674,6 +681,67 @@ describe("reports service", () => {
     expect(connectionQuery.mock.calls.some(([sql]) =>
       String(sql).includes("SELECT run_id, production_revision")
     )).toBeFalse();
+  });
+
+  test("normalizes Puppeteer timeouts and removes a partial PDF", async () => {
+    const experiment = buildExperiment({ experiment_id: 990014 });
+    poolQuery.mockImplementation(async (sql: string) => {
+      if (sql.includes("SELECT * FROM experiment_status")) return [[experiment]];
+      throw new Error(`Unexpected SQL in PDF timeout test: ${sql}`);
+    });
+    const puppeteerTimeout = new Error("page.pdf timed out");
+    puppeteerTimeout.name = "TimeoutError";
+    pagePdf.mockImplementationOnce(async (options: { path: string }) => {
+      await Bun.write(options.path, "partial-pdf");
+      throw puppeteerTimeout;
+    });
+
+    await expect(submitReport(990014, 20241002, "# Test"))
+      .rejects.toBeInstanceOf(PdfGenerationTimeoutError);
+    expect(getConnection).not.toHaveBeenCalled();
+    expect(browser.close).toHaveBeenCalledTimes(1);
+    expect(await listGeneratedReports(990014, 20241002)).toEqual([]);
+  });
+
+  test("keeps a generated report when browser close rejects and force-terminates the process", async () => {
+    const experiment = buildExperiment({ experiment_id: 990013 });
+    poolQuery.mockImplementation(async (sql: string) => {
+      if (sql.includes("SELECT * FROM experiment_status")) return [[experiment]];
+      throw new Error(`Unexpected SQL in browser close rejection test: ${sql}`);
+    });
+    connectionQuery.mockImplementation(async (sql: string) => {
+      if (sql === "SET TRANSACTION ISOLATION LEVEL READ COMMITTED") return [[]];
+      if (sql.includes("SELECT user_id FROM users")) return [[{ user_id: 20241002 }]];
+      if (sql.includes("SELECT * FROM experiment_status") && sql.includes("FOR UPDATE")) {
+        return [[experiment]];
+      }
+      if (sql.includes("SELECT run_id, production_revision")) {
+        return [[{
+          run_id: REPORT_RUN_ID,
+          production_revision: REPORT_PRODUCTION_REVISION,
+        }]];
+      }
+      if (sql.includes("FROM experiment_reports") && sql.includes("FOR UPDATE")) return [[]];
+      if (sql.includes("INSERT INTO experiment_reports")) {
+        return [{ insertId: 880013, affectedRows: 1 }];
+      }
+      if (sql.includes("UPDATE experiment_grade") || sql.includes("UPDATE experiment_status")) {
+        return [{ affectedRows: 1 }];
+      }
+      throw new Error(`Unexpected SQL in browser close rejection transaction: ${sql}`);
+    });
+    browser.close.mockRejectedValueOnce(new Error("browser close failed"));
+    browserProcessKill.mockImplementationOnce(() => {
+      throw new Error("kill acknowledgement failed");
+    });
+
+    await expect(submitReport(990013, 20241002, "# Test")).resolves.toMatchObject({
+      data: { report_id: 880013 },
+      isUpdate: false,
+    });
+    expect(browserProcessKill).toHaveBeenCalledWith("SIGKILL");
+    expect(logger.warn).toHaveBeenCalledTimes(1);
+    expect(await listGeneratedReports(990013, 20241002)).toHaveLength(1);
   });
 
   test("gives same-millisecond report submissions independent PDF ownership", async () => {

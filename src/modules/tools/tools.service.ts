@@ -7,7 +7,7 @@ import {
 
 export async function performAdfTest(series: AdfInputPoint[]): Promise<AdfResult> {
   return await withModelOperationContext("adf", async (context) =>
-    await withModelOperationLease(context, { mode: "slot_only" }, async (lease) => {
+    await withModelOperationLease(context, {}, async (lease) => {
       lease.throwIfTerminated();
       const result = await runAdf(series, lease.terminationSignal);
       lease.throwIfTerminated();

@@ -6,13 +6,15 @@ import {
   resetAuthRateLimitersForTest,
 } from "../../../src/modules/auth/auth.rate-limit";
 import { RATE_LIMITS } from "../../../src/utils/constants";
+import { getClientIp } from "../../../src/utils/rate-limit";
 
 interface FakeContext extends Context {
   capturedHeaders: Headers;
 }
 
-function createContext(ip: string): FakeContext {
+function createContext(ip: string, realIp?: string): FakeContext {
   const requestHeaders = new Headers({ "x-forwarded-for": ip });
+  if (realIp) requestHeaders.set("x-real-ip", realIp);
   const capturedHeaders = new Headers();
 
   return {
@@ -43,6 +45,13 @@ async function expectRateLimitResponse(response: Response | null, expectedError:
 describe("auth rate limit guards", () => {
   beforeEach(() => {
     resetAuthRateLimitersForTest();
+  });
+
+  test("uses nginx-authenticated X-Real-IP instead of spoofable forwarding prefixes", () => {
+    expect(getClientIp(createContext("192.0.2.9, 198.51.100.10", "203.0.113.7")))
+      .toBe("203.0.113.7");
+    expect(getClientIp(createContext("192.0.2.9, 198.51.100.10")))
+      .toBe("198.51.100.10");
   });
 
   test("blocks repeated login attempts for the same account before service execution", async () => {

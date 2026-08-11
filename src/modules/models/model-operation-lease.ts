@@ -8,14 +8,11 @@ import {
   ModelOperationDeadlineError,
 } from "./model-errors";
 import {
-  acquireModelExecutionLock,
-  acquireModelSlot,
-  combineModelLockSignals,
   releaseModelExecutionLock,
-  releaseModelSlot,
-  verifyModelLockOwned,
-  type AdvisoryLockHandle,
-} from "./model-locks";
+  tryAcquireModelExecutionLock,
+  verifyModelExecutionLockOwned,
+  type ModelExecutionLockHandle,
+} from "./model-execution-lock";
 
 export type ModelOperation =
   | "guided_training_session"
@@ -24,8 +21,6 @@ export type ModelOperation =
   | "production_preparation"
   | "prediction"
   | "adf";
-
-type ModelLeaseMode = "slot_and_execution" | "slot_only" | "execution_only";
 
 export interface ModelOperationContext {
   readonly operation: ModelOperation;
@@ -40,24 +35,19 @@ export interface ModelOperationLease {
 }
 
 interface LeaseOptions {
-  mode: ModelLeaseMode;
-  experimentId?: number;
-  modelType?: ModelType;
+  execution?: {
+    experimentId: number;
+    modelType: ModelType;
+  };
 }
 
-export interface ModelOperationLockAdapter {
-  acquireModelSlot(signal?: AbortSignal): Promise<AdvisoryLockHandle | null>;
-  acquireModelExecutionLock(
+export interface ModelExecutionLockAdapter {
+  tryAcquire(
     experimentId: number,
     modelType: ModelType,
-    signal?: AbortSignal,
-  ): Promise<AdvisoryLockHandle | null>;
-  releaseModelExecutionLock(handle: AdvisoryLockHandle | null | undefined): Promise<void>;
-  releaseModelSlot(handle: AdvisoryLockHandle | null | undefined): Promise<void>;
-  verifyModelLockOwned(handle: AdvisoryLockHandle | null | undefined): Promise<void>;
-  combineModelLockSignals(
-    ...handles: Array<AdvisoryLockHandle | null | undefined>
-  ): AbortSignal | undefined;
+  ): ModelExecutionLockHandle | null;
+  release(handle: ModelExecutionLockHandle | null | undefined): void;
+  verifyOwned(handle: ModelExecutionLockHandle | null | undefined): void;
 }
 
 interface ModelOperationLogger {
@@ -68,17 +58,14 @@ interface ModelOperationLogger {
 export interface ModelOperationLeaseManagerOptions {
   capacity: number;
   deadlineMs: number;
-  locks?: ModelOperationLockAdapter;
+  executionLocks?: ModelExecutionLockAdapter;
   logger?: ModelOperationLogger;
 }
 
-const defaultLocks: ModelOperationLockAdapter = {
-  acquireModelSlot,
-  acquireModelExecutionLock,
-  releaseModelExecutionLock,
-  releaseModelSlot,
-  verifyModelLockOwned,
-  combineModelLockSignals,
+const defaultExecutionLocks: ModelExecutionLockAdapter = {
+  tryAcquire: tryAcquireModelExecutionLock,
+  release: releaseModelExecutionLock,
+  verifyOwned: verifyModelExecutionLockOwned,
 };
 
 const abortReason = (signal: AbortSignal): Error => {
@@ -97,7 +84,7 @@ export function createModelOperationLeaseManager(
   }
 
   const admission = new Semaphore(options.capacity);
-  const locks = options.locks ?? defaultLocks;
+  const executionLocks = options.executionLocks ?? defaultExecutionLocks;
   const operationLogger = options.logger ?? logger;
   const operationStats = {
     started: 0,
@@ -120,6 +107,7 @@ export function createModelOperationLeaseManager(
   const getModelOperationStats = () => ({
     ...operationStats,
     admission: {
+      scope: "process" as const,
       capacity: admission.capacity,
       active: admission.active,
       pending: admission.pending,
@@ -196,43 +184,22 @@ export function createModelOperationLeaseManager(
     operationStats.activeLeases += 1;
     incrementActive(context.operation, 1);
 
-    let slotLock: AdvisoryLockHandle | null = null;
-    let executionLock: AdvisoryLockHandle | null = null;
+    let executionLock: ModelExecutionLockHandle | null = null;
     try {
-      const needsSlot = leaseOptions.mode !== "execution_only";
-      const needsExecution = leaseOptions.mode !== "slot_only";
-
-      if (needsSlot) {
-        slotLock = await locks.acquireModelSlot(context.deadlineSignal);
-        context.throwIfTerminated();
-        if (!slotLock) {
-          operationStats.capacityRejected += 1;
-          throw new ModelCapacityBusyError();
-        }
-      }
-
-      if (needsExecution) {
-        if (leaseOptions.experimentId === undefined || leaseOptions.modelType === undefined) {
-          throw new Error("execution lock requires experimentId and modelType");
-        }
-        executionLock = await locks.acquireModelExecutionLock(
-          leaseOptions.experimentId,
-          leaseOptions.modelType,
-          context.deadlineSignal,
+      if (leaseOptions.execution) {
+        executionLock = executionLocks.tryAcquire(
+          leaseOptions.execution.experimentId,
+          leaseOptions.execution.modelType,
         );
-        context.throwIfTerminated();
         if (!executionLock) {
           operationStats.modelBusyRejected += 1;
           throw new ModelConflictError("同一模型正在训练或预测，请稍后再试", "MODEL_BUSY");
         }
       }
 
-      const lockSignal = locks.combineModelLockSignals(slotLock, executionLock);
       // Deliberately internal-only: never merge the HTTP Request.signal here.
       // Once admitted, closing/offlining the browser must not cancel backend work.
-      const terminationSignal = lockSignal
-        ? AbortSignal.any([context.deadlineSignal, lockSignal])
-        : context.deadlineSignal;
+      const terminationSignal = context.deadlineSignal;
       const throwIfTerminated = () => {
         if (terminationSignal.aborted) throw abortReason(terminationSignal);
       };
@@ -241,9 +208,7 @@ export function createModelOperationLeaseManager(
         throwIfTerminated,
         verifyOwned: async () => {
           throwIfTerminated();
-          await locks.verifyModelLockOwned(slotLock);
-          throwIfTerminated();
-          await locks.verifyModelLockOwned(executionLock);
+          executionLocks.verifyOwned(executionLock);
           throwIfTerminated();
         },
       };
@@ -252,17 +217,13 @@ export function createModelOperationLeaseManager(
       throwIfTerminated();
       return result;
     } finally {
-      // Reverse order is part of the resource invariant: execution -> slot -> admission.
+      // The execution mutex is nested inside admission and must be released first.
       try {
-        await locks.releaseModelExecutionLock(executionLock);
+        executionLocks.release(executionLock);
       } finally {
-        try {
-          await locks.releaseModelSlot(slotLock);
-        } finally {
-          admission.release();
-          operationStats.activeLeases = Math.max(0, operationStats.activeLeases - 1);
-          incrementActive(context.operation, -1);
-        }
+        admission.release();
+        operationStats.activeLeases = Math.max(0, operationStats.activeLeases - 1);
+        incrementActive(context.operation, -1);
       }
     }
   };
