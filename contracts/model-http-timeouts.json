@@ -1,0 +1,19 @@
+{
+  "schemaVersion": 1,
+  "policyVersion": 1,
+  "model": {
+    "executionHardCapMs": 600000,
+    "orchestrationHardCapMs": 630000,
+    "operationDeadlineHardCapMs": 660000,
+    "processTerminationGraceDefaultMs": 5000,
+    "responseReserveMs": 6000,
+    "nginxReadTimeoutMs": 675000,
+    "browserRequestTimeoutMs": 690000,
+    "metadataBrowserRequestTimeoutMs": 30000
+  },
+  "adf": {
+    "executionTimeoutMs": 30000,
+    "nginxReadTimeoutMs": 45000,
+    "browserRequestTimeoutMs": 120000
+  }
+}

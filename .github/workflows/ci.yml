@@ -58,6 +58,9 @@ jobs:
       - name: Typecheck
         run: bun run typecheck
 
+      - name: Validate model HTTP timeout contract
+        run: bun run timeout:check
+
       - name: Validate OpenAPI contract
         run: bun run lint:openapi
 

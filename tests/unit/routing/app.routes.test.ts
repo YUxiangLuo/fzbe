@@ -471,6 +471,7 @@ describe("app route smoke tests", () => {
           adfOperationMs?: unknown;
           adfOperationCleanupBudgetMs?: unknown;
           adfNginxReadMs?: unknown;
+          adfBrowserRequestMs?: unknown;
           pdfQueueMs?: unknown;
           pdfGenerationMs?: unknown;
         };
@@ -507,6 +508,7 @@ describe("app route smoke tests", () => {
       adfOperationMs: 34_000,
       adfOperationCleanupBudgetMs: 11_000,
       adfNginxReadMs: 45_000,
+      adfBrowserRequestMs: 120_000,
     });
     expect(payload.data?.modelOperations).toMatchObject({
       admission: {

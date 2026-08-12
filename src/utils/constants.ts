@@ -4,6 +4,7 @@
  */
 
 import { availableParallelism } from "node:os";
+import { MODEL_HTTP_TIMEOUT_CONTRACT } from "../config/model-http-timeout-contract";
 
 function parsePositiveIntegerEnv(name: string): number | null {
   const rawValue = process.env[name]?.trim();
@@ -20,10 +21,12 @@ function parsePositiveIntegerEnv(name: string): number | null {
   return parsed;
 }
 
-/** 模型执行的不可配置硬上限：10 分钟。 */
-export const MODEL_EXECUTION_HARD_CAP_MS = 10 * 60 * 1000;
+/** 模型执行和传输层的静态预算来自版本化跨仓契约。 */
+export const MODEL_EXECUTION_HARD_CAP_MS =
+  MODEL_HTTP_TIMEOUT_CONTRACT.model.executionHardCapMs;
 /** A guided/production orchestration process may give one nested model the full cap. */
-export const MODEL_ORCHESTRATION_HARD_CAP_MS = 630_000;
+export const MODEL_ORCHESTRATION_HARD_CAP_MS =
+  MODEL_HTTP_TIMEOUT_CONTRACT.model.orchestrationHardCapMs;
 
 function parseModelTimeoutEnv(name: string, fallbackMs: number): number {
   const value = parsePositiveIntegerEnv(name) ?? fallbackMs;
@@ -37,22 +40,24 @@ function parseModelTimeoutEnv(name: string, fallbackMs: number): number {
 
 /**
  * 模型 HTTP 超时必须保持：operation + 最坏进程终止 + 响应余量 <= nginx < browser。
- * nginx 和前端当前是静态部署配置，因此后端只允许缩短 operation deadline，
- * 不允许通过单个环境变量把它提高到传输层预算之外。
+ * 静态预算由 contracts/model-http-timeouts.json 定义；环境变量只能缩短后端 deadline。
  */
 export const MODEL_HTTP_TIMEOUT_BUDGETS = {
-  OPERATION_DEADLINE_HARD_CAP: 660_000,
-  NGINX_READ: 675_000,
-  BROWSER_REQUEST: 690_000,
+  OPERATION_DEADLINE_HARD_CAP:
+    MODEL_HTTP_TIMEOUT_CONTRACT.model.operationDeadlineHardCapMs,
+  NGINX_READ: MODEL_HTTP_TIMEOUT_CONTRACT.model.nginxReadTimeoutMs,
+  BROWSER_REQUEST: MODEL_HTTP_TIMEOUT_CONTRACT.model.browserRequestTimeoutMs,
   /** Includes the bounded failure-status write plus response serialization/network time. */
-  RESPONSE_RESERVE: 6_000,
+  RESPONSE_RESERVE: MODEL_HTTP_TIMEOUT_CONTRACT.model.responseReserveMs,
 } as const;
 
-const ADF_EXECUTION_TIMEOUT_MS = 30_000;
+const ADF_EXECUTION_TIMEOUT_MS =
+  MODEL_HTTP_TIMEOUT_CONTRACT.adf.executionTimeoutMs;
 
 /** The production nginx exact ADF route uses this independent short budget. */
 export const ADF_HTTP_TIMEOUT_BUDGETS = {
-  NGINX_READ: 45_000,
+  NGINX_READ: MODEL_HTTP_TIMEOUT_CONTRACT.adf.nginxReadTimeoutMs,
+  BROWSER_REQUEST: MODEL_HTTP_TIMEOUT_CONTRACT.adf.browserRequestTimeoutMs,
   RESPONSE_RESERVE: MODEL_HTTP_TIMEOUT_BUDGETS.RESPONSE_RESERVE,
 } as const;
 
@@ -69,7 +74,8 @@ const MODEL_DB_QUERY_TIMEOUT_MS =
 const MODEL_DB_CONNECTION_ACQUIRE_TIMEOUT_MS =
   parsePositiveIntegerEnv("MODEL_DB_CONNECTION_ACQUIRE_TIMEOUT_MS") ?? 10_000;
 const MODEL_PROCESS_TERMINATION_GRACE_MS =
-  parsePositiveIntegerEnv("MODEL_PROCESS_TERMINATION_GRACE_MS") ?? 5_000;
+  parsePositiveIntegerEnv("MODEL_PROCESS_TERMINATION_GRACE_MS")
+  ?? MODEL_HTTP_TIMEOUT_CONTRACT.model.processTerminationGraceDefaultMs;
 const ADF_OPERATION_CLEANUP_BUDGET_MS =
   MODEL_PROCESS_TERMINATION_GRACE_MS
   + ADF_HTTP_TIMEOUT_BUDGETS.RESPONSE_RESERVE;
