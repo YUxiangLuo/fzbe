@@ -44,6 +44,7 @@ const buildRuntimeInfo = () => ({
     adfOperationMs: TIMEOUTS.ADF_OPERATION,
     adfOperationCleanupBudgetMs: TIMEOUTS.ADF_OPERATION_CLEANUP_BUDGET,
     adfNginxReadMs: ADF_HTTP_TIMEOUT_BUDGETS.NGINX_READ,
+    adfBrowserRequestMs: ADF_HTTP_TIMEOUT_BUDGETS.BROWSER_REQUEST,
     modelTrainingMs: TIMEOUTS.MODEL_TRAINING,
     modelPredictionMs: TIMEOUTS.MODEL_PREDICTION,
     pdfQueueMs: TIMEOUTS.PDF_QUEUE,

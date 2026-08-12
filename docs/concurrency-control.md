@@ -35,7 +35,7 @@ TF_NUM_INTEROP_THREADS = 1
 
 ## 3. 配置入口
 
-主要配置由 `src/utils/constants.ts` 统一计算。
+跨后端、nginx 和浏览器的静态模型/ADF 预算以 `contracts/model-http-timeouts.json` 为唯一数据源，生成和发布规则见 [model-http-timeouts.md](./model-http-timeouts.md)。`src/utils/constants.ts` 校验该契约，并在其上应用只能缩短有效 deadline 的环境覆盖。
 
 | 配置项 | 默认值 | 说明 |
 | --- | ---: | --- |
@@ -113,7 +113,7 @@ Retry-After: 2
 - 每次 predict 独立计时；
 - ADF 使用较短的独立预算。
 
-静态传输层预算为：
+当前契约生成的静态传输层预算为：
 
 ```text
 Python <= 600s
