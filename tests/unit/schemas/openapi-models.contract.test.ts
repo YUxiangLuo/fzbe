@@ -102,7 +102,7 @@ describe("OpenAPI model contracts", () => {
       .toMatchObject({ type: "integer", minimum: 2, maximum: 12 });
     expect(schemas.ModelPredictRequest.properties.forecast_steps)
       .toMatchObject({ type: "integer", minimum: 2, maximum: 12 });
-    expect(schemas.ProductionPreparationSessionResponse.properties.results.properties
+    expect(schemas.ProductionPreparationSessionResponsePayload.properties.results.properties
       .prepared_forecast_steps)
       .toMatchObject({ type: "integer", minimum: 2, maximum: 12 });
     expect(schemas.ProductionPredictionResults.properties.predictions)
@@ -149,6 +149,59 @@ describe("OpenAPI model contracts", () => {
     expect(schemas.ModelObservabilityResponse.properties.data.$ref)
       .toBe("#/components/schemas/ModelObservabilityResponsePayload");
     expect(schemas.ModelObservabilityResponsePayload.required).toEqual(["models"]);
+  });
+
+  test("documents the application-level envelopes for guided and production sessions", () => {
+    const guidedResponseRef = "#/components/schemas/GuidedTrainingSessionResponse";
+    const guidedOperations = [
+      document.paths["/api/v1/models/{model_type}/guided-training/sessions"].post,
+      document.paths["/api/v1/models/{model_type}/guided-training/sessions/{session_id}"].get,
+      document.paths[
+        "/api/v1/models/{model_type}/guided-training/sessions/{session_id}/steps/{step_id}/run"
+      ].post,
+    ];
+    for (const operation of guidedOperations) {
+      expect(operation.responses["200"].content["application/json"].schema.$ref)
+        .toBe(guidedResponseRef);
+    }
+    expect(schemas.GuidedTrainingSessionResponse.required).toEqual(["data"]);
+    expect(schemas.GuidedTrainingSessionResponse.properties.data.$ref)
+      .toBe("#/components/schemas/GuidedTrainingSession");
+    expect(schemas.GuidedTrainingSession.required).toEqual([
+      "session_id",
+      "experiment_id",
+      "model_type",
+      "status",
+      "current_step_id",
+      "next_step_id",
+      "steps",
+      "step_outputs",
+      "result",
+      "error_message",
+      "error_code",
+      "experiment_state_version",
+    ]);
+
+    const preparationResponseRef =
+      "#/components/schemas/ProductionPreparationSessionResponse";
+    const preparationOperations = [
+      document.paths["/api/v1/models/{model_type}/production-preparation/sessions"].post,
+      document.paths[
+        "/api/v1/models/{model_type}/production-preparation/sessions/{session_id}"
+      ].get,
+      document.paths[
+        "/api/v1/models/{model_type}/production-preparation/sessions/{session_id}/steps/{step_id}/run"
+      ].post,
+    ];
+    for (const operation of preparationOperations) {
+      expect(operation.responses["200"].content["application/json"].schema.$ref)
+        .toBe(preparationResponseRef);
+    }
+    expect(schemas.ProductionPreparationSessionResponse.required).toEqual(["data"]);
+    expect(schemas.ProductionPreparationSessionResponse.properties.data.$ref)
+      .toBe("#/components/schemas/ProductionPreparationSessionResponsePayload");
+    expect(schemas.ProductionPreparationSessionResponsePayload.required)
+      .toEqual(["status", "results"]);
   });
 
   test("documents read-only legacy forecasts separately from strict v2 writes", () => {

@@ -1255,7 +1255,19 @@ components:
 
     GuidedTrainingSession:
       type: object
-      required: [session_id, experiment_id, model_type, status, steps, step_outputs]
+      required:
+        - session_id
+        - experiment_id
+        - model_type
+        - status
+        - current_step_id
+        - next_step_id
+        - steps
+        - step_outputs
+        - result
+        - error_message
+        - error_code
+        - experiment_state_version
       properties:
         session_id:
           type: string
@@ -1300,8 +1312,12 @@ components:
           nullable: true
 
     GuidedTrainingSessionResponse:
-      allOf:
-        - $ref: '#/components/schemas/GuidedTrainingSession'
+      type: object
+      description: 全局成功响应中间件会把 guided training 会话包装在 data 字段内。
+      required: [data]
+      properties:
+        data:
+          $ref: '#/components/schemas/GuidedTrainingSession'
 
     ProductionPreparationStep:
       type: object
@@ -1314,7 +1330,7 @@ components:
           type: string
           minLength: 1
 
-    ProductionPreparationSessionResponse:
+    ProductionPreparationSessionResponsePayload:
       type: object
       required: [status, results]
       properties:
@@ -1361,6 +1377,14 @@ components:
               maximum: 12
             reused_existing:
               type: boolean
+
+    ProductionPreparationSessionResponse:
+      type: object
+      description: 全局成功响应中间件会把生产准备会话 payload 包装在 data 字段内。
+      required: [data]
+      properties:
+        data:
+          $ref: '#/components/schemas/ProductionPreparationSessionResponsePayload'
 
     AcademicTerm:
       type: object
