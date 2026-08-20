@@ -934,15 +934,76 @@ describe("experiments service", () => {
 
     const result = await updateExperiment(990002, 20240002, input);
 
+    expect(result).toEqual({
+      error: "invalid_production_plan",
+      code: "PRODUCTION_PLAN_INVALID",
+      message: expect.stringContaining("完整覆盖"),
+    });
     const updateCall = connectionQuery.mock.calls.find(([sql]) =>
       String(sql).includes("UPDATE experiment_status SET")
     );
-    expect(updateCall?.[1]).toContain(JSON.stringify([validProductionPredictionPoint]));
-    expect(String(updateCall?.[0])).toContain("production_forecast_evidence = ?");
-    expect(updateCall?.[1]).toContain(null);
+    expect(updateCall).toBeUndefined();
+  });
+
+  test("persists a signed incomplete v2 forecast draft bound to the selected model", async () => {
+    const forecasts = [{ ...validProductionPredictionPoint }, { ...validProductionPredictionPoint }];
+    const evidence = issueProductionForecastEvidence({
+      experiment_id: 990002,
+      student_id: 20240002,
+      model_type: "arima",
+      run_id: "draft-run",
+      production_revision: "draft-revision",
+      forecast_steps: forecasts.length,
+      forecasts,
+    });
+    connectionQuery
+      .mockResolvedValueOnce([
+        [{
+          experiment_id: 990002,
+          student_id: 20240002,
+          status: "In Progress",
+          selected_best_model: "arima",
+          start_time: "2026-03-08T09:00:00.000Z",
+          last_activity_at: "2026-03-08T09:30:00.000Z",
+          total_active_duration_seconds: 120,
+          state_version: 0,
+        }],
+      ])
+      .mockResolvedValueOnce([
+        [{
+          run_id: "draft-run",
+          production_revision: "draft-revision",
+        }],
+      ])
+      .mockResolvedValueOnce([{ affectedRows: 1 }])
+      .mockResolvedValueOnce([
+        [{
+          experiment_id: 990002,
+          student_id: 20240002,
+          status: "In Progress",
+          selected_best_model: "arima",
+          production_forecast_results: JSON.stringify(forecasts),
+          production_forecast_evidence: evidence,
+        }],
+      ]);
+    const input = updateExperimentSchema.parse({
+      expected_version: 0,
+      production_forecast_periods: 2,
+      production_forecast_results: forecasts,
+      production_forecast_evidence: evidence,
+    });
+
+    const result = await updateExperiment(990002, 20240002, input);
+
+    const updateCall = connectionQuery.mock.calls.find(([sql]) =>
+      String(sql).includes("UPDATE experiment_status SET")
+    );
+    expect(updateCall?.[1]).toContain(JSON.stringify(forecasts));
+    expect(updateCall?.[1]).toContain(evidence);
     expect(result).toEqual({
       data: expect.objectContaining({
-        production_forecast_results: [validProductionPredictionPoint],
+        production_forecast_results: forecasts,
+        production_forecast_evidence: evidence,
       }),
     });
   });

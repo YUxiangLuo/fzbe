@@ -520,6 +520,41 @@ describe("Experiments Schemas", () => {
       })).toEqual({ ok: true, evidenceClaims: null });
     });
 
+    test("binds incomplete v2 forecast drafts to the selected model", () => {
+      const snapshot = buildCurrentProductionSnapshot();
+      const draft = {
+        ...snapshot,
+        production_plan_completed: false,
+        production_mps_table: [],
+        production_capacity_mode: null,
+        production_capacity: null,
+      };
+
+      expect(validateCompletedProductionPlan(draft)).toMatchObject({
+        ok: true,
+        evidenceClaims: {
+          experiment_id: 91,
+          student_id: 92,
+          model_type: "arima",
+          forecast_steps: 2,
+        },
+      });
+      expect(validateCompletedProductionPlan({
+        ...draft,
+        selected_best_model: "ma",
+      })).toMatchObject({
+        ok: false,
+        code: "PRODUCTION_FORECAST_EVIDENCE_STALE",
+      });
+      expect(validateCompletedProductionPlan({
+        ...draft,
+        production_forecast_evidence: null,
+      })).toMatchObject({
+        ok: false,
+        code: "PRODUCTION_FORECAST_EVIDENCE_REQUIRED",
+      });
+    });
+
     test("accepts a frontend forecast roundtrip when Python adds runner-only metadata", () => {
       const snapshot = buildCurrentProductionSnapshot();
       const runnerForecasts = snapshot.production_forecast_results.map((point, index) => ({

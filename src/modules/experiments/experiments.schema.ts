@@ -371,6 +371,61 @@ const invalidProductionPlan = (
   code: ProductionPlanValidationCode = "PRODUCTION_PLAN_INVALID",
 ): ProductionPlanValidationResult => ({ ok: false, code, message });
 
+const hasProductionForecastEvidenceValue = (value: unknown): value is string =>
+  typeof value === "string" && value.trim().length > 0;
+
+const bindWritableV2ForecastEvidence = (
+  snapshot: Record<string, unknown>,
+  forecasts: CompatibleProductionForecastResults["data"],
+  periods: number,
+): ProductionPlanValidationResult => {
+  if (!hasProductionForecastEvidenceValue(snapshot.production_forecast_evidence)) {
+    return invalidProductionPlan(
+      "生产预测缺少服务端生成的有效凭证，请重新生成预测",
+      "PRODUCTION_FORECAST_EVIDENCE_REQUIRED",
+    );
+  }
+  const evidence = verifyProductionForecastEvidence(
+    snapshot.production_forecast_evidence,
+  );
+  if (!evidence.ok) {
+    return invalidProductionPlan(
+      "生产预测凭证无效，请重新生成预测",
+      "PRODUCTION_FORECAST_EVIDENCE_INVALID",
+    );
+  }
+
+  const experimentId = toFiniteNumber(snapshot.experiment_id);
+  const studentId = toFiniteNumber(snapshot.student_id);
+  const selectedBestModel = typeof snapshot.selected_best_model === "string"
+    ? snapshot.selected_best_model
+    : null;
+  const runtimeModel = selectedBestModel
+    ? EXPERIMENT_BEST_MODEL_TO_RUNTIME_MODEL[
+      selectedBestModel as keyof typeof EXPERIMENT_BEST_MODEL_TO_RUNTIME_MODEL
+    ]
+    : undefined;
+  const claimsMatchSnapshot = (
+    experimentId !== null
+    && Number.isInteger(experimentId)
+    && studentId !== null
+    && Number.isInteger(studentId)
+    && runtimeModel !== undefined
+    && evidence.claims.experiment_id === experimentId
+    && evidence.claims.student_id === studentId
+    && evidence.claims.model_type === runtimeModel
+    && evidence.claims.forecast_steps === periods
+    && evidence.claims.forecast_sha256 === hashProductionForecasts(forecasts)
+  );
+  if (!claimsMatchSnapshot) {
+    return invalidProductionPlan(
+      "生产预测凭证与当前实验、模型或预测结果不匹配，请重新生成预测",
+      "PRODUCTION_FORECAST_EVIDENCE_STALE",
+    );
+  }
+  return { ok: true, evidenceClaims: evidence.claims };
+};
+
 export interface ProductionPlanValidationOptions {
   /**
    * Temporary compatibility bridge for already-open pages using the immediately
@@ -457,9 +512,12 @@ export const resolveProductionServiceLevelPair = (
 };
 
 /**
- * Validates the complete persisted production-plan snapshot. Partial drafts are
- * allowed, but a snapshot marked completed must be complete and internally
- * consistent before it can be persisted or used for grades/report eligibility.
+ * Validates a persisted production-plan snapshot.
+ *
+ * Incomplete drafts may omit forecasts entirely. Once a draft carries forecast
+ * results or evidence, those fields must bind to the selected model even if
+ * the plan is not yet marked completed. A completed snapshot must also replay
+ * MPS, capacity, and service-level fields.
  */
 export const validateCompletedProductionPlan = (
   snapshot: Record<string, unknown>,
@@ -488,7 +546,31 @@ export const validateCompletedProductionPlan = (
     return invalidProductionPlan("旧版生产预测不能携带新版签名凭证");
   }
   if (!toBoolean(snapshot.production_plan_completed)) {
-    return { ok: true, evidenceClaims: null };
+    const hasEvidence = hasProductionForecastEvidenceValue(
+      snapshot.production_forecast_evidence,
+    );
+    if (compatibleForecasts?.version !== "v2" && !hasEvidence) {
+      return { ok: true, evidenceClaims: null };
+    }
+    if (compatibleForecasts?.version !== "v2") {
+      return invalidProductionPlan(
+        "生产预测凭证与当前实验、模型或预测结果不匹配，请重新生成预测",
+        "PRODUCTION_FORECAST_EVIDENCE_STALE",
+      );
+    }
+    const draftPeriods = toFiniteNumber(snapshot.production_forecast_periods);
+    if (
+      draftPeriods === null
+      || !Number.isInteger(draftPeriods)
+      || draftPeriods !== compatibleForecasts.data.length
+    ) {
+      return invalidProductionPlan("生产预测结果必须完整覆盖全部预测期");
+    }
+    return bindWritableV2ForecastEvidence(
+      snapshot,
+      compatibleForecasts.data,
+      draftPeriods,
+    );
   }
   const isCompletedV1Snapshot = (
     snapshot.status === "Completed"
@@ -528,51 +610,9 @@ export const validateCompletedProductionPlan = (
   const forecasts = compatibleForecasts.data;
   let evidenceClaims: ProductionForecastEvidenceClaims | null = null;
   if (compatibleForecasts.version === "v2" && snapshot.status !== "Completed") {
-    if (!snapshot.production_forecast_evidence) {
-      return invalidProductionPlan(
-        "生产预测缺少服务端生成的有效凭证，请重新生成预测",
-        "PRODUCTION_FORECAST_EVIDENCE_REQUIRED",
-      );
-    }
-    const evidence = verifyProductionForecastEvidence(
-      snapshot.production_forecast_evidence,
-    );
-    if (!evidence.ok) {
-      return invalidProductionPlan(
-        "生产预测凭证无效，请重新生成预测",
-        "PRODUCTION_FORECAST_EVIDENCE_INVALID",
-      );
-    }
-
-    const experimentId = toFiniteNumber(snapshot.experiment_id);
-    const studentId = toFiniteNumber(snapshot.student_id);
-    const selectedBestModel = typeof snapshot.selected_best_model === "string"
-      ? snapshot.selected_best_model
-      : null;
-    const runtimeModel = selectedBestModel
-      ? EXPERIMENT_BEST_MODEL_TO_RUNTIME_MODEL[
-        selectedBestModel as keyof typeof EXPERIMENT_BEST_MODEL_TO_RUNTIME_MODEL
-      ]
-      : undefined;
-    const claimsMatchSnapshot = (
-      experimentId !== null
-      && Number.isInteger(experimentId)
-      && studentId !== null
-      && Number.isInteger(studentId)
-      && runtimeModel !== undefined
-      && evidence.claims.experiment_id === experimentId
-      && evidence.claims.student_id === studentId
-      && evidence.claims.model_type === runtimeModel
-      && evidence.claims.forecast_steps === periods
-      && evidence.claims.forecast_sha256 === hashProductionForecasts(forecasts)
-    );
-    if (!claimsMatchSnapshot) {
-      return invalidProductionPlan(
-        "生产预测凭证与当前实验、模型或预测结果不匹配，请重新生成预测",
-        "PRODUCTION_FORECAST_EVIDENCE_STALE",
-      );
-    }
-    evidenceClaims = evidence.claims;
+    const evidenceBinding = bindWritableV2ForecastEvidence(snapshot, forecasts, periods);
+    if (!evidenceBinding.ok) return evidenceBinding;
+    evidenceClaims = evidenceBinding.evidenceClaims;
   }
 
   const mpsTable = parseProductionMpsTable(snapshot.production_mps_table);
