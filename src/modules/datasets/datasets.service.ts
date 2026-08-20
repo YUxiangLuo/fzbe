@@ -41,7 +41,7 @@ import {
 import { resolveExistingManagedFile } from "../../utils/managed-file";
 import { databaseDatetimeToIsoString } from "../../utils/database-datetime";
 import type { UpdateDatasetInput } from "./datasets.schema";
-import { normalizeSalesValue, normalizeYearMonth } from "./dataset-values";
+import { isNextCalendarMonth, normalizeSalesValue, normalizeYearMonth } from "./dataset-values";
 
 interface DatasetRow extends RowDataPacket {
   dataset_id: number;
@@ -582,6 +582,7 @@ export async function uploadDataset(file: File, dataName: string, description?: 
     for (const [, segment] of segmentsMap.entries()) {
       const timePoints = new Set<string>();
       let previousTime = "";
+      let previousCalendarTime: ReturnType<typeof normalizeYearMonth> = null;
       const firstRow = segment.rows[0];
       if (!firstRow) return { error: "数据格式错误", status: 400 as const, details: { message: `产品 "${segment.productName}" 无有效数据` } };
 
@@ -609,7 +610,15 @@ export async function uploadDataset(file: File, dataName: string, description?: 
         if (previousTime && currentTime < previousTime) {
           return { error: "时间顺序错误", status: 400 as const, details: { message: `产品 "${segment.productName}" 时间顺序颠倒` } };
         }
+        if (previousCalendarTime && !isNextCalendarMonth(previousCalendarTime, normalizedTime)) {
+          return {
+            error: "时间不连续",
+            status: 400 as const,
+            details: { message: `产品 "${segment.productName}" 月度时间点必须连续: ${previousTime} -> ${currentTime}` },
+          };
+        }
         previousTime = currentTime;
+        previousCalendarTime = normalizedTime;
 
         const sales = normalizeSalesValue(row["销售数量"]);
         if (!sales) {

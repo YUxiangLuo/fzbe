@@ -16,7 +16,12 @@ from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import MinMaxScaler, OneHotEncoder, StandardScaler
 
 # Import shared utilities
-from data_utils import ParsedData, infer_feature_types as infer_parsed_feature_types, load_data_from_json
+from data_utils import (
+    ParsedData,
+    attach_training_provenance,
+    infer_feature_types as infer_parsed_feature_types,
+    load_data_from_json,
+)
 from forecast_utils import (
     DEMAND_PREDICTION_DOMAIN,
     apply_prediction_domain,
@@ -974,6 +979,7 @@ def run(args) -> None:
             parsed_data,
             target_key=parsed_data.target_key,
             feature_keys=parsed_data.feature_keys,
+            inference_range=range(ts, te + 1),
         )
         _validate_lstm_feature_types(parsed_data, feature_types)
         _validate_lstm_numeric_columns(parsed_data, feature_types)
@@ -1028,6 +1034,13 @@ def run(args) -> None:
         }
         output_strategy, output_notes = _metadata_for_strategy(DIRECT_FORECAST_STRATEGY)
         attach_method_metadata(next_state, METHOD_NAME, output_strategy, output_notes)
+        attach_training_provenance(
+            next_state,
+            parsed_data,
+            range(ts, te + 1),
+            feature_keys=parsed_data.feature_keys,
+            feature_types=feature_types,
+        )
         dump_model(next_state, save_path)
 
         out: Dict[str, Any] = {
@@ -1137,28 +1150,33 @@ def run(args) -> None:
             args.data, target_key=target_key, feature_keys=feature_keys_list
         )
         months = parsed_data.timestamps or [str(i) for i in range(parsed_data.n_obs)]
+        ts, te = int(args.train_start), int(args.train_end)
+        es, ee = int(args.eval_start), int(args.eval_end)
+        train_range = range(ts, te + 1)
 
+        override_types = dict(feature_types_override)
         inferred_feature_types = infer_parsed_feature_types(
             parsed_data,
             target_key=parsed_data.target_key,
-            feature_keys=parsed_data.feature_keys,
+            feature_keys=[
+                key for key in parsed_data.feature_keys
+                if key not in override_types
+            ],
+            inference_range=train_range,
         )
 
-        # If feature_types is provided, use it as an override over inferred defaults.
-        if feature_types_override:
-            feature_types = {**inferred_feature_types, **dict(feature_types_override)}
+        # Explicit feature types remain authoritative; only omitted fields are inferred.
+        if override_types:
+            feature_types = {**inferred_feature_types, **override_types}
             log.info("Using provided feature_types override.")
         else:
-            log.info("No feature_types provided, inferring from DataFrame.")
+            log.info("No feature_types provided, inferring from training range.")
             feature_types = inferred_feature_types
 
         log.info(f"Resolved feature_types: {feature_types}")
 
         _validate_lstm_feature_types(parsed_data, feature_types)
         _validate_lstm_numeric_columns(parsed_data, feature_types)
-
-        ts, te = int(args.train_start), int(args.train_end)
-        es, ee = int(args.eval_start), int(args.eval_end)
 
         normalization_arg = getattr(args, "normalization", None)
         normalization = normalization_arg if normalization_arg is not None else 'minmax'
@@ -1263,6 +1281,13 @@ def run(args) -> None:
                 "prediction_domain": prediction_domain,
             }
             attach_method_metadata(state, METHOD_NAME, DIRECT_FORECAST_STRATEGY, DIRECT_IMPLEMENTATION_NOTES)
+            attach_training_provenance(
+                state,
+                parsed_data,
+                range(ts, te + 1),
+                feature_keys=parsed_data.feature_keys,
+                feature_types=feature_types,
+            )
             dump_model(state, save_path)
             log.info(f"Model saved successfully to {save_path} (Keras: {keras_model_path})")
             out["saved_model"] = save_path

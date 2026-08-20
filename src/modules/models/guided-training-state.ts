@@ -508,11 +508,25 @@ export const guidedRequestPayloadMatches = (
 ) => stableJsonStringify(parseJsonColumn<TrainInput>(row.request_payload, {} as TrainInput))
   === stableJsonStringify(canonicalBody);
 
+type GuidedSupersessionCasRow = Pick<
+  GuidedTrainingSessionRow,
+  | "session_id"
+  | "status"
+  | "current_step_id"
+  | "active_attempt_id"
+  | "request_hash"
+  | "dataset_revision"
+  | "runtime_revision"
+  | "protocol_version"
+  | "committed_state_path"
+  | "committed_state_sha256"
+>;
+
 export const markGuidedTrainingSessionSuperseded = async (
-  row: Pick<GuidedTrainingSessionRow, "session_id">,
+  row: GuidedSupersessionCasRow,
   reason: string,
 ) => {
-  await queryWithTimeout(pool,
+  const [result] = await queryWithTimeout(pool,
     `UPDATE model_guided_training_sessions
         SET status = 'superseded',
             current_step_id = NULL,
@@ -520,16 +534,84 @@ export const markGuidedTrainingSessionSuperseded = async (
             superseded_reason = ?,
             error_message = NULL
       WHERE session_id = ?
-        AND status <> 'superseded'`,
-    [reason, row.session_id],
+        AND status = ?
+        AND current_step_id <=> ?
+        AND active_attempt_id <=> ?
+        AND request_hash = ?
+        AND dataset_revision = ?
+        AND runtime_revision = ?
+        AND protocol_version = ?
+        AND committed_state_path <=> ?
+        AND committed_state_sha256 <=> ?`,
+    [
+      reason,
+      row.session_id,
+      row.status,
+      row.current_step_id,
+      row.active_attempt_id,
+      row.request_hash,
+      row.dataset_revision,
+      row.runtime_revision,
+      row.protocol_version,
+      row.committed_state_path,
+      row.committed_state_sha256,
+    ],
   );
+  return Number((result as { affectedRows?: number }).affectedRows ?? 0) === 1;
+};
+
+const throwGuidedSupersessionResult = (claimed: boolean, reason: string): never => {
+  if (!claimed) {
+    throw new ModelConflictError(
+      "训练会话状态已变化，请刷新后重试",
+      "GUIDED_SESSION_STATE_CHANGED",
+    );
+  }
+  throw new ModelConflictError(reason, "GUIDED_SESSION_SUPERSEDED");
+};
+
+export const assertGuidedTrainingSessionArtifactsCurrent = async (
+  row: Pick<GuidedTrainingSessionRow, "artifact_dir"> & GuidedSupersessionCasRow,
+) => {
+  let reason: string | null = null;
+  const datasetPath = path.join(row.artifact_dir, GUIDED_DATASET_FILE_NAME);
+
+  try {
+    const datasetDigest = crypto.createHash("sha256")
+      .update(fs.readFileSync(datasetPath))
+      .digest("hex");
+    if (datasetDigest !== row.dataset_revision) {
+      reason = "训练数据快照完整性校验失败，请重新创建训练会话";
+    }
+  } catch {
+    reason = "训练数据快照已丢失或损坏，请重新创建训练会话";
+  }
+
+  const hasCommittedPath = row.committed_state_path !== null;
+  const hasCommittedDigest = row.committed_state_sha256 !== null;
+  if (!reason && hasCommittedPath !== hasCommittedDigest) {
+    reason = "训练检查点记录不完整，请重新创建训练会话";
+  }
+  if (!reason && hasCommittedPath && hasCommittedDigest) {
+    try {
+      if (sha256File(row.committed_state_path!) !== row.committed_state_sha256) {
+        reason = "训练检查点完整性校验失败，请重新创建训练会话";
+      }
+    } catch {
+      reason = "训练检查点已丢失或损坏，请重新创建训练会话";
+    }
+  }
+
+  if (!reason) return;
+  const claimed = await markGuidedTrainingSessionSuperseded(row, reason);
+  return throwGuidedSupersessionResult(claimed, reason);
 };
 
 export const assertGuidedTrainingIdentityCurrent = async (
   row: Pick<
     GuidedTrainingSessionRow,
-    "session_id" | "experiment_id" | "model_type" | "request_payload" | "request_hash" | "dataset_revision" | "runtime_revision"
-  >,
+    "experiment_id" | "model_type" | "request_payload"
+  > & GuidedSupersessionCasRow,
   studentId: number,
   options: ArtifactValidationOptions = {},
 ) => {
@@ -548,8 +630,8 @@ export const assertGuidedTrainingIdentityCurrent = async (
     const reason = error instanceof Error
       ? `训练会话依赖已变化：${error.message}`
       : "训练会话依赖已变化";
-    await markGuidedTrainingSessionSuperseded(row, reason);
-    throw new ModelConflictError(reason, "GUIDED_SESSION_SUPERSEDED");
+    const claimed = await markGuidedTrainingSessionSuperseded(row, reason);
+    return throwGuidedSupersessionResult(claimed, reason);
   }
 
   if (
@@ -558,8 +640,8 @@ export const assertGuidedTrainingIdentityCurrent = async (
     || current.runtimeRevision !== row.runtime_revision
   ) {
     const reason = "训练数据、实验配置、基础模型或运行环境已变化，请重新创建训练会话";
-    await markGuidedTrainingSessionSuperseded(row, reason);
-    throw new ModelConflictError(reason, "GUIDED_SESSION_SUPERSEDED");
+    const claimed = await markGuidedTrainingSessionSuperseded(row, reason);
+    return throwGuidedSupersessionResult(claimed, reason);
   }
   return current;
 };
@@ -567,8 +649,8 @@ export const assertGuidedTrainingIdentityCurrent = async (
 export const assertCompletedGuidedTrainingRunCurrent = async (
   row: Pick<
     GuidedTrainingSessionRow,
-    "session_id" | "experiment_id" | "student_id" | "model_type" | "request_payload" | "request_hash" | "dataset_revision" | "runtime_revision"
-  >,
+    "experiment_id" | "student_id" | "model_type" | "request_payload"
+  > & GuidedSupersessionCasRow,
   studentId: number,
   options: ArtifactValidationOptions = {},
 ) => {
@@ -645,8 +727,8 @@ export const assertCompletedGuidedTrainingRunCurrent = async (
     const reason = error instanceof Error
       ? `已完成训练会话依赖已变化：${error.message}`
       : "已完成训练会话依赖已变化";
-    await markGuidedTrainingSessionSuperseded(row, reason);
-    throw new ModelConflictError(reason, "GUIDED_SESSION_SUPERSEDED");
+    const claimed = await markGuidedTrainingSessionSuperseded(row, reason);
+    return throwGuidedSupersessionResult(claimed, reason);
   }
 };
 
@@ -835,9 +917,7 @@ export const beginGuidedStepAttempt = async (
       attemptId,
     );
     const inputStatePath = session.committed_state_path;
-    const inputStateSha256 = inputStatePath && fs.existsSync(inputStatePath)
-      ? sha256File(inputStatePath)
-      : null;
+    const inputStateSha256 = session.committed_state_sha256;
     const leaseSeconds = Math.ceil((timeoutMs + 60_000) / 1000);
     await connection.query(
       `INSERT INTO model_guided_training_step_attempts

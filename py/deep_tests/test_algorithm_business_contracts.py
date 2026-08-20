@@ -19,11 +19,12 @@ import random
 import sys
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 from types import SimpleNamespace
 from typing import Any
 
 import guided_ensemble_model
-from data_utils import load_data_from_json
+from data_utils import attach_training_provenance, load_data_from_json
 from ensemble_utils import (
     parse_base_model_names,
     resolve_base_model_artifact_configs,
@@ -36,6 +37,7 @@ from py.deep_tests.support.harness import (
     run_command,
 )
 from py.deep_tests.support.oracles import metrics as independent_metrics
+from py.src.models import weighted_avg
 from py.deep_tests.support.profiles import profile
 
 
@@ -404,6 +406,7 @@ class EnsembleManualParameterContractTests(unittest.TestCase):
     def _valid_artifacts(
         self,
         workspace: Path,
+        records: list[dict[str, Any]],
     ) -> dict[str, Path]:
         states = {
             "ma": {"model_type": "ma", "window": 9},
@@ -428,9 +431,16 @@ class EnsembleManualParameterContractTests(unittest.TestCase):
                 "look_back": 8,
             },
         }
+        parsed_data = load_data_from_json(json.dumps(records, ensure_ascii=False))
         paths: dict[str, Path] = {}
         for model_name, state in states.items():
             path = workspace / f"{model_name}-source.pkl"
+            attach_training_provenance(
+                state,
+                parsed_data,
+                range(0, 72),
+                feature_keys=["价格,指数", "渠道"] if model_name == "lstm" else [],
+            )
             _write_pickle(path, state)
             paths[model_name] = path
         return paths
@@ -439,7 +449,7 @@ class EnsembleManualParameterContractTests(unittest.TestCase):
     def test_each_guided_ensemble_uses_artifact_params_not_conflicting_fallbacks(self):
         records = _small_contract_records()
         with IsolatedWorkspace() as workspace:
-            artifacts = self._valid_artifacts(workspace)
+            artifacts = self._valid_artifacts(workspace, records)
             before = {path: _sha256(path) for path in artifacts.values()}
             for ensemble_name in ENSEMBLE_MODELS:
                 state: dict[str, Any] = {}
@@ -477,6 +487,44 @@ class EnsembleManualParameterContractTests(unittest.TestCase):
                 before,
                 {path: _sha256(path) for path in artifacts.values()},
             )
+
+    @profile("fast")
+    def test_provenance_mismatch_rejects_before_member_training_starts(self):
+        records = _small_contract_records()
+        parsed_data = load_data_from_json(json.dumps(records, ensure_ascii=False))
+        with IsolatedWorkspace() as workspace:
+            source_path = workspace / "wrong-prefix-ma.pkl"
+            source_state = {"model_type": "ma", "window": 4}
+            attach_training_provenance(
+                source_state,
+                parsed_data,
+                range(1, 72),
+                feature_keys=[],
+            )
+            _write_pickle(source_path, source_state)
+            args = SimpleNamespace(
+                data=json.dumps(records, ensure_ascii=False),
+                train_start=0,
+                train_end=71,
+                eval_start=72,
+                eval_end=83,
+                models="ma,es",
+                base_model_files=json.dumps({"ma": str(source_path)}),
+                window=4,
+                alpha=0.3,
+                pretty=False,
+                save_model=None,
+                load_model=None,
+                fit_only=False,
+            )
+            with (
+                patch.object(weighted_avg, "train_and_evaluate") as training,
+                patch.object(weighted_avg, "run_base_model_subprocess") as member_subprocess,
+                self.assertRaisesRegex(ValueError, "training provenance"),
+            ):
+                weighted_avg.run(args)
+            training.assert_not_called()
+            member_subprocess.assert_not_called()
 
     @profile("fast")
     def test_invalid_or_ambiguous_source_artifacts_are_rejected_early(self):
@@ -643,6 +691,7 @@ class EnsembleManualParameterContractTests(unittest.TestCase):
                             fallback_params,
                             {model_name: str(source_path)},
                             "Contract test",
+                            range(0, len(records)),
                         )
 
             corrupt_path = workspace / "corrupt.pkl"
@@ -654,6 +703,7 @@ class EnsembleManualParameterContractTests(unittest.TestCase):
                     fallback_params,
                     {"ma": str(corrupt_path)},
                     "Contract test",
+                    range(0, len(records)),
                 )
 
             missing_path = workspace / "missing.pkl"
@@ -664,6 +714,7 @@ class EnsembleManualParameterContractTests(unittest.TestCase):
                     fallback_params,
                     {"ma": str(missing_path)},
                     "Contract test",
+                    range(0, len(records)),
                 )
 
             arima_path = workspace / "unselected-arima.pkl"
@@ -678,6 +729,7 @@ class EnsembleManualParameterContractTests(unittest.TestCase):
                     fallback_params,
                     {"arima": str(arima_path)},
                     "Contract test",
+                    range(0, len(records)),
                 )
 
             wrong_type_path = workspace / "wrong-type.pkl"
@@ -692,6 +744,7 @@ class EnsembleManualParameterContractTests(unittest.TestCase):
                     fallback_params,
                     {"ma": str(wrong_type_path)},
                     "Contract test",
+                    range(0, len(records)),
                 )
 
     @profile("fast")
@@ -715,6 +768,8 @@ class EnsembleManualParameterContractTests(unittest.TestCase):
     @profile("fast")
     def test_artifact_boundaries_are_revalidated_by_all_ensemble_planners(self):
         records = _small_contract_records()
+        parsed_data = load_data_from_json(json.dumps(records, ensure_ascii=False))
+        training_range = range(0, 72)
         with IsolatedWorkspace() as workspace:
             valid_es = workspace / "valid-es.pkl"
             invalid_ma = workspace / "invalid-ma.pkl"
@@ -722,14 +777,13 @@ class EnsembleManualParameterContractTests(unittest.TestCase):
             valid_ma = workspace / "valid-ma.pkl"
             invalid_arima = workspace / "invalid-arima.pkl"
             invalid_lstm = workspace / "invalid-lstm.pkl"
-            _write_pickle(valid_es, {"model_type": "es", "alpha": 0.27})
-            _write_pickle(invalid_ma, {"model_type": "ma", "window": 1})
-            _write_pickle(invalid_es, {"model_type": "es", "alpha": 0.0})
-            _write_pickle(valid_ma, {"model_type": "ma", "window": 4})
-            _write_pickle(invalid_arima, {"model_type": "arima", "d": -1})
-            _write_pickle(
-                invalid_lstm,
-                {
+            artifact_states = {
+                valid_es: {"model_type": "es", "alpha": 0.27},
+                invalid_ma: {"model_type": "ma", "window": 1},
+                invalid_es: {"model_type": "es", "alpha": 0.0},
+                valid_ma: {"model_type": "ma", "window": 4},
+                invalid_arima: {"model_type": "arima", "d": -1},
+                invalid_lstm: {
                     "model_type": "lstm",
                     "normalization": "unit",
                     "target_key": AIRCON_TARGET,
@@ -739,7 +793,20 @@ class EnsembleManualParameterContractTests(unittest.TestCase):
                         "价格,指数": "numeric",
                     },
                 },
-            )
+            }
+            for artifact_path, artifact_state in artifact_states.items():
+                provenance_features = (
+                    artifact_state.get("feature_keys", [])
+                    if artifact_state["model_type"] == "lstm"
+                    else []
+                )
+                attach_training_provenance(
+                    artifact_state,
+                    parsed_data,
+                    training_range,
+                    feature_keys=provenance_features,
+                )
+                _write_pickle(artifact_path, artifact_state)
 
             invalid_maps = (
                 (

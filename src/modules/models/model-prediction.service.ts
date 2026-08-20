@@ -151,15 +151,22 @@ const predictExperimentModelWithLease = async (
 
   let predictions: ReturnType<typeof normalizeDemandPredictionPoints>;
   try {
+    const normalizationOptions = {
+      requireStdDev: true,
+      requireUpperErrorP99: true,
+      requireCalibrationDiagnostics: true,
+      requireIntervalMetadata: true,
+    } as const;
     predictions = normalizeDemandPredictionPoints(
       result.predictions,
       forecastSteps,
-      {
-        requireStdDev: true,
-        requireUpperErrorP99: true,
-        requireCalibrationDiagnostics: true,
-        requireIntervalMetadata: true,
-      },
+      normalizationOptions,
+    );
+    predictions = applyPlanningUncertaintyFloor(predictions, activeRun.metrics);
+    predictions = normalizeDemandPredictionPoints(
+      predictions,
+      forecastSteps,
+      normalizationOptions,
     );
   } catch (error) {
     if (!(error instanceof Error) || !error.message.startsWith("[PYTHON_DATA]")) {
@@ -172,8 +179,6 @@ const predictExperimentModelWithLease = async (
       { required_action: "prepare" },
     );
   }
-
-  predictions = applyPlanningUncertaintyFloor(predictions, activeRun.metrics);
 
   const metadata = Object.fromEntries(
     ["method_name", "forecast_strategy", "implementation_notes"]

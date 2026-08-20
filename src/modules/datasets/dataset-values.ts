@@ -8,6 +8,15 @@ export interface NormalizedYearMonth {
   year: string;
 }
 
+export function isNextCalendarMonth(
+  previous: NormalizedYearMonth,
+  current: NormalizedYearMonth,
+): boolean {
+  const previousOrdinal = Number(previous.year) * 12 + Number(previous.month) - 1;
+  const currentOrdinal = Number(current.year) * 12 + Number(current.month) - 1;
+  return currentOrdinal === previousOrdinal + 1;
+}
+
 const DECIMAL_NUMBER_PATTERN = /^[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:e[+-]?\d+)?$/i;
 
 export function normalizeSalesValue(raw: unknown): NormalizedSalesValue | null {

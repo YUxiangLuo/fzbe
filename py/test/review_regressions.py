@@ -52,7 +52,7 @@ from uncertainty import (  # noqa: E402
     moving_average_profile,
     ses_profile,
 )
-from data_utils import load_data_from_json  # noqa: E402
+from data_utils import attach_training_provenance, load_data_from_json  # noqa: E402
 from adf.core import adf_fixed_d  # noqa: E402
 from error_protocol import format_known_error  # noqa: E402
 from forecast_utils import (  # noqa: E402
@@ -542,7 +542,7 @@ def assert_ensemble_entrypoints_require_lstm_features() -> None:
     try:
         guided_ensemble_model._build_model_params(
             parsed_data,
-            19,
+            range(0, 19),
             ["ma", "lstm"],
             guided_args,
         )
@@ -554,7 +554,7 @@ def assert_ensemble_entrypoints_require_lstm_features() -> None:
     guided_args.lstm_features = "[]"
     guided_params = guided_ensemble_model._build_model_params(
         parsed_data,
-        19,
+        range(0, 19),
         ["ma", "lstm"],
         guided_args,
     )
@@ -565,7 +565,10 @@ def assert_ensemble_entrypoints_require_lstm_features() -> None:
         ["ma", "lstm"],
         guided_params,
     )
-    assert all(set(record) == {"销售数量"} for record in lstm_records)
+    assert all(set(record) == {"销售数量", "月份"} for record in lstm_records)
+    assert load_data_from_json(
+        json.dumps(lstm_records, ensure_ascii=False)
+    ).time_key == "月份"
 
 
 def assert_dynamic_hidden_configuration() -> None:
@@ -773,6 +776,12 @@ def assert_source_artifact_configuration_resolution() -> None:
         source_files: dict[str, str] = {}
         for model_name, source_state in source_states.items():
             source_file = temp_path / f"{model_name}.pkl"
+            attach_training_provenance(
+                source_state,
+                parsed_data,
+                range(0, 12),
+                feature_keys=["价格指数"] if model_name == "lstm" else [],
+            )
             with source_file.open("wb") as handle:
                 pickle.dump(source_state, handle)
             source_files[model_name] = str(source_file)
@@ -783,6 +792,7 @@ def assert_source_artifact_configuration_resolution() -> None:
             fallback_params,
             source_files,
             "Regression ensemble",
+            range(0, 12),
         )
         assert validated_files == source_files
         assert resolved_params["ma"]["window"] == 3
@@ -793,27 +803,111 @@ def assert_source_artifact_configuration_resolution() -> None:
         assert resolved_params["lstm"]["normalization"] == "zscore"
         assert json.loads(resolved_params["lstm"]["lstm_features"]) == ["价格指数"]
 
+        future_records = sample_records(18)
+        future_records[17]["销售数量"] = 99999
+        future_data = load_data_from_json(json.dumps(future_records, ensure_ascii=False))
+        resolve_base_model_artifact_configs(
+            future_data,
+            ["ma"],
+            {"ma": {"window": 17}},
+            {"ma": source_files["ma"]},
+            "Future-only provenance regression",
+            range(0, 12),
+        )
+
+        prefix_records = sample_records(18)
+        prefix_records[3]["销售数量"] = 99999
+        prefix_data = load_data_from_json(json.dumps(prefix_records, ensure_ascii=False))
+        for mismatch_data, mismatch_range in (
+            (prefix_data, range(0, 12)),
+            (parsed_data, range(1, 12)),
+        ):
+            try:
+                resolve_base_model_artifact_configs(
+                    mismatch_data,
+                    ["ma"],
+                    {"ma": {"window": 17}},
+                    {"ma": source_files["ma"]},
+                    "Mismatched provenance regression",
+                    mismatch_range,
+                )
+            except ValueError as exc:
+                assert "training provenance" in str(exc)
+            else:
+                raise AssertionError("Mismatched base artifact provenance was accepted")
+
+        missing_provenance_file = temp_path / "ma-missing-provenance.pkl"
+        with missing_provenance_file.open("wb") as handle:
+            pickle.dump({"model_type": "ma", "window": 3}, handle)
+        try:
+            resolve_base_model_artifact_configs(
+                parsed_data,
+                ["ma"],
+                {"ma": {"window": 17}},
+                {"ma": str(missing_provenance_file)},
+                "Missing provenance regression",
+                range(0, 12),
+            )
+        except ValueError as exc:
+            assert "missing training provenance" in str(exc)
+        else:
+            raise AssertionError("Digest-less external base artifact was accepted")
+
         target_only_lstm_file = temp_path / "lstm-target-only.pkl"
         with target_only_lstm_file.open("wb") as handle:
-            pickle.dump(
-                {
-                    "model_type": "lstm",
-                    "target_key": "销售数量",
-                    "feature_keys": [],
-                    "feature_types": {"销售数量": "numeric"},
-                    "normalization": "minmax",
-                },
-                handle,
+            target_only_state = {
+                "model_type": "lstm",
+                "target_key": "销售数量",
+                "feature_keys": [],
+                "feature_types": {"销售数量": "numeric"},
+                "normalization": "minmax",
+            }
+            attach_training_provenance(
+                target_only_state,
+                parsed_data,
+                range(0, 12),
+                feature_keys=[],
             )
+            pickle.dump(target_only_state, handle)
         target_only_params, _ = resolve_base_model_artifact_configs(
             parsed_data,
             ["lstm"],
             {"lstm": dict(fallback_params["lstm"])},
             {"lstm": str(target_only_lstm_file)},
             "Target-only regression ensemble",
+            range(0, 12),
         )
         assert json.loads(target_only_params["lstm"]["lstm_features"]) == []
         assert target_only_params["lstm"]["feature_types"] == {"销售数量": "numeric"}
+
+        # Legacy artifacts without feature_types must infer from the requested
+        # training range, not from future rows with changed cardinality.
+        parsed_data.df["mystery"] = [index % 2 if index < 12 else index for index in range(18)]
+        legacy_lstm_file = temp_path / "lstm-legacy-no-feature-types.pkl"
+        with legacy_lstm_file.open("wb") as handle:
+            legacy_lstm_state = {
+                "model_type": "lstm",
+                "target_key": "销售数量",
+                "feature_keys": ["mystery"],
+                "normalization": "minmax",
+            }
+            attach_training_provenance(
+                legacy_lstm_state,
+                parsed_data,
+                range(0, 12),
+                feature_keys=["mystery"],
+                feature_types={"mystery": "categorical"},
+            )
+            pickle.dump(legacy_lstm_state, handle)
+        legacy_params, _ = resolve_base_model_artifact_configs(
+            parsed_data,
+            ["lstm"],
+            {"lstm": dict(fallback_params["lstm"])},
+            {"lstm": str(legacy_lstm_file)},
+            "Legacy LSTM regression ensemble",
+            range(0, 12),
+        )
+        assert legacy_params["lstm"]["feature_types"]["mystery"] == "categorical"
 
         missing_feature_list_file = temp_path / "lstm-missing-feature-list.pkl"
         with missing_feature_list_file.open("wb") as handle:
@@ -833,6 +927,7 @@ def assert_source_artifact_configuration_resolution() -> None:
                 {"lstm": dict(fallback_params["lstm"])},
                 {"lstm": str(missing_feature_list_file)},
                 "Invalid LSTM regression ensemble",
+                range(0, 12),
             )
         except ValueError as exc:
             assert "invalid training configuration" in str(exc)
@@ -850,6 +945,7 @@ def assert_source_artifact_configuration_resolution() -> None:
             {"ma": {"window": 3}, "es": {"alpha": 0.4}},
             {},
             "Regression ensemble",
+            range(0, 12),
         )
         assert no_artifact_params == {"ma": {"window": 3}, "es": {"alpha": 0.4}}
         assert no_artifact_files == {}
@@ -867,6 +963,7 @@ def assert_source_artifact_configuration_resolution() -> None:
                     {"ma": {"window": 4}},
                     files,
                     "Regression ensemble",
+                    range(0, 12),
                 )
             except ValueError as exc:
                 assert str(exc).startswith("[VALIDATION]")
@@ -883,6 +980,7 @@ def assert_source_artifact_configuration_resolution() -> None:
                 {"ma": {"window": 4}},
                 {"ma": str(corrupt_file)},
                 "Regression ensemble",
+                range(0, 12),
             )
         except ValueError as exc:
             assert "cannot be read" in str(exc)

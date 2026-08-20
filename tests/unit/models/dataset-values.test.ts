@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import {
+  isNextCalendarMonth,
   normalizeSalesValue,
   normalizeYearMonth,
 } from "../../../src/modules/datasets/dataset-values";
@@ -33,5 +34,20 @@ describe("dataset value normalization", () => {
     expect(normalizeYearMonth("2024", "12")).toEqual({ year: "2024", month: "12" });
     expect(normalizeYearMonth("24", "1")).toBeNull();
     expect(normalizeYearMonth("2024", "13")).toBeNull();
+  });
+
+  test("recognizes only contiguous calendar months including year rollover", () => {
+    expect(isNextCalendarMonth(
+      { year: "2024", month: "12" },
+      { year: "2025", month: "01" },
+    )).toBe(true);
+    expect(isNextCalendarMonth(
+      { year: "2024", month: "01" },
+      { year: "2024", month: "03" },
+    )).toBe(false);
+    expect(isNextCalendarMonth(
+      { year: "2024", month: "03" },
+      { year: "2024", month: "02" },
+    )).toBe(false);
   });
 });

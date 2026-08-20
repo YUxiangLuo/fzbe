@@ -3,6 +3,12 @@ import { spawn } from "node:child_process";
 import path from "node:path";
 import { resolvePythonExecutable } from "../../src/utils/python";
 import { assertE2eDatabaseResetAllowed } from "../../scripts/test-database-reset-guard";
+import {
+  MODEL_EDGE_CHECKOUT_ROOT,
+  captureModelEdgeArtifactBaseline,
+  cleanupModelEdgeOwnedArtifacts,
+  withModelEdgeRunnerLock,
+} from "./model-edge-runtime";
 
 type Layer = "python" | "api" | "all";
 type Profile = "full";
@@ -24,7 +30,7 @@ type AppLike = {
   request: (input: string | Request, init?: RequestInit) => Response | Promise<Response>;
 };
 
-const ROOT = process.cwd();
+const ROOT = MODEL_EDGE_CHECKOUT_ROOT;
 const PYTHON_EDGE_SCRIPT = path.join(ROOT, "py", "test", "model_edge_cases.py");
 const STUDENT_USERNAME = process.env.E2E_STUDENT_USERNAME ?? "20240002";
 const STUDENT_PASSWORD = process.env.E2E_STUDENT_PASSWORD ?? "StudentE2E!234";
@@ -550,32 +556,57 @@ async function createModelExperiment(
   if (!Number.isInteger(experimentId)) {
     throw new Error(`create experiment missing experiment_id: ${JSON.stringify(created)}`);
   }
-  assertStatus(
-    await requestApp(app, `/api/v1/experiment-runs/${experimentId}`, {
-      method: "PATCH",
-      token,
-      body: {
-        ...baseExperimentPatch(),
-        expected_version: Number(created.state_version ?? 0),
-      },
-    }),
-    200,
-    "prepare model stage experiment",
-  );
-  return experimentId;
+  return {
+    experimentId,
+    stateVersion: Number(created.state_version ?? 0),
+  };
 }
 
 async function runApiLayer() {
   assertE2eDatabaseResetAllowed();
   await resetAndSeedDatabase();
   await resetStudentPassword();
-  const [{ app }, { pool }] = await Promise.all([
-    import("../../src/index"),
-    import("../../src/config"),
-  ]);
-  const token = await login(app);
-  const experimentId = await createModelExperiment(app, token);
-  const trainedModels: ModelType[] = [];
+  const { pool } = await import("../../src/config");
+  const errors: unknown[] = [];
+  let artifactBaseline: ReturnType<typeof captureModelEdgeArtifactBaseline> | null = null;
+  let baselineExperimentIds = new Set<number>();
+  let studentId: number | null = null;
+  let experimentId: number | null = null;
+  let result: Record<string, unknown> | undefined;
+  try {
+    artifactBaseline = captureModelEdgeArtifactBaseline();
+    const [studentRows] = await pool.query<mysql.RowDataPacket[]>(
+      "SELECT user_id FROM users WHERE username = ? LIMIT 1",
+      [STUDENT_USERNAME],
+    );
+    studentId = Number(studentRows[0]?.user_id);
+    if (!Number.isInteger(studentId)) {
+      throw new Error(`[model-edge] could not resolve student id for ${STUDENT_USERNAME}`);
+    }
+    const [baselineRows] = await pool.query<mysql.RowDataPacket[]>(
+      "SELECT experiment_id FROM experiment_status",
+    );
+    baselineExperimentIds = new Set(
+      baselineRows.map((row) => Number(row.experiment_id)).filter(Number.isInteger),
+    );
+
+    const { app } = await import("../../src/index");
+    const token = await login(app);
+    const createdExperiment = await createModelExperiment(app, token);
+    experimentId = createdExperiment.experimentId;
+    assertStatus(
+      await requestApp(app, `/api/v1/experiment-runs/${experimentId}`, {
+        method: "PATCH",
+        token,
+        body: {
+          ...baseExperimentPatch(),
+          expected_version: createdExperiment.stateVersion,
+        },
+      }),
+      200,
+      "prepare model stage experiment",
+    );
+    const trainedModels: ModelType[] = [];
 
   const badModelType = await requestApp(app, "/api/v1/models/not-real/guided-training/sessions", {
     method: "POST",
@@ -661,13 +692,153 @@ async function runApiLayer() {
   });
   assertStatus(invalidPredict, 400, "predict should reject forecast_steps <= 0");
 
-  await pool.end();
-  return {
-    status: "ok",
-    experiment_id: experimentId,
-    trained_models: trainedModels,
-    expanded_horizon_models: expandedHorizonModels,
-  };
+    result = {
+      status: "ok",
+      experiment_id: experimentId,
+      trained_models: trainedModels,
+      expanded_horizon_models: expandedHorizonModels,
+    };
+  } catch (error) {
+    errors.push(error);
+  }
+
+  const introducedExperimentIds = new Set<number>();
+  if (experimentId !== null) introducedExperimentIds.add(experimentId);
+  try {
+    if (studentId !== null) {
+      const [currentRows] = await pool.query<mysql.RowDataPacket[]>(
+        "SELECT experiment_id, student_id FROM experiment_status",
+      );
+      for (const row of currentRows) {
+        const currentId = Number(row.experiment_id);
+        if (
+          Number(row.student_id) === studentId
+          && Number.isInteger(currentId)
+          && !baselineExperimentIds.has(currentId)
+        ) {
+          introducedExperimentIds.add(currentId);
+        }
+      }
+    }
+  } catch (error) {
+    errors.push(new Error("[model-edge] failed to discover introduced experiments", { cause: error }));
+  }
+
+  const guidedDirs: string[] = [];
+  const preparationDirs: string[] = [];
+  const modelPaths: string[] = [];
+  const experimentIds = [...introducedExperimentIds];
+  if (experimentIds.length > 0) {
+    const placeholders = experimentIds.map(() => "?").join(",");
+    const collect = async (
+      label: string,
+      sql: string,
+      consume: (row: mysql.RowDataPacket) => void,
+    ) => {
+      try {
+        const [rows] = await pool.query<mysql.RowDataPacket[]>(sql, experimentIds);
+        for (const row of rows) consume(row);
+      } catch (error) {
+        errors.push(new Error(`[model-edge] failed to collect ${label}`, { cause: error }));
+      }
+    };
+    await collect(
+      "guided artifact directories",
+      `SELECT artifact_dir FROM model_guided_training_sessions WHERE experiment_id IN (${placeholders})`,
+      (row) => guidedDirs.push(String(row.artifact_dir)),
+    );
+    await collect(
+      "production artifact ownership",
+      `SELECT artifact_dir, committed_state_path FROM model_production_preparation_sessions WHERE experiment_id IN (${placeholders})`,
+      (row) => {
+        const artifactDir = String(row.artifact_dir);
+        preparationDirs.push(artifactDir);
+        if (row.committed_state_path) {
+          const committedPath = path.resolve(String(row.committed_state_path));
+          const relativeToArtifactDir = path.relative(path.resolve(artifactDir), committedPath);
+          if (
+            relativeToArtifactDir.startsWith("..")
+            || path.isAbsolute(relativeToArtifactDir)
+          ) {
+            modelPaths.push(committedPath);
+          }
+        }
+      },
+    );
+    await collect(
+      "training-run artifact ownership",
+      `SELECT artifact_path, production_artifact_path FROM model_training_runs WHERE experiment_id IN (${placeholders})`,
+      (row) => {
+        if (row.artifact_path) modelPaths.push(String(row.artifact_path));
+        if (row.production_artifact_path) modelPaths.push(String(row.production_artifact_path));
+      },
+    );
+  }
+
+  if (artifactBaseline && studentId !== null && experimentIds.length > 0) {
+    try {
+      await cleanupModelEdgeOwnedArtifacts({
+        baseline: artifactBaseline,
+        experimentIds,
+        studentId,
+        guidedDirs,
+        preparationDirs,
+        modelPaths,
+      });
+    } catch (error) {
+      errors.push(error);
+    }
+  }
+
+  for (const introducedId of experimentIds) {
+    try {
+      await pool.query(
+        "DELETE FROM experiment_status WHERE experiment_id = ? AND student_id = ?",
+        [introducedId, studentId],
+      );
+    } catch (error) {
+      errors.push(new Error(
+        `[model-edge] failed to delete experiment ${introducedId}`,
+        { cause: error },
+      ));
+    }
+  }
+  if (experimentIds.length > 0) {
+    try {
+      const placeholders = experimentIds.map(() => "?").join(",");
+      const [rows] = await pool.query<mysql.RowDataPacket[]>(
+        `SELECT
+           (SELECT COUNT(*) FROM experiment_status WHERE experiment_id IN (${placeholders}))
+             AS experiment_count,
+           (SELECT COUNT(*) FROM model_guided_training_sessions WHERE experiment_id IN (${placeholders}))
+             + (SELECT COUNT(*) FROM model_production_preparation_sessions WHERE experiment_id IN (${placeholders}))
+             + (SELECT COUNT(*) FROM model_training_runs WHERE experiment_id IN (${placeholders}))
+             AS dependent_count`,
+        [...experimentIds, ...experimentIds, ...experimentIds, ...experimentIds],
+      );
+      if (
+        Number(rows[0]?.experiment_count) !== 0
+        || Number(rows[0]?.dependent_count) !== 0
+      ) {
+        throw new Error(
+          `[model-edge] database teardown left experiment/session/run rows for ${experimentIds.join(",")}`,
+        );
+      }
+    } catch (error) {
+      errors.push(new Error("[model-edge] failed database teardown verification", { cause: error }));
+    }
+  }
+  try {
+    await pool.end();
+  } catch (error) {
+    errors.push(new Error("[model-edge] failed to close database pool", { cause: error }));
+  }
+
+  if (errors.length === 1) throw errors[0];
+  if (errors.length > 1) {
+    throw new AggregateError(errors, "model-edge API run and teardown failed");
+  }
+  return result;
 }
 
 async function main() {
@@ -681,9 +852,11 @@ Options:
   --json                 Forward JSON output mode to the Python layer
   --help, -h             Show this help
 
-The API layer resets and reseeds the configured test database.
-It requires E2E_ALLOW_DB_RESET=1 and a disposable database named
-fangzhen_e2e, fz_e2e_*, fz_pr_* or fz_test_*.`);
+The runner holds an exclusive checkout lock and removes only artifacts owned
+by experiment rows created during this run; unrelated and baseline entries remain untouched.
+The API layer resets and reseeds the configured test database. It requires
+E2E_ALLOW_DB_RESET=1 and a disposable database named fangzhen_e2e,
+fz_e2e_*, fz_pr_* or fz_test_*.`);
     return;
   }
 
@@ -698,12 +871,14 @@ fangzhen_e2e, fz_e2e_*, fz_pr_* or fz_test_*.`);
     started_at: new Date(startedAt).toISOString(),
   };
 
-  if (options.layer === "python" || options.layer === "all") {
-    summary.python = await runPythonLayer(options);
-  }
-  if (options.layer === "api" || options.layer === "all") {
-    summary.api = await runApiLayer();
-  }
+  await withModelEdgeRunnerLock(async () => {
+    if (options.layer === "python" || options.layer === "all") {
+      summary.python = await runPythonLayer(options);
+    }
+    if (options.layer === "api" || options.layer === "all") {
+      summary.api = await runApiLayer();
+    }
+  });
 
   summary.duration_ms = Date.now() - startedAt;
   summary.status = "ok";

@@ -395,6 +395,54 @@ describe("models service prediction", () => {
     expect(result.results.forecast_evidence).toEqual(expect.any(String));
   });
 
+  test("invalidates production preparation when the planning floor overflows", async () => {
+    const productionPath = path.join(mockedTrainedModelsRoot, "ma-overflow-floor-production.pkl");
+    const activeRun = buildActiveRun("ma", {
+      production_artifact_path: productionPath,
+      metrics: JSON.stringify({
+        rmse: Number.MAX_VALUE,
+        interval_evaluation: {
+          count: 12,
+          observed_inclusion_rate: 0,
+          coverage_claim: "none",
+        },
+      }),
+    });
+    useActiveRuns(activeRun);
+    mockExperimentAndDatasetQueries();
+    existsSync.mockReturnValue(true);
+    createReadStream.mockImplementation(() =>
+      Readable.from([modelDatasetCsv]) as unknown as ReturnType<typeof createReadStream>
+    );
+    spawnMock.mockImplementationOnce(() => createSpawnResult(JSON.stringify({
+      predictions: [{
+        prediction: Number.MAX_VALUE,
+        std_dev: 1,
+        upper_error_p99: 1,
+        uncertainty_source: "empirical",
+        calibration_source: "post_selection_calibration",
+        calibration_mean_error: 0,
+        calibration_count: 12,
+        interval_lower: Number.MAX_VALUE,
+        interval_upper: Number.MAX_VALUE,
+        interval_level: 0.95,
+        interval_kind: "empirical_residual_quantile",
+        coverage_claim: "none",
+      }],
+    })));
+
+    await expect(
+      predictExperimentModel("ma", 20240002, 990002, 1, preparationToken),
+    ).rejects.toMatchObject({
+      code: "PRODUCTION_PREPARATION_REQUIRED",
+      details: { required_action: "prepare" },
+    });
+    expect(clearProductionArtifactForRun).toHaveBeenCalledWith(
+      activeRun.run_id,
+      preparationToken,
+    );
+  });
+
   for (const invalidStdDev of invalidLegacyStdDevCases) {
     test(`invalidates checksummed production output with ${invalidStdDev.label} std_dev`, async () => {
       const productionPath = path.join(
@@ -552,7 +600,7 @@ describe("models service prediction", () => {
     const result = await predictExperimentModel("ma", 20240002, 990002, 2, preparationToken);
 
     expect(result.results.predictions).toEqual([
-      { ...pythonPredictions[0], prediction: 0 },
+      { ...pythonPredictions[0], prediction: 0, interval_upper: 0 },
       pythonPredictions[1],
     ]);
   });

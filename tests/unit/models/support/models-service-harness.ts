@@ -66,6 +66,18 @@ export const modelDatasetCsv =
   "2025-05,260,2.8,2.4\n" +
   "2025-06,270,2.9,2.5\n";
 
+const modelDatasetJson = JSON.stringify(
+  modelDatasetCsv.trim().split("\n").slice(1).map((line) => {
+    const [month, sales, priceIndex, utilization] = line.split(",");
+    return {
+      "月份": month,
+      "销售数量": sales,
+      "价格指数": priceIndex,
+      "产能利用率": utilization,
+    };
+  }),
+);
+
 export const ENSEMBLE_MODEL_TYPES = ["weighted_avg", "boosting", "stacking"];
 // The ensemble manifest is produced inside the (mocked) Python digest script, so
 // tests only need a stable value shared between buildActiveRun and the spawn stub.
@@ -128,6 +140,17 @@ export const copyFileSync = mock((_: string, __: string) => {});
 export const renameSync = mock((_: string, __: string) => {});
 export const mkdirSync = mock((_: string, __?: unknown) => undefined);
 export const rmSync = mock((_: string, __?: unknown) => undefined);
+const originalReadFileSync = actualFs.readFileSync;
+export const readFileSync = mock((filePath: actualFs.PathOrFileDescriptor, options?: unknown) => {
+  try {
+    return originalReadFileSync(filePath, options as never);
+  } catch (error) {
+    if (typeof filePath === "string" && path.basename(filePath) === "dataset.json") {
+      return Buffer.from(modelDatasetJson);
+    }
+    throw error;
+  }
+});
 export const createSpawnResult = (stdout = "", stderr = "", exitCode = 0) => ({
   stdout: new ReadableStream({
     start(controller) {
@@ -233,6 +256,7 @@ mock.module("fs", () => ({
     renameSync,
     mkdirSync,
     rmSync,
+    readFileSync,
   },
   existsSync,
   createReadStream,
@@ -243,6 +267,7 @@ mock.module("fs", () => ({
   renameSync,
   mkdirSync,
   rmSync,
+  readFileSync,
 }));
 
 mock.module(pythonModulePath, () => ({
@@ -579,6 +604,7 @@ export const setupModelsServiceTestHooks = () => {
     renameSync.mockClear();
     mkdirSync.mockClear();
     rmSync.mockClear();
+    readFileSync.mockClear();
     spawnMock.mockReset();
     spawnMock.mockImplementation(() => createSpawnResult('{"predictions":[]}'));
     (Bun as { spawn: typeof Bun.spawn }).spawn = spawnMock as typeof Bun.spawn;

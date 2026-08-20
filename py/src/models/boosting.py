@@ -1420,6 +1420,7 @@ def run(args) -> None:
                 parsed_data=parsed_data,
                 target_key=target_feature,
                 feature_keys=lstm_feature_names,
+                inference_range=train_range,
             )
 
         allowed_keys = set(lstm_feature_names + [target_feature])
@@ -1441,6 +1442,7 @@ def run(args) -> None:
         model_params,
         base_model_files,
         "Boosting",
+        train_range,
     )
 
     _validate_training_args(parsed_data, ts, te, es, ee, models_to_use, model_params, base_model_files)

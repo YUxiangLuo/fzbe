@@ -23,9 +23,10 @@ const {
   ModelNotFoundError,
   ModelTimeoutError,
 } = await harness.initializeModelsServiceHarness("guided-training");
-const { beginGuidedStepAttempt } = await import(
-  "../../../src/modules/models/guided-training-state"
-);
+const {
+  assertGuidedTrainingSessionArtifactsCurrent,
+  beginGuidedStepAttempt,
+} = await import("../../../src/modules/models/guided-training-state");
 const trainModel = createOrResumeGuidedTrainingSession;
 
 const {
@@ -59,6 +60,7 @@ const {
   renameSync,
   mkdirSync,
   rmSync,
+  readFileSync,
   createSpawnResult,
   withEnsembleAuxiliarySpawns,
   spawnMock,
@@ -86,6 +88,57 @@ const {
 
 describe("models service guided training", () => {
   setupModelsServiceTestHooks();
+
+  test("durably supersedes guided sessions with corrupt snapshots or checkpoint pointers", async () => {
+    const artifactDir = `/tmp/guided-integrity-${process.pid}`;
+    const datasetPath = path.join(artifactDir, "dataset.json");
+    const checkpointPath = path.join(artifactDir, "checkpoint.pkl");
+    await actualFs.promises.mkdir(artifactDir, { recursive: true });
+    const datasetRevision = crypto.createHash("sha256").update("trusted-dataset").digest("hex");
+    const checkpointDigest = crypto.createHash("sha256").update("trusted-checkpoint").digest("hex");
+    const row = buildGuidedSessionRow({
+      artifact_dir: artifactDir,
+      dataset_revision: datasetRevision,
+      committed_state_path: checkpointPath,
+      committed_state_sha256: checkpointDigest,
+    });
+    await writeFile(datasetPath, "trusted-dataset");
+    await writeFile(checkpointPath, "trusted-checkpoint");
+
+    try {
+      poolQuery.mockResolvedValue([{ affectedRows: 1 }]);
+      await expect(assertGuidedTrainingSessionArtifactsCurrent(row as never)).resolves.toBeUndefined();
+
+      await writeFile(datasetPath, "tampered-dataset");
+      await expect(assertGuidedTrainingSessionArtifactsCurrent(row as never))
+        .rejects.toMatchObject({ code: "GUIDED_SESSION_SUPERSEDED" });
+
+      expect(poolQuery.mock.calls.some(([sql]) =>
+        String(sql).includes("SET status = 'superseded'")
+      )).toBe(true);
+
+      await writeFile(datasetPath, "trusted-dataset");
+      await writeFile(checkpointPath, "tampered-checkpoint");
+      await expect(assertGuidedTrainingSessionArtifactsCurrent(row as never))
+        .rejects.toMatchObject({ code: "GUIDED_SESSION_SUPERSEDED" });
+
+      await writeFile(checkpointPath, "trusted-checkpoint");
+      await actualFs.promises.rm(datasetPath, { force: true });
+      readFileSync.mockImplementationOnce(() => {
+        throw new Error("snapshot missing");
+      });
+      await expect(assertGuidedTrainingSessionArtifactsCurrent(row as never))
+        .rejects.toMatchObject({ code: "GUIDED_SESSION_SUPERSEDED" });
+
+      await writeFile(datasetPath, "trusted-dataset");
+      await expect(assertGuidedTrainingSessionArtifactsCurrent({
+        ...row,
+        committed_state_sha256: null,
+      } as never)).rejects.toMatchObject({ code: "GUIDED_SESSION_SUPERSEDED" });
+    } finally {
+      await actualFs.promises.rm(artifactDir, { recursive: true, force: true });
+    }
+  });
 
   test("uses the database-computed lease flag when date strings have no timezone", async () => {
     const row = buildGuidedSessionRow({
@@ -381,6 +434,98 @@ describe("models service guided training", () => {
     expect(poolQuery.mock.calls.some(([sql]) => String(sql).includes("SET status = 'superseded'"))).toBe(false);
     expect(copyFileSync).not.toHaveBeenCalled();
     expect(commitModelTrainingRun).not.toHaveBeenCalled();
+  });
+
+  test("does not let a stale unlocked GET supersede a concurrently completed session", async () => {
+    const requestBody = {
+      experiment_id: 990002,
+      selected_industry: "制造业",
+      selected_company: "样本企业",
+      selected_product: "样本产品",
+      data_window_train_start_index: 0,
+      data_window_train_end_index: 11,
+      data_window_evaluate_start_index: 12,
+      data_window_evaluate_end_index: 17,
+      moving_average_window: 4,
+    };
+    poolQuery.mockReset();
+    createReadStream.mockImplementation(() =>
+      Readable.from([modelDatasetCsv]) as unknown as ReturnType<typeof createReadStream>
+    );
+    poolQuery.mockResolvedValueOnce([[{ file_path: datasetCsvPath }]]);
+    const currentDataset = await loadDatasetFromDb("制造业", "样本企业", "样本产品");
+    const row = buildGuidedSessionRow({
+      session_id: "guided-get-final-commit-race",
+      request_hash: "current-request-hash",
+      dataset_revision: hashDatasetSnapshot(JSON.stringify(currentDataset)),
+      runtime_revision: getModelRuntimeRevision(true),
+      request_payload: JSON.stringify(requestBody),
+      status: "ready",
+      current_step_id: "prepare_data",
+      completed_step_ids: JSON.stringify([]),
+      result_payload: null,
+    });
+    const completedResult = JSON.stringify({
+      status: "success",
+      results: { metrics: { rmse: 1, mae: 1, r2: 0.9 } },
+    });
+    const activeRun = buildActiveRun("ma", {
+      session_id: row.session_id,
+      request_hash: row.request_hash,
+      dataset_revision: row.dataset_revision,
+      runtime_revision: row.runtime_revision,
+    });
+    useActiveRuns(activeRun);
+    existsSync.mockImplementation((filePath: string) => filePath === activeRun.artifact_path);
+    buildModelTrainingRequestHash
+      .mockReturnValueOnce("post-commit-transient-hash")
+      .mockReturnValue(row.request_hash);
+
+    let releaseIdentity!: () => void;
+    const identityGate = new Promise<void>((resolve) => { releaseIdentity = resolve; });
+    let announceIdentity!: () => void;
+    const identityStarted = new Promise<void>((resolve) => { announceIdentity = resolve; });
+    let status: "ready" | "completed" = "ready";
+    let firstExperimentRead = true;
+    let supersedeAttempts = 0;
+    poolQuery.mockImplementation(async (sql: string, params?: unknown[]) => {
+      if (sql.includes("FROM model_guided_training_sessions")) {
+        return [[{
+          ...row,
+          status,
+          current_step_id: status === "completed" ? null : row.current_step_id,
+          result_payload: status === "completed" ? completedResult : null,
+        }]];
+      }
+      if (sql.includes("FROM experiment_status")) {
+        if (firstExperimentRead) {
+          firstExperimentRead = false;
+          announceIdentity();
+          await identityGate;
+        }
+        return [[buildExperimentContextRow()]];
+      }
+      if (sql.includes("FROM dataset_segments")) return [[{ file_path: datasetCsvPath }]];
+      if (sql.includes("SET status = 'superseded'")) {
+        supersedeAttempts += 1;
+        expect(params?.[2]).toBe("ready");
+        return [{ affectedRows: 0 }];
+      }
+      return [[buildExperimentContextRow()]];
+    });
+
+    const pending = getGuidedTrainingSession("ma", 20240002, row.session_id);
+    await identityStarted;
+    status = "completed";
+    releaseIdentity();
+    const session = await pending;
+
+    expect(session.status).toBe("completed");
+    expect(supersedeAttempts).toBe(1);
+    expect(poolQuery.mock.calls.some(([sql]) =>
+      String(sql).includes("AND status = ?")
+      && String(sql).includes("AND request_hash = ?")
+    )).toBeTrue();
   });
 
   test("keeps legacy artifact validation out of guided session metadata reads", async () => {
@@ -920,6 +1065,7 @@ describe("models service guided training", () => {
     const experiment = buildExperimentContextRow({ moving_average_window: 11 });
     poolQuery.mockImplementation(async (sql: string) => {
       if (sql.includes("FROM dataset_segments")) return [[{ file_path: datasetCsvPath }]];
+      if (sql.includes("SET status = 'superseded'")) return [{ affectedRows: 1 }];
       if (sql.includes("FROM model_guided_training_sessions")) {
         return [[buildGuidedSessionRow({
           session_id: "guided-dynamic-split",
@@ -1100,7 +1246,8 @@ describe("models service guided training", () => {
 
     expect(error).toMatchObject({ code: "GUIDED_SESSION_SUPERSEDED" });
     expect(poolQuery.mock.calls.some(([sql]) =>
-      String(sql).includes("AND status <> 'superseded'"),
+      String(sql).includes("AND status = ?")
+      && String(sql).includes("AND request_hash = ?"),
     )).toBe(true);
     expect(copyFileSync).not.toHaveBeenCalled();
   });
@@ -1474,6 +1621,7 @@ describe("models service guided training", () => {
     const experiment = buildExperimentContextRow();
     poolQuery.mockImplementation(async (sql: string) => {
       if (sql.includes("FROM dataset_segments")) return [[{ file_path: datasetCsvPath }]];
+      if (sql.includes("SET status = 'superseded'")) return [{ affectedRows: 1 }];
       if (sql.includes("FROM model_guided_training_sessions")) {
         return [[{
           session_id: "guided-ensemble-existing",
@@ -1686,6 +1834,7 @@ describe("models service guided training", () => {
     );
     poolQuery.mockImplementation(async (sql: string) => {
       if (sql.includes("FROM dataset_segments")) return [[{ file_path: datasetCsvPath }]];
+      if (sql.includes("SET status = 'superseded'")) return [{ affectedRows: 1 }];
       if (sql.includes("FROM model_guided_training_sessions")) {
         return [[{
           session_id: "guided-features-existing",

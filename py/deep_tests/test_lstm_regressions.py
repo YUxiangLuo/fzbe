@@ -5,6 +5,8 @@ import math
 import sys
 import unittest
 from dataclasses import dataclass
+from types import SimpleNamespace
+from unittest.mock import patch
 
 import numpy as np
 import pandas as pd
@@ -34,6 +36,12 @@ class _FixedDirectModel:
         del verbose
         self.last_input_shape = tuple(np.asarray(values).shape)
         return np.asarray([self.scaled_predictions], dtype=float)
+
+
+class _SavedFitOnlyModel:
+    def save(self, path: str) -> None:
+        with open(path, "wb") as handle:
+            handle.write(b"keras-placeholder")
 
 
 def _mixed_records() -> list[dict[str, object]]:
@@ -73,6 +81,77 @@ class LstmFeatureAndPreprocessingTests(unittest.TestCase):
                     r"\[VALIDATION\].*explicit feature list",
                 ):
                     lstm._parse_feature_key_list(missing)
+
+    @profile("fast")
+    def test_fit_only_legacy_schema_fallback_uses_requested_training_range(self):
+        records = [
+            {
+                "month": f"{2024 + index // 12:04d}-{index % 12 + 1:02d}",
+                "y": 50 + index,
+                "mystery": index % 2 if index < 12 else index,
+            }
+            for index in range(18)
+        ]
+        legacy_state = {
+            "model_type": "lstm",
+            "target_key": "y",
+            "feature_keys": ["mystery"],
+            "normalization": "minmax",
+            "production_forecast_horizon": 2,
+            "prediction_domain": "nonnegative_demand",
+        }
+        fake_tensorflow = SimpleNamespace(
+            get_logger=lambda: SimpleNamespace(setLevel=lambda _level: None),
+            keras=SimpleNamespace(
+                utils=SimpleNamespace(set_random_seed=lambda _seed: None),
+            ),
+        )
+
+        with IsolatedWorkspace() as workspace:
+            save_path = workspace / "fit-only.pkl"
+            args = SimpleNamespace(
+                fit_only=True,
+                data=json.dumps(records),
+                save_model=str(save_path),
+                load_model=str(workspace / "legacy.pkl"),
+                train_start=0,
+                train_end=11,
+                fit_forecast_steps=2,
+                fit_predict_steps=0,
+                allow_negative_predictions=False,
+                pretty=False,
+            )
+            fit_result = (
+                _SavedFitOnlyModel(),
+                object(),
+                pd.DataFrame(),
+                {"look_back": 2, "regime": "teaching_demo", "feature_count": 2},
+                [1.0, 1.0],
+                {},
+            )
+            with (
+                patch.dict(sys.modules, {"tensorflow": fake_tensorflow}),
+                patch.object(lstm, "_load_state", return_value=legacy_state),
+                patch.object(
+                    lstm,
+                    "infer_parsed_feature_types",
+                    wraps=lstm.infer_parsed_feature_types,
+                ) as infer_types,
+                patch.object(lstm, "_fit_direct_model", return_value=fit_result),
+                patch.object(lstm, "dump_model") as dump_model,
+                patch("builtins.print"),
+            ):
+                lstm.run(args)
+
+            self.assertEqual(range(0, 12), infer_types.call_args.kwargs["inference_range"])
+            saved_state = dump_model.call_args.args[0]
+            self.assertEqual("categorical", saved_state["feature_types"]["mystery"])
+            self.assertEqual(
+                "fz.training-prefix.v1",
+                saved_state["training_provenance"]["schema"],
+            )
+            self.assertEqual(0, saved_state["training_provenance"]["train_start_index"])
+            self.assertEqual(11, saved_state["training_provenance"]["train_end_index"])
 
     @profile("fast")
     def test_minmax_and_zscore_preserve_feature_order_and_ignore_unseen_category(self):

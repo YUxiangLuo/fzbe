@@ -282,6 +282,38 @@ describe("models service cleanup", () => {
     expect(poolQuery.mock.calls[3]?.[1]).toEqual(["production-expired-safe"]);
   });
 
+  test("blocks cleanup for a DB-live running attempt regardless of parent status", async () => {
+    const now = new Date("2026-07-05T00:00:00.000Z");
+    poolQuery.mockReset();
+    poolQuery
+      .mockResolvedValueOnce([[
+        {
+          session_id: "ready-parent-live-attempt",
+          experiment_id: 990002,
+          model_type: "ma",
+          artifact_dir: "/tmp/fangzhen-py/production_preparation/ready-parent-live-attempt",
+          status: "ready",
+          candidate_model_path: path.join(mockedTrainedModelsRoot, "ready-live.pkl"),
+          candidate_is_active: 0,
+        },
+      ]])
+      // Models a running lease becoming live after selection but before claim.
+      .mockResolvedValueOnce([{ affectedRows: 0 }])
+      .mockResolvedValueOnce([[]]);
+    readdirSync.mockReturnValueOnce([]);
+
+    const result = await cleanupExpiredProductionPreparationSessions({ now, limit: 50 });
+
+    expect(result).toEqual({ deletedSessions: 0, deletedArtifactDirs: 0 });
+    for (const callIndex of [0, 1]) {
+      const sql = String(poolQuery.mock.calls[callIndex]?.[0]);
+      expect(sql).toContain("attempts.status = 'running'");
+      expect(sql).toContain("attempts.lease_expires_at > ?");
+      expect(sql).not.toContain("sessions.status = 'running'");
+    }
+    expect(rmSync).not.toHaveBeenCalled();
+  });
+
   test("does not delete a production preparation session renewed after cleanup selection", async () => {
     const artifactDir = "/tmp/fangzhen-py/production_preparation/exp990002-student20240002-ma-renewed";
     const now = new Date("2026-07-05T00:00:00.000Z");

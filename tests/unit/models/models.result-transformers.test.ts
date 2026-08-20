@@ -528,6 +528,62 @@ describe("production prediction calibration diagnostics", () => {
     });
   });
 
+  test("widens intervals only when the defensive demand clamp changes the point", () => {
+    const diagnostics = { calibration_mean_error: 0, calibration_count: 8 };
+    const [fullyNegative] = normalizeProductionPoint({
+      ...diagnostics,
+      prediction: -2,
+      interval_lower: -7,
+      interval_upper: -1,
+    });
+    expect(fullyNegative).toMatchObject({
+      prediction: 0,
+      interval_lower: -7,
+      interval_upper: 0,
+    });
+
+    const [straddling] = normalizeProductionPoint({
+      ...diagnostics,
+      prediction: -2,
+      interval_lower: -7,
+      interval_upper: 3,
+    });
+    expect(straddling).toMatchObject({
+      prediction: 0,
+      interval_lower: -7,
+      interval_upper: 3,
+    });
+
+    const [biasedPositive] = normalizeProductionPoint({
+      ...diagnostics,
+      prediction: 10,
+      interval_lower: 1,
+      interval_upper: 2,
+    });
+    expect(biasedPositive).toMatchObject({
+      prediction: 10,
+      interval_lower: 1,
+      interval_upper: 2,
+    });
+  });
+
+  test("rejects non-finite planning-floor derivatives", () => {
+    const prediction = {
+      ...predictionPoint(Number.MAX_VALUE, 1),
+      calibration_mean_error: 0,
+      calibration_count: 8,
+      coverage_claim: "none" as const,
+    };
+    expect(() => applyPlanningUncertaintyFloor([prediction], {
+      rmse: Number.MAX_VALUE,
+      interval_evaluation: {
+        count: 12,
+        observed_inclusion_rate: 0,
+        coverage_claim: "none",
+      },
+    })).toThrow("[PYTHON_DATA] Planning uncertainty floor produced non-finite metadata");
+  });
+
   test("floors under-dispersed production uncertainty after poor outer inclusion", () => {
     const [adjusted] = applyPlanningUncertaintyFloor([{
       prediction: 100,

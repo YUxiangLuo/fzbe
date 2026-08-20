@@ -226,13 +226,16 @@ def main() -> None:
             eval_end,
         )
         short_horizon_lstm_source = temp_path / "lstm-short-source.pkl"
+        # Keep the source artifact bound to the exact ensemble training prefix;
+        # only its saved direct-forecast horizon is intentionally shorter than
+        # the five-point ensemble evaluation below.
         train_lstm_source_artifact(
             data_json,
             short_horizon_lstm_source,
             train_start=0,
-            train_end=27,
-            eval_start=28,
-            eval_end=29,
+            train_end=30,
+            eval_start=31,
+            eval_end=32,
         )
         assert (temp_path / "lstm-backtest_keras_model.h5").exists()
 

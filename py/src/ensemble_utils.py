@@ -17,6 +17,7 @@ from data_utils import (
     build_numeric_subprocess_records,
     build_subprocess_records,
     infer_feature_types,
+    validate_training_provenance,
 )
 # Re-exported here because all ensemble modules share this boundary helper.
 from forecast_utils import normalize_demand_forecast as normalize_demand_forecast
@@ -136,6 +137,7 @@ def load_lstm_source_state(model_file: str, context: str) -> Dict[str, Any]:
 def build_lstm_params_from_source_state(
     parsed_data: ParsedData,
     source_model_state: Dict[str, Any],
+    training_range: range,
 ) -> Dict[str, Any]:
     raw_target_feature = source_model_state.get("target_key")
     if not isinstance(raw_target_feature, str) or not raw_target_feature.strip():
@@ -213,6 +215,7 @@ def build_lstm_params_from_source_state(
             parsed_data=parsed_data,
             target_key=target_feature,
             feature_keys=feature_keys,
+            inference_range=training_range,
         )
     feature_types[target_feature] = "numeric"
 
@@ -714,6 +717,7 @@ def resolve_base_model_artifact_configs(
     model_params: Dict[str, Dict[str, Any]],
     base_model_files: Dict[str, str],
     context: str,
+    training_range: range,
 ) -> Tuple[Dict[str, Dict[str, Any]], Dict[str, str]]:
     """Validate explicit source artifacts and make their fixed configuration authoritative.
 
@@ -816,12 +820,34 @@ def resolve_base_model_artifact_configs(
                 canonical_params[model_name] = build_lstm_params_from_source_state(
                     parsed_data,
                     source_state,
+                    training_range,
                 )
             except (KeyError, TypeError, ValueError) as exc:
                 raise ValueError(
                     f"[VALIDATION] {context} LSTM source artifact has invalid "
                     f"training configuration: {exc}"
                 ) from exc
+
+        provenance_features: List[str] = []
+        provenance_feature_types: Optional[Dict[str, str]] = None
+        if model_name == "lstm":
+            provenance_features = json.loads(
+                canonical_params[model_name]["lstm_features"]
+            )
+            provenance_feature_types = canonical_params[model_name].get("feature_types")
+        try:
+            validate_training_provenance(
+                source_state,
+                parsed_data,
+                training_range,
+                feature_keys=provenance_features,
+                feature_types=provenance_feature_types,
+            )
+        except ValueError as exc:
+            raise ValueError(
+                f"[VALIDATION] {context} source artifact for {model_name} has invalid "
+                f"training provenance: {exc}"
+            ) from exc
 
         validated_files[model_name] = model_file
 
@@ -841,7 +867,11 @@ def build_ensemble_subprocess_data(
             lstm_params.get("lstm_features") if "lstm_features" in lstm_params else None,
             "Ensemble LSTM member",
         )
-        lstm_data_dicts, _ = build_subprocess_records(parsed_data, feature_keys=lstm_feature_keys)
+        lstm_data_dicts, _ = build_subprocess_records(
+            parsed_data,
+            feature_keys=lstm_feature_keys,
+            feature_types=lstm_params.get("feature_types"),
+        )
 
     return numeric_data_dicts, lstm_data_dicts
 

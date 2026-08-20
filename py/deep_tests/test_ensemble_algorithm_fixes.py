@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import itertools
+import json
 import math
 import sys
 import unittest
@@ -17,6 +18,7 @@ from py.deep_tests.support.harness import (
     run_command,
     run_loaded,
 )
+from py.deep_tests.support.oracles import shrunk_inverse_mse_weights
 from py.deep_tests.support.profiles import profile
 from py.src.data_utils import ParsedData
 from py.src.ensemble_utils import (
@@ -51,7 +53,12 @@ class WeightedAverageDegenerateCaseTests(unittest.TestCase):
         self.assertEqual(set(equal_columns), set(weights))
         np.testing.assert_allclose(list(weights.values()), [1 / 3] * 3, atol=1e-15)
         self.assertAlmostEqual(1.0, sum(weights.values()), places=15)
-        self.assertGreater(details["epsilon"], 0.0)
+        self.assertEqual(0.0, details["epsilon"])
+        self.assertEqual(
+            "equal_raw_weight_among_exact_zero_members",
+            details["zero_error_policy"],
+        )
+        self.assertEqual(set(equal_columns), set(details["exact_zero_members"]))
         self.assertTrue(
             np.isfinite(
                 list(details["raw_weights"].values())
@@ -65,25 +72,161 @@ class WeightedAverageDegenerateCaseTests(unittest.TestCase):
             "biased": targets + 3.0,
             "noisy": np.asarray([8.0, 1.0, 9.0, 2.0, 12.0]),
         }
-        base_weights, _ = weighted_avg._compute_inverse_residual_mse_weights(
+        base_weights, base_details = weighted_avg._compute_inverse_residual_mse_weights(
             targets,
             columns,
         )
-        scaled_weights, _ = weighted_avg._compute_inverse_residual_mse_weights(
-            targets * 1e9,
-            {name: values * 1e9 for name, values in columns.items()},
-        )
-        for name in columns:
-            self.assertAlmostEqual(base_weights[name], scaled_weights[name], places=10)
+        for multiplier in (1e-15, 1.0, 1e15):
+            scaled_weights, scaled_details = weighted_avg._compute_inverse_residual_mse_weights(
+                targets * multiplier,
+                {name: values * multiplier for name, values in columns.items()},
+            )
+            for name in columns:
+                self.assertAlmostEqual(base_weights[name], scaled_weights[name], places=13)
+                self.assertAlmostEqual(
+                    base_details["residual_mse_normalized"][name],
+                    scaled_details["residual_mse_normalized"][name],
+                    places=13,
+                )
+            self.assertAlmostEqual(
+                base_details["normalization_scale"] * multiplier,
+                scaled_details["normalization_scale"],
+                places=13,
+            )
+        self.assertEqual(1.0, base_details["raw_weights"]["perfect"])
+        self.assertEqual(0.0, base_details["raw_weights"]["biased"])
+        self.assertEqual(0.0, base_details["raw_weights"]["noisy"])
         self.assertGreater(base_weights["perfect"], base_weights["biased"])
         self.assertLess(base_weights["perfect"], 1.0)
         self.assertGreater(min(base_weights.values()), 0.0)
+
+        no_exact_columns = {
+            "near": targets + np.asarray([0.25, -0.5, 0.75, -1.0, 1.25]),
+            "biased": targets + 3.0,
+            "noisy": np.asarray([8.0, 1.0, 9.0, 2.0, 12.0]),
+        }
+        reference_weights, reference_details = (
+            weighted_avg._compute_inverse_residual_mse_weights(
+                targets,
+                no_exact_columns,
+            )
+        )
+        for multiplier in (1e-15, 1.0, 1e15):
+            observed, diagnostics = weighted_avg._compute_inverse_residual_mse_weights(
+                targets * multiplier,
+                {
+                    name: values * multiplier
+                    for name, values in no_exact_columns.items()
+                },
+            )
+            np.testing.assert_allclose(
+                list(observed.values()),
+                list(reference_weights.values()),
+                rtol=2e-14,
+                atol=2e-14,
+            )
+            np.testing.assert_allclose(
+                list(diagnostics["residual_mse_normalized"].values()),
+                list(reference_details["residual_mse_normalized"].values()),
+                rtol=2e-14,
+                atol=2e-14,
+            )
+            self.assertEqual(
+                "no_epsilon_normalized_inverse_ratio",
+                diagnostics["epsilon_policy"],
+            )
+            self.assertTrue(np.isfinite(list(observed.values())).all())
+
+        tiny_targets = np.asarray([1.0, 0.0])
+        tiny_columns = {
+            "near": np.asarray([1.0, 1e-200]),
+            "far": np.asarray([1.0, 2e-200]),
+        }
+        tiny_weights, tiny_details = weighted_avg._compute_inverse_residual_mse_weights(
+            tiny_targets,
+            tiny_columns,
+        )
+        oracle_weights = shrunk_inverse_mse_weights(tiny_targets, tiny_columns)
+        self.assertEqual([], tiny_details["exact_zero_members"])
+        self.assertAlmostEqual(0.8, tiny_details["raw_weights"]["near"], places=14)
+        self.assertAlmostEqual(0.2, tiny_details["raw_weights"]["far"], places=14)
+        self.assertAlmostEqual(0.62, tiny_weights["near"], places=14)
+        self.assertAlmostEqual(0.38, tiny_weights["far"], places=14)
+        np.testing.assert_allclose(
+            list(tiny_weights.values()),
+            list(oracle_weights.values()),
+            rtol=1e-14,
+            atol=1e-14,
+        )
+        self.assertEqual({"near": None, "far": None}, tiny_details["residual_mse_normalized"])
+        self.assertGreater(tiny_details["residual_rms_normalized"]["far"], 0.0)
+
+        mixed_targets = np.asarray([1e308, 0.0])
+        mixed_columns = {
+            "near": np.asarray([1e308, 1e-200]),
+            "far": np.asarray([1e308, 2e-200]),
+        }
+        mixed_weights, mixed_details = weighted_avg._compute_inverse_residual_mse_weights(
+            mixed_targets,
+            mixed_columns,
+        )
+        mixed_oracle = shrunk_inverse_mse_weights(mixed_targets, mixed_columns)
+        self.assertEqual([], mixed_details["exact_zero_members"])
+        self.assertAlmostEqual(0.8, mixed_details["raw_weights"]["near"], places=14)
+        self.assertAlmostEqual(0.2, mixed_details["raw_weights"]["far"], places=14)
+        self.assertAlmostEqual(0.62, mixed_weights["near"], places=14)
+        self.assertAlmostEqual(0.38, mixed_weights["far"], places=14)
+        np.testing.assert_allclose(
+            list(mixed_weights.values()),
+            list(mixed_oracle.values()),
+            rtol=1e-14,
+            atol=1e-14,
+        )
+        self.assertEqual({"near": None, "far": None}, mixed_details["residual_mse"])
+        self.assertEqual(
+            {"near": None, "far": None},
+            mixed_details["residual_mse_normalized"],
+        )
+        json.dumps(mixed_details, allow_nan=False)
+
+        extreme_targets = np.asarray([1e308, -1e308])
+        extreme_columns = {
+            "half": np.asarray([5e307, -5e307]),
+            "zero": np.asarray([0.0, 0.0]),
+            "opposite": np.asarray([-1e308, 1e308]),
+        }
+        extreme_weights, extreme_details = (
+            weighted_avg._compute_inverse_residual_mse_weights(
+                extreme_targets,
+                extreme_columns,
+            )
+        )
+        self.assertTrue(np.isfinite(list(extreme_weights.values())).all())
+        self.assertAlmostEqual(1.0, sum(extreme_weights.values()), places=15)
+        self.assertTrue(np.isfinite(
+            list(extreme_details["residual_mse_normalized"].values())
+        ).all())
+        self.assertIn(None, extreme_details["residual_mse"].values())
 
         with self.assertRaisesRegex(ValueError, r"\[VALIDATION\].*at least one"):
             weighted_avg._compute_inverse_residual_mse_weights(
                 np.asarray([1.0, 2.0]),
                 {},
             )
+        with self.assertRaisesRegex(ValueError, "match the target length"):
+            weighted_avg._compute_inverse_residual_mse_weights(
+                np.asarray([1.0, 2.0]),
+                {"ma": [1.0]},
+            )
+        for invalid_targets, invalid_predictions in (
+            ([1.0, float("nan")], {"ma": [1.0, 2.0]}),
+            ([1.0, 2.0], {"ma": [1.0, float("inf")]}),
+        ):
+            with self.assertRaisesRegex(ValueError, "finite"):
+                weighted_avg._compute_inverse_residual_mse_weights(
+                    np.asarray(invalid_targets),
+                    invalid_predictions,
+                )
 
 
 class StackingDegenerateCaseTests(unittest.TestCase):

@@ -64,6 +64,7 @@ const {
   renameSync,
   mkdirSync,
   rmSync,
+  readFileSync,
   createSpawnResult,
   withEnsembleAuxiliarySpawns,
   spawnMock,
@@ -356,6 +357,248 @@ describe("models service production preparation", () => {
     }
   });
 
+  test("replaces expired and corrupt incomplete production sessions in the same create request", async () => {
+    const newSessionId = "123e4567-e89b-42d3-a456-426614174996";
+    const randomUuidSpy = jest.spyOn(crypto, "randomUUID").mockReturnValue(newSessionId);
+    let retired = false;
+    let insertedSession: Record<string, unknown> | null = null;
+    try {
+      createReadStream.mockImplementation(() =>
+        Readable.from([modelDatasetCsv]) as unknown as ReturnType<typeof createReadStream>
+      );
+      poolQuery.mockResolvedValueOnce([[{ file_path: datasetCsvPath }]]);
+      const currentDataset = await loadDatasetFromDb("制造业", "样本企业", "样本产品");
+      const datasetRevision = hashDatasetSnapshot(JSON.stringify(currentDataset));
+      const activeRun = buildActiveRun("ma", {
+        request_hash: "training-request-current",
+        dataset_revision: datasetRevision,
+        runtime_revision: getModelRuntimeRevision(true),
+        production_revision: null,
+        is_active: 1,
+      });
+      useActiveRuns(activeRun);
+      let staleSession = {
+        session_id: "expired-production-session",
+        experiment_id: 990002,
+        student_id: 20240002,
+        run_id: activeRun.run_id,
+        model_type: "ma",
+        request_hash: "production-request-hash",
+        dataset_revision: datasetRevision,
+        runtime_revision: activeRun.runtime_revision,
+        protocol_version: 1,
+        forecast_steps: 6,
+        status: "ready",
+        current_step_id: "initialize",
+        completed_step_ids: "[]",
+        step_plan: JSON.stringify([
+          { id: "initialize", label: "初始化" },
+          { id: "finalize", label: "完成" },
+        ]),
+        artifact_dir: "/tmp/fangzhen-py/production_preparation/expired-production-session",
+        candidate_model_path: path.join(mockedTrainedModelsRoot, "expired-production.pkl"),
+        committed_state_path: null,
+        committed_state_sha256: null,
+        active_attempt_id: null,
+        production_revision: null,
+        error_message: null,
+        superseded_reason: null,
+        session_is_live: 0,
+        active_attempt_lease_is_live: 0,
+      };
+      poolQuery.mockImplementation(async (sql: string, params: unknown[] = []) => {
+        if (sql.includes("FROM dataset_segments")) return [[{ file_path: datasetCsvPath }]];
+        if (sql.includes("SET status = 'superseded'")) return [{ affectedRows: 1 }];
+        if (sql.includes("DELETE session")) {
+          retired = true;
+          return [{ affectedRows: 1 }];
+        }
+        if (sql.includes("FROM model_training_runs") && sql.includes("FOR UPDATE")) return [[activeRun]];
+        if (sql.includes("INSERT INTO model_production_preparation_sessions")) {
+          insertedSession = {
+            ...staleSession,
+            session_id: params[0],
+            request_hash: params[5],
+            status: "ready",
+            artifact_dir: params[12],
+            candidate_model_path: params[13],
+            session_is_live: 1,
+          };
+          return [{ affectedRows: 1 }];
+        }
+        if (sql.includes("FROM model_production_preparation_sessions")) {
+          if (sql.includes("WHERE session_id = ?")) return insertedSession ? [[insertedSession]] : [[]];
+          return retired ? [[]] : [[staleSession]];
+        }
+        return [[buildExperimentContextRow()]];
+      });
+
+      const result = await createOrResumeProductionPreparationSession("ma", 20240002, 990002, 6);
+      expect(result.results.session_id).toBe(newSessionId);
+      expect(result.results.session_status).toBe("ready");
+      const statements = poolQuery.mock.calls.map(([sql]) => String(sql));
+      expect(statements.some((sql) => sql.includes("SET status = 'superseded'"))).toBe(true);
+      expect(statements.some((sql) => sql.includes("DELETE session"))).toBe(true);
+      expect(spawnMock).not.toHaveBeenCalled();
+
+      const corruptReplacementId = "123e4567-e89b-42d3-a456-426614174995";
+      randomUuidSpy.mockReturnValue(corruptReplacementId);
+      staleSession = {
+        ...staleSession,
+        session_id: "corrupt-production-session",
+        artifact_dir: "/tmp/fangzhen-py/production_preparation/corrupt-production-session",
+        session_is_live: 1,
+      };
+      retired = false;
+      insertedSession = null;
+      poolQuery.mockClear();
+
+      const corruptResult = await createOrResumeProductionPreparationSession(
+        "ma",
+        20240002,
+        990002,
+        6,
+      );
+      expect(corruptResult.results.session_id).toBe(corruptReplacementId);
+      expect(poolQuery.mock.calls.some(([sql]) =>
+        String(sql).includes("SET status = 'superseded'")
+      )).toBe(true);
+      expect(poolQuery.mock.calls.some(([sql]) =>
+        String(sql).includes("DELETE session")
+      )).toBe(true);
+    } finally {
+      randomUuidSpy.mockRestore();
+    }
+  });
+
+  test("does not clean artifacts when an expired-session retirement CAS loses", async () => {
+    createReadStream.mockImplementation(() =>
+      Readable.from([modelDatasetCsv]) as unknown as ReturnType<typeof createReadStream>
+    );
+    poolQuery.mockResolvedValueOnce([[{ file_path: datasetCsvPath }]]);
+    const dataset = await loadDatasetFromDb("制造业", "样本企业", "样本产品");
+    const datasetRevision = hashDatasetSnapshot(JSON.stringify(dataset));
+    const activeRun = buildActiveRun("ma", {
+      dataset_revision: datasetRevision,
+      runtime_revision: getModelRuntimeRevision(true),
+    });
+    useActiveRuns(activeRun);
+    const stale = {
+      session_id: "production-aba",
+      experiment_id: 990002,
+      student_id: 20240002,
+      run_id: activeRun.run_id,
+      model_type: "ma",
+      request_hash: "production-aba-request",
+      dataset_revision: datasetRevision,
+      runtime_revision: activeRun.runtime_revision,
+      protocol_version: 1,
+      forecast_steps: 6,
+      status: "ready",
+      current_step_id: "initialize",
+      completed_step_ids: "[]",
+      step_plan: JSON.stringify([
+        { id: "initialize", label: "初始化" },
+        { id: "fit_model", label: "拟合" },
+        { id: "finalize", label: "完成" },
+      ]),
+      artifact_dir: "/tmp/fangzhen-py/production_preparation/production-aba",
+      candidate_model_path: path.join(mockedTrainedModelsRoot, "production-aba.pkl"),
+      committed_state_path: null,
+      committed_state_sha256: null,
+      active_attempt_id: null,
+      expires_at: "2026-08-01 00:00:00",
+      production_revision: null,
+      error_message: null,
+      superseded_reason: null,
+      session_is_live: 0,
+      active_attempt_lease_is_live: 0,
+    };
+    const renewed = {
+      ...stale,
+      status: "ready",
+      current_step_id: "fit_model",
+      completed_step_ids: JSON.stringify(["initialize"]),
+      committed_state_path: "/tmp/fangzhen-py/production_preparation/production-aba/state.pkl",
+      committed_state_sha256: "a".repeat(64),
+      expires_at: "2026-08-30 00:00:00",
+      session_is_live: 1,
+    };
+    let initialSelected = false;
+    poolQuery.mockImplementation(async (sql: string) => {
+      if (sql.includes("FROM dataset_segments")) return [[{ file_path: datasetCsvPath }]];
+      if (sql.includes("SET status = 'superseded'")) return [{ affectedRows: 0 }];
+      if (sql.includes("FROM model_production_preparation_sessions")) {
+        if (sql.includes("WHERE session_id = ?")) return [[renewed]];
+        if (!initialSelected) {
+          initialSelected = true;
+          return [[stale]];
+        }
+        return [[renewed]];
+      }
+      return [[buildExperimentContextRow()]];
+    });
+
+    const result = await createOrResumeProductionPreparationSession("ma", 20240002, 990002, 6);
+
+    expect(result.results).toMatchObject({
+      session_id: stale.session_id,
+      completed_step_ids: ["initialize"],
+      next_step: { id: "fit_model" },
+    });
+    expect(poolQuery.mock.calls.some(([sql]) => String(sql).includes("DELETE session"))).toBe(false);
+    expect(rmSync).not.toHaveBeenCalled();
+    expect(unlinkSync).not.toHaveBeenCalled();
+  });
+
+  test("does not retire an expired session while its active attempt lease is live", async () => {
+    const activeRun = buildActiveRun("ma");
+    const liveSession = {
+      session_id: "expired-live-production-session",
+      experiment_id: 990002,
+      student_id: 20240002,
+      run_id: activeRun.run_id,
+      model_type: "ma",
+      request_hash: "production-request-hash",
+      dataset_revision: activeRun.dataset_revision,
+      runtime_revision: activeRun.runtime_revision,
+      protocol_version: 1,
+      forecast_steps: 6,
+      status: "running",
+      current_step_id: "initialize",
+      completed_step_ids: "[]",
+      step_plan: JSON.stringify([
+        { id: "initialize", label: "初始化" },
+        { id: "finalize", label: "完成" },
+      ]),
+      artifact_dir: "/tmp/fangzhen-py/production_preparation/expired-live-production-session",
+      candidate_model_path: path.join(mockedTrainedModelsRoot, "live-production.pkl"),
+      committed_state_path: null,
+      committed_state_sha256: null,
+      active_attempt_id: "live-attempt",
+      production_revision: null,
+      error_message: null,
+      superseded_reason: null,
+      session_is_live: 0,
+      active_attempt_lease_is_live: 1,
+    };
+    useActiveRuns(activeRun);
+    mockExperimentAndDatasetQueries();
+    poolQuery.mockImplementation(async (sql: string) => {
+      if (sql.includes("FROM dataset_segments")) return [[{ file_path: datasetCsvPath }]];
+      if (sql.includes("FROM model_production_preparation_sessions")) return [[liveSession]];
+      return [[buildExperimentContextRow()]];
+    });
+    createReadStream.mockImplementation(() =>
+      Readable.from([modelDatasetCsv]) as unknown as ReturnType<typeof createReadStream>
+    );
+
+    const result = await createOrResumeProductionPreparationSession("ma", 20240002, 990002, 6);
+    expect(result.results.session_id).toBe(liveSession.session_id);
+    expect(poolQuery.mock.calls.some(([sql]) => String(sql).includes("DELETE session"))).toBe(false);
+    expect(poolQuery.mock.calls.some(([sql]) => String(sql).includes("SET status = 'superseded'"))).toBe(false);
+  });
+
   test("removes an uncommitted production session directory after a known INSERT failure", async () => {
     const sessionId = "123e4567-e89b-42d3-a456-426614174998";
     const artifactDir = path.join(
@@ -635,6 +878,84 @@ describe("models service production preparation", () => {
     expect(connection.release).toHaveBeenCalledTimes(1);
   });
 
+  test("replaces an attached failed attempt when it has no durable receipt", async () => {
+    const session = {
+      session_id: "production-failed-attempt-session",
+      experiment_id: 990002,
+      student_id: 20240002,
+      run_id: "ma-run-current",
+      model_type: "ma",
+      request_hash: "production-request",
+      dataset_revision: "dataset-revision",
+      runtime_revision: getModelRuntimeRevision(true),
+      protocol_version: 1,
+      forecast_steps: 6,
+      status: "failed",
+      current_step_id: "initialize",
+      completed_step_ids: JSON.stringify([]),
+      step_plan: JSON.stringify([
+        { id: "initialize", label: "确认材料" },
+        { id: "finalize", label: "完成" },
+      ]),
+      artifact_dir: "/tmp/fangzhen-py/production_preparation/production-failed-attempt-session",
+      candidate_model_path: "/tmp/fangzhen-py/trained_models/ma-production.pkl",
+      committed_state_path: null,
+      committed_state_sha256: null,
+      active_attempt_id: "production-failed-attempt",
+      observed_production_revision: null,
+      production_revision: null,
+      error_message: "previous failure",
+      superseded_reason: null,
+      expires_at: null,
+    };
+    const previousAttempt = {
+      attempt_id: "production-failed-attempt",
+      session_id: session.session_id,
+      step_id: "initialize",
+      status: "failed",
+      receipt_path: "/tmp/nonexistent-production-receipt.json",
+      lease_expires_at: null,
+      lease_is_active: 0,
+    };
+    const nextAttempt = {
+      ...previousAttempt,
+      attempt_id: "production-retry-attempt",
+      status: "running",
+      candidate_state_path: "/tmp/production-retry-attempt.pkl",
+      receipt_path: "/tmp/production-retry-attempt.receipt.json",
+    };
+    const statements: string[] = [];
+    const connection = {
+      beginTransaction: mock(async () => undefined),
+      commit: mock(async () => undefined),
+      rollback: mock(async () => undefined),
+      release: mock(() => undefined),
+      destroy: mock(() => undefined),
+      query: mock(async (sql: string) => {
+        statements.push(sql);
+        if (sql.includes("FROM model_production_preparation_sessions")) return [[session]];
+        if (sql.includes("FROM model_production_preparation_step_attempts")) {
+          return [[previousAttempt]];
+        }
+        return [{ affectedRows: 1 }];
+      }),
+    };
+    poolGetConnection.mockResolvedValueOnce(connection as never);
+
+    await installProductionPreparationAttempt({
+      session: session as never,
+      attempt: nextAttempt as never,
+      stepId: "initialize",
+      observedProductionRevision: null,
+      leaseSeconds: 120,
+    });
+
+    expect(statements.some((sql) =>
+      sql.includes("INSERT INTO model_production_preparation_step_attempts")
+    )).toBeTrue();
+    expect(connection.commit).toHaveBeenCalledTimes(1);
+  });
+
   test("commits an intermediate production checkpoint with attempt ownership CAS", async () => {
     const attemptId = "production-intermediate-attempt";
     const connection = {
@@ -674,6 +995,38 @@ describe("models service production preparation", () => {
     expect(statements[2]).toContain("UPDATE model_production_preparation_sessions");
     expect(statements[2]).toContain("AND active_attempt_id = ?");
     expect(statements[2]).toContain("AND status = 'running'");
+    expect(connection.commit).toHaveBeenCalledTimes(1);
+  });
+
+  test("keeps a failed production attempt attached for durable receipt discovery", async () => {
+    const attemptId = "receipt-bearing-attempt";
+    const connection = {
+      beginTransaction: mock(async () => undefined),
+      commit: mock(async () => undefined),
+      rollback: mock(async () => undefined),
+      release: mock(() => undefined),
+      destroy: mock(() => undefined),
+      query: mock(async (sql: string) => {
+        if (sql.includes("SELECT active_attempt_id")) {
+          return [[{ active_attempt_id: attemptId, status: "running" }]];
+        }
+        return [{ affectedRows: 1 }];
+      }),
+    };
+    poolGetConnection.mockResolvedValueOnce(connection as never);
+
+    await recordProductionPreparationAttemptFailure({
+      sessionId: "production-session",
+      attemptId,
+      stepId: "initialize",
+      message: "receipt written before commit failed",
+    });
+
+    const statements = connection.query.mock.calls.map(([sql]) => String(sql));
+    expect(statements[1]).toContain("SET status = 'failed'");
+    expect(statements[2]).toContain("SET status = 'failed'");
+    expect(statements[2]).not.toContain("active_attempt_id = NULL");
+    expect(statements[2]).toContain("AND active_attempt_id = ?");
     expect(connection.commit).toHaveBeenCalledTimes(1);
   });
 
@@ -756,7 +1109,7 @@ describe("models service production preparation", () => {
       session_status: "ready",
       next_step: { id: "initialize" },
     });
-    expect(tryAcquireModelExecutionLock).not.toHaveBeenCalled();
+    expect(tryAcquireModelExecutionLock).toHaveBeenCalledTimes(1);
     expect(spawnMock).not.toHaveBeenCalled();
   });
 
@@ -851,6 +1204,344 @@ describe("models service production preparation", () => {
     expect(spawnMock).not.toHaveBeenCalled();
   });
 
+  test("self-heals malformed production progress before step-order conflicts", async () => {
+    const baseRow = {
+      session_id: "production-malformed-progress",
+      experiment_id: 990002,
+      student_id: 20240002,
+      run_id: "ma-run-current",
+      model_type: "ma",
+      request_hash: "production-request-hash",
+      dataset_revision: "dataset-revision",
+      runtime_revision: getModelRuntimeRevision(),
+      protocol_version: 1,
+      forecast_steps: 6,
+      status: "ready",
+      current_step_id: "initialize",
+      completed_step_ids: JSON.stringify([]),
+      step_plan: JSON.stringify([
+        { id: "initialize", label: "确认生产准备材料" },
+        { id: "finalize", label: "组装并校验生产产物" },
+      ]),
+      artifact_dir: "/tmp/fangzhen-py/production_preparation/production-malformed-progress",
+      candidate_model_path: path.join(mockedTrainedModelsRoot, "ma-production.pkl"),
+      committed_state_path: null,
+      committed_state_sha256: null,
+      active_attempt_id: null,
+      expires_at: "2026-08-20 00:00:00",
+      production_revision: null,
+      error_message: null,
+      superseded_reason: null,
+    };
+    const cases = [
+      {
+        label: "non-array completed IDs",
+        row: { ...baseRow, completed_step_ids: JSON.stringify({ initialize: true }) },
+      },
+      {
+        label: "unknown middle work item",
+        row: {
+          ...baseRow,
+          step_plan: JSON.stringify([
+            { id: "initialize", label: "确认生产准备材料" },
+            { id: "fit_member_prophet", label: "unknown" },
+            { id: "finalize", label: "组装并校验生产产物" },
+          ]),
+        },
+      },
+      {
+        label: "malformed plan JSON shape",
+        row: { ...baseRow, step_plan: JSON.stringify({ id: "initialize" }) },
+      },
+    ];
+
+    for (const { label, row } of cases) {
+      expect(label.length).toBeGreaterThan(0);
+      poolQuery.mockReset();
+      poolQuery
+        .mockResolvedValueOnce([[row]])
+        .mockResolvedValueOnce([{ affectedRows: 1 }]);
+      await expect(
+        runProductionPreparationStep("ma", 20240002, row.session_id, "finalize"),
+      ).rejects.toMatchObject({ code: "PRODUCTION_PREPARATION_STALE" });
+      expect(String(poolQuery.mock.calls[1]?.[0])).toContain("SET status = 'superseded'");
+      expect(spawnMock).not.toHaveBeenCalled();
+    }
+  });
+
+  test("builds a safe metadata payload from malformed production JSON", async () => {
+    poolQuery.mockResolvedValueOnce([[
+      {
+        session_id: "production-malformed-payload",
+        experiment_id: 990002,
+        student_id: 20240002,
+        model_type: "ma",
+        protocol_version: 1,
+        forecast_steps: 6,
+        status: "ready",
+        completed_step_ids: JSON.stringify({ bad: true }),
+        step_plan: JSON.stringify("bad-plan"),
+        production_revision: null,
+        error_message: null,
+      },
+    ]]).mockResolvedValueOnce([[buildExperimentContextRow()]]);
+
+    const result = await getProductionPreparationSession(
+      "ma",
+      20240002,
+      "production-malformed-payload",
+    );
+    expect(result.results).toMatchObject({
+      completed_step_ids: [],
+      total_steps: 0,
+      next_step: null,
+    });
+  });
+
+  test("replays a durable intermediate production receipt without rerunning Python", async () => {
+    poolQuery.mockResolvedValueOnce([[{ file_path: datasetCsvPath }]]);
+    createReadStream.mockImplementationOnce(() =>
+      Readable.from([modelDatasetCsv]) as unknown as ReturnType<typeof createReadStream>
+    );
+    const currentDataset = await loadDatasetFromDb("制造业", "样本企业", "样本产品");
+    const datasetJson = JSON.stringify(currentDataset);
+    const datasetRevision = hashDatasetSnapshot(datasetJson);
+    const runtimeRevision = getModelRuntimeRevision(true);
+    const sessionId = `production-replay-intermediate-${process.pid}`;
+    const artifactDir = path.join("/tmp/fangzhen-py/production_preparation", sessionId);
+    const datasetSnapshotPath = path.join(artifactDir, "dataset.json");
+    const sourceModelPath = path.join(mockedTrainedModelsRoot, `${sessionId}-source.pkl`);
+    const candidateModelPath = path.join(mockedTrainedModelsRoot, `${sessionId}-production.pkl`);
+    const candidateStatePath = path.join(artifactDir, "attempts", "attempt-replay", "candidate.pkl");
+    const receiptPath = path.join(artifactDir, "attempts", "attempt-replay", "receipt.json");
+    const candidateContents = modelDatasetCsv;
+    const candidateDigest = crypto.createHash("sha256").update(candidateContents).digest("hex");
+    const activeRun = buildActiveRun("ma", {
+      artifact_path: sourceModelPath,
+      dataset_revision: datasetRevision,
+      runtime_revision: runtimeRevision,
+      production_revision: null,
+    });
+    const requestHash = crypto.createHash("sha256").update(JSON.stringify({
+      runId: activeRun.run_id,
+      datasetRevision,
+      runtimeRevision,
+      forecastSteps: 6,
+    })).digest("hex");
+    const sessionRow: Record<string, unknown> = {
+      session_id: sessionId,
+      experiment_id: 990002,
+      student_id: 20240002,
+      run_id: activeRun.run_id,
+      model_type: "ma",
+      request_hash: requestHash,
+      dataset_revision: datasetRevision,
+      runtime_revision: runtimeRevision,
+      protocol_version: 1,
+      forecast_steps: 6,
+      status: "running",
+      current_step_id: "initialize",
+      completed_step_ids: JSON.stringify([]),
+      step_plan: JSON.stringify([
+        { id: "initialize", label: "确认生产准备材料" },
+        { id: "finalize", label: "组装并校验生产产物" },
+      ]),
+      artifact_dir: artifactDir,
+      candidate_model_path: candidateModelPath,
+      committed_state_path: null,
+      committed_state_sha256: null,
+      active_attempt_id: "attempt-replay",
+      observed_production_revision: null,
+      production_revision: null,
+      expires_at: "2026-08-01 00:00:00",
+      session_is_live: 0,
+      active_attempt_lease_is_live: 0,
+      error_message: null,
+      superseded_reason: null,
+    };
+    const attemptRow = {
+      attempt_id: "attempt-replay",
+      session_id: sessionId,
+      step_id: "initialize",
+      status: "running",
+      input_state_path: null,
+      input_state_sha256: null,
+      candidate_state_path: candidateStatePath,
+      candidate_state_sha256: null,
+      receipt_path: receiptPath,
+      output_payload: null,
+      error_message: null,
+      lease_expires_at: "2026-08-01 00:00:00",
+      lease_is_active: 0,
+    };
+    const receipt = {
+      protocol_version: 1,
+      attempt_id: attemptRow.attempt_id,
+      step_id: "initialize",
+      candidate_state_path: candidateStatePath,
+      candidate_state_sha256: candidateDigest,
+      input_state_path: null,
+      input_state_sha256: null,
+      output: { work_items: [{ id: "fit_model" }] },
+    };
+    const commitConnection = {
+      beginTransaction: mock(async () => undefined),
+      commit: mock(async () => undefined),
+      rollback: mock(async () => undefined),
+      release: mock(() => undefined),
+      destroy: mock(() => undefined),
+      query: mock(async (sql: string, params: unknown[] = []) => {
+        if (sql.includes("FROM model_production_preparation_sessions")) {
+          return [[sessionRow]];
+        }
+        if (sql.includes("FROM model_production_preparation_step_attempts")) {
+          return [[attemptRow]];
+        }
+        if (sql.includes("UPDATE model_production_preparation_step_attempts")) {
+          if (sql.includes("SET status = 'running'")) {
+            Object.assign(attemptRow, { status: "running", error_message: null });
+          } else if (sql.includes("SET status = 'failed'")) {
+            Object.assign(attemptRow, { status: "failed", error_message: params[0] });
+          }
+        }
+        if (sql.includes("UPDATE model_production_preparation_sessions")) {
+          if (sql.includes("SET status = 'running'")) {
+            Object.assign(sessionRow, {
+              status: "running",
+              current_step_id: "initialize",
+              session_is_live: 1,
+            });
+          } else if (sql.includes("SET status = 'failed'")) {
+            Object.assign(sessionRow, {
+              status: "failed",
+              current_step_id: params[0],
+              error_message: params[1],
+              session_is_live: 1,
+            });
+          } else {
+            Object.assign(sessionRow, {
+              status: params[0],
+              current_step_id: params[1],
+              completed_step_ids: params[2],
+              step_plan: params[3],
+              committed_state_path: params[4],
+              committed_state_sha256: params[5],
+              active_attempt_id: null,
+              session_is_live: 1,
+            });
+          }
+        }
+        return [{ affectedRows: 1 }];
+      }),
+    };
+
+    try {
+      await actualFs.promises.mkdir(path.dirname(candidateStatePath), { recursive: true });
+      await actualFs.promises.mkdir(mockedTrainedModelsRoot, { recursive: true });
+      await Bun.write(datasetSnapshotPath, datasetJson);
+      await Bun.write(sourceModelPath, modelDatasetCsv);
+      await Bun.write(candidateStatePath, candidateContents);
+      await Bun.write(receiptPath, JSON.stringify({
+        ...receipt,
+        candidate_state_sha256: "0".repeat(64),
+      }));
+      expect(
+        crypto.createHash("sha256").update(readFileSync(candidateStatePath)).digest("hex"),
+      ).toBe(candidateDigest);
+      existsSync.mockImplementation((filePath: string) => [
+        sourceModelPath,
+        candidateStatePath,
+        receiptPath,
+      ].includes(filePath) || filePath.endsWith("production_prepare_model.py"));
+      createReadStream.mockImplementation((filePath: string) =>
+        Readable.from([
+          filePath === datasetCsvPath ? modelDatasetCsv : readFileSync(filePath),
+        ]) as unknown as ReturnType<typeof createReadStream>
+      );
+      useActiveRuns(activeRun);
+      poolGetConnection.mockResolvedValue(commitConnection as never);
+      poolQuery.mockImplementation(async (sql: string) => {
+        if (
+          sql.includes("FROM model_production_preparation_step_attempts")
+          && sql.includes("WHERE attempt_id = ?")
+        ) return [[attemptRow]];
+        if (sql.includes("FROM model_production_preparation_sessions")) return [[sessionRow]];
+        if (sql.includes("FROM dataset_segments")) return [[{ file_path: datasetCsvPath }]];
+        if (sql.includes("SET status = 'running'")) return [{ affectedRows: 1 }];
+        return [[buildExperimentContextRow()]];
+      });
+
+      Object.assign(sessionRow, {
+        session_is_live: 1,
+        active_attempt_lease_is_live: 1,
+      });
+      Object.assign(attemptRow, { lease_is_active: 1 });
+      const invalidReceiptFallback = await runProductionPreparationStep(
+        "ma",
+        20240002,
+        sessionId,
+        "initialize",
+      );
+      expect(invalidReceiptFallback.results.session_status).toBe("running");
+      expect(spawnMock).not.toHaveBeenCalled();
+
+      await Bun.write(receiptPath, JSON.stringify(receipt));
+      Object.assign(sessionRow, {
+        session_is_live: 0,
+        active_attempt_lease_is_live: 0,
+      });
+      Object.assign(attemptRow, { status: "committed", lease_is_active: 0 });
+      await expect(
+        runProductionPreparationStep("ma", 20240002, sessionId, "initialize"),
+      ).rejects.toMatchObject({
+        code: "PRODUCTION_PREPARATION_STEP_IN_PROGRESS",
+      });
+      expect(spawnMock).not.toHaveBeenCalled();
+
+      Object.assign(sessionRow, {
+        status: "running",
+        active_attempt_id: attemptRow.attempt_id,
+        active_attempt_lease_is_live: 0,
+      });
+      Object.assign(attemptRow, { status: "running", lease_is_active: 0 });
+      await recordProductionPreparationAttemptFailure({
+        sessionId,
+        attemptId: attemptRow.attempt_id,
+        stepId: "initialize",
+        message: "known failure after receipt write",
+      });
+      expect(sessionRow.status).toBe("failed");
+      expect(sessionRow.active_attempt_id).toBe(attemptRow.attempt_id);
+      expect(attemptRow.status).toBe("failed");
+
+      const result = await runProductionPreparationStep(
+        "ma",
+        20240002,
+        sessionId,
+        "initialize",
+      );
+      expect(result.results).toMatchObject({
+        session_status: "ready",
+        completed_step_ids: ["initialize"],
+        next_step: { id: "fit_model" },
+      });
+      expect(spawnMock).not.toHaveBeenCalled();
+      const failedAttemptRearm = commitConnection.query.mock.calls.find(([sql]) =>
+        String(sql).includes("SET status = 'running'")
+        && String(sql).includes("model_production_preparation_step_attempts")
+      );
+      expect(failedAttemptRearm).toBeDefined();
+      expect(failedAttemptRearm?.[1]?.[4]).toBe("failed");
+      expect(commitConnection.query.mock.calls.some(([sql]) =>
+        String(sql).includes("SET status = 'committed'")
+      )).toBe(true);
+    } finally {
+      await actualFs.promises.rm(artifactDir, { recursive: true, force: true });
+      await actualFs.promises.rm(sourceModelPath, { force: true });
+      existsSync.mockImplementation(() => false);
+    }
+  });
+
   test("supersedes production preparation and requires retraining when the dataset changed", async () => {
     const staleDatasetRevision = "d".repeat(64);
     const activeRun = buildActiveRun("ma", {
@@ -917,6 +1608,66 @@ describe("models service production preparation", () => {
     )).toBe(true);
     expect(setProductionArtifactForRun).not.toHaveBeenCalled();
     expect(commitProductionPreparationResult).not.toHaveBeenCalled();
+    expect(spawnMock).not.toHaveBeenCalled();
+  });
+
+  test("durably supersedes a corrupt production snapshot before starting Python", async () => {
+    const datasetRevision = "a".repeat(64);
+    const runtimeRevision = getModelRuntimeRevision(true);
+    const activeRun = buildActiveRun("ma", { dataset_revision: datasetRevision, runtime_revision: runtimeRevision });
+    useActiveRuns(activeRun);
+    const artifactDir = "/tmp/fangzhen-py/production_preparation/corrupt-snapshot-session";
+    const sessionRow = {
+      session_id: "corrupt-snapshot-session",
+      experiment_id: 990002,
+      student_id: 20240002,
+      run_id: activeRun.run_id,
+      model_type: "ma",
+      request_hash: "production-request-hash",
+      dataset_revision: datasetRevision,
+      runtime_revision: runtimeRevision,
+      protocol_version: 1,
+      forecast_steps: 6,
+      status: "ready",
+      current_step_id: "initialize",
+      completed_step_ids: "[]",
+      step_plan: JSON.stringify([
+        { id: "initialize", label: "初始化" },
+        { id: "finalize", label: "完成" },
+      ]),
+      artifact_dir: artifactDir,
+      candidate_model_path: path.join(mockedTrainedModelsRoot, "corrupt-snapshot-production.pkl"),
+      committed_state_path: null,
+      committed_state_sha256: null,
+      active_attempt_id: null,
+      production_revision: null,
+      error_message: null,
+      superseded_reason: null,
+      session_is_live: 1,
+      active_attempt_lease_is_live: 0,
+    };
+    createReadStream.mockImplementation((filePath: string) =>
+      Readable.from([
+        filePath === path.join(artifactDir, "dataset.json") ? "corrupt" : modelDatasetCsv,
+      ]) as unknown as ReturnType<typeof createReadStream>
+    );
+    poolQuery.mockImplementation(async (sql: string) => {
+      if (sql.includes("FROM model_production_preparation_sessions")) return [[sessionRow]];
+      if (sql.includes("SET expires_at")) return [{ affectedRows: 1 }];
+      if (sql.includes("SET status = 'superseded'")) return [{ affectedRows: 1 }];
+      if (sql.includes("FROM dataset_segments")) return [[{ file_path: datasetCsvPath }]];
+      return [[buildExperimentContextRow()]];
+    });
+
+    await expect(runProductionPreparationStep(
+      "ma",
+      20240002,
+      sessionRow.session_id,
+      "initialize",
+    )).rejects.toMatchObject({ code: "PRODUCTION_PREPARATION_STALE" });
+    expect(poolQuery.mock.calls.some(([sql]) =>
+      String(sql).includes("SET status = 'superseded'")
+    )).toBe(true);
     expect(spawnMock).not.toHaveBeenCalled();
   });
 
@@ -1073,12 +1824,14 @@ describe("models service production preparation", () => {
         return [{ affectedRows: 1 }];
       }),
     };
-    const checkpointContents = "durable-production-final-checkpoint";
+    const checkpointContents = modelDatasetCsv;
     const productionModelContents = "possibly-published-production-model";
     const checkpointSha256 = crypto
       .createHash("sha256")
       .update(checkpointContents)
       .digest("hex");
+    let recoveredAttemptId: string | null = null;
+    let recoveredAttemptStatus: "running" | "failed" = "running";
     let candidateStatePath: string | null = null;
     let receiptPath: string | null = null;
     const commitError = new ModelCommitOutcomeUnknownError();
@@ -1096,21 +1849,37 @@ describe("models service production preparation", () => {
       ));
       createReadStream.mockImplementation((filePath: string) =>
         Readable.from([
-          filePath === datasetSnapshotPath
-            ? datasetJson
-            : filePath === candidateStatePath
-              ? checkpointContents
-              : filePath === candidateModelPath
-                ? productionModelContents
-                : modelDatasetCsv,
+          filePath === datasetCsvPath ? modelDatasetCsv : readFileSync(filePath),
         ]) as unknown as ReturnType<typeof createReadStream>
       );
       useActiveRuns(activeRun);
       poolGetConnection.mockResolvedValueOnce(installConnection as never);
       poolQuery.mockImplementation(async (sql: string) => {
+        if (
+          sql.includes("FROM model_production_preparation_step_attempts")
+          && sql.includes("WHERE attempt_id = ?")
+        ) {
+          return [[{
+            attempt_id: recoveredAttemptId,
+            session_id: sessionId,
+            step_id: "finalize",
+            status: recoveredAttemptStatus,
+            input_state_path: null,
+            input_state_sha256: null,
+            candidate_state_path: candidateStatePath,
+            candidate_state_sha256: null,
+            receipt_path: receiptPath,
+            output_payload: null,
+            error_message: null,
+            lease_expires_at: "2026-08-01 00:00:00",
+            lease_is_active: 0,
+          }]];
+        }
         if (sql.includes("FROM model_production_preparation_sessions")) return [[sessionRow]];
         if (sql.includes("FROM dataset_segments")) return [[{ file_path: datasetCsvPath }]];
-        if (sql.includes("SET expires_at = CASE")) return [{ affectedRows: 1 }];
+        if (sql.includes("SET expires_at = CASE") || sql.includes("SET status = 'running'")) {
+          return [{ affectedRows: 1 }];
+        }
         return [[buildExperimentContextRow()]];
       });
       spawnMock.mockImplementation((command: string[]) => {
@@ -1120,6 +1889,7 @@ describe("models service production preparation", () => {
           return command[index + 1]!;
         };
         const attemptId = argumentAfter("--attempt-id");
+        recoveredAttemptId = attemptId;
         candidateStatePath = argumentAfter("--output-state-file");
         receiptPath = argumentAfter("--receipt-file");
         const saveModelPath = argumentAfter("--save-model");
@@ -1135,6 +1905,13 @@ describe("models service production preparation", () => {
           output: { finalized: true },
           final_result: { prepared: true },
         };
+        Bun.spawnSync(["mkdir", "-p", path.dirname(candidateStatePath)]);
+        Bun.spawnSync([
+          "sh", "-c", "printf %s \"$1\" > \"$2\"", "sh", checkpointContents, candidateStatePath,
+        ]);
+        Bun.spawnSync([
+          "sh", "-c", "printf %s \"$1\" > \"$2\"", "sh", JSON.stringify(receipt), receiptPath,
+        ]);
         return createSpawnResult(JSON.stringify(receipt));
       });
       commitProductionPreparationResult.mockRejectedValueOnce(commitError);
@@ -1180,6 +1957,46 @@ describe("models service production preparation", () => {
         || filePath === candidateStatePath
         || filePath === receiptPath,
       )).toBeFalse();
+
+      recoveredAttemptStatus = "failed";
+      Object.assign(sessionRow, {
+        status: "running",
+        active_attempt_id: recoveredAttemptId,
+        session_is_live: 0,
+        active_attempt_lease_is_live: 0,
+        expires_at: "2026-08-01 00:00:00",
+      });
+      existsSync.mockImplementation((filePath: string) => (
+        filePath.endsWith("production_prepare_model.py")
+        || filePath === sourceModelPath
+        || filePath === candidateModelPath
+        || filePath === candidateStatePath
+        || filePath === receiptPath
+      ));
+      commitProductionPreparationResult.mockImplementationOnce(async () => {
+        Object.assign(sessionRow, {
+          status: "completed",
+          active_attempt_id: null,
+          current_step_id: null,
+          completed_step_ids: sessionRow.step_plan,
+          production_revision: preparationToken,
+        });
+        return { committed: true, replacedProductionArtifactPath: null };
+      });
+
+      const recovered = await runProductionPreparationStep(
+        "ma",
+        20240002,
+        sessionId,
+        "finalize",
+      );
+      expect(recovered.results.session_status).toBe("completed");
+      const finalFailedAttemptRearm = poolQuery.mock.calls.find(([sql]) =>
+        String(sql).includes("SET status = 'running'")
+        && String(sql).includes("model_production_preparation_step_attempts")
+      );
+      expect(finalFailedAttemptRearm?.[1]?.[4]).toBe("failed");
+      expect(spawnMock).toHaveBeenCalledTimes(1);
     } finally {
       await actualFs.promises.rm(artifactDir, { recursive: true, force: true });
       await actualFs.promises.rm(sourceModelPath, { force: true });

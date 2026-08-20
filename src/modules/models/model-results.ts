@@ -176,9 +176,17 @@ export const normalizeDemandPredictionPoints = (
         );
       }
     }
+    const normalizedPrediction = Math.max(0, prediction);
+    const predictionWasClamped = normalizedPrediction !== prediction;
     return {
       ...point,
-      prediction: Math.max(0, prediction),
+      prediction: normalizedPrediction,
+      ...(predictionWasClamped && hasIntervalField
+        ? {
+          interval_lower: Math.min(point.interval_lower as number, normalizedPrediction),
+          interval_upper: Math.max(point.interval_upper as number, normalizedPrediction),
+        }
+        : {}),
     };
   });
 };
@@ -362,16 +370,25 @@ export const applyPlanningUncertaintyFloor = (
       && Number.isFinite(point.upper_error_p99)
       ? point.upper_error_p99
       : 0;
+    const intervalHalfWidth = NORMAL_95 * planningScale;
+    const p99Offset = NORMAL_99_ONE_SIDED * planningScale;
+    const upperErrorP99 = Math.max(currentUpperErrorP99, p99Offset);
+    const intervalLower = Math.max(0, point.prediction - intervalHalfWidth);
+    const intervalUpper = point.prediction + intervalHalfWidth;
+    if (![planningScale, intervalHalfWidth, p99Offset, upperErrorP99, intervalLower, intervalUpper]
+      .every(Number.isFinite)) {
+      throw new Error("[PYTHON_DATA] Planning uncertainty floor produced non-finite metadata");
+    }
 
     return {
       ...point,
       std_dev: planningScale,
-      upper_error_p99: Math.max(currentUpperErrorP99, NORMAL_99_ONE_SIDED * planningScale),
+      upper_error_p99: upperErrorP99,
       uncertainty_source: "fallback",
       uncertainty_reason: "outer_evaluation_undercoverage_rmse_floor",
       calibration_source: "outer_evaluation_rmse_floor",
-      interval_lower: Math.max(0, point.prediction - NORMAL_95 * planningScale),
-      interval_upper: point.prediction + NORMAL_95 * planningScale,
+      interval_lower: intervalLower,
+      interval_upper: intervalUpper,
       interval_level: 0.95,
       interval_kind: "fallback_normal_approximation",
       coverage_claim: "none",

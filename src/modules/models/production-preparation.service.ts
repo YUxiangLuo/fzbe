@@ -25,6 +25,7 @@ import {
 } from "./model-operation-lease";
 import {
   runPythonProductionPreparationStep,
+  type ProductionPreparationPythonStepResult,
 } from "./model-python-runner";
 import {
   commitProductionPreparationResult,
@@ -105,6 +106,10 @@ export interface ProductionPreparationSessionRow extends RowDataPacket {
   error_message: string | null;
   superseded_reason: string | null;
   expires_at: Date | string | null;
+  updated_at: Date | string;
+  /** Computed by MySQL to avoid application timezone interpretation. */
+  session_is_live?: number | boolean | string | null;
+  active_attempt_lease_is_live?: number | boolean | string | null;
 }
 
 export interface ProductionPreparationAttemptRow extends RowDataPacket {
@@ -167,23 +172,68 @@ export interface ProductionPreparationSessionPayload {
   };
 }
 
-const parseProductionPreparationStepPlan = (value: unknown): ProductionPreparationStepDefinition[] => {
-  if (!Array.isArray(value)) return [];
-  return value.filter((item): item is ProductionPreparationStepDefinition => (
-    isRecordValue(item)
-    && typeof item.id === "string"
-    && item.id.length > 0
-    && typeof item.label === "string"
-    && item.label.length > 0
-  ));
+const PRODUCTION_WORK_ITEM_ID = /^(?:fit_model|fit_member_(?:ma|es|arima|lstm)|fit_stage_\d+_(?:ma|es|arima|lstm))$/;
+
+const parseProductionCompletedStepIds = (value: unknown): string[] | null => {
+  const parsed = parseJsonColumn<unknown>(value, null);
+  if (
+    !Array.isArray(parsed)
+    || !parsed.every((item) => typeof item === "string" && item.length > 0)
+  ) {
+    return null;
+  }
+  return parsed;
+};
+
+const parseProductionPreparationStepPlan = (
+  value: unknown,
+): ProductionPreparationStepDefinition[] | null => {
+  const parsed = parseJsonColumn<unknown>(value, null);
+  if (!Array.isArray(parsed)) return null;
+  const plan: ProductionPreparationStepDefinition[] = [];
+  for (const item of parsed) {
+    if (
+      !isRecordValue(item)
+      || typeof item.id !== "string"
+      || item.id.length === 0
+      || typeof item.label !== "string"
+      || item.label.length === 0
+    ) {
+      return null;
+    }
+    plan.push({ id: item.id, label: item.label });
+  }
+  return plan;
+};
+
+const hasValidProductionStepProgress = (
+  row: Pick<ProductionPreparationSessionRow, "completed_step_ids" | "step_plan" | "status">,
+) => {
+  const stepPlan = parseProductionPreparationStepPlan(row.step_plan);
+  const completedStepIds = parseProductionCompletedStepIds(row.completed_step_ids);
+  if (!stepPlan || !completedStepIds) return false;
+  const planIds = stepPlan.map((step) => step.id);
+  const hasValidPlan = planIds.length >= 2
+    && planIds[0] === "initialize"
+    && planIds.at(-1) === "finalize"
+    && planIds.slice(1, -1).every((id) => PRODUCTION_WORK_ITEM_ID.test(id))
+    && new Set(planIds).size === planIds.length;
+  const hasValidPrefix = completedStepIds.every(
+    (stepId, index) => stepId === planIds[index],
+  ) && (
+    row.status === "completed"
+      ? completedStepIds.length === planIds.length
+      : completedStepIds.length < planIds.length
+  );
+  return hasValidPlan && hasValidPrefix;
 };
 
 const buildProductionPreparationPayload = (
   row: ProductionPreparationSessionRow,
   reusedExisting = false,
 ): ProductionPreparationSessionPayload => {
-  const completedStepIds = parseJsonColumn<string[]>(row.completed_step_ids, []);
-  const stepPlan = parseProductionPreparationStepPlan(parseJsonColumn<unknown>(row.step_plan, []));
+  const completedStepIds = parseProductionCompletedStepIds(row.completed_step_ids) ?? [];
+  const stepPlan = parseProductionPreparationStepPlan(row.step_plan) ?? [];
   const completed = new Set(completedStepIds);
   const nextStep = row.status === "completed" || row.status === "superseded"
     ? null
@@ -271,7 +321,17 @@ const fetchProductionPreparationSession = async (sessionId: string) => {
             production_revision,
             error_message,
             superseded_reason,
-            expires_at
+            expires_at,
+            updated_at,
+            expires_at IS NOT NULL AND expires_at > NOW() AS session_is_live,
+            EXISTS (
+              SELECT 1
+                FROM model_production_preparation_step_attempts AS active_attempt
+               WHERE active_attempt.attempt_id = model_production_preparation_sessions.active_attempt_id
+                 AND active_attempt.session_id = model_production_preparation_sessions.session_id
+                 AND active_attempt.status = 'running'
+                 AND active_attempt.lease_expires_at > NOW()
+            ) AS active_attempt_lease_is_live
        FROM model_production_preparation_sessions
       WHERE session_id = ?
       LIMIT 1`,
@@ -306,21 +366,157 @@ export interface ProductionPreparationIdentity {
   requestHash: string;
 }
 
+const jsonColumnCasValue = (value: unknown) => (
+  typeof value === "string" ? value : JSON.stringify(value)
+);
+
 const markProductionPreparationSessionSuperseded = async (
-  row: Pick<ProductionPreparationSessionRow, "session_id">,
+  row: Pick<
+    ProductionPreparationSessionRow,
+    | "session_id"
+    | "status"
+    | "active_attempt_id"
+    | "expires_at"
+    | "current_step_id"
+    | "completed_step_ids"
+    | "step_plan"
+    | "committed_state_path"
+    | "committed_state_sha256"
+  >,
   reason: string,
 ) => {
-  await queryWithTimeout(pool,
-    `UPDATE model_production_preparation_sessions
+  if (!(["ready", "running", "failed"] as const).includes(
+    row.status as "ready" | "running" | "failed",
+  )) return false;
+  const [result] = await queryWithTimeout(pool,
+    `UPDATE model_production_preparation_sessions AS session
         SET status = 'superseded',
             current_step_id = NULL,
             active_attempt_id = NULL,
             superseded_reason = ?,
             error_message = NULL
-      WHERE session_id = ?
-        AND status <> 'superseded'`,
-    [reason, row.session_id],
+      WHERE session.session_id = ?
+        AND session.status = ?
+        AND session.active_attempt_id <=> ?
+        AND session.expires_at <=> ?
+        AND session.current_step_id <=> ?
+        AND session.completed_step_ids = ?
+        AND session.step_plan = ?
+        AND session.committed_state_path <=> ?
+        AND session.committed_state_sha256 <=> ?
+        AND session.status IN ('ready', 'running', 'failed')
+        AND NOT EXISTS (
+          SELECT 1
+            FROM model_production_preparation_step_attempts AS attempt
+           WHERE attempt.attempt_id = session.active_attempt_id
+             AND attempt.session_id = session.session_id
+             AND attempt.status = 'running'
+             AND attempt.lease_expires_at > NOW()
+        )`,
+    [
+      reason,
+      row.session_id,
+      row.status,
+      row.active_attempt_id,
+      row.expires_at,
+      row.current_step_id,
+      jsonColumnCasValue(row.completed_step_ids),
+      jsonColumnCasValue(row.step_plan),
+      row.committed_state_path,
+      row.committed_state_sha256,
+    ],
   );
+  return Number((result as { affectedRows?: number }).affectedRows ?? 0) === 1;
+};
+
+const claimAlreadySupersededProductionPreparationSession = async (
+  row: ProductionPreparationSessionRow,
+) => {
+  const claimToken = `Retirement claim ${crypto.randomUUID()}`;
+  const [result] = await queryWithTimeout(pool,
+    `UPDATE model_production_preparation_sessions
+        SET superseded_reason = ?
+      WHERE session_id = ?
+        AND status = 'superseded'
+        AND active_attempt_id <=> ?
+        AND completed_step_ids = ?
+        AND step_plan = ?
+        AND committed_state_path <=> ?
+        AND committed_state_sha256 <=> ?`,
+    [
+      claimToken,
+      row.session_id,
+      row.active_attempt_id,
+      jsonColumnCasValue(row.completed_step_ids),
+      jsonColumnCasValue(row.step_plan),
+      row.committed_state_path,
+      row.committed_state_sha256,
+    ],
+  );
+  return Number((result as { affectedRows?: number }).affectedRows ?? 0) === 1;
+};
+
+const hasLiveProductionPreparationAttempt = (
+  row: Pick<ProductionPreparationSessionRow, "active_attempt_lease_is_live">,
+) => Number(row.active_attempt_lease_is_live) === 1;
+
+const classifyProductionPreparationSessionHealth = async (
+  row: ProductionPreparationSessionRow,
+  terminationSignal?: AbortSignal,
+  allowExpiredReceiptReplay = false,
+): Promise<{ healthy: boolean; liveAttempt: boolean; reason?: string }> => {
+  const liveAttempt = hasLiveProductionPreparationAttempt(row);
+  if (Number(row.protocol_version) !== PRODUCTION_PREPARATION_PROTOCOL_VERSION) {
+    return { healthy: false, liveAttempt: false, reason: "生产准备会话协议已失效" };
+  }
+  if (row.status === "superseded") {
+    return { healthy: false, liveAttempt: false, reason: row.superseded_reason ?? "生产准备会话已失效" };
+  }
+  if (!hasValidProductionStepProgress(row)) {
+    return { healthy: false, liveAttempt, reason: "生产准备步骤状态已损坏" };
+  }
+  if (row.status === "completed") return { healthy: true, liveAttempt: false };
+  if (liveAttempt && !allowExpiredReceiptReplay) {
+    return { healthy: true, liveAttempt: true };
+  }
+  // Production SELECTs always project these DB-time booleans. Older unit-test
+  // fixtures may omit both and are treated as metadata-only legacy fixtures.
+  if (
+    row.session_is_live === undefined
+    && row.active_attempt_lease_is_live === undefined
+  ) {
+    return { healthy: true, liveAttempt: false };
+  }
+  if (Number(row.session_is_live) !== 1 && !allowExpiredReceiptReplay) {
+    return { healthy: false, liveAttempt: false, reason: "生产准备会话已过期" };
+  }
+
+  try {
+    const datasetPath = path.join(row.artifact_dir, GUIDED_DATASET_FILE_NAME);
+    if (await hashFileContents(datasetPath, terminationSignal) !== row.dataset_revision) {
+      return { healthy: false, liveAttempt: false, reason: "生产准备数据快照已损坏" };
+    }
+    const hasCheckpointPath = row.committed_state_path !== null;
+    const hasCheckpointDigest = row.committed_state_sha256 !== null;
+    if (hasCheckpointPath !== hasCheckpointDigest) {
+      return { healthy: false, liveAttempt: false, reason: "生产准备 checkpoint 状态不完整" };
+    }
+    if (
+      hasCheckpointPath
+      && await hashFileContents(row.committed_state_path!, terminationSignal)
+        !== row.committed_state_sha256
+    ) {
+      return { healthy: false, liveAttempt: false, reason: "生产准备 checkpoint 已损坏" };
+    }
+  } catch (error) {
+    if (terminationSignal?.aborted) {
+      throw terminationSignal.reason instanceof Error
+        ? terminationSignal.reason
+        : error;
+    }
+    return { healthy: false, liveAttempt: false, reason: "生产准备会话工件缺失或不可读" };
+  }
+  return { healthy: true, liveAttempt: false };
 };
 
 const computeCurrentProductionPreparationIdentity = async (
@@ -365,17 +561,7 @@ const computeCurrentProductionPreparationIdentity = async (
 };
 
 const assertProductionPreparationIdentityCurrent = async (
-  row: Pick<
-    ProductionPreparationSessionRow,
-    | "session_id"
-    | "experiment_id"
-    | "model_type"
-    | "forecast_steps"
-    | "run_id"
-    | "request_hash"
-    | "dataset_revision"
-    | "runtime_revision"
-  >,
+  row: ProductionPreparationSessionRow,
   studentId: number,
   terminationSignal?: AbortSignal,
 ): Promise<ProductionPreparationIdentity> => {
@@ -531,6 +717,11 @@ export async function createOrResumeProductionPreparationSession(
       runtimeRevision,
       forecastSteps,
     });
+    return await withModelOperationLease(
+      operationContext,
+      { execution: { experimentId, modelType } },
+      async (lease) => {
+        await lease.verifyOwned();
     const [existingRows] = await queryWithTimeout<ProductionPreparationSessionRow[]>(pool,
       `SELECT session_id,
               experiment_id,
@@ -555,7 +746,17 @@ export async function createOrResumeProductionPreparationSession(
               production_revision,
               error_message,
               superseded_reason,
-              expires_at
+              expires_at,
+              updated_at,
+              expires_at IS NOT NULL AND expires_at > NOW() AS session_is_live,
+              EXISTS (
+                SELECT 1
+                  FROM model_production_preparation_step_attempts AS active_attempt
+                 WHERE active_attempt.attempt_id = model_production_preparation_sessions.active_attempt_id
+                   AND active_attempt.session_id = model_production_preparation_sessions.session_id
+                   AND active_attempt.status = 'running'
+                   AND active_attempt.lease_expires_at > NOW()
+              ) AS active_attempt_lease_is_live
          FROM model_production_preparation_sessions
         WHERE experiment_id = ?
           AND student_id = ?
@@ -582,31 +783,132 @@ export async function createOrResumeProductionPreparationSession(
         "PRODUCTION_PREPARATION_STALE",
       );
     }
-    const completedSessionStillCurrent = existing?.status !== "completed" || (
+    let completedSessionStillCurrent = existing?.status !== "completed" || (
       Boolean(existing.production_revision)
       && existing.production_revision === currentActiveRun.production_revision
       && currentActiveRun.production_artifact_forecast_steps !== null
       && Number(currentActiveRun.production_artifact_forecast_steps) >= forecastSteps
     );
+    let existingHealth: Awaited<ReturnType<typeof classifyProductionPreparationSessionHealth>> | null = null;
+    let retirementClaimed = false;
+    let retirementReason = "生产准备会话已失效";
+    if (existing) {
+      existingHealth = await classifyProductionPreparationSessionHealth(
+        existing,
+        lease.terminationSignal,
+      );
+      if (existing.status === "completed" && !existingHealth.healthy) {
+        completedSessionStillCurrent = false;
+      }
+      if (
+        !existingHealth.healthy
+        && existing.status !== "superseded"
+        && existing.status !== "completed"
+      ) {
+        retirementReason = existingHealth.reason ?? retirementReason;
+        retirementClaimed = await markProductionPreparationSessionSuperseded(
+          existing,
+          retirementReason,
+        );
+        if (!retirementClaimed) {
+          const retained = await fetchProductionPreparationSession(existing.session_id);
+          if (retained && retained.status !== "superseded") {
+            return buildProductionPreparationPayload(retained);
+          }
+          throw new ModelConflictError(
+            "生产准备会话状态已变化，请重试",
+            "PRODUCTION_PREPARATION_STALE",
+          );
+        }
+      }
+    }
     if (
       existing
       && existing.protocol_version === PRODUCTION_PREPARATION_PROTOCOL_VERSION
       && existing.status !== "superseded"
       && completedSessionStillCurrent
+      && existingHealth?.healthy === true
     ) {
       return buildProductionPreparationPayload(existing);
     }
     if (existing) {
-      if (existing.candidate_model_path !== currentActiveRun.production_artifact_path) {
-        removeModelArtifactGroup(existing.candidate_model_path);
+      let deleteResult: unknown;
+      if (existing.status === "completed") {
+        // Completed-stale retirement is intentionally separate from generic
+        // incomplete-session supersession and uses the freshly re-read run.
+        [deleteResult] = await queryWithTimeout(pool,
+          `DELETE session
+             FROM model_production_preparation_sessions AS session
+            WHERE session.session_id = ?
+              AND session.status = 'completed'
+              AND session.active_attempt_id <=> ?
+              AND session.production_revision <=> ?
+              AND session.completed_step_ids = ?
+              AND session.step_plan = ?`,
+          [
+            existing.session_id,
+            existing.active_attempt_id,
+            existing.production_revision,
+            jsonColumnCasValue(existing.completed_step_ids),
+            jsonColumnCasValue(existing.step_plan),
+          ],
+        );
+      } else {
+        if (existing.status === "superseded") {
+          retirementClaimed = await claimAlreadySupersededProductionPreparationSession(
+            existing,
+          );
+        }
+        if (!retirementClaimed) {
+          const retained = await fetchProductionPreparationSession(existing.session_id);
+          if (retained && retained.status !== "superseded") {
+            return buildProductionPreparationPayload(retained);
+          }
+          throw new ModelConflictError(
+            "生产准备会话状态已变化，请重试",
+            "PRODUCTION_PREPARATION_STALE",
+          );
+        }
+        [deleteResult] = await queryWithTimeout(pool,
+          `DELETE session
+             FROM model_production_preparation_sessions AS session
+            WHERE session.session_id = ?
+              AND session.status = 'superseded'
+              AND session.active_attempt_id IS NULL
+              AND session.completed_step_ids = ?
+              AND session.step_plan = ?
+              AND session.committed_state_path <=> ?
+              AND session.committed_state_sha256 <=> ?`,
+          [
+            existing.session_id,
+            jsonColumnCasValue(existing.completed_step_ids),
+            jsonColumnCasValue(existing.step_plan),
+            existing.committed_state_path,
+            existing.committed_state_sha256,
+          ],
+        );
       }
-      if (!removeProductionPreparationArtifactDir(existing.artifact_dir)) {
-        throw new ModelValidationError("旧的生产准备会话工件目录不安全，无法重建会话");
+      if (Number((deleteResult as { affectedRows?: number }).affectedRows ?? 0) !== 1) {
+        const retained = await fetchProductionPreparationSession(existing.session_id);
+        if (retained && retained.status !== "superseded") {
+          return buildProductionPreparationPayload(retained);
+        }
+        throw new ModelConflictError(
+          "生产准备会话状态已变化，请重试",
+          "PRODUCTION_PREPARATION_STALE",
+        );
       }
-      await queryWithTimeout(pool,
-        "DELETE FROM model_production_preparation_sessions WHERE session_id = ?",
-        [existing.session_id],
-      );
+      try {
+        if (existing.candidate_model_path !== currentActiveRun.production_artifact_path) {
+          removeModelArtifactGroup(existing.candidate_model_path);
+        }
+        removeProductionPreparationArtifactDir(existing.artifact_dir);
+      } catch (error) {
+        logger.warn(
+          { err: error, sessionId: existing.session_id, artifactDir: existing.artifact_dir },
+          "重建生产准备会话后清理旧工件失败",
+        );
+      }
     }
 
     const sessionId = crypto.randomUUID();
@@ -743,6 +1045,8 @@ export async function createOrResumeProductionPreparationSession(
     const created = await fetchProductionPreparationSession(sessionId);
     if (!created) throw new Error("生产准备会话创建后无法读取");
     return buildProductionPreparationPayload(created);
+      },
+    );
   });
 }
 
@@ -793,6 +1097,163 @@ const validateProductionPreparationReceipt = async (
   return result;
 };
 
+const fetchProductionPreparationAttempt = async (attemptId: string) => {
+  const [rows] = await queryWithTimeout<ProductionPreparationAttemptRow[]>(pool,
+    `SELECT *, lease_expires_at > NOW() AS lease_is_active
+       FROM model_production_preparation_step_attempts
+      WHERE attempt_id = ?
+      LIMIT 1`,
+    [attemptId],
+  );
+  return rows[0] ?? null;
+};
+
+const parseProductionPreparationAttemptReceipt = async (
+  attempt: ProductionPreparationAttemptRow,
+  terminationSignal?: AbortSignal,
+): Promise<ProductionPreparationPythonStepResult | null> => {
+  if (!fs.existsSync(attempt.receipt_path) || !fs.existsSync(attempt.candidate_state_path)) {
+    return null;
+  }
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(fs.readFileSync(attempt.receipt_path, "utf8"));
+  } catch {
+    return null;
+  }
+  if (!isRecordValue(parsed)) return null;
+  try {
+    return await validateProductionPreparationReceipt(
+      parsed as unknown as ProductionPreparationPythonStepResult,
+      attempt,
+      terminationSignal,
+    );
+  } catch (error) {
+    if (terminationSignal?.aborted) throw error;
+    logger.warn(
+      { err: error, attemptId: attempt.attempt_id },
+      "忽略无效 production preparation receipt 并回退到正常 attempt 流程",
+    );
+    return null;
+  }
+};
+
+const claimProductionPreparationReceiptReplay = async (
+  session: ProductionPreparationSessionRow,
+  attempt: ProductionPreparationAttemptRow,
+  leaseSeconds: number,
+) => await runProductionAttemptTransaction(async (connection) => {
+  const [sessionRows] = await connection.query<ProductionPreparationSessionRow[]>(
+    `SELECT *
+       FROM model_production_preparation_sessions
+      WHERE session_id = ?
+      LIMIT 1
+      FOR UPDATE`,
+    [session.session_id],
+  );
+  const lockedSession = sessionRows[0];
+  if (
+    !lockedSession
+    || lockedSession.status !== session.status
+    || lockedSession.active_attempt_id !== attempt.attempt_id
+    || lockedSession.current_step_id !== session.current_step_id
+  ) {
+    return false;
+  }
+
+  const [attemptRows] = await connection.query<ProductionPreparationAttemptRow[]>(
+    `SELECT *
+       FROM model_production_preparation_step_attempts
+      WHERE attempt_id = ?
+        AND session_id = ?
+      LIMIT 1
+      FOR UPDATE`,
+    [attempt.attempt_id, session.session_id],
+  );
+  const lockedAttempt = attemptRows[0];
+  if (
+    !lockedAttempt
+    || lockedAttempt.step_id !== attempt.step_id
+    || !(["running", "failed"] as const).includes(
+      lockedAttempt.status as "running" | "failed",
+    )
+    || lockedAttempt.status !== attempt.status
+    || lockedAttempt.input_state_path !== attempt.input_state_path
+    || lockedAttempt.input_state_sha256 !== attempt.input_state_sha256
+    || lockedAttempt.candidate_state_path !== attempt.candidate_state_path
+    || lockedAttempt.candidate_state_sha256 !== attempt.candidate_state_sha256
+    || lockedAttempt.receipt_path !== attempt.receipt_path
+  ) {
+    return false;
+  }
+
+  const [attemptUpdate] = await connection.query(
+    `UPDATE model_production_preparation_step_attempts
+        SET status = 'running',
+            error_message = NULL,
+            lease_expires_at = DATE_ADD(NOW(), INTERVAL ? SECOND)
+      WHERE attempt_id = ?
+        AND session_id = ?
+        AND step_id = ?
+        AND status = ?
+        AND input_state_path <=> ?
+        AND input_state_sha256 <=> ?
+        AND candidate_state_path = ?
+        AND candidate_state_sha256 <=> ?
+        AND receipt_path = ?`,
+    [
+      leaseSeconds,
+      attempt.attempt_id,
+      session.session_id,
+      attempt.step_id,
+      attempt.status,
+      attempt.input_state_path,
+      attempt.input_state_sha256,
+      attempt.candidate_state_path,
+      attempt.candidate_state_sha256,
+      attempt.receipt_path,
+    ],
+  );
+  if (Number((attemptUpdate as { affectedRows?: number }).affectedRows ?? 0) !== 1) {
+    return false;
+  }
+
+  const [sessionUpdate] = await connection.query(
+    `UPDATE model_production_preparation_sessions
+        SET status = 'running',
+            current_step_id = ?,
+            error_message = NULL,
+            expires_at = DATE_ADD(NOW(), INTERVAL 7 DAY)
+      WHERE session_id = ?
+        AND status = ?
+        AND active_attempt_id = ?
+        AND current_step_id <=> ?
+        AND completed_step_ids = ?
+        AND step_plan = ?
+        AND committed_state_path <=> ?
+        AND committed_state_sha256 <=> ?
+        AND status IN ('ready', 'running', 'failed')`,
+    [
+      attempt.step_id,
+      session.session_id,
+      session.status,
+      attempt.attempt_id,
+      session.current_step_id,
+      jsonColumnCasValue(session.completed_step_ids),
+      jsonColumnCasValue(session.step_plan),
+      session.committed_state_path,
+      session.committed_state_sha256,
+    ],
+  );
+  if (Number((sessionUpdate as { affectedRows?: number }).affectedRows ?? 0) !== 1) {
+    throw new ModelConflictError(
+      "生产准备 receipt replay ownership 已变化",
+      "PRODUCTION_PREPARATION_STEP_IN_PROGRESS",
+    );
+  }
+  return true;
+});
+
 export const installProductionPreparationAttempt = async (input: {
   session: ProductionPreparationSessionRow;
   attempt: ProductionPreparationAttemptRow;
@@ -824,10 +1285,14 @@ export const installProductionPreparationAttempt = async (input: {
       );
     }
 
-    const completedStepIds = parseJsonColumn<string[]>(session.completed_step_ids, []);
-    const stepPlan = parseProductionPreparationStepPlan(
-      parseJsonColumn<unknown>(session.step_plan, []),
-    );
+    const completedStepIds = parseProductionCompletedStepIds(session.completed_step_ids);
+    const stepPlan = parseProductionPreparationStepPlan(session.step_plan);
+    if (!completedStepIds || !stepPlan || !hasValidProductionStepProgress(session)) {
+      throw new ModelConflictError(
+        "生产准备步骤状态已损坏",
+        "PRODUCTION_PREPARATION_STALE",
+      );
+    }
     const nextStep = stepPlan.find((step) => !completedStepIds.includes(step.id));
     if (completedStepIds.includes(input.stepId) || nextStep?.id !== input.stepId) {
       throw new ModelConflictError(
@@ -1039,7 +1504,6 @@ export const recordProductionPreparationAttemptFailure = async (input: {
         `UPDATE model_production_preparation_sessions
             SET status = 'failed',
                 current_step_id = ?,
-                active_attempt_id = NULL,
                 error_message = ?,
                 expires_at = DATE_ADD(NOW(), INTERVAL 7 DAY)
           WHERE session_id = ?
@@ -1081,32 +1545,37 @@ export async function runProductionPreparationStep(
     if (initialRow.protocol_version !== PRODUCTION_PREPARATION_PROTOCOL_VERSION || initialRow.status === "superseded") {
       throw new ModelConflictError("生产准备会话已失效，请重新创建", "PRODUCTION_PREPARATION_STALE");
     }
-    const completedStepIds = parseJsonColumn<string[]>(initialRow.completed_step_ids, []);
-    if (completedStepIds.includes(stepId)) return buildProductionPreparationPayload(initialRow);
-    const stepPlan = parseProductionPreparationStepPlan(parseJsonColumn<unknown>(initialRow.step_plan, []));
-    const nextStep = stepPlan.find((step) => !completedStepIds.includes(step.id));
-    if (!nextStep || nextStep.id !== stepId) {
-      throw new ModelConflictError("只能执行生产准备会话的下一步骤", "PRODUCTION_PREPARATION_STEP_CONFLICT");
-    }
-
-    const [refreshResult] = await queryWithTimeout(pool,
-      `UPDATE model_production_preparation_sessions
-          SET expires_at = CASE
-                WHEN expires_at IS NULL THEN DATE_ADD(NOW(), INTERVAL 7 DAY)
-                ELSE GREATEST(
-                  DATE_ADD(expires_at, INTERVAL 1 SECOND),
-                  DATE_ADD(NOW(), INTERVAL 7 DAY)
-                )
-              END
-        WHERE session_id = ?
-          AND status IN ('ready', 'failed', 'running')
-          AND (expires_at IS NULL OR expires_at > NOW())`,
-      [sessionId],
+    const initialCompletedStepIds = parseProductionCompletedStepIds(
+      initialRow.completed_step_ids,
     );
-    if (Number((refreshResult as { affectedRows?: number }).affectedRows ?? 0) !== 1) {
-      throw new ModelConflictError("生产准备会话已过期，请重新创建", "PRODUCTION_PREPARATION_STALE");
+    const initialStepPlan = parseProductionPreparationStepPlan(initialRow.step_plan);
+    if (
+      !initialCompletedStepIds
+      || !initialStepPlan
+      || !hasValidProductionStepProgress(initialRow)
+    ) {
+      const reason = "生产准备步骤状态已损坏";
+      const claimed = await markProductionPreparationSessionSuperseded(initialRow, reason);
+      if (!claimed) {
+        const retained = await fetchProductionPreparationSession(sessionId);
+        if (retained && retained.status !== "superseded") {
+          return buildProductionPreparationPayload(retained);
+        }
+      }
+      throw new ModelConflictError(reason, "PRODUCTION_PREPARATION_STALE");
     }
-
+    if (initialCompletedStepIds.includes(stepId)) {
+      return buildProductionPreparationPayload(initialRow);
+    }
+    const initialNextStep = initialStepPlan.find(
+      (step) => !initialCompletedStepIds.includes(step.id),
+    );
+    if (!initialNextStep || initialNextStep.id !== stepId) {
+      throw new ModelConflictError(
+        "只能执行生产准备会话的下一步骤",
+        "PRODUCTION_PREPARATION_STEP_CONFLICT",
+      );
+    }
     return await withModelOperationLease(
       operationContext,
       { execution: { experimentId: initialRow.experiment_id, modelType } },
@@ -1115,7 +1584,7 @@ export async function runProductionPreparationStep(
         // but before this request acquired the process-local execution lock.
         // Re-read under the lock so stale
         // checkpoint pointers can never replay or overwrite a later step.
-        const currentRow = await fetchProductionPreparationSession(sessionId);
+        let currentRow = await fetchProductionPreparationSession(sessionId);
         if (!currentRow || currentRow.model_type !== modelType || currentRow.student_id !== studentId) {
           throw new ModelNotFoundError("未找到生产准备会话");
         }
@@ -1125,32 +1594,170 @@ export async function runProductionPreparationStep(
         ) {
           throw new ModelConflictError("生产准备会话已失效，请重新创建", "PRODUCTION_PREPARATION_STALE");
         }
-        const currentCompletedStepIds = parseJsonColumn<string[]>(currentRow.completed_step_ids, []);
+        const currentCompletedStepIds = parseProductionCompletedStepIds(
+          currentRow.completed_step_ids,
+        );
+        const currentStepPlan = parseProductionPreparationStepPlan(currentRow.step_plan);
+        if (
+          !currentCompletedStepIds
+          || !currentStepPlan
+          || !hasValidProductionStepProgress(currentRow)
+        ) {
+          const reason = "生产准备步骤状态已损坏";
+          const claimed = await markProductionPreparationSessionSuperseded(currentRow, reason);
+          if (!claimed) {
+            const retained = await fetchProductionPreparationSession(sessionId);
+            if (retained && retained.status !== "superseded") {
+              return buildProductionPreparationPayload(retained);
+            }
+          }
+          throw new ModelConflictError(reason, "PRODUCTION_PREPARATION_STALE");
+        }
         if (currentCompletedStepIds.includes(stepId)) {
           return buildProductionPreparationPayload(currentRow);
         }
-        const currentStepPlan = parseProductionPreparationStepPlan(
-          parseJsonColumn<unknown>(currentRow.step_plan, []),
+        const currentNextStep = currentStepPlan.find(
+          (step) => !currentCompletedStepIds.includes(step.id),
         );
-        const currentNextStep = currentStepPlan.find((step) => !currentCompletedStepIds.includes(step.id));
         if (!currentNextStep || currentNextStep.id !== stepId) {
           throw new ModelConflictError(
             "只能执行生产准备会话的下一步骤",
             "PRODUCTION_PREPARATION_STEP_CONFLICT",
           );
         }
+
+        let recoveredAttempt: ProductionPreparationAttemptRow | null = null;
+        let recoveredReceipt: ProductionPreparationPythonStepResult | null = null;
+        if (currentRow.active_attempt_id) {
+          const activeAttempt = await fetchProductionPreparationAttempt(
+            currentRow.active_attempt_id,
+          );
+          if (activeAttempt?.session_id === sessionId && activeAttempt.step_id === stepId) {
+            recoveredReceipt = await parseProductionPreparationAttemptReceipt(
+              activeAttempt,
+              lease.terminationSignal,
+            );
+            if (recoveredReceipt) {
+              const replayLeaseSeconds = Math.ceil((
+                resolveProductionPreparationStepTimeoutMs(modelType, stepId) + 60_000
+              ) / 1000);
+              const claimed = await claimProductionPreparationReceiptReplay(
+                currentRow,
+                activeAttempt,
+                replayLeaseSeconds,
+              );
+              if (!claimed) {
+                const retained = await fetchProductionPreparationSession(sessionId);
+                const retainedCompleted = retained
+                  ? parseProductionCompletedStepIds(retained.completed_step_ids)
+                  : null;
+                if (
+                  retained
+                  && (
+                    retained.status === "completed"
+                    || retained.active_attempt_id !== activeAttempt.attempt_id
+                    || retainedCompleted?.includes(stepId)
+                  )
+                ) {
+                  return buildProductionPreparationPayload(retained);
+                }
+                throw new ModelConflictError(
+                  "生产准备 receipt attempt 已提交、替换或状态已变化",
+                  "PRODUCTION_PREPARATION_STEP_IN_PROGRESS",
+                );
+              }
+              const replayRow = await fetchProductionPreparationSession(sessionId);
+              if (!replayRow || replayRow.active_attempt_id !== activeAttempt.attempt_id) {
+                throw new ModelConflictError(
+                  "生产准备会话状态已变化，请重试",
+                  "PRODUCTION_PREPARATION_STALE",
+                );
+              }
+              currentRow = replayRow;
+              recoveredAttempt = activeAttempt;
+            } else if (
+              activeAttempt.status === "running"
+              && Number(activeAttempt.lease_is_active) === 1
+            ) {
+              return buildProductionPreparationPayload(currentRow);
+            }
+          } else if (hasLiveProductionPreparationAttempt(currentRow)) {
+            return buildProductionPreparationPayload(currentRow);
+          }
+        }
+
+        const currentHealth = await classifyProductionPreparationSessionHealth(
+          currentRow,
+          lease.terminationSignal,
+          recoveredReceipt !== null,
+        );
+        if (!currentHealth.healthy) {
+          const reason = currentHealth.reason ?? "生产准备会话工件已失效";
+          const claimed = await markProductionPreparationSessionSuperseded(currentRow, reason);
+          if (!claimed) {
+            const retained = await fetchProductionPreparationSession(sessionId);
+            if (retained && retained.status !== "superseded") {
+              return buildProductionPreparationPayload(retained);
+            }
+          }
+          throw new ModelConflictError(reason, "PRODUCTION_PREPARATION_STALE");
+        }
+        if (!recoveredReceipt && !hasLiveProductionPreparationAttempt(currentRow)) {
+          const [refreshResult] = await queryWithTimeout(pool,
+            `UPDATE model_production_preparation_sessions
+                SET expires_at = CASE
+                      WHEN expires_at IS NULL THEN DATE_ADD(NOW(), INTERVAL 7 DAY)
+                      ELSE GREATEST(
+                        DATE_ADD(expires_at, INTERVAL 1 SECOND),
+                        DATE_ADD(NOW(), INTERVAL 7 DAY)
+                      )
+                    END
+              WHERE session_id = ?
+                AND status = ?
+                AND active_attempt_id <=> ?
+                AND expires_at <=> ?
+                AND completed_step_ids = ?
+                AND step_plan = ?
+                AND status IN ('ready', 'failed', 'running')
+                AND expires_at > NOW()`,
+            [
+              sessionId,
+              currentRow.status,
+              currentRow.active_attempt_id,
+              currentRow.expires_at,
+              jsonColumnCasValue(currentRow.completed_step_ids),
+              jsonColumnCasValue(currentRow.step_plan),
+            ],
+          );
+          if (Number((refreshResult as { affectedRows?: number }).affectedRows ?? 0) !== 1) {
+            const reason = "生产准备会话已过期，请重新创建";
+            const claimed = await markProductionPreparationSessionSuperseded(currentRow, reason);
+            if (!claimed) {
+              const retained = await fetchProductionPreparationSession(sessionId);
+              if (retained && retained.status !== "superseded") {
+                return buildProductionPreparationPayload(retained);
+              }
+            }
+            throw new ModelConflictError(reason, "PRODUCTION_PREPARATION_STALE");
+          }
+          const refreshed = await fetchProductionPreparationSession(sessionId);
+          if (!refreshed) throw new ModelNotFoundError("未找到生产准备会话");
+          currentRow = refreshed;
+        }
         let stepIdentity = await assertProductionPreparationIdentityCurrent(
           currentRow,
           studentId,
           lease.terminationSignal,
         );
-        const reusable = await getReusableProductionModelArtifactResult(
-          modelType,
-          currentRow.forecast_steps,
-          stepIdentity.experiment,
-          stepIdentity.activeRun,
-          lease.terminationSignal,
-        );
+        const reusable = recoveredReceipt
+          ? null
+          : await getReusableProductionModelArtifactResult(
+            modelType,
+            currentRow.forecast_steps,
+            stepIdentity.experiment,
+            stepIdentity.activeRun,
+            lease.terminationSignal,
+          );
         if (reusable) {
           await lease.verifyOwned();
           return await completeProductionPreparationWithReusableArtifact(
@@ -1175,67 +1782,50 @@ export async function runProductionPreparationStep(
           activeRun,
           lease.terminationSignal,
         );
-        const datasetSnapshotPath = path.join(currentRow.artifact_dir, GUIDED_DATASET_FILE_NAME);
-        const datasetSnapshotSha256 = await hashFileContents(datasetSnapshotPath, lease.terminationSignal);
-        if (datasetSnapshotSha256 !== currentRow.dataset_revision) {
-          throw new ModelConflictError(
-            "生产准备数据快照已损坏，请重新创建会话",
-            "PRODUCTION_PREPARATION_STALE",
-          );
-        }
-        if (currentRow.committed_state_path) {
-          if (
-            !currentRow.committed_state_sha256
-            || await hashFileContents(currentRow.committed_state_path, lease.terminationSignal)
-              !== currentRow.committed_state_sha256
-          ) {
-            throw new ModelConflictError(
-              "生产准备 checkpoint 已损坏，请重新创建会话",
-              "PRODUCTION_PREPARATION_STALE",
-            );
-          }
-        } else if (currentRow.committed_state_sha256) {
-          throw new ModelConflictError(
-            "生产准备 checkpoint 状态不完整，请重新创建会话",
-            "PRODUCTION_PREPARATION_STALE",
-          );
-        }
+        const datasetSnapshotPath = path.join(
+          currentRow.artifact_dir,
+          GUIDED_DATASET_FILE_NAME,
+        );
         const timeoutMs = resolveProductionPreparationStepTimeoutMs(modelType, stepId);
-        const attemptLeaseSeconds = Math.ceil((timeoutMs + 60_000) / 1000);
-        const attemptId = crypto.randomUUID();
-        const attemptDir = path.join(currentRow.artifact_dir, "attempts", attemptId);
-        fs.mkdirSync(attemptDir, { recursive: true });
-        const attempt: ProductionPreparationAttemptRow = {
-          attempt_id: attemptId,
-          session_id: sessionId,
-          step_id: stepId,
-          status: "running",
-          input_state_path: currentRow.committed_state_path,
-          input_state_sha256: currentRow.committed_state_sha256,
-          candidate_state_path: path.join(attemptDir, "candidate.pkl"),
-          candidate_state_sha256: null,
-          receipt_path: path.join(attemptDir, "receipt.json"),
-          output_payload: null,
-          error_message: null,
-          lease_expires_at: null,
-        } as ProductionPreparationAttemptRow;
-        try {
-          await installProductionPreparationAttempt({
-            session: currentRow,
-            attempt,
-            stepId,
-            observedProductionRevision: activeRun.production_revision,
-            leaseSeconds: attemptLeaseSeconds,
-          });
-        } catch (error) {
-          if (!isModelCommitOutcomeUnknownError(error)) {
-            fs.rmSync(attemptDir, { recursive: true, force: true });
+        let attempt = recoveredAttempt;
+        if (!attempt) {
+          const attemptLeaseSeconds = Math.ceil((timeoutMs + 60_000) / 1000);
+          const attemptId = crypto.randomUUID();
+          const attemptDir = path.join(currentRow.artifact_dir, "attempts", attemptId);
+          fs.mkdirSync(attemptDir, { recursive: true });
+          attempt = {
+            attempt_id: attemptId,
+            session_id: sessionId,
+            step_id: stepId,
+            status: "running",
+            input_state_path: currentRow.committed_state_path,
+            input_state_sha256: currentRow.committed_state_sha256,
+            candidate_state_path: path.join(attemptDir, "candidate.pkl"),
+            candidate_state_sha256: null,
+            receipt_path: path.join(attemptDir, "receipt.json"),
+            output_payload: null,
+            error_message: null,
+            lease_expires_at: null,
+          } as ProductionPreparationAttemptRow;
+          try {
+            await installProductionPreparationAttempt({
+              session: currentRow,
+              attempt,
+              stepId,
+              observedProductionRevision: activeRun.production_revision,
+              leaseSeconds: attemptLeaseSeconds,
+            });
+          } catch (error) {
+            if (!isModelCommitOutcomeUnknownError(error)) {
+              fs.rmSync(attemptDir, { recursive: true, force: true });
+            }
+            throw error;
           }
-          throw error;
         }
+        const attemptId = attempt.attempt_id;
 
         try {
-          const rawReceipt = await runPythonProductionPreparationStep(
+          const rawReceipt = recoveredReceipt ?? await runPythonProductionPreparationStep(
             modelType,
             stepId,
             {
@@ -1255,7 +1845,7 @@ export async function runProductionPreparationStep(
             timeoutMs,
             lease.terminationSignal,
           );
-          const receipt = await validateProductionPreparationReceipt(
+          const receipt = recoveredReceipt ?? await validateProductionPreparationReceipt(
             rawReceipt,
             attempt,
             lease.terminationSignal,

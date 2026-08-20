@@ -12,6 +12,7 @@ from py.src.forecast_utils import (
     normalize_demand_forecast,
     resolve_prediction_domain,
 )
+from py.src.models import arima
 
 
 class OutputDomainTests(unittest.TestCase):
@@ -21,6 +22,14 @@ class OutputDomainTests(unittest.TestCase):
         np.testing.assert_array_equal(apply_prediction_domain(raw, DEMAND_PREDICTION_DOMAIN), [0, 0, 0, 3.5, 12])
         np.testing.assert_array_equal(apply_prediction_domain(raw, SIGNED_PREDICTION_DOMAIN), [-5, 0, 0, 3.5, 12])
         np.testing.assert_array_equal(normalize_demand_forecast(raw), [0, 0, 0, 3.5, 12])
+
+    @profile("fast")
+    def test_arima_clamp_widens_only_the_upper_bound_and_preserves_negative_tail(self):
+        [point] = arima._format_predictions([-4.0], [[-7.0, -1.0]])
+        self.assertEqual(0.0, point["prediction"])
+        self.assertEqual(-7.0, point["interval_lower"])
+        self.assertEqual(0.0, point["interval_upper"])
+        self.assertLess(point["interval_lower"], 0.0)
 
     @profile("fast")
     def test_unknown_domain_is_a_validation_error(self):

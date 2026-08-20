@@ -33,6 +33,7 @@ const {
   getProductFields,
   getProductSales,
   toCsvString,
+  uploadDataset,
 } = await import(freshDatasetsServiceModulePath);
 const { getCsvHeaders, readCsvRows } = await import("../../../src/utils/csv-processor");
 const { CSV_LIMITS } = await import("../../../src/utils/constants");
@@ -114,6 +115,22 @@ describe("datasets service CSV encoding", () => {
         "备注\"字段": "包含\"引号\"和值,逗号",
       },
     ]);
+  });
+
+  test("rejects a non-contiguous monthly product segment before persistence", async () => {
+    const sparseCsv = [
+      "行业名称,公司名称,产品名称,年份,月份,销售数量,数量单位",
+      "制造业,样本企业,样本产品,2024,1,100,件",
+      "制造业,样本企业,样本产品,2024,3,120,件",
+    ].join("\n");
+
+    await expect(uploadDataset(
+      new File([sparseCsv], "sparse.csv", { type: "text/csv" }),
+      "稀疏月度数据",
+    )).resolves.toMatchObject({
+      error: "时间不连续",
+      status: 400,
+    });
   });
 
   test("keeps aggregate uploads and model-readable product segments independently bounded", () => {

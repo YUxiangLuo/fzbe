@@ -916,6 +916,7 @@ def run(args) -> None:
                 parsed_data=parsed_data,
                 target_key=target_feature,
                 feature_keys=lstm_feature_names,
+                inference_range=range(ts, te + 1),
             )
 
         allowed_keys = set(lstm_feature_names + [target_feature])
@@ -937,6 +938,7 @@ def run(args) -> None:
         model_params,
         base_model_files,
         "Stacking",
+        range(ts, te + 1),
     )
 
     # Validate all parameters

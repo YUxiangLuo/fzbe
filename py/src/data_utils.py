@@ -6,6 +6,7 @@ Centralized data parsing and preparation utilities for all time series models.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 from typing import Any, Dict, List, Optional, Tuple
@@ -45,11 +46,25 @@ class ParsedData:
         target_key: str,
         time_key: Optional[str] = None,
         feature_keys: Optional[List[str]] = None,
+        source_records: Optional[List[Dict[str, Any]]] = None,
     ):
         self.df = df
         self.target_key = target_key
         self.time_key = time_key
         self.feature_keys = feature_keys or []
+        self.source_records = source_records
+
+    def source_value(self, row_index: int, column: str) -> Any:
+        """Return the per-row JSON scalar before DataFrame dtype promotion.
+
+        Internally constructed ParsedData instances have no source snapshot and
+        safely fall back to the DataFrame value.
+        """
+        if self.source_records is not None and row_index < len(self.source_records):
+            row = self.source_records[row_index]
+            if column in row:
+                return row[column]
+        return self.df.iloc[row_index][column]
 
     @property
     def n_obs(self) -> int:
@@ -83,7 +98,241 @@ class ParsedData:
         return None
 
 
-def build_numeric_subprocess_records(parsed_data: "ParsedData") -> Tuple[List[Dict[str, float]], List[str]]:
+def _validate_monthly_calendar_cadence(df: pd.DataFrame, time_key: Optional[str]) -> None:
+    """Reject invalid, sparse, duplicate, and reversed calendar timestamps."""
+    if not time_key or time_key not in df.columns:
+        return
+
+    raw_values = df[time_key].astype(str).str.strip()
+    calendar_shape_mask = raw_values.str.match(r"^\d{4}-\d+(?:$|[-T ].*)")
+    if not calendar_shape_mask.any():
+        return
+
+    valid_month_mask = raw_values.str.match(
+        r"^\d{4}-(?:0?[1-9]|1[0-2])(?:$|[-T ].*)"
+    )
+    if not calendar_shape_mask.all() or not valid_month_mask.all():
+        raise _data_error(f"Calendar timestamp column '{time_key}' contains invalid values.")
+
+    try:
+        periods = pd.PeriodIndex(raw_values, freq="M")
+    except (TypeError, ValueError) as exc:
+        raise _data_error(f"Calendar timestamp column '{time_key}' contains invalid values.") from exc
+
+    ordinals = periods.asi8
+    invalid_positions = np.flatnonzero(np.diff(ordinals) != 1)
+    if invalid_positions.size:
+        index = int(invalid_positions[0])
+        raise _data_error(
+            "Monthly calendar timestamps must be contiguous: "
+            f"{raw_values.iloc[index]} -> {raw_values.iloc[index + 1]}."
+        )
+
+
+def _normalize_calendar_parts(df: pd.DataFrame) -> Tuple[pd.Series, pd.Series]:
+    """Validate separate year/month fields before composing calendar timestamps."""
+    year_values = pd.to_numeric(df["年份"], errors="coerce")
+    month_values = pd.to_numeric(df["月份"], errors="coerce")
+    valid_years = (
+        year_values.notna()
+        & np.isfinite(year_values)
+        & np.isclose(year_values, np.round(year_values), atol=1e-9)
+        & year_values.between(1000, 9999)
+    )
+    valid_months = (
+        month_values.notna()
+        & np.isfinite(month_values)
+        & np.isclose(month_values, np.round(month_values), atol=1e-9)
+        & month_values.between(1, 12)
+    )
+    if not bool(valid_years.all()) or not bool(valid_months.all()):
+        raise _data_error("Separate year/month columns contain invalid calendar values.")
+    return year_values.astype(int), month_values.astype(int)
+
+
+TRAINING_PROVENANCE_SCHEMA = "fz.training-prefix.v1"
+
+
+def _canonical_provenance_scalar(value: Any) -> Dict[str, Any]:
+    if isinstance(value, (np.bool_, bool)):
+        return {"type": "boolean", "value": bool(value)}
+    if value is None:
+        return {"type": "null"}
+    if isinstance(value, (np.integer, int)):
+        return {"type": "integer", "value": str(int(value))}
+    if isinstance(value, (np.floating, float)):
+        numeric = float(value)
+        if not np.isfinite(numeric):
+            raise _data_error("Training provenance cannot encode non-finite numeric values.")
+        if numeric == 0.0:
+            numeric = 0.0
+        return {"type": "float", "value": numeric.hex()}
+    if not isinstance(value, str) and bool(pd.isna(value)):
+        return {"type": "null"}
+    if isinstance(value, str):
+        return {"type": "string", "value": value}
+    raise _data_error(
+        f"Training provenance cannot encode scalar type {type(value).__name__}."
+    )
+
+
+def _canonical_numeric_consumed_scalar(value: Any) -> Dict[str, Any]:
+    if isinstance(value, (np.bool_, bool)) or value is None:
+        raise _data_error("Training provenance numeric values must be finite numbers.")
+    try:
+        numeric = float(value)
+    except (TypeError, ValueError) as exc:
+        raise _data_error("Training provenance numeric values must be finite numbers.") from exc
+    if not np.isfinite(numeric):
+        raise _data_error("Training provenance cannot encode non-finite numeric values.")
+    if numeric == 0.0:
+        numeric = 0.0
+    return {"type": "float", "value": numeric.hex()}
+
+
+def build_training_provenance(
+    parsed_data: "ParsedData",
+    train_range: range,
+    *,
+    feature_keys: Optional[List[str]] = None,
+    feature_types: Optional[Dict[str, str]] = None,
+) -> Dict[str, Any]:
+    if train_range.step != 1 or train_range.start < 0 or train_range.stop > parsed_data.n_obs:
+        raise _data_error("Training provenance range is invalid.")
+    if train_range.start >= train_range.stop:
+        raise _data_error("Training provenance range must contain at least one row.")
+
+    consumed_features = list(feature_keys or [])
+    if any(not isinstance(key, str) or not key for key in consumed_features):
+        raise _data_error("Training provenance feature names must be non-empty strings.")
+    if len(set(consumed_features)) != len(consumed_features):
+        raise _data_error("Training provenance feature names must not contain duplicates.")
+    role_keys = {parsed_data.target_key}
+    if parsed_data.time_key:
+        role_keys.add(parsed_data.time_key)
+    collisions = [key for key in consumed_features if key in role_keys]
+    if collisions:
+        raise _data_error(
+            "Training provenance features collide with target/time roles: "
+            + ", ".join(collisions)
+        )
+    columns = [parsed_data.target_key]
+    if parsed_data.time_key:
+        columns.append(parsed_data.time_key)
+    columns.extend(consumed_features)
+    missing_columns = [column for column in columns if column not in parsed_data.df.columns]
+    if missing_columns:
+        raise _data_error(
+            "Training provenance columns are missing from the dataset: "
+            + ", ".join(missing_columns)
+        )
+
+    feature_semantics = [
+        "categorical"
+        if feature_types and feature_types.get(column) == "categorical"
+        else "numeric"
+        if (
+            feature_types and feature_types.get(column) == "numeric"
+        ) or pd.api.types.is_numeric_dtype(parsed_data.df[column])
+        else "categorical"
+        for column in consumed_features
+    ]
+
+    def canonical_row(index: int) -> List[Dict[str, Any]]:
+        values = [
+            _canonical_numeric_consumed_scalar(
+                parsed_data.df.iloc[index][parsed_data.target_key]
+            )
+        ]
+        if parsed_data.time_key:
+            values.append(
+                _canonical_provenance_scalar(
+                    parsed_data.source_value(index, parsed_data.time_key)
+                )
+            )
+        for column, semantics in zip(consumed_features, feature_semantics):
+            value = (
+                parsed_data.df.iloc[index][column]
+                if semantics == "numeric"
+                else parsed_data.source_value(index, column)
+            )
+            values.append(
+                _canonical_numeric_consumed_scalar(value)
+                if semantics == "numeric"
+                else _canonical_provenance_scalar(value)
+            )
+        return values
+
+    canonical = {
+        "schema": TRAINING_PROVENANCE_SCHEMA,
+        "train_start_index": train_range.start,
+        "train_end_index": train_range.stop - 1,
+        "target_key": parsed_data.target_key,
+        "time_key": parsed_data.time_key,
+        "feature_keys": consumed_features,
+        "feature_semantics": feature_semantics,
+        "columns": columns,
+        "rows": [canonical_row(index) for index in train_range],
+    }
+    encoded = json.dumps(
+        canonical,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return {
+        "schema": TRAINING_PROVENANCE_SCHEMA,
+        "train_start_index": train_range.start,
+        "train_end_index": train_range.stop - 1,
+        "target_key": parsed_data.target_key,
+        "time_key": parsed_data.time_key,
+        "feature_keys": consumed_features,
+        "feature_semantics": feature_semantics,
+        "columns": columns,
+        "sha256": hashlib.sha256(encoded).hexdigest(),
+    }
+
+
+def attach_training_provenance(
+    state: Dict[str, Any],
+    parsed_data: "ParsedData",
+    train_range: range,
+    *,
+    feature_keys: Optional[List[str]] = None,
+    feature_types: Optional[Dict[str, str]] = None,
+) -> Dict[str, Any]:
+    state["training_provenance"] = build_training_provenance(
+        parsed_data,
+        train_range,
+        feature_keys=feature_keys,
+        feature_types=feature_types,
+    )
+    return state
+
+
+def validate_training_provenance(
+    state: Dict[str, Any],
+    parsed_data: "ParsedData",
+    expected_train_range: range,
+    *,
+    feature_keys: Optional[List[str]] = None,
+    feature_types: Optional[Dict[str, str]] = None,
+) -> Dict[str, Any]:
+    actual = state.get("training_provenance")
+    if not isinstance(actual, dict):
+        raise ValueError("[VALIDATION] Base artifact is missing training provenance.")
+    expected = build_training_provenance(
+        parsed_data,
+        expected_train_range,
+        feature_keys=feature_keys,
+        feature_types=feature_types,
+    )
+    if actual != expected:
+        raise ValueError("[VALIDATION] Base artifact training provenance does not match the requested training range and dataset.")
+    return expected
+
+
+def build_numeric_subprocess_records(parsed_data: "ParsedData") -> Tuple[List[Dict[str, Any]], List[str]]:
     """
     Build row dicts for subprocess-based models and keep only numeric features.
 
@@ -114,9 +363,13 @@ def build_numeric_subprocess_records(parsed_data: "ParsedData") -> Tuple[List[Di
 
         log.warning("Skipping non-numeric feature for subprocess model: %s", feat_key)
 
-    data_dicts: List[Dict[str, float]] = []
+    data_dicts: List[Dict[str, Any]] = []
     for i in range(parsed_data.n_obs):
-        row: Dict[str, float] = {parsed_data.target_key: float(parsed_data.y[i])}
+        row: Dict[str, Any] = {parsed_data.target_key: float(parsed_data.y[i])}
+        if parsed_data.time_key:
+            row[parsed_data.time_key] = _to_json_scalar(
+                parsed_data.source_value(i, parsed_data.time_key)
+            )
         for feat_key in numeric_feature_keys:
             row[feat_key] = float(parsed_data.df.iloc[i][feat_key])
         data_dicts.append(row)
@@ -152,6 +405,7 @@ def _to_json_scalar(value: Any) -> Any:
 def build_subprocess_records(
     parsed_data: "ParsedData",
     feature_keys: Optional[List[str]] = None,
+    feature_types: Optional[Dict[str, str]] = None,
 ) -> Tuple[List[Dict[str, Any]], List[str]]:
     """
     Build subprocess row dicts while preserving categorical feature values.
@@ -160,10 +414,20 @@ def build_subprocess_records(
     features via their own preprocessing pipeline.
     """
     source_keys = feature_keys if feature_keys is not None else parsed_data.feature_keys
+    if len(set(source_keys)) != len(source_keys):
+        raise _data_error("Feature list must not contain duplicate names.")
+    role_keys = {parsed_data.target_key}
+    if parsed_data.time_key:
+        role_keys.add(parsed_data.time_key)
+    collisions = [key for key in source_keys if key in role_keys]
+    if collisions:
+        raise _data_error(
+            "Feature list collides with target/time roles: " + ", ".join(collisions)
+        )
     selected_feature_keys: List[str] = []
 
     for feat_key in source_keys:
-        if not feat_key or feat_key == parsed_data.target_key:
+        if not feat_key:
             continue
         if feat_key not in parsed_data.df.columns:
             log.warning("Feature not found in dataframe, skipping: %s", feat_key)
@@ -188,8 +452,18 @@ def build_subprocess_records(
     data_dicts: List[Dict[str, Any]] = []
     for i in range(parsed_data.n_obs):
         row: Dict[str, Any] = {parsed_data.target_key: float(parsed_data.y[i])}
+        if parsed_data.time_key:
+            row[parsed_data.time_key] = _to_json_scalar(
+                parsed_data.source_value(i, parsed_data.time_key)
+            )
         for feat_key in selected_feature_keys:
-            row[feat_key] = _to_json_scalar(parsed_data.df.iloc[i][feat_key])
+            semantics = feature_types.get(feat_key) if feature_types else None
+            value = (
+                parsed_data.source_value(i, feat_key)
+                if semantics == "categorical"
+                else parsed_data.df.iloc[i][feat_key]
+            )
+            row[feat_key] = _to_json_scalar(value)
         data_dicts.append(row)
 
     return data_dicts, selected_feature_keys
@@ -339,11 +613,13 @@ def infer_feature_types(
     parsed_data: "ParsedData",
     target_key: Optional[str] = None,
     feature_keys: Optional[List[str]] = None,
+    inference_range: Optional[range] = None,
 ) -> Dict[str, str]:
     """
-    Infer feature types from both observed values and feature-name heuristics.
+    Infer feature types from observed values in the declared training range.
 
-    Numeric-like string columns are treated as numeric after coercion.
+    Numeric-like string columns are treated as numeric after coercion. The
+    resolved schema is then applied to the full dataframe without re-inferring.
     """
     resolved_target_key = target_key or parsed_data.target_key
     source_keys = feature_keys if feature_keys is not None else parsed_data.feature_keys
@@ -361,12 +637,13 @@ def infer_feature_types(
             continue
 
         series = parsed_data.df[feat_key]
-        inferred_type = _infer_single_feature_type(feat_key, series)
+        inference_series = series if inference_range is None else series.iloc[inference_range]
+        inferred_type = _infer_single_feature_type(feat_key, inference_series)
         if inferred_type == "numeric" and not pd.api.types.is_numeric_dtype(series):
-            converted = _coerce_numeric_series(series)
-            if converted.notna().any() and _non_finite_mask(converted.dropna()).any():
+            converted_inference = _coerce_numeric_series(inference_series)
+            if converted_inference.notna().any() and _non_finite_mask(converted_inference.dropna()).any():
                 raise _data_error(f"Feature column '{feat_key}' contains non-finite values.")
-            parsed_data.df[feat_key] = converted
+            parsed_data.df[feat_key] = _coerce_numeric_series(series)
         inferred[feat_key] = inferred_type
 
     return inferred
@@ -396,7 +673,11 @@ def load_data_from_json(
         log.error(f"JSONDecodeError: {e}")
         raise _data_error(f"Invalid JSON format: {e}")
 
-    if not isinstance(records, list) or not records:
+    if (
+        not isinstance(records, list)
+        or not records
+        or not all(isinstance(record, dict) for record in records)
+    ):
         log.error("JSON data is not a non-empty array of objects.")
         raise _data_error("JSON data must be a non-empty array of objects.")
 
@@ -416,41 +697,40 @@ def load_data_from_json(
         log.error(f"Target key '{target_key}' not found. Available columns: {df.columns.tolist()}")
         raise _data_error(f"Cannot determine target key. Please specify one. Available columns: {df.columns.tolist()}")
 
-    # Auto-detect time_key and create composite timestamp if possible
+    # Separate year/month fields are an explicit calendar contract even when a
+    # different time key was requested. Validate them before any construction.
+    calendar_parts: Optional[Tuple[pd.Series, pd.Series]] = None
+    if "年份" in df.columns and "月份" in df.columns:
+        calendar_parts = _normalize_calendar_parts(df)
+
+    # Auto-detect time_key and create a composite timestamp when possible.
     if time_key is None:
-        if "年份" in df.columns and "月份" in df.columns:
-            log.info("Found '年份' and '月份' columns, attempting to create composite timestamp.")
-            try:
-                # Ensure year and month are clean strings before combining
-                year_str = df["年份"].astype(str)
-                month_str = pd.to_numeric(df["月份"], errors='coerce').apply(lambda x: f"{int(x):02d}")
-
-                if month_str.isnull().any():
-                    log.warning("Could not create composite timestamp due to non-numeric '月份' values. Falling back.")
-                    raise ValueError("Non-numeric month values")
-
-                df["timestamp"] = year_str + "-" + month_str
-                time_key = "timestamp"
-                log.info(f"Created composite time_key: '{time_key}'")
-
-                # Convert 年份 and 月份 to numeric for use as features
-                df["年份"] = pd.to_numeric(df["年份"], errors='coerce')
-                df["月份"] = pd.to_numeric(df["月份"], errors='coerce')
-                log.info("Converted '年份' and '月份' to numeric types for use as features")
-            except Exception as e:
-                log.warning(f"Could not create composite timestamp: {e}. Falling back to simpler time key.")
-                if "月份" in df.columns:
-                    time_key = "月份"
-                elif "年份" in df.columns:
-                    time_key = "年份"
-
+        if calendar_parts is not None:
+            log.info("Found valid '年份' and '月份' columns, creating composite timestamp.")
+            year_values, month_values = calendar_parts
+            df["timestamp"] = (
+                year_values.map(lambda value: f"{value:04d}")
+                + "-"
+                + month_values.map(lambda value: f"{value:02d}")
+            )
+            time_key = "timestamp"
+            df["年份"] = year_values
+            df["月份"] = month_values
+            log.info("Created composite time_key and normalized year/month features")
+        elif (
+            "月份" in df.columns
+            and df["月份"].astype(str).str.strip().str.match(r"^\d{4}-\d+").any()
+        ):
+            time_key = "月份"
         elif "month" in df.columns:
             time_key = "month"
         elif "date" in df.columns:
             time_key = "date"
 
-        if time_key and time_key not in ["timestamp"]:
-             log.info(f"Auto-detected time_key: '{time_key}'")
+        if time_key and time_key != "timestamp":
+            log.info(f"Auto-detected time_key: '{time_key}'")
+
+    _validate_monthly_calendar_cadence(df, time_key)
 
     # Auto-detect feature keys if they are not provided
     if feature_keys is None:
@@ -504,9 +784,21 @@ def load_data_from_json(
     # Keep 年份 and 月份 as numeric features (no longer dropping them)
     # This allows models like LSTM to use month for seasonality
 
+    source_records: List[Dict[str, Any]] = []
+    for index, original in enumerate(records):
+        source_records.append({
+            column: (
+                original[column]
+                if column in original
+                else _to_json_scalar(df_filtered.iloc[index][column])
+            )
+            for column in columns_to_keep
+        })
+
     return ParsedData(
         df=df_filtered,
         target_key=target_key,
         time_key=time_key,
         feature_keys=feature_keys,
+        source_records=source_records,
     )

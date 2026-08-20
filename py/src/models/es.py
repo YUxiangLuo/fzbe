@@ -9,7 +9,7 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 import numpy as np
 from statsmodels.tsa.api import SimpleExpSmoothing
 
-from data_utils import load_data_from_json
+from data_utils import attach_training_provenance, load_data_from_json
 from forecast_utils import (
     DEMAND_PREDICTION_DOMAIN,
     apply_prediction_domain,
@@ -334,6 +334,7 @@ def run(args) -> None:
             "prediction_domain": prediction_domain,
         }
         attach_method_metadata(next_state, METHOD_NAME, FORECAST_STRATEGY, IMPLEMENTATION_NOTES)
+        attach_training_provenance(next_state, parsed_data, range(ts, te + 1), feature_keys=[])
         dump_model(next_state, save_path)
 
         out: Dict[str, Any] = {
@@ -489,6 +490,7 @@ def run(args) -> None:
                 "prediction_domain": prediction_domain,
             }
             attach_method_metadata(state, METHOD_NAME, FORECAST_STRATEGY, IMPLEMENTATION_NOTES)
+            attach_training_provenance(state, parsed_data, range(ts, te + 1), feature_keys=[])
             dump_model(state, save_path)
             log.info(f"Model saved successfully to {save_path}")
             out["saved_model"] = save_path

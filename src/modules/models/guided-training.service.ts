@@ -1,6 +1,5 @@
 import crypto from "crypto";
 import fs from "fs";
-import path from "path";
 import type { RowDataPacket } from "mysql2/promise";
 import { pool } from "../../config";
 import logger from "../../utils/logger";
@@ -70,7 +69,6 @@ import {
   hashDatasetSnapshot,
 } from "./model-runtime-identity";
 import {
-  GUIDED_DATASET_FILE_NAME,
   GUIDED_TRAINING_PROTOCOL_VERSION,
 } from "./model-service-constants";
 import {
@@ -82,6 +80,7 @@ import {
   type GuidedTrainingStepAttemptRow,
   assertCompletedGuidedTrainingRunCurrent,
   assertGuidedTrainingIdentityCurrent,
+  assertGuidedTrainingSessionArtifactsCurrent,
   beginGuidedStepAttempt,
   buildCanonicalTrainingBody,
   buildGuidedTrainingPythonParams,
@@ -196,7 +195,21 @@ const createOrResumeGuidedTrainingSessionInternal = async (
 
   const existingSession = existingRows[0];
   if (existingSession) {
-    if (existingSession.status === "superseded" || existingSession.protocol_version !== GUIDED_TRAINING_PROTOCOL_VERSION) {
+    let shouldRebuild = existingSession.status === "superseded"
+      || existingSession.protocol_version !== GUIDED_TRAINING_PROTOCOL_VERSION;
+
+    if (!shouldRebuild) {
+      try {
+        await assertGuidedTrainingSessionArtifactsCurrent(existingSession);
+      } catch (error) {
+        if (!(error instanceof ModelConflictError) || error.code !== "GUIDED_SESSION_SUPERSEDED") {
+          throw error;
+        }
+        shouldRebuild = true;
+      }
+    }
+
+    if (shouldRebuild) {
       operationContext.throwIfTerminated();
       const deletedSession = await deleteGuidedTrainingSession(existingSession);
       operationContext.throwIfTerminated();
@@ -228,12 +241,6 @@ const createOrResumeGuidedTrainingSessionInternal = async (
         }
       }
     } else {
-      const datasetFile = path.join(existingSession.artifact_dir, GUIDED_DATASET_FILE_NAME);
-      if (!fs.existsSync(datasetFile)) {
-        operationContext.throwIfTerminated();
-        await writeGuidedDatasetSnapshot(existingSession.artifact_dir, datasetJson);
-        operationContext.throwIfTerminated();
-      }
       operationContext.throwIfTerminated();
       return buildGuidedTrainingSessionPayload(existingSession);
     }
@@ -258,6 +265,7 @@ const createOrResumeGuidedTrainingSessionInternal = async (
         && guidedRequestPayloadMatches(completedSession, canonicalBody)
       ) {
         try {
+          await assertGuidedTrainingSessionArtifactsCurrent(completedSession);
           await assertCompletedGuidedTrainingRunCurrent(completedSession, studentId, { terminationSignal });
           return await buildRefreshedCompletedGuidedTrainingSessionPayload(completedSession, studentId);
         } catch (error) {
@@ -452,12 +460,38 @@ export async function getGuidedTrainingSession(
         await assertGuidedTrainingIdentityCurrent(row, studentId, { verifyArtifacts: false });
       }
     } catch (error) {
-      if (!(error instanceof ModelConflictError) || error.code !== "GUIDED_SESSION_SUPERSEDED") {
+      if (
+        !(error instanceof ModelConflictError)
+        || !["GUIDED_SESSION_SUPERSEDED", "GUIDED_SESSION_STATE_CHANGED"].includes(error.code)
+      ) {
         throw error;
       }
-      const supersededRow = await fetchGuidedTrainingSessionRow(sessionId);
-      if (!supersededRow) throw new ModelNotFoundError("未找到分阶段训练会话");
-      return buildGuidedTrainingSessionPayload(supersededRow);
+      const currentRow = await fetchGuidedTrainingSessionRow(sessionId);
+      if (!currentRow) throw new ModelNotFoundError("未找到分阶段训练会话");
+      if (currentRow.status === "completed") {
+        await assertCompletedGuidedTrainingRunCurrent(currentRow, studentId, {
+          verifyArtifacts: false,
+        });
+        return await buildRefreshedCompletedGuidedTrainingSessionPayload(currentRow, studentId);
+      }
+      if (currentRow.status !== "superseded") {
+        try {
+          await assertGuidedTrainingIdentityCurrent(currentRow, studentId, {
+            verifyArtifacts: false,
+          });
+        } catch (refreshError) {
+          if (
+            !(refreshError instanceof ModelConflictError)
+            || refreshError.code !== "GUIDED_SESSION_SUPERSEDED"
+          ) {
+            throw refreshError;
+          }
+          const supersededRow = await fetchGuidedTrainingSessionRow(sessionId);
+          if (!supersededRow) throw new ModelNotFoundError("未找到分阶段训练会话");
+          return buildGuidedTrainingSessionPayload(supersededRow);
+        }
+      }
+      return buildGuidedTrainingSessionPayload(currentRow);
     }
   }
   return buildGuidedTrainingSessionPayload(row);
@@ -553,6 +587,7 @@ export async function runGuidedTrainingStep(
             throw new ModelAccessError("权限不足：该训练会话不属于当前用户", 403);
           }
           if (row.status === "completed") {
+            await assertGuidedTrainingSessionArtifactsCurrent(row);
             await assertCompletedGuidedTrainingRunCurrent(row, studentId, {
               terminationSignal: lease.terminationSignal,
             });
@@ -560,7 +595,16 @@ export async function runGuidedTrainingStep(
           }
           if (row.status === "superseded" || row.protocol_version !== GUIDED_TRAINING_PROTOCOL_VERSION) {
             if (row.status !== "superseded") {
-              await markGuidedTrainingSessionSuperseded(row, "训练会话协议已升级，请重新创建训练会话");
+              const claimed = await markGuidedTrainingSessionSuperseded(
+                row,
+                "训练会话协议已升级，请重新创建训练会话",
+              );
+              if (!claimed) {
+                throw new ModelConflictError(
+                  "训练会话状态已变化，请刷新后重试",
+                  "GUIDED_SESSION_STATE_CHANGED",
+                );
+              }
             }
             throw new ModelConflictError(
               row.superseded_reason ?? "训练会话已失效，请重新创建训练会话",
@@ -592,6 +636,7 @@ export async function runGuidedTrainingStep(
           await assertGuidedTrainingIdentityCurrent(row, studentId, {
             terminationSignal: lease.terminationSignal,
           });
+          await assertGuidedTrainingSessionArtifactsCurrent(row);
           const stepTimeoutMs = resolveGuidedStepTimeoutMs(modelType, stepId, body);
           const attemptContext = await beginGuidedStepAttempt(row, stepId, stepTimeoutMs);
           const activeAttempt = attemptContext.attempt;
@@ -629,6 +674,7 @@ export async function runGuidedTrainingStep(
           await assertGuidedTrainingIdentityCurrent(row, studentId, {
             terminationSignal: lease.terminationSignal,
           });
+          await assertGuidedTrainingSessionArtifactsCurrent(row);
 
           const nextCompletedStepIds = [...completedStepIds, stepId];
           const stepOutputs = parseJsonColumn<Record<string, unknown>>(row.step_outputs, {});

@@ -10,6 +10,7 @@ Combines predictions from a flexible set of base models.
 Uses subprocess to call base models for consistency with API behavior.
 """
 import json
+import math
 import os
 import sys
 import tempfile
@@ -58,7 +59,7 @@ METHOD_NAME = "选择残差 MSE 倒数加权平均融合"
 FORECAST_STRATEGY = "validation_residual_mse_weighted_average"
 IMPLEMENTATION_NOTES = [
     "教科书组合预测常用逆方差或误差方差-协方差思想分配权重；当预测误差近似无偏时，MSE 与方差口径一致。",
-    "本系统按时间顺序拆分训练前缀、权重选择集和选择后校准集，并根据模型数、样本数及所有成员的最小可训练条件动态缩减留出段；候选权重先按 1/(MSE+epsilon) 归一化，再按选择样本可靠度向等权组合收缩。",
+    "本系统按时间顺序拆分训练前缀、权重选择集和选择后校准集，并根据模型数、样本数及所有成员的最小可训练条件动态缩减留出段；先按目标与成员预测的共同绝对量级归一化，再按残差 MSE 倒数比例形成候选权重，最后按选择样本可靠度向等权组合收缩。精确零误差成员并列分享全部候选权重。",
     "该规则会同时惩罚系统性偏差和残差波动，但没有估计模型误差之间的协方差；可靠度收缩避免很短选择段产生近乎全押单一模型的权重。",
     "内部选择只沿用用户选择的 MA 窗口、ES alpha、ARIMA d 与 LSTM 特征/归一化；ARIMA 阶数和 LSTM look-back、容量、批大小、轮数均按当前子训练段重新推导，避免完整训练段信息泄漏。",
     "固定权重后，各成员仅用选择集之前及选择集的数据重新拟合，并在更晚的校准段生成组合残差；基础模型最后使用完整训练区间的既有匹配产物或重新拟合产物生成外层选择评估预测。",
@@ -93,60 +94,225 @@ def _compute_inverse_residual_mse_weights(
     This is equivalent to inverse-SSE weighting when every model is evaluated on
     the same validation segment length, and it penalizes systematic bias.
     """
-    raw_inverse: Dict[str, float] = {}
-    residual_mses: Dict[str, float] = {}
-    total_inverse_error = 0.0
+    if not predictions_by_model:
+        raise ValueError("[VALIDATION] Weighted Average requires at least one prediction column.")
 
     targets = np.asarray(y_true, dtype=float)
-    scale = max(1.0, float(np.mean(np.square(targets))))
-    epsilon = max(1e-12, float(np.finfo(float).eps * scale))
+    if targets.ndim != 1 or targets.size == 0:
+        raise ValueError("[VALIDATION] Weighted Average targets must be a non-empty one-dimensional array.")
+    if not np.isfinite(targets).all():
+        raise ValueError("[VALIDATION] Weighted Average targets must contain only finite values.")
 
+    prediction_arrays: Dict[str, np.ndarray] = {}
+    normalization_scale = float(np.max(np.abs(targets)))
     for model_name, predictions in predictions_by_model.items():
-        residuals = np.asarray(y_true, dtype=float) - np.asarray(predictions, dtype=float)
-        residual_mse = float(np.mean(np.square(residuals)))
-        inverse_error = 1.0 / (residual_mse + epsilon)
-        residual_mses[model_name] = residual_mse
-        raw_inverse[model_name] = inverse_error
-        total_inverse_error += inverse_error
+        values = np.asarray(predictions, dtype=float)
+        if values.ndim != 1 or len(values) != len(targets):
+            raise ValueError(
+                "[VALIDATION] Weighted Average prediction columns must be one-dimensional "
+                "and match the target length."
+            )
+        if not np.isfinite(values).all():
+            raise ValueError(
+                f"[VALIDATION] Weighted Average predictions for {model_name} must be finite."
+            )
+        prediction_arrays[model_name] = values
+        normalization_scale = max(
+            normalization_scale,
+            float(np.max(np.abs(values))),
+        )
 
-    model_count = len(raw_inverse)
-    if model_count == 0:
-        raise ValueError("[VALIDATION] Weighted Average requires at least one prediction column.")
-    if not np.isfinite(total_inverse_error) or total_inverse_error <= 0:
-        raw_weights = {name: 1.0 / model_count for name in raw_inverse}
-    else:
+    def stable_log_rms(actual: np.ndarray, predicted: np.ndarray) -> float | None:
+        """Return log(RMS) without losing tiny residuals or overflowing subtraction."""
+        log_magnitudes: list[float] = []
+        for actual_value, predicted_value in zip(actual, predicted):
+            actual_float = float(actual_value)
+            predicted_float = float(predicted_value)
+            if actual_float == predicted_float:
+                continue
+
+            difference = actual_float - predicted_float
+            if math.isfinite(difference) and difference != 0.0:
+                log_magnitudes.append(math.log(abs(difference)))
+                continue
+
+            element_scale = max(abs(actual_float), abs(predicted_float))
+            scaled_difference = abs(
+                actual_float / element_scale - predicted_float / element_scale
+            )
+            if element_scale == 0.0 or scaled_difference == 0.0:
+                raise ValueError(
+                    "[VALIDATION] Weighted Average residual magnitude could not be represented."
+                )
+            log_magnitudes.append(
+                math.log(element_scale) + math.log(scaled_difference)
+            )
+
+        if not log_magnitudes:
+            return None
+        maximum_log = max(log_magnitudes)
+        scaled_square_sum = math.fsum(
+            math.exp(2.0 * (value - maximum_log))
+            for value in log_magnitudes
+        )
+        log_rms = maximum_log + 0.5 * (
+            math.log(scaled_square_sum) - math.log(len(actual))
+        )
+        if not math.isfinite(log_rms):
+            raise ValueError("[VALIDATION] Weighted Average residual RMS is invalid.")
+        return log_rms
+
+    rms_logs = {
+        name: stable_log_rms(targets, values)
+        for name, values in prediction_arrays.items()
+    }
+    exact_zero_members = [
+        name for name, values in prediction_arrays.items()
+        if bool(np.array_equal(targets, values))
+    ]
+    model_count = len(rms_logs)
+    if exact_zero_members:
+        exact_weight = 1.0 / len(exact_zero_members)
         raw_weights = {
-            name: value / total_inverse_error for name, value in raw_inverse.items()
+            name: exact_weight if name in exact_zero_members else 0.0
+            for name in rms_logs
         }
+        inverse_scores = dict(raw_weights)
+        zero_policy = "equal_raw_weight_among_exact_zero_members"
+    else:
+        if any(value is None for value in rms_logs.values()):
+            raise ValueError("[VALIDATION] Weighted Average nonzero residual RMS is missing.")
+        minimum_log_rms = min(float(value) for value in rms_logs.values())
+        inverse_scores = {
+            name: float(np.exp(2.0 * (minimum_log_rms - float(log_rms))))
+            for name, log_rms in rms_logs.items()
+        }
+        score_total = float(sum(inverse_scores.values()))
+        if not np.isfinite(score_total) or score_total <= 0.0:
+            raise ValueError("[VALIDATION] Weighted Average inverse-MSE scores are invalid.")
+        raw_weights = {
+            name: value / score_total
+            for name, value in inverse_scores.items()
+        }
+        zero_policy = "no_exact_zero_member"
+
     reliability = len(targets) / (len(targets) + model_count + 1.0)
     uniform_weight = 1.0 / model_count
     weights = {
         name: reliability * raw_weights[name] + (1.0 - reliability) * uniform_weight
         for name in raw_weights
     }
+    final_total = float(sum(weights.values()))
+    if not np.isfinite(final_total) or final_total <= 0.0:
+        raise ValueError("[VALIDATION] Weighted Average final weights are invalid.")
+    weights = {name: value / final_total for name, value in weights.items()}
+    if not np.isfinite(list(weights.values())).all():
+        raise ValueError("[VALIDATION] Weighted Average final weights are not finite.")
+
+    minimum_float_log = float(np.log(np.nextafter(0.0, 1.0)))
+    maximum_float_log = float(np.log(np.finfo(float).max))
+
+    def materialize_from_log(value_log: float | None) -> float | None:
+        if value_log is None or value_log < minimum_float_log or value_log > maximum_float_log:
+            return None
+        value = float(np.exp(value_log))
+        return value if np.isfinite(value) and value > 0.0 else None
+
+    normalization_log = (
+        math.log(normalization_scale) if normalization_scale > 0.0 else None
+    )
+
+    def normalized_log_rms(original_log_rms: float | None) -> float | None:
+        if original_log_rms is None or normalization_log is None:
+            return original_log_rms
+        return original_log_rms - normalization_log
+
+    normalized_rmses = {
+        name: (
+            0.0 if log_rms is None
+            else materialize_from_log(normalized_log_rms(log_rms))
+        )
+        for name, log_rms in rms_logs.items()
+    }
+    normalized_mses = {
+        name: (
+            0.0 if log_rms is None
+            else materialize_from_log(2.0 * normalized_log_rms(log_rms))
+        )
+        for name, log_rms in rms_logs.items()
+    }
+
+    def original_rmse_from_log(original_log_rms: float | None) -> float | None:
+        if original_log_rms is None:
+            return 0.0
+        return materialize_from_log(original_log_rms)
+
+    def original_mse_from_log(original_log_rms: float | None) -> float | None:
+        if original_log_rms is None:
+            return 0.0
+        return materialize_from_log(2.0 * original_log_rms)
+
+    residual_mses = {
+        name: original_mse_from_log(log_rms)
+        for name, log_rms in rms_logs.items()
+    }
     prediction_matrix = np.asarray(
-        [predictions_by_model[name] for name in raw_weights],
+        [prediction_arrays[name] for name in raw_weights],
         dtype=float,
     ).T
-    equal_weight_predictions = np.mean(prediction_matrix, axis=1)
-    selected_weight_predictions = prediction_matrix @ np.asarray(
-        [weights[name] for name in raw_weights],
-        dtype=float,
+
+    def convex_blend(blend_weights: np.ndarray) -> np.ndarray:
+        blended: list[float] = []
+        for row in prediction_matrix:
+            row_scale = float(np.max(np.abs(row)))
+            if row_scale == 0.0:
+                blended.append(0.0)
+                continue
+            normalized_value = math.fsum(
+                float(value / row_scale) * float(weight)
+                for value, weight in zip(row, blend_weights)
+            )
+            normalized_value = min(1.0, max(-1.0, normalized_value))
+            blended.append(row_scale * normalized_value)
+        return np.asarray(blended, dtype=float)
+
+    equal_weight_predictions = convex_blend(
+        np.full(model_count, 1.0 / model_count, dtype=float)
     )
-    equal_weight_rmse = float(np.sqrt(np.mean(np.square(targets - equal_weight_predictions))))
-    selected_weight_rmse = float(np.sqrt(np.mean(np.square(targets - selected_weight_predictions))))
-    best_member_name = min(residual_mses, key=residual_mses.get)
+    selected_weight_predictions = convex_blend(
+        np.asarray([weights[name] for name in raw_weights], dtype=float)
+    )
+    equal_weight_log_rms = stable_log_rms(targets, equal_weight_predictions)
+    selected_weight_log_rms = stable_log_rms(targets, selected_weight_predictions)
+    nonzero_member_logs = {
+        name: log_rms
+        for name, log_rms in rms_logs.items()
+        if log_rms is not None
+    }
+    best_member_name = (
+        exact_zero_members[0]
+        if exact_zero_members
+        else min(nonzero_member_logs, key=lambda name: float(nonzero_member_logs[name]))
+    )
     return weights, {
         "residual_mse": residual_mses,
+        "residual_mse_original": residual_mses,
+        "residual_mse_normalized": normalized_mses,
+        "residual_rms_normalized": normalized_rmses,
+        "normalization_scale": normalization_scale,
+        "inverse_mse_scores": inverse_scores,
         "raw_weights": raw_weights,
         "final_weights": weights,
         "reliability": float(reliability),
-        "epsilon": float(epsilon),
-        "equal_weight_rmse": equal_weight_rmse,
-        "selected_weight_rmse": selected_weight_rmse,
+        "epsilon": 0.0,
+        "epsilon_policy": "no_epsilon_normalized_inverse_ratio",
+        "zero_error_policy": zero_policy,
+        "exact_zero_members": exact_zero_members,
+        "equal_weight_rmse": original_rmse_from_log(equal_weight_log_rms),
+        "selected_weight_rmse": original_rmse_from_log(selected_weight_log_rms),
         "best_member": {
             "model_name": best_member_name,
-            "rmse": float(np.sqrt(residual_mses[best_member_name])),
+            "rmse": original_rmse_from_log(rms_logs[best_member_name]),
         },
     }
 
@@ -377,8 +543,9 @@ def train_and_evaluate(
 
     Algorithm: inverse validation residual-MSE weighting
     (an inverse-variance-inspired rule adapted for potentially biased forecasts)
-    - weight_i = 1 / (residual_mse_i + epsilon)
-    - normalized_weight_i = weight_i / sum(weight_j)
+    - common_scale = max(abs(actual), abs(all member predictions))
+    - normalized_mse_i = mean((actual/common_scale - prediction_i/common_scale)^2)
+    - exact-zero members share all raw weight; otherwise inverse-MSE ratios are normalized
     - reliability = n_validation / (n_validation + model_count + 1)
     - weight_i = reliability * normalized_weight_i + (1 - reliability) / model_count
     - final_prediction = sum(weight_i * prediction_i)
@@ -471,10 +638,18 @@ def train_and_evaluate(
         y_true_val, weight_selection_predictions
     )
     for name in models_to_use:
-        residuals = y_true_val - np.asarray(weight_selection_predictions[name], dtype=float)
-        residual_mse = float(np.mean(np.square(residuals)))
-        inverse_error = 1.0 / (residual_mse + weight_diagnostics["epsilon"])
-        print(f"    {name}: residual_mse={residual_mse:.6f}, inverse_error={inverse_error:.6f}", file=sys.stderr)
+        residual_mse = weight_diagnostics["residual_mse"][name]
+        normalized_mse = weight_diagnostics["residual_mse_normalized"][name]
+        inverse_score = weight_diagnostics["inverse_mse_scores"][name]
+        residual_label = "not-representable" if residual_mse is None else f"{residual_mse:.6f}"
+        normalized_label = (
+            "not-representable" if normalized_mse is None else f"{normalized_mse:.12g}"
+        )
+        print(
+            f"    {name}: residual_mse={residual_label}, "
+            f"normalized_mse={normalized_label}, inverse_score={inverse_score:.12g}",
+            file=sys.stderr,
+        )
     print("  可靠度收缩后的权重:", file=sys.stderr)
     for name in models_to_use:
         print(f"    {name}: normalized_weight={weights[name]:.6f}", file=sys.stderr)
@@ -864,6 +1039,7 @@ def run(args) -> None:
                 parsed_data=parsed_data,
                 target_key=target_feature,
                 feature_keys=lstm_feature_names,
+                inference_range=range(ts, te + 1),
             )
 
         allowed_keys = set(lstm_feature_names + [target_feature])
@@ -885,6 +1061,7 @@ def run(args) -> None:
         model_params,
         base_model_files,
         "Weighted Average",
+        range(ts, te + 1),
     )
 
     _validate_training_args(parsed_data, ts, te, es, ee, models_to_use, model_params, base_model_files)

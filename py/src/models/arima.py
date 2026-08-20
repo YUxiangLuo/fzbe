@@ -11,7 +11,7 @@ import numpy as np
 import pmdarima as pm
 from statsmodels.stats.diagnostic import acorr_ljungbox
 
-from data_utils import load_data_from_json
+from data_utils import attach_training_provenance, load_data_from_json
 from forecast_utils import (
     DEMAND_PREDICTION_DOMAIN,
     apply_prediction_domain,
@@ -34,7 +34,7 @@ IMPLEMENTATION_NOTES = [
     "p/q 搜索上限按差分后的有效样本量自动收紧；少于 6 个有效样本时拒绝拟合，不用不可靠结果冒充完整 ARIMA。",
     "候选模型必须收敛；AICc 排名靠前的规格会先按完整规格将最大迭代数加倍重拟合一次，仍不收敛时依次尝试下一名有效候选，并记录候选回退和 Ljung-Box 白噪声诊断。",
     "预测未来销量时使用拟合后的 ARIMA 模型直接生成多步 forecast；原始点预测可能为负，本系统将用于残差、指标和输出的销量点预测按 max(0, y_hat) 截断。该约束是业务后处理，不属于教科书 ARIMA。",
-    "默认 95% 预测区间仍由未截断的 ARIMA 预测分布计算；std_dev 按该分布的精确 95% 正态临界值由区间宽度反推，99% 上侧误差压力诊断也由同一未截断分布计算。该诊断不参与客户安全库存公式，区间本身也不是截断正态区间。",
+    "默认 95% 预测区间仍由未截断的 ARIMA 预测分布计算，std_dev 与 99% 上侧误差仍基于该原始分布。仅当销量点截断为 0 且原区间不含 0 时，上界扩至 0，负下尾不变。该区间不是截断正态区间。",
 ]
 
 
@@ -75,11 +75,20 @@ def _format_predictions(
 
     points: List[Dict[str, Any]] = []
     for prediction, interval in zip(preds, conf_intervals):
-        numeric_prediction = float(prediction)
-        lower = float(interval[0])
-        upper = float(interval[1])
-        std_dev = max(0.0, (upper - lower) / (2.0 * NORMAL_95))
-        raw_distribution_mean = (lower + upper) / 2.0
+        raw_prediction = float(prediction)
+        numeric_prediction = max(0.0, raw_prediction)
+        raw_lower = float(interval[0])
+        raw_upper = float(interval[1])
+        lower = raw_lower
+        upper = raw_upper
+        prediction_was_clamped = raw_prediction < 0.0 or (
+            raw_prediction == 0.0 and raw_upper < 0.0
+        )
+        if prediction_was_clamped:
+            lower = min(raw_lower, numeric_prediction)
+            upper = max(raw_upper, numeric_prediction)
+        std_dev = max(0.0, (raw_upper - raw_lower) / (2.0 * NORMAL_95))
+        raw_distribution_mean = (raw_lower + raw_upper) / 2.0
         points.append({
             "prediction": numeric_prediction,
             "std_dev": std_dev,
@@ -616,8 +625,10 @@ def run(args) -> None:
             "prediction_domain": prediction_domain,
             "calibration_mean_error": state.get("calibration_mean_error"),
             "calibration_count": state.get("calibration_count"),
+            "train_end_index": te,
         }
         attach_method_metadata(next_state, METHOD_NAME, FORECAST_STRATEGY, IMPLEMENTATION_NOTES)
+        attach_training_provenance(next_state, parsed_data, range(ts, te + 1), feature_keys=[])
         dump_model(next_state, save_path)
 
         out: Dict[str, Any] = {
@@ -785,8 +796,10 @@ def run(args) -> None:
             "prediction_domain": prediction_domain,
             "calibration_mean_error": calibration_mean_error,
             "calibration_count": calibration_count,
+            "train_end_index": te,
         }
         attach_method_metadata(state, METHOD_NAME, FORECAST_STRATEGY, IMPLEMENTATION_NOTES)
+        attach_training_provenance(state, parsed_data, range(ts, te + 1), feature_keys=[])
         dump_model(state, save_path)
         log.info(f"Model saved successfully to {save_path}")
         out["saved_model"] = save_path

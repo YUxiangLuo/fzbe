@@ -166,10 +166,11 @@ def _parse_models(args) -> List[str]:
 
 def _build_model_params(
     parsed_data,
-    train_size: int,
+    train_range: range,
     models_to_use: List[str],
     args,
 ) -> Dict[str, Dict[str, Any]]:
+    train_size = len(train_range)
     auto_window = max(3, min(12, train_size // 4))
     model_params: Dict[str, Dict[str, Any]] = {}
 
@@ -200,6 +201,7 @@ def _build_model_params(
                 parsed_data=parsed_data,
                 target_key=target_feature,
                 feature_keys=lstm_feature_names,
+                inference_range=train_range,
             )
 
         allowed_keys = set(lstm_feature_names + [target_feature])
@@ -225,11 +227,10 @@ def _initialize_state(model_type: str, args, state: Dict[str, Any]) -> Dict[str,
     train_range = range(ts, te + 1)
     eval_range = range(es_idx, ee + 1)
     models_to_use = _parse_models(args)
-    train_size = te - ts + 1
     base_model_files = parse_base_model_files_arg(_get_arg(args, "base_model_files", None))
     model_params = _build_model_params(
         parsed_data,
-        train_size,
+        train_range,
         models_to_use,
         args,
     )
@@ -239,6 +240,7 @@ def _initialize_state(model_type: str, args, state: Dict[str, Any]) -> Dict[str,
         model_params,
         base_model_files,
         f"Guided {model_type}",
+        train_range,
     )
 
     module._validate_training_args(

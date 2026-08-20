@@ -41,17 +41,55 @@ def metrics(actual: Sequence[float], predicted: Sequence[float]) -> dict[str, fl
 
 
 def shrunk_inverse_mse_weights(actual: Sequence[float], columns: Mapping[str, Sequence[float]]) -> dict[str, float]:
-    scale = max(1.0, math.fsum(float(v) ** 2 for v in actual) / len(actual))
-    epsilon = max(1e-12, math.ulp(1.0) * scale)
-    inverse = {
-        name: 1.0 / (math.fsum((float(a) - float(p)) ** 2 for a, p in zip(actual, predictions)) / len(actual) + epsilon)
+    actual_values = [float(value) for value in actual]
+    prediction_values = {
+        name: [float(value) for value in predictions]
         for name, predictions in columns.items()
     }
-    total = math.fsum(inverse.values())
-    count = len(inverse)
-    raw = {name: value / total for name, value in inverse.items()}
-    reliability = len(actual) / (len(actual) + count + 1.0)
-    return {name: reliability * raw[name] + (1.0 - reliability) / count for name in raw}
+    def log_difference(left: float, right: float) -> float:
+        difference = left - right
+        if math.isfinite(difference):
+            return math.log(abs(difference))
+        scale = max(abs(left), abs(right))
+        return math.log(scale) + math.log(abs(left / scale - right / scale))
+
+    log_rms = {}
+    zero_names = []
+    for name, predictions in prediction_values.items():
+        differences = [
+            log_difference(actual_value, prediction_value)
+            for actual_value, prediction_value in zip(actual_values, predictions)
+            if actual_value != prediction_value
+        ]
+        if not differences:
+            zero_names.append(name)
+            continue
+        largest = max(differences)
+        square_sum = math.fsum(math.exp(2.0 * (value - largest)) for value in differences)
+        log_rms[name] = largest + 0.5 * (
+            math.log(square_sum) - math.log(len(actual_values))
+        )
+    count = len(prediction_values)
+    if zero_names:
+        raw = {
+            name: 1.0 / len(zero_names) if name in zero_names else 0.0
+            for name in prediction_values
+        }
+    else:
+        minimum_log_rms = min(log_rms.values())
+        scores = {
+            name: math.exp(2.0 * (minimum_log_rms - value))
+            for name, value in log_rms.items()
+        }
+        total = math.fsum(scores.values())
+        raw = {name: value / total for name, value in scores.items()}
+    reliability = len(actual_values) / (len(actual_values) + count + 1.0)
+    shrunk = {
+        name: reliability * raw[name] + (1.0 - reliability) / count
+        for name in raw
+    }
+    total = math.fsum(shrunk.values())
+    return {name: value / total for name, value in shrunk.items()}
 
 
 def nonnegative_line_search(residual: Iterable[float], prediction: Iterable[float]) -> float:

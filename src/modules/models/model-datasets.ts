@@ -7,7 +7,12 @@ import {
   type ManagedStorageEnvironment,
 } from "../../utils/managed-storage";
 import { resolveExistingManagedFile } from "../../utils/managed-file";
-import { normalizeSalesValue, normalizeYearMonth } from "../datasets/dataset-values";
+import {
+  isNextCalendarMonth,
+  normalizeSalesValue,
+  normalizeYearMonth,
+  type NormalizedYearMonth,
+} from "../datasets/dataset-values";
 import { ModelValidationError } from "./model-errors";
 import { queryWithTimeout } from "./model-db-guard";
 
@@ -69,6 +74,7 @@ export async function loadDatasetFromDb(
     throwIfTerminated();
     const rows = await readCsvRows(datasetFilePath, terminationSignal);
     throwIfTerminated();
+    let previousTime: NormalizedYearMonth | null = null;
     return rows.map((row, index) => {
       const separateTime = normalizeYearMonth(row["年份"], row["月份"]);
       const combinedMonthMatch = String(row["月份"] ?? "").trim().match(/^(\d{4})-(0?[1-9]|1[0-2])$/);
@@ -83,6 +89,14 @@ export async function loadDatasetFromDb(
           code: "DATASET_ROW_INVALID",
         });
       }
+      if (previousTime && !isNextCalendarMonth(previousTime, time)) {
+        throw new ModelValidationError(`数据集第 ${index + 1} 行月度时间点不连续`, {
+          row: index + 1,
+          field: "年份/月份",
+          code: "DATASET_MONTHLY_CADENCE_INVALID",
+        });
+      }
+      previousTime = time;
       const sales = normalizeSalesValue(row["销售数量"]);
       if (!sales) {
         throw new ModelValidationError(`数据集第 ${index + 1} 行销售数量无效`, {

@@ -530,17 +530,20 @@ def main() -> None:
         ) == LSTM_FEATURE_KEYS
 
         short_horizon_lstm_source = temp_path / "lstm-reuse-short-horizon.pkl"
+        # Match the ensemble training prefix exactly; only the source model's
+        # saved direct horizon is intentionally shorter than the five-point
+        # stacking evaluation below.
         invoke_model(
             "lstm",
             data_json,
             "--train-start",
             "0",
             "--train-end",
-            "27",
+            "30",
             "--eval-start",
-            "28",
+            "31",
             "--eval-end",
-            "29",
+            "32",
             "--look-back",
             "4",
             "--epochs",

@@ -21,7 +21,7 @@ import numpy as np
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "src")))
 
-from data_utils import infer_feature_types, load_data_from_json
+from data_utils import attach_training_provenance, infer_feature_types, load_data_from_json
 from error_protocol import format_known_error
 from forecast_utils import DEMAND_PREDICTION_DOMAIN, normalize_demand_forecast
 from logger import get_log_contents
@@ -169,6 +169,7 @@ def _run_ma(step_id: str, args, state: Dict[str, Any]) -> Dict[str, Any]:
         state.clear()
         state.update({
             "model_type": "ma",
+            "parsed_data": parsed_data,
             "y": y,
             "timestamps": timestamps,
             "window": window,
@@ -325,6 +326,12 @@ def _run_ma(step_id: str, args, state: Dict[str, Any]) -> Dict[str, Any]:
                 "prediction_domain": DEMAND_PREDICTION_DOMAIN,
             }
             attach_method_metadata(model_state, ma.METHOD_NAME, ma.FORECAST_STRATEGY, ma.IMPLEMENTATION_NOTES)
+            attach_training_provenance(
+                model_state,
+                state["parsed_data"],
+                train_range,
+                feature_keys=[],
+            )
             dump_model(model_state, state["save_model"])
             final_result["saved_model"] = state["save_model"]
 
@@ -346,6 +353,7 @@ def _run_es(step_id: str, args, state: Dict[str, Any]) -> Dict[str, Any]:
         state.clear()
         state.update({
             "model_type": "es",
+            "parsed_data": parsed_data,
             "y": y,
             "timestamps": timestamps,
             "alpha": alpha,
@@ -503,6 +511,12 @@ def _run_es(step_id: str, args, state: Dict[str, Any]) -> Dict[str, Any]:
                 "prediction_domain": DEMAND_PREDICTION_DOMAIN,
             }
             attach_method_metadata(model_state, es.METHOD_NAME, es.FORECAST_STRATEGY, es.IMPLEMENTATION_NOTES)
+            attach_training_provenance(
+                model_state,
+                state["parsed_data"],
+                train_range,
+                feature_keys=[],
+            )
             dump_model(model_state, state["save_model"])
             final_result["saved_model"] = state["save_model"]
 
@@ -543,6 +557,7 @@ def _run_arima(step_id: str, args, state: Dict[str, Any]) -> Dict[str, Any]:
         state.clear()
         state.update({
             "model_type": "arima",
+            "parsed_data": parsed_data,
             "y": y,
             "timestamps": timestamps,
             "d": d,
@@ -781,8 +796,15 @@ def _run_arima(step_id: str, args, state: Dict[str, Any]) -> Dict[str, Any]:
                 "prediction_domain": DEMAND_PREDICTION_DOMAIN,
                 "calibration_mean_error": state["calibration_mean_error"],
                 "calibration_count": state["calibration_count"],
+                "train_end_index": train_range.stop - 1,
             }
             attach_method_metadata(model_state, arima.METHOD_NAME, arima.FORECAST_STRATEGY, arima.IMPLEMENTATION_NOTES)
+            attach_training_provenance(
+                model_state,
+                state["parsed_data"],
+                train_range,
+                feature_keys=[],
+            )
             dump_model(model_state, state["save_model"])
             final_result["saved_model"] = state["save_model"]
 
@@ -821,16 +843,21 @@ def _run_lstm(step_id: str, args, state: Dict[str, Any]) -> Dict[str, Any]:
         feature_types_override = json.loads(getattr(args, "feature_types", None) or "{}")
         parsed_data = load_data_from_json(_read_data_json(args), target_key=target_key, feature_keys=feature_keys)
         months = parsed_data.timestamps or [str(i) for i in range(parsed_data.n_obs)]
+        ts, te, es_idx, ee = _parse_common_ranges(args)
+        override_types = dict(feature_types_override)
         inferred_feature_types = infer_feature_types(
             parsed_data,
             target_key=parsed_data.target_key,
-            feature_keys=parsed_data.feature_keys,
+            feature_keys=[
+                key for key in parsed_data.feature_keys
+                if key not in override_types
+            ],
+            inference_range=range(ts, te + 1),
         )
-        feature_types = {**inferred_feature_types, **dict(feature_types_override)} if feature_types_override else inferred_feature_types
+        feature_types = {**inferred_feature_types, **override_types}
         lstm._validate_lstm_feature_types(parsed_data, feature_types)
         lstm._validate_lstm_numeric_columns(parsed_data, feature_types)
 
-        ts, te, es_idx, ee = _parse_common_ranges(args)
         normalization = getattr(args, "normalization", None) or "minmax"
         lstm._validate_training_args(parsed_data, ts, te, es_idx, ee)
 
@@ -1124,6 +1151,13 @@ def _run_lstm(step_id: str, args, state: Dict[str, Any]) -> Dict[str, Any]:
                 "prediction_domain": DEMAND_PREDICTION_DOMAIN,
             }
             attach_method_metadata(model_state, lstm.METHOD_NAME, lstm.DIRECT_FORECAST_STRATEGY, lstm.DIRECT_IMPLEMENTATION_NOTES)
+            attach_training_provenance(
+                model_state,
+                parsed_data,
+                train_range,
+                feature_keys=parsed_data.feature_keys,
+                feature_types=state["feature_types"],
+            )
             dump_model(model_state, save_path)
             final_result["saved_model"] = save_path
 

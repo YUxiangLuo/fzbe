@@ -83,6 +83,7 @@ const knownUnitDirectories = new Set([
   "schemas",
   "security",
   "services",
+  "system",
   "utils",
 ]);
 const unknownUnitDirectories = bunTests

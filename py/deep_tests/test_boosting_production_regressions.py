@@ -9,11 +9,12 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 import numpy as np
+import pandas as pd
 
 import guided_ensemble_model
 import production_prepare_model
 from baselines import fit_baseline_state
-from data_utils import load_data_from_json
+from data_utils import ParsedData, load_data_from_json
 from py.deep_tests.support.profiles import profile
 from py.src.models import boosting
 from py.src.uncertainty import ensemble_growth_profile
@@ -51,7 +52,16 @@ def _calendar_parsed_data(months: list[str]):
         }
         for month in months
     ]
-    return records, load_data_from_json(json.dumps(records, ensure_ascii=False))
+    frame = pd.DataFrame(records)
+    frame["timestamp"] = months
+    # These tests exercise Boosting's internal calendar alignment directly.
+    # Public JSON ingestion rejects sparse monthly input by contract.
+    return records, ParsedData(
+        df=frame,
+        target_key="销售数量",
+        time_key="timestamp",
+        feature_keys=["年份", "月份"],
+    )
 
 
 class BoostingShrinkageMetadataTests(unittest.TestCase):
@@ -289,10 +299,7 @@ class CalendarAlignedSeasonalBaselineTests(unittest.TestCase):
     @profile("fast")
     def test_production_initialize_replays_calendar_aligned_saved_baseline(self):
         months = [f"2024-{month:02d}" for month in range(1, 13)] + [
-            "2025-02",
-            "2025-03",
-            "2025-04",
-            "2025-05",
+            f"2025-{month:02d}" for month in range(1, 6)
         ]
         records, parsed_data = _calendar_parsed_data(months)
         source_baseline = boosting.fit_baseline_state_for_range(

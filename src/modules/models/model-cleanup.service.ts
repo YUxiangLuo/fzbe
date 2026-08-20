@@ -379,8 +379,7 @@ export async function cleanupExpiredProductionPreparationSessions(
       WHERE sessions.expires_at IS NOT NULL
         AND sessions.expires_at <= ${expirationCutoffExpression}
         AND NOT (
-          sessions.status = 'running'
-          AND attempts.status = 'running'
+          attempts.status = 'running'
           AND attempts.lease_expires_at IS NOT NULL
           AND attempts.lease_expires_at > ${expirationCutoffExpression}
         )
@@ -400,21 +399,23 @@ export async function cleanupExpiredProductionPreparationSessions(
     try {
       if (row.status !== "superseded") {
         const claimCutoffParams = options.now ? [row.session_id, options.now, options.now] : [row.session_id];
+        const completedClaim = row.status === "completed";
         const [claimResult] = await queryWithTimeout(pool,
           `UPDATE model_production_preparation_sessions AS sessions
            LEFT JOIN model_production_preparation_step_attempts AS attempts
              ON attempts.attempt_id = sessions.active_attempt_id
-              SET sessions.status = 'superseded',
+              SET ${completedClaim
+                ? "sessions.superseded_reason = 'Completed production preparation cleanup claimed'"
+                : `sessions.status = 'superseded',
                   sessions.current_step_id = NULL,
                   sessions.active_attempt_id = NULL,
-                  sessions.superseded_reason = 'Production preparation session expired'
+                  sessions.superseded_reason = 'Production preparation session expired'`}
             WHERE sessions.session_id = ?
               AND sessions.expires_at IS NOT NULL
               AND sessions.expires_at <= ${expirationCutoffExpression}
-              AND sessions.status <> 'superseded'
+              AND sessions.status = '${completedClaim ? "completed" : row.status}'
               AND NOT (
-                sessions.status = 'running'
-                AND attempts.status = 'running'
+                attempts.status = 'running'
                 AND attempts.lease_expires_at IS NOT NULL
                 AND attempts.lease_expires_at > ${expirationCutoffExpression}
               )`,
