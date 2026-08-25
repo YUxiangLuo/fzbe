@@ -8,6 +8,7 @@ import { env, pool, connectionLimit } from "./config";
 import { jwtAuth, requireStudent } from "./middleware";
 import logger from "./utils/logger";
 import { CONCURRENCY_LIMITS, DB_POOL_CONFIG } from "./utils/constants";
+import { beginRequestObservation } from "./utils/request-observability";
 import { runStartupEnvironmentChecks } from "./utils/startup-checks";
 import type { JwtPayload, UserRole } from "./types";
 // Import new modular controllers
@@ -56,7 +57,12 @@ import {
 import { resolveExistingManagedFile } from "./utils/managed-file";
 
 // --- Hono App Initialization ---
-const app = new Hono();
+type AppEnv = {
+  Variables: {
+    requestId: string;
+  };
+};
+const app = new Hono<AppEnv>();
 const uploadsRoot = path.resolve(import.meta.dir, "../uploads");
 const reportsRoot = path.resolve(uploadsRoot, "reports");
 const exportsRoot = path.resolve(uploadsRoot, "exports");
@@ -401,7 +407,7 @@ async function resolveAccessibleManualFile(
 
 const directFileResponsePathPattern = /^\/(?:manuals|datasets|reports|exports)\//;
 const CORS_ALLOW_HEADERS = ["Authorization", "Content-Type", "Range"];
-const CORS_EXPOSE_HEADERS = ["Content-Length", "Content-Range", "Content-Disposition", "Accept-Ranges", "ETag", "Last-Modified"];
+const CORS_EXPOSE_HEADERS = ["Content-Length", "Content-Range", "Content-Disposition", "Accept-Ranges", "ETag", "Last-Modified", "X-Request-ID"];
 function normalizeConfiguredCorsOrigin(rawOrigin: string): string {
   try {
     const parsedUrl = new URL(rawOrigin);
@@ -487,7 +493,37 @@ function applyDirectFileCorsHeaders(headers: Headers, requestOrigin?: string | n
 }
 
 // --- Global Middleware ---
-// app.use(timestampedLogger);
+app.use("*", async (c, next) => {
+  const observation = beginRequestObservation(
+    c.req.method,
+    c.req.header("x-request-id"),
+  );
+  c.set("requestId", observation.requestId);
+  c.header("X-Request-ID", observation.requestId);
+
+  let failureStatus: number | null = null;
+  try {
+    await next();
+  } catch (error) {
+    failureStatus = error instanceof HTTPException ? error.status : 500;
+    throw error;
+  } finally {
+    const status = failureStatus ?? c.res.status;
+    const result = observation.finish(status);
+    if (result) {
+      const bindings = {
+        requestId: observation.requestId,
+        method: c.req.method,
+        path: c.req.path,
+        status,
+        statusClass: result.statusClass,
+        durationMs: Number(result.durationMs.toFixed(3)),
+      };
+      if (status >= 500) logger.warn(bindings, "HTTP request completed with server error");
+      else logger.info(bindings, "HTTP request completed");
+    }
+  }
+});
 app.use("*", async (c, next) => {
   const requestOrigin = c.req.header("origin");
   if (!isDirectFileResponsePath(new URL(c.req.url).pathname)) {
@@ -729,6 +765,7 @@ app.onError((err, c) => {
       logger.error(
         {
           err: { message: err.message, stack: err.stack },
+          requestId: c.get("requestId"),
           path: c.req.path,
           method: c.req.method,
           status: err.status,
@@ -738,6 +775,7 @@ app.onError((err, c) => {
     } else if (err.status !== 401 && err.status !== 403) {
       logger.warn(
         {
+          requestId: c.get("requestId"),
           path: c.req.path,
           method: c.req.method,
           status: err.status,
@@ -751,6 +789,7 @@ app.onError((err, c) => {
   logger.error(
     {
       err: err instanceof Error ? { message: err.message, stack: err.stack } : err,
+      requestId: c.get("requestId"),
       path: c.req.path,
       method: c.req.method,
     },

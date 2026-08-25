@@ -9,6 +9,7 @@ info:
     - 大多数 2xx JSON 响应会被全局中间件包装为 `{ "data": ... }`。
     - 少数已经包含顶层 `data` 的响应（例如 `/api/v1/users`、`/api/v1/users/search`）保持原样，不再二次包装。
     - 错误响应统一为 `{ "error": "..." }`，并可能带扩展字段（`details`、`invalid_rows`、`conflicts`、`current_class` 等）。
+    - nginx 代理请求会覆盖 `X-Request-ID`，后端在响应头和结构化日志中回显同一标识，用于跨层故障关联。
 servers:
   - url: http://localhost:3001
     description: Local development
@@ -243,6 +244,78 @@ components:
               additionalProperties: false
           additionalProperties: false
       additionalProperties: false
+
+    RequestObservabilitySnapshot:
+      type: object
+      required: [scope, activeRequests, totalRequests, completedRequests, methods, statusClasses, latencyMs]
+      additionalProperties: false
+      properties:
+        scope:
+          type: string
+          enum: [process]
+        activeRequests:
+          type: integer
+          minimum: 0
+        totalRequests:
+          type: integer
+          minimum: 0
+        completedRequests:
+          type: integer
+          minimum: 0
+        methods:
+          type: object
+          required: [GET, POST, PUT, PATCH, DELETE, HEAD, OPTIONS, OTHER]
+          additionalProperties: false
+          properties:
+            GET: { type: integer, minimum: 0 }
+            POST: { type: integer, minimum: 0 }
+            PUT: { type: integer, minimum: 0 }
+            PATCH: { type: integer, minimum: 0 }
+            DELETE: { type: integer, minimum: 0 }
+            HEAD: { type: integer, minimum: 0 }
+            OPTIONS: { type: integer, minimum: 0 }
+            OTHER: { type: integer, minimum: 0 }
+        statusClasses:
+          type: object
+          required: ['1xx', '2xx', '3xx', '4xx', '5xx']
+          additionalProperties: false
+          properties:
+            '1xx': { type: integer, minimum: 0 }
+            '2xx': { type: integer, minimum: 0 }
+            '3xx': { type: integer, minimum: 0 }
+            '4xx': { type: integer, minimum: 0 }
+            '5xx': { type: integer, minimum: 0 }
+        latencyMs:
+          type: object
+          required: [count, total, average, max]
+          additionalProperties: false
+          properties:
+            count: { type: integer, minimum: 0 }
+            total: { type: number, minimum: 0 }
+            average: { type: number, minimum: 0 }
+            max: { type: number, minimum: 0 }
+
+    RuntimeInfo:
+      type: object
+      required: [deploymentMode, coordinationScope, requests]
+      properties:
+        deploymentMode:
+          type: string
+          enum: [single_instance]
+        coordinationScope:
+          type: string
+          enum: [process]
+        requests:
+          $ref: '#/components/schemas/RequestObservabilitySnapshot'
+      additionalProperties: true
+
+    RuntimeInfoResponse:
+      type: object
+      required: [data]
+      additionalProperties: false
+      properties:
+        data:
+          $ref: '#/components/schemas/RuntimeInfo'
 
     DataEnvelope:
       type: object
@@ -2637,7 +2710,7 @@ paths:
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/DataEnvelope'
+                $ref: '#/components/schemas/RuntimeInfoResponse'
         '401':
           description: 未授权
           content:

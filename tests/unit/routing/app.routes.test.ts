@@ -373,10 +373,14 @@ describe("app route smoke tests", () => {
   test("exposes only a minimal public health response", async () => {
     const app = await getApp();
     const response = await app.fetch(
-      new Request("http://localhost/api/v1/health"),
+      new Request("http://localhost/api/v1/health", {
+        headers: { "X-Request-ID": "0123456789abcdef0123456789abcdef" },
+      }),
     );
 
     expect(response.status).toBe(200);
+    expect(response.headers.get("X-Request-ID"))
+      .toBe("0123456789abcdef0123456789abcdef");
     await expect(response.json()).resolves.toEqual({
       data: { app: "fangzhen-be", status: "ok" },
     });
@@ -475,6 +479,15 @@ describe("app route smoke tests", () => {
           pdfQueueMs?: unknown;
           pdfGenerationMs?: unknown;
         };
+        requests?: {
+          scope?: unknown;
+          activeRequests?: unknown;
+          totalRequests?: unknown;
+          completedRequests?: unknown;
+          methods?: Record<string, unknown>;
+          statusClasses?: Record<string, unknown>;
+          latencyMs?: Record<string, unknown>;
+        };
         modelOperations?: Record<string, unknown>;
         modelExecutionLocks?: Record<string, unknown>;
         pdfQueue?: Record<string, unknown>;
@@ -509,6 +522,13 @@ describe("app route smoke tests", () => {
       adfOperationCleanupBudgetMs: 11_000,
       adfNginxReadMs: 45_000,
       adfBrowserRequestMs: 120_000,
+    });
+    expect(payload.data?.requests).toMatchObject({
+      scope: "process",
+      activeRequests: 1,
+      methods: expect.objectContaining({ GET: expect.any(Number) }),
+      statusClasses: expect.objectContaining({ "2xx": expect.any(Number) }),
+      latencyMs: expect.objectContaining({ count: expect.any(Number) }),
     });
     expect(payload.data?.modelOperations).toMatchObject({
       admission: {

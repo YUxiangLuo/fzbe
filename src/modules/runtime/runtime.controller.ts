@@ -12,6 +12,7 @@ import {
 import { getModelExecutionLockStats } from "../models/model-execution-lock";
 import { getModelOperationStats } from "../models/model-operation-lease";
 import { getPdfQueueStats } from "../reports/reports.service";
+import { getRequestObservabilityStats } from "../../utils/request-observability";
 
 const runtimeController = new Hono();
 
@@ -50,6 +51,7 @@ const buildRuntimeInfo = () => ({
     pdfQueueMs: TIMEOUTS.PDF_QUEUE,
     pdfGenerationMs: TIMEOUTS.PDF_GENERATION,
   },
+  requests: getRequestObservabilityStats(),
   modelOperations: getModelOperationStats(),
   modelExecutionLocks: getModelExecutionLockStats(),
   pdfQueue: getPdfQueueStats(),

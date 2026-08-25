@@ -201,6 +201,7 @@ nginx 必须覆盖客户端提交的代理 IP 头，后端只信任 nginx 设置
 管理员调用 `GET /api/v1/runtime-info` 可查看：
 
 - `deploymentMode=single_instance`、`coordinationScope=process`；
+- 进程生命周期内的 HTTP 活跃数、总量、方法/状态码类别和聚合延迟；每个请求由 nginx 生成并覆盖 `X-Request-ID`，后端在响应与结构化日志中回显同一标识；
 - CPU、模型/PDF 容量、DB pool、Python 线程数；
 - operation/Python/PDF 超时；
 - admission active/pending 和各 operation 活跃数；
