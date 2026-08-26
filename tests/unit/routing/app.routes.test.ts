@@ -642,6 +642,8 @@ describe("app route smoke tests", () => {
       expect(fullResponse.status).toBe(200);
       expect(fullResponse.headers.get("content-length")).toBe("10");
       expect(fullResponse.headers.get("accept-ranges")).toBe("bytes");
+      expect(fullResponse.headers.get("x-request-id"))
+        .toMatch(/^[a-f0-9-]{36}$/);
       expect(await fullResponse.text()).toBe("0123456789");
 
       const rangeResponse = await app.fetch(
@@ -656,6 +658,8 @@ describe("app route smoke tests", () => {
       expect(rangeResponse.status).toBe(206);
       expect(rangeResponse.headers.get("content-length")).toBe("4");
       expect(rangeResponse.headers.get("content-range")).toBe("bytes 2-5/10");
+      expect(rangeResponse.headers.get("x-request-id"))
+        .toMatch(/^[a-f0-9-]{36}$/);
       expect(await rangeResponse.text()).toBe("2345");
 
       const multiRangeResponse = await app.fetch(

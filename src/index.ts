@@ -2,7 +2,7 @@ import { Hono } from "hono";
 import { HTTPException } from "hono/http-exception";
 import { cors } from "hono/cors";
 import path from "path";
-import { stat } from "node:fs/promises";
+import { open as openFile, stat } from "node:fs/promises";
 import type { RowDataPacket } from "mysql2/promise";
 import { env, pool, connectionLimit } from "./config";
 import { jwtAuth, requireStudent } from "./middleware";
@@ -229,7 +229,31 @@ async function buildLocalFileResponse(options: LocalFileResponseOptions): Promis
 
   if (range && range !== "unsupported") {
     const contentLength = range.end - range.start + 1;
-    return new Response(file.slice(range.start, range.end + 1, contentType), {
+    // BunFile.slice() is correct when consumed in-process, but Bun's HTTP
+    // server can stream the underlying complete file while retaining a 206
+    // Content-Range header. Read the bounded segment explicitly so the wire
+    // body always matches Content-Length and Content-Range.
+    const handle = await openFile(options.absolutePath, "r").catch(() => null);
+    if (!handle) return null;
+    const bytes = new Uint8Array(contentLength);
+    let bytesRead = 0;
+    try {
+      while (bytesRead < contentLength) {
+        const result = await handle.read(
+          bytes,
+          bytesRead,
+          contentLength - bytesRead,
+          range.start + bytesRead,
+        );
+        if (result.bytesRead === 0) break;
+        bytesRead += result.bytesRead;
+      }
+    } finally {
+      await handle.close();
+    }
+    if (bytesRead !== contentLength) return null;
+
+    return new Response(bytes, {
       status: 206,
       headers: {
         ...baseHeaders,
@@ -504,6 +528,10 @@ app.use("*", async (c, next) => {
   let failureStatus: number | null = null;
   try {
     await next();
+    // Route handlers that return a native Response (for example byte-range
+    // file downloads) replace Hono's pending response headers. Re-apply the
+    // correlation header after dispatch so every successful response keeps it.
+    c.header("X-Request-ID", observation.requestId);
   } catch (error) {
     failureStatus = error instanceof HTTPException ? error.status : 500;
     throw error;
