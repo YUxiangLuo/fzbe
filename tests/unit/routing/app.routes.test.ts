@@ -679,4 +679,50 @@ describe("app route smoke tests", () => {
       await rm(filePath, { force: true });
     }
   });
+
+  test("streams open-ended byte ranges in bounded chunks", async () => {
+    const app = await getApp();
+    const uploadsDir = resolve(import.meta.dir, "../../../uploads/manuals");
+    const filename = "unit-large-range-fixture.pdf";
+    const filePath = resolve(uploadsDir, filename);
+    const fileSize = 2 * 1024 * 1024;
+    const token = await sign(
+      {
+        sub: 123,
+        role: "Student",
+        exp: Math.floor(Date.now() / 1000) + 3600,
+      },
+      "test-jwt-secret",
+    );
+
+    await mkdir(uploadsDir, { recursive: true });
+    await writeFile(filePath, Buffer.alloc(fileSize, 0x61));
+
+    try {
+      const response = await app.fetch(
+        new Request(`http://localhost/manuals/${filename}`, {
+          headers: {
+            Authorization: `Bearer ${token}`,
+            Range: "bytes=0-",
+          },
+        }),
+      );
+
+      expect(response.status).toBe(206);
+      expect(response.headers.get("content-length")).toBe(String(fileSize));
+      expect(response.headers.get("content-range"))
+        .toBe(`bytes 0-${fileSize - 1}/${fileSize}`);
+      expect(response.body).not.toBeNull();
+
+      const reader = response.body!.getReader();
+      const firstChunk = await reader.read();
+      expect(firstChunk.done).toBeFalse();
+      expect(firstChunk.value?.byteLength).toBeGreaterThan(0);
+      expect(firstChunk.value?.byteLength).toBeLessThanOrEqual(64 * 1024);
+      expect(firstChunk.value?.byteLength).toBeLessThan(fileSize);
+      await reader.cancel();
+    } finally {
+      await rm(filePath, { force: true });
+    }
+  });
 });

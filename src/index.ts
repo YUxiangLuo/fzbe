@@ -113,6 +113,62 @@ interface ByteRange {
 
 type ParsedByteRange = ByteRange | "invalid" | "unsupported" | null;
 
+const FILE_RANGE_STREAM_CHUNK_BYTES = 64 * 1024;
+
+function createBoundedFileStream(
+  handle: Awaited<ReturnType<typeof openFile>>,
+  range: ByteRange,
+): ReadableStream<Uint8Array> {
+  let position = range.start;
+  let closePromise: Promise<void> | null = null;
+
+  const closeHandle = () => {
+    closePromise ??= handle.close();
+    return closePromise;
+  };
+
+  return new ReadableStream<Uint8Array>({
+    async pull(controller) {
+      if (position > range.end) {
+        await closeHandle();
+        controller.close();
+        return;
+      }
+
+      const chunkLength = Math.min(
+        FILE_RANGE_STREAM_CHUNK_BYTES,
+        range.end - position + 1,
+      );
+      const chunk = new Uint8Array(chunkLength);
+
+      try {
+        const { bytesRead } = await handle.read(chunk, 0, chunkLength, position);
+        if (bytesRead === 0) {
+          throw new Error("文件在字节范围响应期间意外结束");
+        }
+
+        position += bytesRead;
+        const bodyChunk = bytesRead === chunk.length
+          ? chunk
+          : chunk.subarray(0, bytesRead);
+        if (position > range.end) {
+          await closeHandle();
+          controller.enqueue(bodyChunk);
+          controller.close();
+          return;
+        }
+        controller.enqueue(bodyChunk);
+      } catch (error) {
+        await closeHandle().catch(() => {});
+        controller.error(error);
+      }
+    },
+    async cancel() {
+      await closeHandle().catch(() => {});
+    },
+  });
+}
+
 function isPlainObject(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
@@ -231,29 +287,13 @@ async function buildLocalFileResponse(options: LocalFileResponseOptions): Promis
     const contentLength = range.end - range.start + 1;
     // BunFile.slice() is correct when consumed in-process, but Bun's HTTP
     // server can stream the underlying complete file while retaining a 206
-    // Content-Range header. Read the bounded segment explicitly so the wire
-    // body always matches Content-Length and Content-Range.
+    // Content-Range header. A bounded web stream keeps the wire body correct
+    // without allocating the entire requested range in the single Bun process.
     const handle = await openFile(options.absolutePath, "r").catch(() => null);
     if (!handle) return null;
-    const bytes = new Uint8Array(contentLength);
-    let bytesRead = 0;
-    try {
-      while (bytesRead < contentLength) {
-        const result = await handle.read(
-          bytes,
-          bytesRead,
-          contentLength - bytesRead,
-          range.start + bytesRead,
-        );
-        if (result.bytesRead === 0) break;
-        bytesRead += result.bytesRead;
-      }
-    } finally {
-      await handle.close();
-    }
-    if (bytesRead !== contentLength) return null;
+    const body = createBoundedFileStream(handle, range);
 
-    return new Response(bytes, {
+    return new Response(body, {
       status: 206,
       headers: {
         ...baseHeaders,

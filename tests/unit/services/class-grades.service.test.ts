@@ -1,8 +1,9 @@
 import { describe, expect, test } from "bun:test";
-import { mkdtemp, readdir, rm, utimes, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readdir, rm, utimes, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 
+import { env } from "../../../src/config";
 import { EXP_FLOW_FIELDS } from "../../../src/modules/class-grades/class-grades.schema";
 import {
   allocateReportArchiveEntryFilename,
@@ -21,6 +22,7 @@ import {
   validateGradeWeightTotals,
 } from "../../../src/modules/class-grades/class-grades.service";
 import { FILESYSTEM_FILENAME_MAX_BYTES } from "../../../src/utils/file-validator";
+import { getDatabaseManagedStorageRoot } from "../../../src/utils/managed-storage";
 
 const defaultWeights: Record<string, number> = {
   exp_flow_demand_data_preparation: 5,
@@ -265,9 +267,11 @@ describe("report archive entry filenames", () => {
 describe("isReportPdfAvailable", () => {
   test("returns true only when the report PDF exists on disk", async () => {
     const reportsDir = await mkdtemp(path.join(os.tmpdir(), "fangzhen-report-file-test-"));
-    const existingReport = path.join(reportsDir, "report.pdf");
-    const missingReport = path.join(reportsDir, "missing.pdf");
+    const storageDir = getDatabaseManagedStorageRoot(reportsDir, env);
+    const existingReport = path.join(storageDir, "report.pdf");
+    const missingReport = path.join(storageDir, "missing.pdf");
 
+    await mkdir(storageDir, { recursive: true });
     await writeFile(existingReport, "%PDF-1.4\n%%EOF\n");
 
     try {
@@ -299,8 +303,10 @@ describe("isReportPdfAvailable", () => {
   test("does not alias a stale outside absolute path to a same-basename managed file", async () => {
     const reportsDir = await mkdtemp(path.join(os.tmpdir(), "fangzhen-served-report-test-"));
     const staleReportPath = path.join(os.tmpdir(), `stale-fangzhen-${Date.now()}`, "served-report.pdf");
-    const servedReportPath = path.join(reportsDir, path.basename(staleReportPath));
+    const storageDir = getDatabaseManagedStorageRoot(reportsDir, env);
+    const servedReportPath = path.join(storageDir, path.basename(staleReportPath));
 
+    await mkdir(storageDir, { recursive: true });
     await writeFile(servedReportPath, "%PDF-1.4\n%%EOF\n");
 
     try {

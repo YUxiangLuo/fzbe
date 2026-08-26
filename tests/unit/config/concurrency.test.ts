@@ -87,8 +87,11 @@ async function loadConstantsSnapshot(
       childEnv[name] = value;
     }
   }
+  // Bun automatically reloads project-root .env files in child processes.
+  // Explicit empty values prevent deployment settings from replacing the
+  // defaults this snapshot is intended to exercise.
   for (const name of CONFIG_ENV_NAMES) {
-    delete childEnv[name];
+    childEnv[name] = "";
   }
   Object.assign(childEnv, configEnv);
 
