@@ -255,6 +255,82 @@ describe("models service production preparation", () => {
     expect(spawnMock).not.toHaveBeenCalled();
   });
 
+  test("reuses a current completed session before acquiring model admission or execution", async () => {
+    createReadStream.mockImplementation(() =>
+      Readable.from([modelDatasetCsv]) as unknown as ReturnType<typeof createReadStream>
+    );
+    poolQuery.mockResolvedValueOnce([[{ file_path: datasetCsvPath }]]);
+    const dataset = await loadDatasetFromDb("制造业", "样本企业", "样本产品");
+    const datasetRevision = hashDatasetSnapshot(JSON.stringify(dataset));
+    const runtimeRevision = getModelRuntimeRevision(true);
+    const activeRun = buildActiveRun("ma", {
+      dataset_revision: datasetRevision,
+      runtime_revision: runtimeRevision,
+      production_artifact_forecast_steps: 6,
+      production_revision: preparationToken,
+    });
+    const requestHash = crypto.createHash("sha256").update(JSON.stringify({
+      runId: activeRun.run_id,
+      datasetRevision,
+      runtimeRevision,
+      forecastSteps: 6,
+    })).digest("hex");
+    const stepPlan = [
+      { id: "initialize", label: "确认生产准备材料" },
+      { id: "fit_model", label: "重拟合生产模型" },
+      { id: "finalize", label: "组装并校验生产产物" },
+    ];
+    const completedSession = {
+      session_id: "completed-production-session",
+      experiment_id: 990002,
+      student_id: 20240002,
+      run_id: activeRun.run_id,
+      model_type: "ma",
+      request_hash: requestHash,
+      dataset_revision: datasetRevision,
+      runtime_revision: runtimeRevision,
+      protocol_version: 1,
+      forecast_steps: 6,
+      status: "completed",
+      current_step_id: null,
+      completed_step_ids: JSON.stringify(stepPlan.map((step) => step.id)),
+      step_plan: JSON.stringify(stepPlan),
+      artifact_dir: "/tmp/fangzhen-py/production_preparation/completed-production-session",
+      candidate_model_path: activeRun.production_artifact_path,
+      committed_state_path: null,
+      committed_state_sha256: null,
+      active_attempt_id: null,
+      observed_production_revision: preparationToken,
+      production_revision: preparationToken,
+      error_message: null,
+      superseded_reason: null,
+      session_is_live: 1,
+      active_attempt_lease_is_live: 0,
+    };
+    useActiveRuns(activeRun);
+    poolQuery.mockImplementation(async (sql: string) => {
+      if (sql.includes("FROM dataset_segments")) return [[{ file_path: datasetCsvPath }]];
+      if (sql.includes("FROM model_production_preparation_sessions")) return [[completedSession]];
+      return [[buildExperimentContextRow()]];
+    });
+
+    const result = await createOrResumeProductionPreparationSession(
+      "ma",
+      20240002,
+      990002,
+      6,
+    );
+
+    expect(result.results).toMatchObject({
+      session_id: completedSession.session_id,
+      session_status: "completed",
+      preparation_token: preparationToken,
+      reused_existing: true,
+    });
+    expect(tryAcquireModelExecutionLock).not.toHaveBeenCalled();
+    expect(poolGetConnection).not.toHaveBeenCalled();
+  });
+
   test("locks student, experiment, and active run before creating a production session", async () => {
     const sessionId = "123e4567-e89b-42d3-a456-426614174999";
     const artifactDir = path.join(

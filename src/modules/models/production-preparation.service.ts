@@ -340,6 +340,58 @@ const fetchProductionPreparationSession = async (sessionId: string) => {
   return rows[0] ?? null;
 };
 
+const fetchProductionPreparationSessionByRequest = async (input: {
+  experimentId: number;
+  studentId: number;
+  modelType: ModelType;
+  requestHash: string;
+}) => {
+  const [rows] = await queryWithTimeout<ProductionPreparationSessionRow[]>(pool,
+    `SELECT session_id,
+            experiment_id,
+            student_id,
+            run_id,
+            model_type,
+            request_hash,
+            dataset_revision,
+            runtime_revision,
+            protocol_version,
+            forecast_steps,
+            status,
+            current_step_id,
+            completed_step_ids,
+            step_plan,
+            artifact_dir,
+            candidate_model_path,
+            committed_state_path,
+            committed_state_sha256,
+            active_attempt_id,
+            observed_production_revision,
+            production_revision,
+            error_message,
+            superseded_reason,
+            expires_at,
+            updated_at,
+            expires_at IS NOT NULL AND expires_at > NOW() AS session_is_live,
+            EXISTS (
+              SELECT 1
+                FROM model_production_preparation_step_attempts AS active_attempt
+               WHERE active_attempt.attempt_id = model_production_preparation_sessions.active_attempt_id
+                 AND active_attempt.session_id = model_production_preparation_sessions.session_id
+                 AND active_attempt.status = 'running'
+                 AND active_attempt.lease_expires_at > NOW()
+            ) AS active_attempt_lease_is_live
+       FROM model_production_preparation_sessions
+      WHERE experiment_id = ?
+        AND student_id = ?
+        AND model_type = ?
+        AND request_hash = ?
+      LIMIT 1`,
+    [input.experimentId, input.studentId, input.modelType, input.requestHash],
+  );
+  return rows[0] ?? null;
+};
+
 const buildProductionPreparationArtifactDir = (
   experimentId: number,
   studentId: number,
@@ -717,55 +769,40 @@ export async function createOrResumeProductionPreparationSession(
       runtimeRevision,
       forecastSteps,
     });
+    const requestIdentity = { experimentId, studentId, modelType, requestHash };
+
+    // A completed, current session is immutable metadata and does not start a
+    // Python process. Resolve that fast path before model admission so students
+    // can reuse an existing production artifact while unrelated model jobs have
+    // filled the process capacity. Any uncertain or stale state falls through
+    // to the serialized path below for CAS retirement/rebuild.
+    const reusableBeforeAdmission = await fetchProductionPreparationSessionByRequest(
+      requestIdentity,
+    );
+    if (
+      reusableBeforeAdmission?.status === "completed"
+      && reusableBeforeAdmission.protocol_version === PRODUCTION_PREPARATION_PROTOCOL_VERSION
+      && reusableBeforeAdmission.run_id === activeRun.run_id
+      && reusableBeforeAdmission.dataset_revision === activeRun.dataset_revision
+      && reusableBeforeAdmission.runtime_revision === activeRun.runtime_revision
+      && Boolean(reusableBeforeAdmission.production_revision)
+      && reusableBeforeAdmission.production_revision === activeRun.production_revision
+      && activeRun.production_artifact_forecast_steps !== null
+      && Number(activeRun.production_artifact_forecast_steps) >= forecastSteps
+      && (await classifyProductionPreparationSessionHealth(
+        reusableBeforeAdmission,
+        operationContext.deadlineSignal,
+      )).healthy
+    ) {
+      return buildProductionPreparationPayload(reusableBeforeAdmission, true);
+    }
+
     return await withModelOperationLease(
       operationContext,
       { execution: { experimentId, modelType } },
       async (lease) => {
         await lease.verifyOwned();
-    const [existingRows] = await queryWithTimeout<ProductionPreparationSessionRow[]>(pool,
-      `SELECT session_id,
-              experiment_id,
-              student_id,
-              run_id,
-              model_type,
-              request_hash,
-              dataset_revision,
-              runtime_revision,
-              protocol_version,
-              forecast_steps,
-              status,
-              current_step_id,
-              completed_step_ids,
-              step_plan,
-              artifact_dir,
-              candidate_model_path,
-              committed_state_path,
-              committed_state_sha256,
-              active_attempt_id,
-              observed_production_revision,
-              production_revision,
-              error_message,
-              superseded_reason,
-              expires_at,
-              updated_at,
-              expires_at IS NOT NULL AND expires_at > NOW() AS session_is_live,
-              EXISTS (
-                SELECT 1
-                  FROM model_production_preparation_step_attempts AS active_attempt
-                 WHERE active_attempt.attempt_id = model_production_preparation_sessions.active_attempt_id
-                   AND active_attempt.session_id = model_production_preparation_sessions.session_id
-                   AND active_attempt.status = 'running'
-                   AND active_attempt.lease_expires_at > NOW()
-              ) AS active_attempt_lease_is_live
-         FROM model_production_preparation_sessions
-        WHERE experiment_id = ?
-          AND student_id = ?
-          AND model_type = ?
-          AND request_hash = ?
-        LIMIT 1`,
-      [experimentId, studentId, modelType, requestHash],
-    );
-    const existing = existingRows[0];
+    const existing = await fetchProductionPreparationSessionByRequest(requestIdentity);
     // Finalization records the production artifact before marking the session
     // completed. Re-read the active run before deciding that a completed
     // session is stale; otherwise a concurrent create request that loaded the

@@ -12,6 +12,7 @@ import {
   buildCsvContent,
   cleanupExpiredExportFiles,
   computeExperimentScores,
+  createZipArchive,
   encodeCsvCell,
   formatCsvDateTime,
   isReportPdfAvailable,
@@ -140,6 +141,42 @@ describe("cleanupExpiredExportFiles", () => {
       expect(remaining).toContain(path.basename(unrelated));
     } finally {
       await rm(exportsDir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("createZipArchive", () => {
+  test("creates a ZIP without invoking a host zip executable", async () => {
+    const directory = await mkdtemp(path.join(os.tmpdir(), "fangzhen-zip-export-test-"));
+    const archivePath = path.join(directory, "reports.zip");
+    const firstName = "学生甲_student_1_experiment_2.pdf";
+    const secondName = "学生乙_student_3_experiment_4.pdf";
+    try {
+      await writeFile(path.join(directory, firstName), "first-pdf");
+      await writeFile(path.join(directory, secondName), "second-pdf");
+
+      await createZipArchive(archivePath, [firstName, secondName], directory);
+
+      const archive = Buffer.from(await Bun.file(archivePath).arrayBuffer());
+      expect(archive.subarray(0, 2).toString("ascii")).toBe("PK");
+      expect(archive.toString("utf8")).toContain(firstName);
+      expect(archive.toString("utf8")).toContain(secondName);
+      expect(archive.includes(Buffer.from("PK\u0005\u0006", "binary"))).toBeTrue();
+    } finally {
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
+
+  test("rejects archive entry paths instead of escaping the working directory", async () => {
+    const directory = await mkdtemp(path.join(os.tmpdir(), "fangzhen-zip-export-path-test-"));
+    try {
+      await expect(createZipArchive(
+        path.join(directory, "reports.zip"),
+        ["../outside.pdf"],
+        directory,
+      )).rejects.toThrow("报告归档条目名称无效");
+    } finally {
+      await rm(directory, { recursive: true, force: true });
     }
   });
 });

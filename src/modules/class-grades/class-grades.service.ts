@@ -1,8 +1,11 @@
 import path from "path";
 import os from "node:os";
 import { createHash, randomUUID } from "node:crypto";
+import { createWriteStream } from "node:fs";
 import { copyFile, mkdtemp, rm } from "node:fs/promises";
+import { pipeline } from "node:stream/promises";
 import type { RowDataPacket, ResultSetHeader, Pool, PoolConnection } from "mysql2/promise";
+import { ZipFile } from "yazl";
 import { env, pool } from "../../config";
 import { CLEANUP_RETENTION } from "../../utils/constants";
 import { cleanupDirectoryEntriesOlderThan } from "../../utils/disk-cleanup";
@@ -115,46 +118,40 @@ export function allocateReportArchiveEntryFilename(
   }
 }
 
-async function createZipArchive(
+export async function createZipArchive(
   zipPath: string,
   sourceBasenames: readonly string[],
   workingDirectory: string,
 ): Promise<void> {
-  const zipProcess = Bun.spawn(
-    // `--` keeps a valid but dash-prefixed student identifier from being
-    // interpreted as another zip option.
-    ["zip", "-q", "-j", zipPath, "--", ...sourceBasenames],
-    { cwd: workingDirectory, stdout: "ignore", stderr: "pipe" },
-  );
-  // Start consuming stderr immediately; otherwise a full pipe can block a
-  // large archive before the parent ever awaits process completion.
-  const stderrPromise = new Response(zipProcess.stderr).text().catch(() => "");
-  let timedOut = false;
-  let timeoutHandle: ReturnType<typeof setTimeout> | undefined;
-  const timeout = new Promise<number>((resolve) => {
-    timeoutHandle = setTimeout(() => {
-      timedOut = true;
-      zipProcess.kill("SIGKILL");
-      resolve(-1);
-    }, ZIP_EXPORT_TIMEOUT_MS);
-  });
-  const exitCode = await Promise.race([zipProcess.exited, timeout]);
-  if (timeoutHandle) clearTimeout(timeoutHandle);
-
-  if (timedOut) {
-    // Give the killed child a short bounded window to close its pipes without
-    // turning export cleanup into an unbounded wait.
-    await Promise.race([
-      zipProcess.exited,
-      new Promise((resolve) => setTimeout(resolve, 1_000)),
-    ]);
-    throw new Error(`zip 命令执行超时（${ZIP_EXPORT_TIMEOUT_MS / 1_000} 秒）`);
+  const archive = new ZipFile();
+  for (const sourceBasename of sourceBasenames) {
+    if (path.basename(sourceBasename) !== sourceBasename) {
+      throw new Error("报告归档条目名称无效");
+    }
+    archive.addFile(path.join(workingDirectory, sourceBasename), sourceBasename);
   }
 
-  const stderr = (await stderrPromise).trim();
-  if (exitCode !== 0) {
-    const detail = stderr ? `: ${stderr.slice(0, 500)}` : "";
-    throw new Error(`zip 命令执行失败（退出码 ${exitCode}）${detail}`);
+  const output = createWriteStream(zipPath, { flags: "wx" });
+  let timedOut = false;
+  let timeoutHandle: ReturnType<typeof setTimeout> | undefined;
+  const timeout = new Promise<never>((_resolve, reject) => {
+    timeoutHandle = setTimeout(() => {
+      timedOut = true;
+      const error = new Error(`ZIP 归档生成超时（${ZIP_EXPORT_TIMEOUT_MS / 1_000} 秒）`);
+      // Destroying the destination makes pipeline tear down the ZIP source too.
+      output.destroy(error);
+      reject(error);
+    }, ZIP_EXPORT_TIMEOUT_MS);
+    timeoutHandle.unref?.();
+  });
+
+  archive.end();
+  const writeArchive = pipeline(archive.outputStream, output);
+  try {
+    await Promise.race([writeArchive, timeout]);
+  } finally {
+    if (timeoutHandle) clearTimeout(timeoutHandle);
+    if (timedOut) await writeArchive.catch(() => {});
   }
 }
 
