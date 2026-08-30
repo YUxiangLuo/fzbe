@@ -6,6 +6,7 @@ import path from "node:path";
 const projectRoot = path.resolve(import.meta.dir, "../../..");
 const bunRunner = path.join(projectRoot, "scripts/run-pinned-bun.sh");
 const uvRunner = path.join(projectRoot, "py/run-pinned-uv.sh");
+const pythonVersionFile = path.join(projectRoot, "py/.python-version");
 const temporaryDirectories: string[] = [];
 
 afterEach(async () => {
@@ -21,6 +22,10 @@ const createExecutable = async (filePath: string, contents: string) => {
 };
 
 describe("commit-pinned tool runners", () => {
+  test("keeps the Python runtime version in the checkout", async () => {
+    expect(await Bun.file(pythonVersionFile).text()).toBe("3.13\n");
+  });
+
   test("uses a versioned Bun package when the bootstrap version differs", async () => {
     const directory = await mkdtemp(path.join(tmpdir(), "fzbe-pinned-bun-"));
     temporaryDirectories.push(directory);

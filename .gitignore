@@ -1,4 +1,5 @@
 .py*
+!py/.python-version
 *.pkl
 /*.txt
 model_csv
