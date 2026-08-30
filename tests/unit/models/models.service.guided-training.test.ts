@@ -426,7 +426,7 @@ describe("models service guided training", () => {
 
     expect(session.status).toBe("completed");
     expect(session.step_outputs.evaluate_metrics).toEqual({
-      metrics: { rmse: 1, mape: null },
+      metrics: { rmse: 1, mape: 0 },
     });
     expect(session.step_outputs.save_artifact).toEqual({
       metrics: { rmse: 1, mape: 12.5 },

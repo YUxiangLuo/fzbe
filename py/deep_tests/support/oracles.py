@@ -32,8 +32,12 @@ def metrics(actual: Sequence[float], predicted: Sequence[float]) -> dict[str, fl
     n = len(actual)
     mse = math.fsum(value * value for value in residuals) / n
     mae = math.fsum(abs(value) for value in residuals) / n
-    nonzero = [(float(a), float(p)) for a, p in zip(actual, predicted) if abs(float(a)) > 1e-12]
-    mape = 100.0 * math.fsum(abs((a - p) / a) for a, p in nonzero) / len(nonzero) if nonzero else None
+    pairs = [(float(a), float(p)) for a, p in zip(actual, predicted)]
+    mape = (
+        None
+        if any(abs(a) <= 1e-12 for a, _ in pairs)
+        else 100.0 * math.fsum(abs((a - p) / a) for a, p in pairs) / len(pairs)
+    )
     mean = math.fsum(float(value) for value in actual) / n
     total = math.fsum((float(value) - mean) ** 2 for value in actual)
     r2 = 1.0 if total <= 1e-12 and mse <= 1e-12 else (0.0 if total <= 1e-12 else 1.0 - math.fsum(v * v for v in residuals) / total)

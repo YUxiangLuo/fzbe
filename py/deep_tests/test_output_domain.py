@@ -32,6 +32,16 @@ class OutputDomainTests(unittest.TestCase):
         self.assertLess(point["interval_lower"], 0.0)
 
     @profile("fast")
+    def test_arima_signed_formatter_preserves_negative_points_and_intervals(self):
+        points = arima._format_predictions(
+            [-6.0, 4.0],
+            [[-8.0, -4.0], [2.0, 6.0]],
+            prediction_domain=SIGNED_PREDICTION_DOMAIN,
+        )
+        self.assertEqual([-6.0, 4.0], [point["prediction"] for point in points])
+        self.assertEqual([-8.0, -4.0], [points[0]["interval_lower"], points[0]["interval_upper"]])
+
+    @profile("fast")
     def test_unknown_domain_is_a_validation_error(self):
         for domain in ("weird", None, ""):
             with self.subTest(domain=domain), self.assertRaisesRegex(ValueError, r"\[VALIDATION\]"):

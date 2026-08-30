@@ -253,12 +253,12 @@ describe("model training result transformers", () => {
       custom: "kept",
       rmse: Math.sqrt(50),
       mae: 5,
-      mape: 100,
+      mape: null,
       r2: -1,
     });
   });
 
-  test("marks MAPE unavailable when every actual value is zero", () => {
+  test("marks MAPE unavailable when any actual value is zero", () => {
     const perfect = transformTrainingResult("es", {
       metrics: {},
       eval_y_true: [0, 0],
@@ -269,9 +269,25 @@ describe("model training result transformers", () => {
       eval_y_true: [0, 0],
       predictions: [predictionPoint(1), predictionPoint(0)],
     });
+    const mixed = transformTrainingResult("es", {
+      metrics: {},
+      eval_y_true: [0, 100],
+      predictions: [predictionPoint(100), predictionPoint(100)],
+    });
+    const nearZero = transformTrainingResult("es", {
+      metrics: {},
+      eval_y_true: [1e-13, 100],
+      predictions: [predictionPoint(100), predictionPoint(100)],
+    });
 
     expect(perfect.results.metrics).toMatchObject({ mape: null, r2: 1 });
     expect(imperfect.results.metrics).toMatchObject({ mape: null, r2: 0 });
+    expect(mixed.results.metrics).toMatchObject({
+      mape: null,
+      rmse: Math.sqrt(5_000),
+      mae: 50,
+    });
+    expect(nearZero.results.metrics).toMatchObject({ mape: null });
   });
 
   test("rejects malformed Python prediction points instead of converting them to demand", () => {

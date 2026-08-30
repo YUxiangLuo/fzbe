@@ -226,9 +226,7 @@ const recomputeCanonicalMetrics = (
 
   const squaredErrors = actual.map((value, index) => (value - predicted[index]!) ** 2);
   const absoluteErrors = actual.map((value, index) => Math.abs(value - predicted[index]!));
-  const nonzeroIndices = actual
-    .map((value, index) => Math.abs(value) > METRIC_EPSILON ? index : -1)
-    .filter((index) => index >= 0);
+  const hasUndefinedMapeActual = actual.some((value) => Math.abs(value) <= METRIC_EPSILON);
   const meanActual = actual.reduce((sum, value) => sum + value, 0) / actual.length;
   const residualSumOfSquares = squaredErrors.reduce((sum, value) => sum + value, 0);
   const totalSumOfSquares = actual.reduce(
@@ -292,12 +290,12 @@ const recomputeCanonicalMetrics = (
     ...trustedMetrics,
     rmse: Math.sqrt(residualSumOfSquares / actual.length),
     mae: absoluteErrors.reduce((sum, value) => sum + value, 0) / actual.length,
-    mape: nonzeroIndices.length === 0
+    mape: hasUndefinedMapeActual
       ? null
-      : 100 * nonzeroIndices.reduce(
-        (sum, index) => sum + absoluteErrors[index]! / Math.abs(actual[index]!),
+      : 100 * absoluteErrors.reduce(
+        (sum, error, index) => sum + error / Math.abs(actual[index]!),
         0,
-      ) / nonzeroIndices.length,
+      ) / actual.length,
     r2: totalSumOfSquares <= METRIC_EPSILON
       ? (residualSumOfSquares <= METRIC_EPSILON ? 1 : 0)
       : 1 - residualSumOfSquares / totalSumOfSquares,

@@ -75,9 +75,10 @@ def mape(y_true: ArrayLike, y_pred: ArrayLike) -> Optional[float]:
         y_pred: Predicted values (list or numpy array)
 
     Returns:
-        MAPE value in percentage, None when every actual value is zero, or NaN
-        if input is empty. Returning None prevents an undefined percentage from
-        being presented to students as a perfect 0% error.
+        MAPE value in percentage, None when any actual value is zero or close
+        enough to zero to make a percentage unstable, or NaN if input is empty.
+        Returning None prevents an undefined partial-subset percentage from
+        being presented to students as the MAPE of the complete evaluation set.
     """
     _validate_inputs(y_true, y_pred)
     if len(y_true) == 0:
@@ -86,11 +87,10 @@ def mape(y_true: ArrayLike, y_pred: ArrayLike) -> Optional[float]:
         np.asarray(y_true, dtype=np.float64),
         np.asarray(y_pred, dtype=np.float64),
     )
-    nonzero_actuals = np.abs(y_true_arr) > EPS
-    if not np.any(nonzero_actuals):
+    if np.any(np.abs(y_true_arr) <= EPS):
         return None
-    diff = np.abs(y_true_arr[nonzero_actuals] - y_pred_arr[nonzero_actuals])
-    return float(100.0 * np.mean(diff / np.abs(y_true_arr[nonzero_actuals])))
+    diff = np.abs(y_true_arr - y_pred_arr)
+    return float(100.0 * np.mean(diff / np.abs(y_true_arr)))
 
 
 def format_optional_metric(value: Optional[float], precision: int = 4) -> str:

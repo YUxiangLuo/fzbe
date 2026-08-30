@@ -71,10 +71,16 @@ class MathematicalGoldenTests(unittest.TestCase):
         actual, predicted = [0, 2, 4, 6], [1, 2, 5, 4]
         expected = metrics(actual, predicted)
         for name, function in (("rmse", rmse), ("mae", mae), ("mape", mape), ("r2", r2)):
-            self.assertAlmostEqual(expected[name], function(actual, predicted), places=12)
+            observed = function(actual, predicted)
+            if expected[name] is None:
+                self.assertIsNone(observed)
+            else:
+                self.assertAlmostEqual(expected[name], observed, places=12)
         self.assertEqual(1.0, r2([3, 3], [3, 3]))
         self.assertEqual(0.0, r2([3, 3], [2, 2]))
         self.assertIsNone(mape([0, 0], [10, 20]))
+        self.assertIsNone(mape([0, 100], [100, 100]))
+        self.assertIsNone(mape([1e-13, 100], [100, 100]))
 
     @profile("fast")
     def test_weighted_stacking_and_boosting_goldens(self):

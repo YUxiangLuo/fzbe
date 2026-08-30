@@ -1212,6 +1212,14 @@ def assert_base_model_prediction_domains() -> None:
     assert demand_predictions == [0.0, 4.0]
     assert signed_predictions == [-6.0, 4.0]
     assert intervals[0] == [-8.0, -4.0]
+    signed_points = arima._format_predictions(
+        signed_predictions,
+        intervals,
+        prediction_domain=SIGNED_PREDICTION_DOMAIN,
+    )
+    assert [point["prediction"] for point in signed_points] == [-6.0, 4.0]
+    assert signed_points[0]["interval_lower"] == -8.0
+    assert signed_points[0]["interval_upper"] == -4.0
 
     with patch.object(lstm, "_forecast_direct_from_state", return_value=([-7.0, 5.0], 1.0)):
         demand_predictions, _ = lstm._forecast_from_state(

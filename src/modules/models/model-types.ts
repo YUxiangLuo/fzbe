@@ -68,7 +68,7 @@ export const GUIDED_TRAINING_STEPS: Record<GuidedModelType, GuidedTrainingStepDe
     {
       id: "evaluate_metrics",
       label: "计算误差指标",
-      description: "汇总 RMSE、MAE、MAPE、R² 等指标，把模型误差转化为可比较的评估结果。",
+      description: "汇总 RMSE、MAE、MAPE、R² 等指标；评估实际值包含零或近零值时，传统 MAPE 标记为不适用。",
       actionLabel: "计算指标",
     },
     {
@@ -106,7 +106,7 @@ export const GUIDED_TRAINING_STEPS: Record<GuidedModelType, GuidedTrainingStepDe
     {
       id: "evaluate_metrics",
       label: "计算误差指标",
-      description: "计算 RMSE、MAE、MAPE、R²，描述固定 α 在当前评估区间的预测误差。",
+      description: "计算 RMSE、MAE、MAPE、R²；评估实际值包含零或近零值时，传统 MAPE 标记为不适用。",
       actionLabel: "计算指标",
     },
     {
@@ -144,7 +144,7 @@ export const GUIDED_TRAINING_STEPS: Record<GuidedModelType, GuidedTrainingStepDe
     {
       id: "forecast",
       label: "预测评估区间",
-      description: "使用选定的非季节 ARIMA(p, d, q) 直接生成多步预测；点预测按 max(0, ŷ) 截断。名义 95% 区间仍来自未截断的 ARIMA 分布，并按标准正态分布约 1.96 的 95% 临界值由区间宽度反推标准差。",
+      description: "使用选定的非季节 ARIMA(p, d, q) 直接生成多步预测；点预测按 max(0, ŷ) 截断。名义 95% 区间仍来自未截断的 ARIMA 分布，并按标准正态分布约 1.96 的 95% 临界值由区间宽度反推标准差；若原区间完全低于截断点，展示上界扩至 0。",
       actionLabel: "生成预测",
     },
     {

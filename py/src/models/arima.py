@@ -44,11 +44,13 @@ def _format_predictions(
     conf_intervals: List[List[float]],
     calibration_mean_error: float | None = None,
     calibration_count: int | None = None,
+    prediction_domain: str = DEMAND_PREDICTION_DOMAIN,
 ) -> List[Dict[str, Any]]:
     """
     Format predictions with 95% prediction intervals for JSON output.
-    Converts interval width to its Gaussian std_dev while preserving the
-    model's original, untruncated interval bounds.
+    Signed residual forecasts preserve their point and interval values. Demand
+    forecasts apply the documented nonnegative point constraint and only widen
+    a fully negative interval enough to include the constrained point.
     """
     has_mean = calibration_mean_error is not None
     has_count = calibration_count is not None
@@ -76,15 +78,21 @@ def _format_predictions(
     points: List[Dict[str, Any]] = []
     for prediction, interval in zip(preds, conf_intervals):
         raw_prediction = float(prediction)
-        numeric_prediction = max(0.0, raw_prediction)
+        numeric_prediction = float(
+            apply_prediction_domain([raw_prediction], prediction_domain)[0]
+        )
         raw_lower = float(interval[0])
         raw_upper = float(interval[1])
         lower = raw_lower
         upper = raw_upper
-        prediction_was_clamped = raw_prediction < 0.0 or (
-            raw_prediction == 0.0 and raw_upper < 0.0
+        demand_interval_needs_point = (
+            prediction_domain == DEMAND_PREDICTION_DOMAIN
+            and (
+                numeric_prediction != raw_prediction
+                or (raw_prediction == 0.0 and raw_upper < 0.0)
+            )
         )
-        if prediction_was_clamped:
+        if demand_interval_needs_point:
             lower = min(raw_lower, numeric_prediction)
             upper = max(raw_upper, numeric_prediction)
         std_dev = max(0.0, (raw_upper - raw_lower) / (2.0 * NORMAL_95))
@@ -654,6 +662,7 @@ def run(args) -> None:
                 confidence_intervals,
                 next_state.get("calibration_mean_error"),
                 next_state.get("calibration_count"),
+                prediction_domain=prediction_domain,
             )
         attach_method_metadata(out, METHOD_NAME, FORECAST_STRATEGY, IMPLEMENTATION_NOTES)
         out["logs"] = get_log_contents()
@@ -663,6 +672,13 @@ def run(args) -> None:
     if load_path:
         log.info(f"Entering prediction mode with model: {load_path}")
         state = _load_state(load_path)
+        allow_negative_predictions = bool(
+            getattr(args, "allow_negative_predictions", False)
+        )
+        prediction_domain = resolve_prediction_domain(
+            state,
+            allow_negative_predictions=allow_negative_predictions,
+        )
         steps = int(getattr(args, "forecast_steps", 0))
         if steps <= 0:
             log.error("forecast_steps must be > 0 for prediction mode.")
@@ -671,7 +687,7 @@ def run(args) -> None:
         log.info(f"Starting prediction with {steps} forecast steps")
         prepared = state.get("prepared_predictions")
         if (
-            not bool(getattr(args, "allow_negative_predictions", False))
+            not allow_negative_predictions
             and isinstance(prepared, list)
             and len(prepared) >= steps
         ):
@@ -681,13 +697,14 @@ def run(args) -> None:
                 load_path,
                 steps,
                 state=state,
-                allow_negative_predictions=bool(getattr(args, "allow_negative_predictions", False)),
+                allow_negative_predictions=allow_negative_predictions,
             )
             predictions_with_std = _format_predictions(
                 preds,
                 conf_int,
                 state.get("calibration_mean_error"),
                 state.get("calibration_count"),
+                prediction_domain=prediction_domain,
             )
 
         out: Dict[str, Any] = {
@@ -765,6 +782,7 @@ def run(args) -> None:
         conf_int,
         calibration_mean_error,
         calibration_count,
+        prediction_domain=prediction_domain,
     )
 
     out: Dict[str, Any] = {
