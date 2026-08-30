@@ -4,7 +4,14 @@ This is an independent standard-library `unittest` suite for `ma`, `es`, `arima`
 
 ## One runner
 
-Install with `./py/install.sh --test` (there are intentionally no extra test dependencies), then use only:
+Install the exact tool version and locked model/test environment first:
+
+```bash
+python -m pip install "uv==$(cat py/.uv-version)"
+./py/install.sh --test
+```
+
+Then use only:
 
 ```bash
 bun run test:deep:fast

@@ -1,6 +1,7 @@
 {
   "name": "fangzhen",
   "module": "index.ts",
+  "packageManager": "bun@1.4.0",
   "devDependencies": {
     "@types/bun": "latest",
     "@types/yazl": "^3.3.1"
@@ -10,14 +11,18 @@
   },
   "private": true,
   "scripts": {
-    "dev": "bun --watch src/index.ts",
-    "start": "bun run src/index.ts",
+    "runtime:check": "bun run scripts/check-bun-version.ts",
+    "dev": "bun run runtime:check && bun --watch src/index.ts",
+    "start": "bun run runtime:check && bun run src/index.ts",
     "typecheck": "bunx tsc --noEmit",
     "lint": "bunx tsc --noEmit --pretty false",
-    "lint:openapi": "bunx @redocly/cli@2.39.0 lint docs/openapi.yaml",
+    "lint:python": "py/venv/bin/ruff check --select F401,F811,F821,F841 py/src py/test py/deep_tests py/guided_model.py py/guided_ensemble_model.py py/run_model.py py/production_prepare_model.py",
+    "lint:openapi": "bunx @redocly/cli@2.39.0 lint --config redocly.yaml docs/openapi.yaml",
+    "python:lock:generate": "bun run scripts/generate-python-production-lock.ts",
+    "python:lock:check": "bun run scripts/generate-python-production-lock.ts --check",
     "timeout:check": "bun run scripts/check-model-http-timeout-contract.ts",
     "test": "bun run test:unit",
-    "test:check": "bun run typecheck && bun run timeout:check && bun run lint:openapi && bun run test:list && bun run test:unit",
+    "test:check": "bun run runtime:check && bun run typecheck && bun run timeout:check && bun run lint:openapi && bun run test:list && bun run test:unit",
     "test:list": "bun run tests/inventory.ts",
     "test:unit": "bun test tests/unit --isolate",
     "test:unit:config": "bun test tests/unit/config --isolate",

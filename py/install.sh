@@ -5,9 +5,15 @@ set -euo pipefail
 
 cd "$(dirname "$0")"
 
-PYTHON_VERSION="3.13"
+PYTHON_VERSION="$(tr -d '[:space:]' < .python-version)"
+UV_RUNNER="$PWD/run-pinned-uv.sh"
 VENV_DIR="venv"
 INSTALL_TESTS=false
+
+if [[ ! "$PYTHON_VERSION" =~ ^[0-9]+\.[0-9]+$ ]]; then
+  echo "Error: invalid Python version in .python-version: $PYTHON_VERSION" >&2
+  exit 1
+fi
 
 for arg in "$@"; do
   case "$arg" in
@@ -16,11 +22,8 @@ for arg in "$@"; do
   esac
 done
 
-# 检查 uv 是否可用
-if ! command -v uv &>/dev/null; then
-  echo "Error: uv is not installed. Install it first: https://docs.astral.sh/uv/getting-started/installation/"
-  exit 1
-fi
+# Provision/check the commit-pinned uv without replacing the host bootstrap.
+"$UV_RUNNER" --version
 
 # 如果存在旧的 .venv 目录，迁移为 venv
 if [ -d ".venv" ] && [ ! -d "$VENV_DIR" ]; then
@@ -41,16 +44,18 @@ fi
 
 if [ ! -d "$VENV_DIR" ]; then
   echo "Creating virtual environment (Python $PYTHON_VERSION)..."
-  uv venv --python "$PYTHON_VERSION" "$VENV_DIR"
+  "$UV_RUNNER" venv --python "$PYTHON_VERSION" "$VENV_DIR"
 fi
 
 echo "Installing dependencies..."
-uv pip install \
-  --python "$VENV_DIR/bin/python3" \
-  -r requirements.txt
+sync_args=(sync --locked --no-install-project)
+if [ "$INSTALL_TESTS" != true ]; then
+  sync_args+=(--no-dev)
+fi
+UV_PROJECT_ENVIRONMENT="$PWD/$VENV_DIR" "$UV_RUNNER" "${sync_args[@]}"
 
 if [ "$INSTALL_TESTS" = true ]; then
-  echo "Deep tests use only the Python standard library; no additional test dependencies are required."
+  echo "Installed the locked development tools used by Python verification."
 fi
 
 # 清理 bytecode 缓存

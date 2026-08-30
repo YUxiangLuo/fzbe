@@ -63,9 +63,17 @@ run_bun_with_service_environment() {
   environment_file="$(realpath -e -- "$environment_file")"
   working_directory="$(realpath -e -- "$working_directory")"
 
-  local bun_executable
+  local bun_executable bun_runner
   bun_executable="$(command -v bun)"
   bun_executable="$(realpath -e -- "$bun_executable")"
+  bun_runner="$working_directory/scripts/run-pinned-bun.sh"
+  if [[ -x "$bun_runner" ]]; then
+    bun_runner="$(realpath -e -- "$bun_runner")"
+  else
+    # Compatibility for tests and the first transition from a checkout that
+    # predates the commit-pinned runner.
+    bun_runner="$bun_executable"
+  fi
   local controlled_path
   controlled_path="$(dirname -- "$bun_executable"):/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 
@@ -98,7 +106,7 @@ run_bun_with_service_environment() {
   fi
 
   sudo systemd-run "${systemd_arguments[@]}" \
-    "$bun_executable" \
+    "$bun_runner" \
     --no-env-file \
     --cwd="$working_directory" \
     "$@"

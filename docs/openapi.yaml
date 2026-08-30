@@ -11,26 +11,42 @@ info:
     - 错误响应统一为 `{ "error": "..." }`，并可能带扩展字段（`details`、`invalid_rows`、`conflicts`、`current_class` 等）。
     - nginx 代理请求会覆盖 `X-Request-ID`，后端在响应头和结构化日志中回显同一标识，用于跨层故障关联。
 servers:
-  - url: http://localhost:3001
-    description: Local development
+  - url: /
+    description: 同源部署；本地开发由前端代理或后端监听地址提供服务
 
 tags:
   - name: Auth
+    description: 登录、会话验证和身份认证。
   - name: Users
+    description: 用户账号、个人资料和密码管理。
   - name: Classes
+    description: 班级创建、查询和教学关系管理。
   - name: Class Members
+    description: 班级成员、选课和助教关联管理。
   - name: Datasets
+    description: 教学数据集、行业、公司与产品数据访问。
   - name: Manuals
+    description: 实验指导书内容和发布管理。
   - name: Question Bank
+    description: 题库题目和可用范围管理。
   - name: Quizzes
+    description: 实验测验生成、作答和结果查询。
   - name: Experiments
+    description: 学生实验生命周期、步骤状态和重试管理。
   - name: Reports
+    description: 实验报告生成、提交和下载。
   - name: Models
+    description: 预测模型训练、诊断、预测和生产准备。
   - name: Grades
+    description: 报告评阅、成绩查询和汇总。
   - name: Academic Terms
+    description: 学年学期及当前学期管理。
   - name: Tools
+    description: ADF 等实验辅助计算工具。
   - name: Runtime
+    description: 健康检查、客户端配置和运行状态。
   - name: Files
+    description: 受管文件的授权读取和下载。
 
 components:
   securitySchemes:
@@ -4411,6 +4427,12 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/DataEnvelope'
+        '401':
+          description: 未认证或会话已失效
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
 
   /api/v1/datasets/industries/{industry}/companies:
     get:
@@ -4428,6 +4450,12 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/DataEnvelope'
+        '401':
+          description: 未认证或会话已失效
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
 
   /api/v1/datasets/industries/{industry}/companies/{company}/products:
     get:
@@ -4446,6 +4474,12 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/DataEnvelope'
+        '401':
+          description: 未认证或会话已失效
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
 
   /api/v1/datasets/industries/{industry}/companies/{company}/products/{product}/fields:
     get:
@@ -5995,6 +6029,12 @@ paths:
                     type: array
                     items:
                       $ref: '#/components/schemas/AcademicTerm'
+        '401':
+          description: 未认证或会话已失效
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
     post:
       tags: [Academic Terms]
       summary: 创建学年学期

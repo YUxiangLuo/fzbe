@@ -1,0 +1,10 @@
+extends:
+  - recommended
+
+# The API is private and has no public license declaration. The two user-path
+# shapes are intentionally disjoint through their documented parameter
+# patterns. A health probe also has no meaningful operation-level 4xx result.
+rules:
+  info-license: off
+  no-ambiguous-paths: off
+  operation-4xx-response: off

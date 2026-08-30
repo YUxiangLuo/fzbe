@@ -3,6 +3,8 @@ set -euo pipefail
 
 project_root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 cd "$project_root"
+./scripts/run-pinned-bun.sh --version
+./py/run-pinned-uv.sh --version
 # shellcheck source=scripts/deployment-environment.sh
 source "$project_root/scripts/deployment-environment.sh"
 
@@ -29,6 +31,14 @@ project_realpath="$(realpath -e -- "$project_root")"
 service_realpath="$(realpath -e -- "$service_working_directory")"
 if [[ "$service_realpath" != "$project_realpath" ]]; then
   echo "Deployment aborted: $service_name runs $service_realpath, not $project_realpath." >&2
+  exit 1
+fi
+service_exec_start="$(systemctl show "$service_name" --property=ExecStart --value)"
+expected_service_runner="$project_root/scripts/run-pinned-bun.sh"
+if [[ "$service_exec_start" != *"$expected_service_runner"* \
+  || "$service_exec_start" != *"run src/index.ts"* ]]; then
+  echo "Deployment aborted: $service_name ExecStart must use $expected_service_runner run src/index.ts." >&2
+  echo "This is required so each commit starts with its own .bun-version and can roll back." >&2
   exit 1
 fi
 
@@ -212,7 +222,7 @@ recover_and_cleanup() {
       git reset --hard "$current_commit" || recovery_status=$?
     fi
     if [[ "$recovery_status" -eq 0 ]]; then
-      bun install --frozen-lockfile || recovery_status=$?
+      ./scripts/run-pinned-bun.sh install --frozen-lockfile || recovery_status=$?
     fi
     if [[ "$recovery_status" -eq 0 && "$python_environment_changed" == true ]]; then
       ./py/install.sh || recovery_status=$?
@@ -244,14 +254,16 @@ cp -p -- "$project_root/.env" "$deployment_environment_snapshot"
 assert_deployment_environment_unchanged
 assert_single_instance_production_environment
 
-if ! git diff --quiet "$current_commit" "$target_commit" -- py/requirements.txt py/install.sh; then
+if ! git diff --quiet "$current_commit" "$target_commit" -- \
+  py/.python-version py/.uv-version py/install.sh py/pyproject.toml \
+  py/production-dependencies.lock py/run-pinned-uv.sh py/uv.lock; then
   python_environment_changed=true
 fi
 
 echo "===========PREPARE BACKEND RELEASE============"
 (
   cd "$release_dir"
-  bun install --frozen-lockfile
+  ./scripts/run-pinned-bun.sh install --frozen-lockfile
   if [[ "$python_environment_changed" == true ]]; then
     ./py/install.sh
   fi
@@ -295,7 +307,7 @@ assert_deployment_environment_unchanged
 
 echo "============ACTIVATE BACKEND RELEASE============"
 git merge --ff-only "$target_commit"
-bun install --frozen-lockfile
+./scripts/run-pinned-bun.sh install --frozen-lockfile
 if [[ "$python_environment_changed" == true ]]; then
   ./py/install.sh
 fi

@@ -66,6 +66,27 @@ and across service startup. A concurrent configuration edit therefore aborts
 activation; if it occurs after the service has stopped, automatic restart is
 refused until an operator reconciles the environment deliberately.
 
+The long-running unit must also start Bun through the checkout-owned version
+runner instead of a global Bun executable. Its service section must use the
+absolute checkout path (replace the example root as appropriate):
+
+```ini
+[Service]
+WorkingDirectory=/srv/fzbe
+ExecStart=/srv/fzbe/scripts/run-pinned-bun.sh run src/index.ts
+```
+
+After changing the unit, run `sudo systemctl daemon-reload` and restart it once.
+`update.sh` verifies this `ExecStart` before staging. Both the current and target
+runner are executed before downtime, which places their `.bun-version` binaries
+in Bun's persistent cache; activation and rollback never replace one global Bun
+binary. The runner accepts Bun from the unit's `PATH`, `BUN_INSTALL`, or the
+service user's standard `$HOME/.bun/bin/bun` location. Python installation
+follows the same rule through
+`py/run-pinned-uv.sh`: `.uv-version` selects an isolated uv tool environment,
+so a target uv upgrade cannot prevent the previous commit from restoring its
+environment.
+
 Database changes are not part of the automatic rollback. If activation or its
 health check fails, `update.sh` restores the previous application commit and
 dependencies, but it does not remove migration-ledger rows or revert schema and

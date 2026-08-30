@@ -26,25 +26,21 @@ const collectPythonRuntimeFiles = (directoryPath: string): string[] => {
   return files;
 };
 
-export const getModelRuntimeRevision = (fresh = false) => {
-  const configuredRevision = process.env.MODEL_RUNTIME_REVISION?.trim();
-  if (configuredRevision) {
-    return crypto.createHash("sha256").update(configuredRevision).digest("hex");
-  }
-  if (!fresh && cachedModelRuntimeRevision) return cachedModelRuntimeRevision;
+export const calculateModelRuntimeRevision = (pythonDirectory: string) => {
   const runtimeFiles = [
-    path.join(PY_DIR, "guided_model.py"),
-    path.join(PY_DIR, "guided_ensemble_model.py"),
-    path.join(PY_DIR, "production_prepare_model.py"),
-    path.join(PY_DIR, "run_model.py"),
-    path.join(PY_DIR, "requirements.txt"),
-    ...collectPythonRuntimeFiles(path.join(PY_DIR, "src")),
+    path.join(pythonDirectory, ".python-version"),
+    path.join(pythonDirectory, "production-dependencies.lock"),
+    path.join(pythonDirectory, "guided_model.py"),
+    path.join(pythonDirectory, "guided_ensemble_model.py"),
+    path.join(pythonDirectory, "production_prepare_model.py"),
+    path.join(pythonDirectory, "run_model.py"),
+    ...collectPythonRuntimeFiles(path.join(pythonDirectory, "src")),
   ].filter((filePath) => fs.existsSync(filePath)).sort();
   const hash = crypto.createHash("sha256").update(MODEL_PIPELINE_REVISION);
   for (const filePath of runtimeFiles) {
     try {
       const contents = fs.readFileSync(filePath);
-      hash.update(path.relative(PY_DIR, filePath));
+      hash.update(path.relative(pythonDirectory, filePath));
       hash.update(contents);
     } catch {
       // A deployment may atomically replace files while the revision is first
@@ -52,7 +48,16 @@ export const getModelRuntimeRevision = (fresh = false) => {
       // next process start.
     }
   }
-  const revision = hash.digest("hex");
+  return hash.digest("hex");
+};
+
+export const getModelRuntimeRevision = (fresh = false) => {
+  const configuredRevision = process.env.MODEL_RUNTIME_REVISION?.trim();
+  if (configuredRevision) {
+    return crypto.createHash("sha256").update(configuredRevision).digest("hex");
+  }
+  if (!fresh && cachedModelRuntimeRevision) return cachedModelRuntimeRevision;
+  const revision = calculateModelRuntimeRevision(PY_DIR);
   if (!fresh) cachedModelRuntimeRevision = revision;
   return revision;
 };

@@ -189,6 +189,8 @@ describe("database migration deployment path", () => {
     expect(update).toContain("--property=KillMode --value");
     expect(update).toContain('service_kill_mode" != "control-group"');
     expect(update).toContain("--property=WorkingDirectory");
+    expect(update).toContain("--property=ExecStart");
+    expect(update).toContain("scripts/run-pinned-bun.sh");
     expect(update).toContain("--property=EnvironmentFiles");
     expect(update).toContain("--property=Environment --value");
     expect(update).toContain("deployment_environment_has_protected_override");
@@ -212,6 +214,7 @@ describe("database migration deployment path", () => {
     expect(update).toContain("/api/v1/health");
     expect(update).toContain('[[ "$(git rev-parse HEAD)" == "$current_commit" ]]');
     expect(update).toContain('git reset --hard "$current_commit"');
+    expect(update).toContain("./scripts/run-pinned-bun.sh install --frozen-lockfile");
     expect(update).not.toContain("git pull");
     expect(update).not.toContain("systemctl restart");
 
