@@ -1,3 +1,4 @@
+export { parseJsonColumn, isRecordValue } from "./model-json";
 import crypto from "crypto";
 import fs from "fs";
 import path from "path";
@@ -274,25 +275,6 @@ export const buildBaseRunContext = async (
   }
   return { fingerprint, artifacts };
 };
-
-export const parseJsonColumn = <T>(value: unknown, fallback: T): T => {
-  if (value === null || value === undefined) {
-    return fallback;
-  }
-
-  if (typeof value === "string") {
-    try {
-      return JSON.parse(value) as T;
-    } catch {
-      return fallback;
-    }
-  }
-
-  return value as T;
-};
-
-export const isRecordValue = (value: unknown): value is Record<string, unknown> =>
-  Boolean(value) && typeof value === "object" && !Array.isArray(value);
 
 export const isGuidedModelType = (modelType: ModelType): modelType is GuidedModelType => {
   return GUIDED_MODEL_TYPES.has(modelType);

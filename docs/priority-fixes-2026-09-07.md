@@ -19,7 +19,7 @@
 
 回归覆盖了失败请求的四类后续状态、无后续更新的原有回滚路径、锁内权重重新校验、缺少权重、写入/提交失败释放连接、教师和助教部分汇总失败、真实空班级与失败的区别、失败班级排除出图表及重试恢复。
 
-跨学期领域模型未在本批迁移；后续方案见 [teaching-enrollment-design.md](./teaching-enrollment-design.md)。
+跨学期领域模型未在本批迁移；该方向现已按用户决定取消，历史草案见 [teaching-enrollment-design.md](./teaching-enrollment-design.md)。
 
 验证结果（项目固定 Bun 1.4.0）：后端 1097 项单测、前端 808 项单测全部通过；两端类型检查、测试清单、正式前端构建、OpenAPI lint 和生成 API 类型一致性检查通过。Python 模型未改动，本批没有重跑 Python 或全角色 E2E。
 
