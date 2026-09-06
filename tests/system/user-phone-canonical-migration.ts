@@ -2,6 +2,7 @@ import mysql, { type Connection, type RowDataPacket } from "mysql2/promise";
 import { buildMigrationDatabaseOptions } from "../../scripts/migration-database";
 import { migrateUserPhoneCanonicalUnique } from "../../scripts/migrate-user-phone-canonical-unique";
 import { assertE2eDatabaseResetAllowed } from "../../scripts/test-database-reset-guard";
+import { ensureE2eDatabaseExists } from "../../scripts/ensure-e2e-database";
 
 const LOCAL_DATABASE_HOSTS = new Set(["127.0.0.1", "localhost", "::1"]);
 
@@ -28,6 +29,7 @@ async function resetUsersTable(connection: Connection): Promise<void> {
 }
 
 assertDisposableTarget();
+await ensureE2eDatabaseExists();
 const connection = await mysql.createConnection(buildMigrationDatabaseOptions());
 
 try {
