@@ -535,6 +535,8 @@ describe("class grade access and summary services", () => {
         semester: 1,
         term_label: "2026-2027 第1学期",
         is_current_term: true,
+        load_status: "ready",
+        load_error: null,
         total_students: 6,
         graded_count: 2,
         submitted_count: 1,
@@ -568,6 +570,33 @@ describe("class grade access and summary services", () => {
       average_score: 90,
     });
   });
+
+  for (const role of ["Teacher", "Assistant"] as const) {
+    test(`${role} summaries distinguish missing policy, query failure and an empty class`, async () => {
+      poolQuery.mockImplementation(async (query: string, values?: unknown[]) => {
+        if (query.includes("SELECT role FROM users")) return [[{ role }]];
+        if (query.includes("FROM classes c")) return [[1, 2, 3].map(class_id => ({
+          class_id, class_name: `Class ${class_id}`, term_id: 4,
+          academic_year: "2026-2027", semester: 1, term_label: "2026-2027 第1学期", is_current_term: 1,
+        }))];
+        if (query.includes("SELECT * FROM grade_weights")) return values?.[0] === 1 ? [[]] : [[weights]];
+        if (query.includes("FROM enrollments e") && values?.[0] === 2) throw new Error("query unavailable");
+        return [[]];
+      });
+      const result = role === "Teacher"
+        ? await getTeacherClassGradeSummaries(9, 9, role, 4)
+        : await getAssistantClassGradeSummaries(9, 9, role, 4);
+      expect(result.data).toEqual([
+        expect.objectContaining({ class_id: 1, load_status: "error", load_error: "missing_grading_policy", total_students: null }),
+        expect.objectContaining({ class_id: 2, load_status: "error", load_error: "query_failed", total_students: null }),
+        expect.objectContaining({ class_id: 3, load_status: "ready", load_error: null, total_students: 0 }),
+      ]);
+      for (const summary of result.data!.slice(0, 2)) {
+        expect(summary).toMatchObject({ graded_count: null, submitted_count: null,
+          rejected_count: null, not_submitted_count: null, average_score: null });
+      }
+    });
+  }
 
   test("fails closed for cross-account summary access and invalid role targets", async () => {
     await expect(getTeacherClassGradeSummaries(9, 10, "Teacher"))

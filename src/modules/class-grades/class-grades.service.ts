@@ -7,6 +7,7 @@ import { pipeline } from "node:stream/promises";
 import type { RowDataPacket, ResultSetHeader, Pool, PoolConnection } from "mysql2/promise";
 import { ZipFile } from "yazl";
 import { env, pool } from "../../config";
+import logger from "../../utils/logger";
 import { CLEANUP_RETENTION } from "../../utils/constants";
 import { cleanupDirectoryEntriesOlderThan } from "../../utils/disk-cleanup";
 import {
@@ -207,7 +208,7 @@ interface TeacherClassRow extends ClassSummarySourceRow {}
 interface AssistantClassRow extends ClassSummarySourceRow {}
 interface UserRoleRow extends RowDataPacket { role: string; }
 
-export interface TeacherClassGradeSummary {
+interface ClassGradeSummaryIdentity {
   class_id: number;
   class_name: string;
   term_id: number;
@@ -215,6 +216,11 @@ export interface TeacherClassGradeSummary {
   semester: 1 | 2;
   term_label: string;
   is_current_term: boolean;
+}
+
+export interface ReadyClassGradeSummary extends ClassGradeSummaryIdentity {
+  load_status: "ready";
+  load_error: null;
   total_students: number;
   graded_count: number;
   submitted_count: number;
@@ -222,6 +228,19 @@ export interface TeacherClassGradeSummary {
   not_submitted_count: number;
   average_score: number | null;
 }
+
+export interface UnavailableClassGradeSummary extends ClassGradeSummaryIdentity {
+  load_status: "error";
+  load_error: "missing_grading_policy" | "query_failed";
+  total_students: null;
+  graded_count: null;
+  submitted_count: null;
+  rejected_count: null;
+  not_submitted_count: null;
+  average_score: null;
+}
+
+export type TeacherClassGradeSummary = ReadyClassGradeSummary | UnavailableClassGradeSummary;
 
 export async function isAssistantAssignedToClass(db: Queryable, classId: number, assistantId: number): Promise<boolean> {
   const [[assignment]] = await db.query<AssignmentRow[]>("SELECT 1 FROM class_assistants WHERE class_id = ? AND assistant_id = ? LIMIT 1", [classId, assistantId]);
@@ -769,36 +788,56 @@ export async function getGradingPolicy(classId: number) {
 }
 
 export async function updateGradingPolicy(classId: number, input: UpdateGradeWeightsInput) {
-  const [existing] = await pool.query<RowDataPacket[]>("SELECT * FROM grade_weights WHERE class_id = ?", [classId]);
-  if (existing.length === 0) return { error: "not_found" as const };
-
-  const mergedWeights = { ...existing[0], ...input };
-  const weightValidation = validateGradeWeightTotals(mergedWeights);
-  if (!weightValidation.valid) return { error: "invalid_weight_total" as const, details: weightValidation };
-
-  const editableWeightFields = [
-    "exp_flow_weight",
-    ...EXP_FLOW_FIELDS,
-    "model_quality_weight",
-    "knowledge_test_weight",
-    "report_quality_weight",
-  ] as const;
-
-  const fields: string[] = [];
-  const values: unknown[] = [];
-  for (const field of editableWeightFields) {
-    const value = input[field];
-    if (value !== undefined) {
-      fields.push(`${field} = ?`);
-      values.push(value);
+  const connection = await pool.getConnection();
+  try {
+    await connection.beginTransaction();
+    // Validate against the same locked row that receives the partial update.
+    // Otherwise two valid patches can combine into a total other than 100.
+    const [existing] = await connection.query<RowDataPacket[]>(
+      "SELECT * FROM grade_weights WHERE class_id = ? FOR UPDATE", [classId],
+    );
+    if (existing.length === 0) {
+      await connection.rollback();
+      return { error: "not_found" as const };
     }
+
+    const weightValidation = validateGradeWeightTotals({ ...existing[0], ...input });
+    if (!weightValidation.valid) {
+      await connection.rollback();
+      return { error: "invalid_weight_total" as const, details: weightValidation };
+    }
+
+    const editableWeightFields = [
+      "exp_flow_weight",
+      ...EXP_FLOW_FIELDS,
+      "model_quality_weight",
+      "knowledge_test_weight",
+      "report_quality_weight",
+    ] as const;
+
+    const fields: string[] = [];
+    const values: unknown[] = [];
+    for (const field of editableWeightFields) {
+      const value = input[field];
+      if (value !== undefined) {
+        fields.push(`${field} = ?`);
+        values.push(value);
+      }
+    }
+
+    values.push(classId);
+    await connection.query(`UPDATE grade_weights SET ${fields.join(", ")} WHERE class_id = ?`, values);
+    const [updatedWeights] = await connection.query<RowDataPacket[]>(
+      "SELECT * FROM grade_weights WHERE class_id = ?", [classId],
+    );
+    await connection.commit();
+    return { data: updatedWeights[0] };
+  } catch (error) {
+    await connection.rollback().catch(() => {});
+    throw error;
+  } finally {
+    connection.release();
   }
-
-  values.push(classId);
-  await pool.query(`UPDATE grade_weights SET ${fields.join(", ")} WHERE class_id = ?`, values);
-
-  const [updatedWeights] = await pool.query<RowDataPacket[]>("SELECT * FROM grade_weights WHERE class_id = ?", [classId]);
-  return { data: updatedWeights[0] };
 }
 
 const LATEST_GRADE_SELECTION_SQL = `SELECT u.user_id, u.username, u.full_name, u.email,
@@ -896,7 +935,7 @@ export async function getGradeSummaries(classId: number) {
 export function buildTeacherClassSummary(
   classRow: ClassSummarySourceRow,
   gradeRows: Array<{ report_status: string | null; final_score: number | null }>,
-): TeacherClassGradeSummary {
+): ReadyClassGradeSummary {
   const gradedCount = gradeRows.filter((row) => row.report_status === "graded").length;
   const submittedCount = gradeRows.filter((row) => row.report_status === "submitted").length;
   const rejectedCount = gradeRows.filter((row) =>
@@ -919,6 +958,8 @@ export function buildTeacherClassSummary(
     semester: classRow.semester,
     term_label: classRow.term_label,
     is_current_term: Boolean(classRow.is_current_term),
+    load_status: "ready",
+    load_error: null,
     total_students: gradeRows.length,
     graded_count: gradedCount,
     submitted_count: submittedCount,
@@ -928,7 +969,10 @@ export function buildTeacherClassSummary(
   };
 }
 
-const createEmptyTeacherClassSummary = (classRow: ClassSummarySourceRow): TeacherClassGradeSummary => ({
+const createUnavailableClassSummary = (
+  classRow: ClassSummarySourceRow,
+  loadError: UnavailableClassGradeSummary["load_error"],
+): UnavailableClassGradeSummary => ({
   class_id: classRow.class_id,
   class_name: classRow.class_name,
   term_id: classRow.term_id,
@@ -936,11 +980,13 @@ const createEmptyTeacherClassSummary = (classRow: ClassSummarySourceRow): Teache
   semester: classRow.semester,
   term_label: classRow.term_label,
   is_current_term: Boolean(classRow.is_current_term),
-  total_students: 0,
-  graded_count: 0,
-  submitted_count: 0,
-  rejected_count: 0,
-  not_submitted_count: 0,
+  load_status: "error",
+  load_error: loadError,
+  total_students: null,
+  graded_count: null,
+  submitted_count: null,
+  rejected_count: null,
+  not_submitted_count: null,
   average_score: null,
 });
 
@@ -949,7 +995,10 @@ async function buildClassGradeSummaries(classRows: ClassSummarySourceRow[]) {
     classRows.map(async (classRow) => {
       try {
         const result = await getGradeSummaries(classRow.class_id);
-        if ("error" in result) return createEmptyTeacherClassSummary(classRow);
+        if ("error" in result) {
+          logger.warn({ classId: classRow.class_id }, "Class grade summary has no grading policy");
+          return createUnavailableClassSummary(classRow, "missing_grading_policy");
+        }
 
         const summaryRows = result.data.map((row) => ({
           report_status: row.report_status ?? null,
@@ -957,8 +1006,9 @@ async function buildClassGradeSummaries(classRows: ClassSummarySourceRow[]) {
         }));
 
         return buildTeacherClassSummary(classRow, summaryRows);
-      } catch {
-        return createEmptyTeacherClassSummary(classRow);
+      } catch (error) {
+        logger.warn({ err: error, classId: classRow.class_id }, "Class grade summary query failed");
+        return createUnavailableClassSummary(classRow, "query_failed");
       }
     }),
   );

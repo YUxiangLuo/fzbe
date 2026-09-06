@@ -56,6 +56,91 @@ components:
       bearerFormat: JWT
 
   schemas:
+    ClassGradeSummaryIdentity:
+      type: object
+      required: [class_id, class_name, term_id, academic_year, semester, term_label, is_current_term]
+      properties:
+        class_id:
+          type: integer
+        class_name:
+          type: string
+        term_id:
+          type: integer
+        academic_year:
+          type: string
+        semester:
+          type: integer
+          enum: [1, 2]
+        term_label:
+          type: string
+        is_current_term:
+          type: boolean
+    ClassGradeSummary:
+      oneOf:
+        - $ref: '#/components/schemas/ReadyClassGradeSummary'
+        - $ref: '#/components/schemas/UnavailableClassGradeSummary'
+    ReadyClassGradeSummary:
+      allOf:
+        - $ref: '#/components/schemas/ClassGradeSummaryIdentity'
+        - type: object
+          required: [load_status, load_error, total_students, graded_count, submitted_count, rejected_count, not_submitted_count, average_score]
+          properties:
+            load_status:
+              type: string
+              enum: [ready]
+            load_error:
+              type: string
+              nullable: true
+              enum: [null]
+            total_students:
+              type: integer
+            graded_count:
+              type: integer
+            submitted_count:
+              type: integer
+            rejected_count:
+              type: integer
+            not_submitted_count:
+              type: integer
+            average_score:
+              type: number
+              nullable: true
+    UnavailableClassGradeSummary:
+      allOf:
+        - $ref: '#/components/schemas/ClassGradeSummaryIdentity'
+        - type: object
+          required: [load_status, load_error, total_students, graded_count, submitted_count, rejected_count, not_submitted_count, average_score]
+          properties:
+            load_status:
+              type: string
+              enum: [error]
+            load_error:
+              type: string
+              enum: [missing_grading_policy, query_failed]
+            total_students:
+              type: integer
+              nullable: true
+              enum: [null]
+            graded_count:
+              type: integer
+              nullable: true
+              enum: [null]
+            submitted_count:
+              type: integer
+              nullable: true
+              enum: [null]
+            rejected_count:
+              type: integer
+              nullable: true
+              enum: [null]
+            not_submitted_count:
+              type: integer
+              nullable: true
+              enum: [null]
+            average_score:
+              type: number
+              nullable: true
+              enum: [null]
     ErrorResponse:
       type: object
       required: [error]
@@ -5129,11 +5214,17 @@ paths:
         - $ref: '#/components/parameters/termIdQuery'
       responses:
         '200':
-          description: 成功
+          description: 成功；各班级独立返回加载状态，失败班级的统计字段为 null，不纳入图表。
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/DataEnvelopeArray'
+                type: object
+                required: [data]
+                properties:
+                  data:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/ClassGradeSummary'
         '400':
           description: 学期不存在
           content:
@@ -5165,11 +5256,17 @@ paths:
         - $ref: '#/components/parameters/termIdQuery'
       responses:
         '200':
-          description: 成功
+          description: 成功；各班级独立返回加载状态，失败班级的统计字段为 null，不纳入图表。
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/DataEnvelopeArray'
+                type: object
+                required: [data]
+                properties:
+                  data:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/ClassGradeSummary'
         '400':
           description: 学期不存在
           content:
