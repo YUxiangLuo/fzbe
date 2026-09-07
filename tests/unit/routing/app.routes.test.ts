@@ -640,6 +640,8 @@ describe("app route smoke tests", () => {
       );
 
       expect(fullResponse.status).toBe(200);
+      expect(fullResponse.headers.get("cache-control")).toBe("private, no-store");
+      expect(fullResponse.headers.get("vary")).toContain("Authorization");
       expect(fullResponse.headers.get("content-length")).toBe("10");
       expect(fullResponse.headers.get("accept-ranges")).toBe("bytes");
       expect(fullResponse.headers.get("x-request-id"))
@@ -656,6 +658,8 @@ describe("app route smoke tests", () => {
       );
 
       expect(rangeResponse.status).toBe(206);
+      expect(rangeResponse.headers.get("cache-control")).toBe("private, no-store");
+      expect(rangeResponse.headers.get("vary")).toContain("Authorization");
       expect(rangeResponse.headers.get("content-length")).toBe("4");
       expect(rangeResponse.headers.get("content-range")).toBe("bytes 2-5/10");
       expect(rangeResponse.headers.get("x-request-id"))
@@ -675,6 +679,13 @@ describe("app route smoke tests", () => {
       expect(multiRangeResponse.headers.get("content-length")).toBe("10");
       expect(multiRangeResponse.headers.get("content-range")).toBeNull();
       expect(await multiRangeResponse.text()).toBe("0123456789");
+
+      const invalidRange = await app.fetch(new Request(`http://localhost/manuals/${filename}`, {
+        headers: { Authorization: `Bearer ${token}`, Range: "bytes=99-" },
+      }));
+      expect(invalidRange.status).toBe(416);
+      expect(invalidRange.headers.get("cache-control")).toBe("private, no-store");
+      expect(invalidRange.headers.get("vary")).toContain("Authorization");
     } finally {
       await rm(filePath, { force: true });
     }

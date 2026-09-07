@@ -265,7 +265,10 @@ async function buildLocalFileResponse(options: LocalFileResponseOptions): Promis
   const baseHeaders = {
     "Content-Type": contentType,
     "Content-Disposition": buildContentDisposition(options.disposition, options.filename),
-    "Cache-Control": "private, max-age=60",
+    // These files have already passed per-user authorization. A private browser
+    // cache is shared by successive logins in that browser, not by user identity.
+    "Cache-Control": "private, no-store",
+    "Vary": "Authorization",
     "Accept-Ranges": "bytes",
     "ETag": etag,
     "Last-Modified": lastModified,
