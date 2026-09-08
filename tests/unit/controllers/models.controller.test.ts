@@ -504,6 +504,20 @@ describe("models controller", () => {
     });
   });
 
+  test.each(["MODEL_DB_QUERY_TIMEOUT", "MODEL_DB_TRANSACTION_TIMEOUT"])(
+    "preserves %s as 503 when the final training-step transaction times out", async (code) => {
+      runGuidedTrainingStep.mockRejectedValueOnce(
+        new ModelServiceUnavailableError("数据库操作超时，请稍后重试", code),
+      );
+      const response = await request(
+        "/api/v1/models/ma/guided-training/sessions/guided-1/steps/save_artifact/run",
+        "POST",
+      );
+      expect(response.status).toBe(503);
+      expect(await response.json()).toEqual({ error: "数据库操作超时，请稍后重试", code });
+    },
+  );
+
   test("returns structured 429 with Retry-After when admission is full", async () => {
     runProductionPreparationStep.mockRejectedValueOnce(new ModelCapacityBusyError());
     const response = await request(

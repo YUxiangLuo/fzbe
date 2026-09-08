@@ -14,7 +14,7 @@ import {
 } from "./models.schema";
 import type { BaseModelType, EnsembleModelType, GuidedModelType } from "./model-types";
 import { ModelValidationError } from "./model-errors";
-import { withDeadlockRetry } from "../../utils/db-retry";
+import { isRetryableTransactionError, withDeadlockRetry } from "../../utils/db-retry";
 
 const BASE_MODELS: BaseModelType[] = ["ma", "es", "arima", "lstm"];
 const ENSEMBLE_MODELS: EnsembleModelType[] = ["weighted_avg", "boosting", "stacking"];
@@ -1075,6 +1075,11 @@ async function commitModelTrainingRunAttempt(
       } catch (rollbackError) {
         disposed = true;
         connection.destroy();
+        // Query/BEGIN timeouts already destroy the connection, so rollback can
+        // fail on that closed session. Preserve non-retryable errors (including
+        // their HTTP classification); only mask SQL errors that the outer
+        // retry loop could replay without an acknowledged rollback.
+        if (!isRetryableTransactionError(error)) throw error;
         throw new Error("模型结果事务回滚失败", { cause: rollbackError });
       }
     }

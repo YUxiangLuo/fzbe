@@ -178,6 +178,8 @@ DB_CONNECTION_LIMIT = explicit override or minimum
 
 上述路径对明确回滚的死锁/锁等待超时最多重试三次，间隔 50ms、150ms。模型重试仅重新执行落库事务，复用已完成的 Python 结果、run ID 和 attempt。回滚失败或 COMMIT ACK 丢失不得进入此重试；创建/重做的未知提交返回 `EXPERIMENT_COMMIT_OUTCOME_UNKNOWN` 503，需读取当前实验确认，模型继续使用原有 receipt 恢复协议。
 
+模型 run 落库的查询/BEGIN 超时会销毁连接，随后对已关闭连接的回滚失败不得覆盖原有 `MODEL_DB_QUERY_TIMEOUT` / `MODEL_DB_TRANSACTION_TIMEOUT` 503。只有已确认回滚的 SQL 死锁/锁等待超时才能重放；回滚失败仍然禁止事务重试。
+
 默认 DB 等待队列为 100。已知的连接池队列耗尽或服务器连接数耗尽统一返回 `DATABASE_BUSY` 503 和 `Retry-After: 2`。这表示容量不足，不应被解读为所有写入都可以自动重放。
 
 报告预览的两项测验证据和模型观测数据按顺序读取，每名学生最多保留一个证据读取请求；50 人同步预览不会再主动扇出 150 个请求。两项测验必须完整，只有模型观测可降级。其他后台流量仍共享连接池，所以该约束不等于任意混合负载的容量保证。
