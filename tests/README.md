@@ -8,6 +8,7 @@
 | Python 工作流 | `py/test/` | 真实 CLI、CSV、保存/加载、guided parity 和生产准备链路 | `bun run test:workflow` |
 | Python deep | `py/deep_tests/` | 七类算法的公式、数据情形、泄漏、持久化、稳定性和资源矩阵 | `bun run test:deep:fast` |
 | 系统边界矩阵 | `tests/system/` | 七类模型的 Python 与真实 API/数据库边界 | `bun run test:system:model-edge` |
+| 真实 SQL 并发 | `tests/system/concurrency-classroom.ts` | 50 人创建/重做、run 激活、连接池阻塞及隔离恢复 | `bun run test:system:concurrency` |
 
 ## 日常命令
 
@@ -59,6 +60,8 @@ CI 只调用 runner，不再逐项复制脚本路径。
 `NODE_ENV=production` 或 `BUN_ENV=production` 默认被拒绝。确需使用远程一次性测试库或 production-mode
 进程时，分别显式设置 `DB_RESET_ALLOW_REMOTE=1`、`DB_RESET_ALLOW_PROD=1`；
 旧的 `DB_SETUP_ALLOW_REMOTE`/`DB_SETUP_ALLOW_PROD` 只作为兼容别名保留。
+
+`test:system:concurrency` 额外要求本地且初始为空的专用测试库；只创建并清理自己拥有的表，不替换已有数据。它固定池大小 40、等待队列 100，将会话基线设为 RR 后验证局部 RC 不泄漏。CI 在 canonical-phone SQL gate 清空测试表后执行它。Python、HTTP 预览和混合负载另由相应回归覆盖，不能用 SQL gate 替代。
 
 ## Bun 单测领域
 

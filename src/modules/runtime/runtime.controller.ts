@@ -13,6 +13,7 @@ import { getModelExecutionLockStats } from "../models/model-execution-lock";
 import { getModelOperationStats } from "../models/model-operation-lease";
 import { getPdfQueueStats } from "../reports/reports.service";
 import { getRequestObservabilityStats } from "../../utils/request-observability";
+import { buildPythonModelProcessEnv } from "../../utils/python-process-env";
 
 const runtimeController = new Hono();
 
@@ -31,6 +32,7 @@ const buildRuntimeInfo = () => ({
     dbMinimumConnectionLimit: DB_POOL_CONFIG.MIN_CONNECTION_LIMIT,
     pythonModelProcessThreads: PYTHON_RUNTIME_CONFIG.MODEL_PROCESS_THREADS,
     pythonTensorflowInterOpThreads: PYTHON_RUNTIME_CONFIG.TF_INTER_OP_THREADS,
+    pythonNativeProcessEnv: buildPythonModelProcessEnv(),
   },
   timeouts: {
     modelExecutionHardCapMs: TIMEOUTS.MODEL_EXECUTION_HARD_CAP,

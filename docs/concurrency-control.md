@@ -51,7 +51,7 @@ TF_NUM_INTEROP_THREADS = 1
 | `PDF_QUEUE_TIMEOUT_MS` | `60000` | PDF 排队上限 |
 | `PDF_GENERATION_TIMEOUT_MS` | `30000` | 单次 PDF 生成上限 |
 | `DB_CONNECTION_LIMIT` | `max(40, ceil(modelJobs/2))` | 短查询和事务共享的 mysql2 pool |
-| `PYTHON_MODEL_THREADS` | `1` | 单个 Python 模型进程的原生计算线程数 |
+| `PYTHON_MODEL_THREADS` | `1` | 模型、产物探测、ADF 的默认原生计算线程数；显式原生环境变量优先 |
 | `TF_NUM_INTEROP_THREADS` | `1` | TensorFlow inter-op 线程数 |
 
 所有显式整数配置必须为正整数。Python 模型进程还有不可配置的 600,000 ms 硬上限。旧 advisory-lock 时代的 `MODEL_LOCK_CONNECTION_ACQUIRE_TIMEOUT_MS`、`MODEL_LOCK_QUERY_TIMEOUT_MS` 和 `DB_QUERY_HEADROOM` 已移除；生产启动会拒绝仍包含这些键的 `.env`，避免静默忽略旧容量配置。
@@ -133,6 +133,8 @@ operation deadline + process termination grace + response reserve
 
 普通 mysql2 查询无法原生通过 AbortSignal 取消，因此模型 operation signal 通过 AsyncLocalStorage 传播到数据库 helper；helper 显式借用连接，并对连接获取、查询、`BEGIN` 和 `ROLLBACK` 设置上限。operation 截止或查询/事务控制超时时会销毁对应连接，`COMMIT` 中止或超时则按结果未知 fail-closed。数据集查找也使用同一有界查询 helper，文件读取和 CSV 解析会响应 operation signal。
 
+销毁客户端连接只保证调用停止等待、连接不再被复用，不能保证 MariaDB/MySQL 上的查询和锁立即消失。服务端可能继续执行当前语句，直到发现连接关闭才清理事务；必须结合真实数据库会话和锁等待观测判断资源是否回收。普通 CRUD 尚未统一使用模型 deadline；浏览器超时后的写入仍可能提交，客户端应重新读取状态和版本确认结果。
+
 ## 6. 客户端断线与 Python 进程
 
 已接受的模型任务不使用 HTTP `Request.signal`。页面关闭、路由跳转或浏览器离线不会提前终止后端任务，也不会提前释放 admission/execution mutex。任务只在以下条件结束：
@@ -149,6 +151,10 @@ Linux 下模型和 ADF 通过 `setsid` 建立进程组。超时后依次执行�
 2. 等待宽限期；
 3. 必要时发送 `SIGKILL`；
 4. 确认整个进程组退出后释放 execution mutex 和 admission。
+
+普通、guided 和 auxiliary runner 的异常分支均等待进程树终止；主进程提前退出或关闭输出流不能抢先结束 lease。回归使用真实的拒绝 `SIGTERM` 的后代进程，同时检查进程组存活和同一执行键重新准入。
+
+模型、辅助脚本及 ADF 共用 `src/utils/python-process-env.ts` 的环境构造函数。`OMP_NUM_THREADS`、`OPENBLAS_NUM_THREADS`、`MKL_NUM_THREADS` 等显式配置优先于 `PYTHON_MODEL_THREADS`；管理员运行时信息的 `concurrency.pythonNativeProcessEnv` 显示实际传入子进程的值，不能把产品默认值视为所有部署的有效值。
 
 模型 run、guided attempt 和 production preparation 仍使用数据库状态、attempt ID、revision、checksum 和提交后复核防止迟到结果覆盖新状态。这些机制处理的是异步结果一致性，不能因为单实例而删除。
 
@@ -168,6 +174,16 @@ DB_CONNECTION_LIMIT = explicit override or minimum
 
 数据库 `FOR UPDATE`、统一的 users → experiment 锁顺序、deadlock retry、提交 ACK 丢失复核和 `state_version` 乐观锁与实例数量无关，全部保留。
 
+首次创建、驳回重做和模型 run 激活事务使用单次 `READ COMMITTED`，避免不同学生在空索引范围上形成 RR gap lock 死锁。它们继续锁定学生及实验实体，并在事务内复核权限、最新尝试、配置 revision 和活跃 run；不修改连接池的会话默认隔离级别。
+
+上述路径对明确回滚的死锁/锁等待超时最多重试三次，间隔 50ms、150ms。模型重试仅重新执行落库事务，复用已完成的 Python 结果、run ID 和 attempt。回滚失败或 COMMIT ACK 丢失不得进入此重试；创建/重做的未知提交返回 `EXPERIMENT_COMMIT_OUTCOME_UNKNOWN` 503，需读取当前实验确认，模型继续使用原有 receipt 恢复协议。
+
+默认 DB 等待队列为 100。已知的连接池队列耗尽或服务器连接数耗尽统一返回 `DATABASE_BUSY` 503 和 `Retry-After: 2`。这表示容量不足，不应被解读为所有写入都可以自动重放。
+
+报告预览的两项测验证据和模型观测数据按顺序读取，每名学生最多保留一个证据读取请求；50 人同步预览不会再主动扇出 150 个请求。两项测验必须完整，只有模型观测可降级。其他后台流量仍共享连接池，所以该约束不等于任意混合负载的容量保证。
+
+学期创建/更新在同一已借连接内读取返回数据后提交；班级成员重复记录分支也复用当前连接。持有连接的服务不得再次向同一池借连接来完成自身响应。
+
 ## 8. 受管文件删除
 
 数据集、手册和用户删除共享一个 process-wide deletion permit，容量为 1：
@@ -180,7 +196,7 @@ deletion permit -> ordered DB row locks -> stage files -> DB commit -> purge/res
 
 ## 9. PDF 并发
 
-PDF 使用独立的进程内 `Semaphore`，允许有界 FIFO 排队：
+PDF 使用独立的进程内 `Semaphore`，允许等待时间有上限的 FIFO 排队，当前没有队列条目数上限：
 
 - 活跃上限：`MAX_CONCURRENT_PDF_JOBS`；
 - 等待超过 `PDF_QUEUE_TIMEOUT_MS` 返回 503；
@@ -188,13 +204,15 @@ PDF 使用独立的进程内 `Semaphore`，允许有界 FIFO 排队：
 - 超时会终止 Chromium，并给关闭流程最多 2 秒清理时间；
 - 所有失败路径清理临时 PDF 并释放 permit；生成超时返回 504。
 
-模型 admission 是 fail-fast，PDF 是有界排队，两者语义不同。
+模型 admission 是 fail-fast，PDF 按等待时间限制排队，两者语义不同。同实验重复提交尚未在 PDF 生成前合并。
 
 ## 10. 认证限流和其他进程内控制
 
 登录/注册固定窗口限流、latest-request gate、运行时计数和清理 timer 都是进程内状态。在单实例约束下它们就是全局状态，无需 Redis、leader election 或共享队列。
 
 nginx 必须覆盖客户端提交的代理 IP 头，后端只信任 nginx 设置的 `X-Real-IP`；这与单实例无关，是限流身份可信度要求。
+
+登录默认每 IP 15 分钟 100 次；50 名学生共享 NAT 时，两轮登录即可耗尽配额。部署验收需包含教师流量、误输密码和重登，按校园实际出口拓扑配置预算。
 
 手册、数据集、报告和导出文件的单范围 `206` 响应使用 64 KiB 有界流读取。即使客户端请求 `bytes=0-`，后端也不得按完整文件或完整范围分配内存；客户端取消时必须关闭文件句柄。
 
@@ -219,6 +237,9 @@ bun run test:check
 bun test tests/unit/config/model-execution-lock.test.ts --isolate
 bun test tests/unit/config/model-operation-lease.test.ts --isolate
 bun test tests/unit/config/model-operation-classroom.test.ts --isolate
+bun test tests/unit/config/python-lease-process-tree.test.ts --isolate
+# 需要本地、空的专用测试库，以及 E2E_ALLOW_DB_RESET=1 和完整 DB_* 环境。
+bun run test:system:concurrency
 ```
 
 真实服务矩阵：
@@ -226,7 +247,13 @@ bun test tests/unit/config/model-operation-classroom.test.ts --isolate
 ```bash
 cd ../fzfe
 bun run test:e2e:concurrency
+bun run test:e2e:concurrency:classroom
+bun run test:e2e:concurrency:mixed
 bun run test:e2e:concurrency:ui
 ```
 
 并发 E2E 必须通过真实 HTTP hold 请求占用同一 Bun 进程的 admission/execution mutex，不能再通过外部数据库 named lock 模拟容量。
+
+`test:system:concurrency` 在真实 MySQL/MariaDB 上测试三轮 50 人创建、50 人重做、同学生竞争、三轮 12 人 run 提交、50 个学期写入和连接隔离恢复；后端 CI 将其作为 MySQL 8.4 gate。它不运行 Python。
+
+前端默认并发命令依次执行 `protocols`（容量拒绝及恢复）与 `classroom`（50 人真实创建、提交两项测验、复用页面函数预览）。原来的 `all` 已更名为 `protocols`，避免将小规模协议测试误当整班负载验收。`mixed` 仍为独立的 MA/LSTM、预测和 PDF 混合测量。`E2E_CONCURRENCY_EXPECT_PDF_503=0` 严格要求所有 PDF 首轮成功，出现 503 即失败，不能靠串行补发变绿。

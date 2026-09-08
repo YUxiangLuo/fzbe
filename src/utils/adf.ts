@@ -5,6 +5,7 @@ import fs from "node:fs";
 import crypto from "node:crypto";
 import os from "node:os";
 import { terminateProcessTree } from "./process-tree";
+import { buildPythonModelProcessEnv } from "./python-process-env";
 import { ModelTimeoutError } from "../modules/models/model-errors";
 
 export interface AdfInputPoint {
@@ -136,6 +137,7 @@ export async function runAdf(
       cwd: PY_DIR,
       stdout: "pipe",
       stderr: "pipe",
+      env: { ...process.env, ...buildPythonModelProcessEnv() },
     });
 
     let forcedTerminationError: Error | null = null;

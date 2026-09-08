@@ -8,6 +8,7 @@ process.env.PORT = "3001";
 import { beforeEach, describe, expect, mock, test } from "bun:test";
 import { Hono } from "hono";
 import { sign } from "hono/jwt";
+import { ModelCommitOutcomeUnknownError } from "../../../src/modules/models/model-errors";
 
 mock.restore();
 
@@ -58,6 +59,19 @@ describe("experiments controller", () => {
       data: { experiment_id: 990003, retry_of_experiment_id: 990002 },
       created: true,
     }));
+  });
+
+  test.each([
+    ["/api/v1/students/me/experiment-runs", {}, createExperiment],
+    ["/api/v1/students/me/experiment-runs/retry", { rejected_report_id: 77 }, retryRejectedExperiment],
+  ] as const)("distinguishes an unknown creation commit outcome for %s", async (pathname, body, operation) => {
+    operation.mockRejectedValueOnce(new ModelCommitOutcomeUnknownError());
+    const response = await app.request(pathname, {
+      method: "POST", headers: await authHeaders(), body: JSON.stringify(body),
+    });
+    expect(response.status).toBe(503);
+    expect(await response.json()).toMatchObject({ code: "EXPERIMENT_COMMIT_OUTCOME_UNKNOWN" });
+    expect(operation).toHaveBeenCalledTimes(1);
   });
 
   test("creates a retry from a numeric rejected report id", async () => {

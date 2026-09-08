@@ -1,7 +1,9 @@
 import path from "path";
 import fs from "fs";
 import logger from "../../utils/logger";
-import { PYTHON_RUNTIME_CONFIG, TIMEOUTS } from "../../utils/constants";
+import { TIMEOUTS } from "../../utils/constants";
+import { buildPythonModelProcessEnv } from "../../utils/python-process-env";
+export { buildPythonModelProcessEnv } from "../../utils/python-process-env";
 import { PY_DIR, resolvePythonExecutable } from "../../utils/python";
 import { terminateProcessTree } from "../../utils/process-tree";
 import { extractPythonTaggedError } from "./model-error-protocol";
@@ -33,22 +35,6 @@ export const resolvePythonProcessHardCapMs = (
     ? TIMEOUTS.MODEL_ORCHESTRATION_HARD_CAP
     : TIMEOUTS.MODEL_EXECUTION_HARD_CAP
 );
-
-export function buildPythonModelProcessEnv(): Record<string, string> {
-  const modelThreads = String(PYTHON_RUNTIME_CONFIG.MODEL_PROCESS_THREADS);
-  const tfInterOpThreads = String(PYTHON_RUNTIME_CONFIG.TF_INTER_OP_THREADS);
-
-  return {
-    OMP_NUM_THREADS: process.env.OMP_NUM_THREADS ?? modelThreads,
-    OPENBLAS_NUM_THREADS: process.env.OPENBLAS_NUM_THREADS ?? modelThreads,
-    MKL_NUM_THREADS: process.env.MKL_NUM_THREADS ?? modelThreads,
-    VECLIB_MAXIMUM_THREADS: process.env.VECLIB_MAXIMUM_THREADS ?? modelThreads,
-    NUMEXPR_NUM_THREADS: process.env.NUMEXPR_NUM_THREADS ?? modelThreads,
-    TF_NUM_INTRAOP_THREADS: process.env.TF_NUM_INTRAOP_THREADS ?? modelThreads,
-    TF_NUM_INTEROP_THREADS: process.env.TF_NUM_INTEROP_THREADS ?? tfInterOpThreads,
-    TF_CPP_MIN_LOG_LEVEL: process.env.TF_CPP_MIN_LOG_LEVEL ?? "3",
-  };
-}
 
 /** TS 参数名 → Python CLI 参数名 的映射 */
 export const allPossiblePythonParams: Record<string, string> = {
@@ -403,11 +389,18 @@ export async function runPythonModel(
 
   try {
     return await Promise.race(competingPromises);
+  } catch (error) {
+    // Stream/parse failures must also settle the process tree before the
+    // caller releases its lease. Termination is idempotent after a timeout.
+    await terminatePythonProcessTree(error instanceof Error ? error : new Error(String(error)));
+    throw error;
   } finally {
     if (timeoutId) clearTimeout(timeoutId);
     if (abortHandler && terminationSignal) {
       terminationSignal.removeEventListener("abort", abortHandler);
     }
+    // proc.exited can win the race while a TERM-resistant descendant remains.
+    if (terminationPromise) await terminationPromise;
   }
 }
 
@@ -577,11 +570,15 @@ export async function runPythonGuidedTrainingStep(
 
   try {
     return await Promise.race(competingPromises);
+  } catch (error) {
+    await terminatePythonProcessTree(error instanceof Error ? error : new Error(String(error)));
+    throw error;
   } finally {
     if (timeoutId) clearTimeout(timeoutId);
     if (abortHandler && terminationSignal) {
       terminationSignal.removeEventListener("abort", abortHandler);
     }
+    if (terminationPromise) await terminationPromise;
   }
 }
 

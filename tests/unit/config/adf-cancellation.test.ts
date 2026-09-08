@@ -14,6 +14,7 @@ mock.module(pythonModulePath, () => ({
 }));
 
 const { runAdf } = await import(`${adfModulePath}?adf-cancellation-test`);
+const { buildPythonModelProcessEnv } = await import("../../../src/utils/python-process-env");
 const originalSpawn = Bun.spawn;
 
 afterEach(() => {
@@ -54,6 +55,7 @@ test("terminates and awaits the ADF subprocess even when killed pipes error", as
   });
   const result = runAdf([{ month: "2025-01", sales: 100 }], controller.signal);
   while (spawn.mock.calls.length === 0) await Bun.sleep(1);
+  expect(spawn.mock.calls[0]?.[1]?.env).toMatchObject(buildPythonModelProcessEnv());
   controller.abort(operationAborted);
 
   let settled = false;

@@ -75,6 +75,11 @@ jobs:
           E2E_ALLOW_DB_RESET: "1"
         run: bun run test:system:user-phone-canonical
 
+      - name: Verify classroom concurrency against MySQL
+        env:
+          E2E_ALLOW_DB_RESET: "1"
+        run: bun run test:system:concurrency
+
       - name: Audit dependencies
         run: bun audit
 

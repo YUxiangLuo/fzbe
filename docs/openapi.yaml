@@ -4787,6 +4787,12 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/ErrorResponse'
+        '503':
+          description: 数据库容量耗尽（DATABASE_BUSY，Retry-After 为 2 秒），或提交结果未知（EXPERIMENT_COMMIT_OUTCOME_UNKNOWN，需重新读取当前实验确认）
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
 
     get:
       tags: [Experiments]
@@ -4899,6 +4905,12 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/ExperimentRetryConflictResponse'
+        '503':
+          description: 数据库容量耗尽（DATABASE_BUSY，Retry-After 为 2 秒），或提交结果未知（EXPERIMENT_COMMIT_OUTCOME_UNKNOWN，需重新读取当前实验确认）
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
 
   /api/v1/experiment-runs/{experimentId}:
     patch:

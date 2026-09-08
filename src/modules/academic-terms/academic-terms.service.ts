@@ -115,8 +115,8 @@ export async function createAcademicTerm(input: AcademicTermInput) {
       [input.academic_year.trim(), input.semester, shouldActivate],
     );
 
+    const term = await getAcademicTermById(result.insertId, connection);
     await connection.commit();
-    const term = await getAcademicTermById(result.insertId);
     return { data: term! };
   } catch (error: unknown) {
     await connection.rollback();
@@ -166,8 +166,8 @@ export async function updateAcademicTerm(termId: number, input: UpdateAcademicTe
     values.push(termId);
     await connection.query(`UPDATE academic_terms SET ${fields.join(", ")} WHERE term_id = ?`, values);
 
+    const term = await getAcademicTermById(termId, connection);
     await connection.commit();
-    const term = await getAcademicTermById(termId);
     return { data: term! };
   } catch (error: unknown) {
     await connection.rollback();

@@ -4,6 +4,7 @@ import { jwtAuth, requireStudent } from "../../middleware";
 import { experimentIdParamSchema, createExperimentSchema, retryExperimentSchema, updateExperimentSchema, experimentEventSchema } from "./experiments.schema";
 import { getActiveExperiment, createExperiment, retryRejectedExperiment, getAllExperiments, deleteExperiment, updateExperiment, createExperimentEvent } from "./experiments.service";
 import { handleUnexpectedError } from "../../utils/error-handler";
+import { isModelCommitOutcomeUnknownError } from "../models/model-errors";
 import type { JwtPayload } from "../../types";
 
 const experimentsController = new Hono();
@@ -36,6 +37,12 @@ experimentsController.post("/api/v1/students/me/experiment-runs", jwtAuth, requi
     }
     return c.json(result.data, 201);
   } catch (error) {
+    if (isModelCommitOutcomeUnknownError(error)) {
+      return c.json({
+        error: "实验创建结果暂时无法确认，请刷新实验状态后继续",
+        code: "EXPERIMENT_COMMIT_OUTCOME_UNKNOWN",
+      }, 503);
+    }
     return handleUnexpectedError(c, error, "创建实验状态失败");
   }
 });
@@ -73,6 +80,12 @@ experimentsController.post("/api/v1/students/me/experiment-runs/retry", jwtAuth,
       ? c.json(result.data, 201)
       : c.json(result.data, 200);
   } catch (error) {
+    if (isModelCommitOutcomeUnknownError(error)) {
+      return c.json({
+        error: "重做实验创建结果暂时无法确认，请刷新实验状态后继续",
+        code: "EXPERIMENT_COMMIT_OUTCOME_UNKNOWN",
+      }, 503);
+    }
     return handleUnexpectedError(c, error, "创建重做实验失败");
   }
 });

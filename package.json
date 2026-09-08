@@ -51,6 +51,7 @@
     "test:system:model-edge:python": "bun run tests/system/model-edge-cases.ts --layer=python --profile=full",
     "test:system:model-edge:api": "bun run tests/system/model-edge-cases.ts --layer=api --profile=full",
     "test:system:user-phone-canonical": "bun run tests/system/user-phone-canonical-migration.ts",
+    "test:system:concurrency": "bun run tests/system/concurrency-classroom.ts",
     "test:full": "bun run test:check && bun run test:workflow:full && bun run test:deep:full",
     "test:python:deep": "bun run test:deep:fast",
     "test:python:fast": "bun run test:deep:fast",

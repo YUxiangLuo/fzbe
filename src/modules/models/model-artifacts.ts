@@ -160,11 +160,15 @@ export const waitForAuxiliaryPythonProcess = async (
 
   try {
     return await Promise.race(competingPromises);
+  } catch (error) {
+    await terminateAndWait(error instanceof Error ? error : new Error(String(error)));
+    throw error;
   } finally {
     if (timeoutId) clearTimeout(timeoutId);
     if (abortHandler && options.terminationSignal) {
       options.terminationSignal.removeEventListener("abort", abortHandler);
     }
+    if (terminationPromise) await terminationPromise;
   }
 };
 

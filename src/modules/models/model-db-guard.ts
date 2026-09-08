@@ -161,8 +161,9 @@ const wrapConnectionQueries = (
               : "数据库事务回滚超时，请稍后重试",
           ),
           // Transaction-control acknowledgement loss makes the session state
-          // unsafe to reuse. Closing it also guarantees an open transaction is
-          // rolled back by the server.
+          // unsafe to reuse. Server-side rollback can lag behind socket close
+          // while the current statement is still executing; this is not an
+          // immediate server query/lock cancellation guarantee.
           destroyConnection,
         ).catch((error) => {
           destroyConnection();

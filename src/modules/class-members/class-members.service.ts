@@ -163,7 +163,7 @@ export async function enrollExistingStudent(classId: number, studentId: number, 
     await connection.rollback();
     const err = error as { code?: string };
     if (err.code === "ER_DUP_ENTRY") {
-      const [[currentEnrollment]] = await pool.query<EnrollmentRow[]>(
+      const [[currentEnrollment]] = await connection.query<EnrollmentRow[]>(
         "SELECT e.class_id, c.class_name FROM enrollments e JOIN classes c ON e.class_id = c.class_id WHERE e.student_id = ? LIMIT 1",
         [studentId],
       );

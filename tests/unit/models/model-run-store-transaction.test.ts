@@ -230,6 +230,7 @@ describe("model run transactional activation", () => {
   test("rejects a missing or non-student identity before locking the experiment", async () => {
     query.mockImplementation(async (sql: unknown) => {
       const statement = String(sql);
+      if (statement.startsWith("SET TRANSACTION")) return [[]];
       if (statement.includes("FROM users")) {
         return [[{ user_id: 20240002, role: "Assistant" }]];
       }
@@ -250,10 +251,41 @@ describe("model run transactional activation", () => {
       artifactPath: "/models/run-ma-v1.pkl",
     })).rejects.toThrow("学生账号不存在或身份已变化");
 
-    expect(query).toHaveBeenCalledTimes(1);
-    expect(String(query.mock.calls[0]?.[0])).toContain("FROM users");
+    expect(query).toHaveBeenCalledTimes(2);
+    expect(String(query.mock.calls[1]?.[0])).toContain("FROM users");
     expect(rollback).toHaveBeenCalledTimes(1);
     expect(commit).not.toHaveBeenCalled();
+  });
+
+  test("retries a rolled-back run INSERT with the same computed result and run identity", async () => {
+    const body: TrainInput = { ...baseBody, moving_average_window: 6 };
+    const requestHash = buildModelTrainingRequestHash({
+      modelType: "ma", body, datasetRevision: "dataset-v1", runtimeRevision: "runtime-v1",
+      experimentRevision: buildExperimentTrainingRevision("ma", baseExperiment, body), baseRunFingerprint: {},
+    });
+    let inserts = 0;
+    query.mockImplementation(async (sql: string) => {
+      if (sql.includes("FROM users")) return [[{ user_id: 20240002, role: "Student" }]];
+      if (sql.includes("SELECT *") && sql.includes("FROM experiment_status")) return [[baseExperiment]];
+      if (sql.includes("SELECT state_version")) return [[{ state_version: 5 }]];
+      if (sql.includes("INSERT INTO model_training_runs") && ++inserts === 1) {
+        throw Object.assign(new Error("deadlocked insert"), { code: "ER_LOCK_DEADLOCK" });
+      }
+      return [{ affectedRows: 1 }];
+    });
+    const result = successResult();
+    await expect(commitModelTrainingRun({
+      runId: "unchanged-computed-run", sessionId: null, experimentId: 42, studentId: 20240002,
+      modelType: "ma", requestHash, datasetRevision: "dataset-v1", runtimeRevision: "runtime-v1",
+      body, result, artifactPath: "/models/computed.pkl", artifactSha256: "a".repeat(64),
+    })).resolves.toMatchObject({ runId: "unchanged-computed-run", stateVersion: 5 });
+    expect(getConnection).toHaveBeenCalledTimes(2);
+    expect(rollback).toHaveBeenCalledTimes(1);
+    expect(commit).toHaveBeenCalledTimes(1);
+    expect(release).toHaveBeenCalledTimes(2);
+    const insertCalls = query.mock.calls.filter(([sql]) => String(sql).includes("INSERT INTO model_training_runs"));
+    expect(insertCalls).toHaveLength(2);
+    expect(insertCalls[0]?.[1]).toEqual(insertCalls[1]?.[1]);
   });
 
   test("destroys an ambiguous COMMIT connection without rolling back or releasing it", async () => {
@@ -279,7 +311,7 @@ describe("model run transactional activation", () => {
       }
       return [{ affectedRows: 1 }];
     });
-    commit.mockRejectedValueOnce(new Error("commit acknowledgement lost"));
+    commit.mockRejectedValueOnce(Object.assign(new Error("Deadlock found during COMMIT"), { code: "ER_LOCK_DEADLOCK" }));
 
     await expect(commitModelTrainingRun({
       runId: "run-ma-ambiguous",
@@ -300,6 +332,7 @@ describe("model run transactional activation", () => {
     });
 
     expect(rollback).not.toHaveBeenCalled();
+    expect(getConnection).toHaveBeenCalledTimes(1);
     expect(release).not.toHaveBeenCalled();
     expect(destroy).toHaveBeenCalledTimes(1);
   });

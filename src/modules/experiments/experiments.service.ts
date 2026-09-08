@@ -18,6 +18,7 @@ import {
 } from "../models/model-run-store";
 import { withDeadlockRetry } from "../../utils/db-retry";
 import { databaseDatetimeToIsoString } from "../../utils/database-datetime";
+import { commitConnectionWithOutcomeGuard } from "../models/model-db-guard";
 
 const BOOLEAN_FIELDS = new Set(["moving_average_completed", "exponential_smoothing_completed", "arima_completed", "lstm_completed", "ensemble_weighted_completed", "ensemble_boosting_completed", "ensemble_stacking_completed", "quiz_about_model_completed", "quiz_about_plan_completed", "production_plan_completed"]);
 const JSON_FIELDS = new Set(["selected_base_models", "selected_ensemble_models", "arima_adf_stationarity", "lstm_features", "ensemble_weighted_base_models", "ensemble_boosting_base_models", "ensemble_stacking_base_models", "production_mps_table", "production_forecast_results"]);
@@ -296,8 +297,17 @@ export async function getActiveExperiment(studentId: number) {
 }
 
 export async function createExperiment(studentId: number, data: CreateExperimentInput) {
+  return withDeadlockRetry(() => createExperimentAttempt(studentId, data));
+}
+
+async function createExperimentAttempt(studentId: number, data: CreateExperimentInput) {
   const connection = await pool.getConnection();
+  let commitAttempted = false;
+  let disposed = false;
   try {
+    // The users row serializes one student's creation. Avoid locking empty
+    // experiment index gaps shared by other students starting at the same time.
+    await connection.query("SET TRANSACTION ISOLATION LEVEL READ COMMITTED");
     await connection.beginTransaction();
     const student = await lockStudent(connection, studentId);
     if (!student) {
@@ -338,13 +348,27 @@ export async function createExperiment(studentId: number, data: CreateExperiment
     if (!row) {
       throw new Error("Created experiment could not be reloaded");
     }
-    await connection.commit();
-    return { data: normalizeExperimentRow(row) };
+    const normalized = normalizeExperimentRow(row);
+    commitAttempted = true;
+    await commitConnectionWithOutcomeGuard(connection);
+    return { data: normalized };
   } catch (error) {
-    await connection.rollback();
+    if (commitAttempted) {
+      // The commit guard destroys an ambiguous connection and returns an
+      // outcome-unknown error, which must never enter transaction retry.
+      disposed = true;
+    } else {
+      try {
+        await connection.rollback();
+      } catch (rollbackError) {
+        disposed = true;
+        connection.destroy();
+        throw new Error("实验创建事务回滚失败", { cause: rollbackError });
+      }
+    }
     throw error;
   } finally {
-    connection.release();
+    if (!disposed) connection.release();
   }
 }
 
@@ -352,8 +376,15 @@ export async function retryRejectedExperiment(
   studentId: number,
   input: RetryExperimentInput,
 ) {
+  return withDeadlockRetry(() => retryRejectedExperimentAttempt(studentId, input));
+}
+
+async function retryRejectedExperimentAttempt(studentId: number, input: RetryExperimentInput) {
   const connection = await pool.getConnection();
+  let commitAttempted = false;
+  let disposed = false;
   try {
+    await connection.query("SET TRANSACTION ISOLATION LEVEL READ COMMITTED");
     await connection.beginTransaction();
     const student = await lockStudent(connection, studentId);
     if (!student) {
@@ -445,8 +476,10 @@ export async function retryRejectedExperiment(
           data: normalizeExperimentRow(existingRetry),
         };
       }
-      await connection.commit();
-      return { data: normalizeExperimentRow(existingRetry), created: false };
+      const normalized = normalizeExperimentRow(existingRetry);
+      commitAttempted = true;
+      await commitConnectionWithOutcomeGuard(connection);
+      return { data: normalized, created: false };
     }
 
     if (Number(latestExperiment?.experiment_id) !== parentExperimentId) {
@@ -470,13 +503,25 @@ export async function retryRejectedExperiment(
       throw new Error("Created retry experiment could not be reloaded");
     }
 
-    await connection.commit();
-    return { data: normalizeExperimentRow(row), created: true };
+    const normalized = normalizeExperimentRow(row);
+    commitAttempted = true;
+    await commitConnectionWithOutcomeGuard(connection);
+    return { data: normalized, created: true };
   } catch (error) {
-    await connection.rollback();
+    if (commitAttempted) {
+      disposed = true;
+    } else {
+      try {
+        await connection.rollback();
+      } catch (rollbackError) {
+        disposed = true;
+        connection.destroy();
+        throw new Error("重做实验事务回滚失败", { cause: rollbackError });
+      }
+    }
     throw error;
   } finally {
-    connection.release();
+    if (!disposed) connection.release();
   }
 }
 

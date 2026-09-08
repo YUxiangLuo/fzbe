@@ -91,12 +91,14 @@ const beginTransaction = mock(async () => {});
 const commit = mock(async () => {});
 const rollback = mock(async () => {});
 const release = mock(() => {});
+const destroy = mock(() => {});
 const getConnection = mock(async () => ({
   query: connectionQuery,
   beginTransaction,
   commit,
   rollback,
   release,
+  destroy,
 }));
 const poolQuery = mock(async () => [[]]);
 const mockedEnv = {
@@ -137,6 +139,7 @@ describe("experiments service", () => {
     commit.mockClear();
     rollback.mockClear();
     release.mockClear();
+    destroy.mockClear();
     getConnection.mockClear();
   });
 
@@ -177,6 +180,7 @@ describe("experiments service", () => {
 
   test("creates the first official experiment while holding the student creation lock", async () => {
     connectionQuery
+      .mockResolvedValueOnce([[]])
       .mockResolvedValueOnce([[{ user_id: 20240002 }]])
       .mockResolvedValueOnce([[]])
       .mockResolvedValueOnce([{ insertId: 990002 }])
@@ -202,16 +206,68 @@ describe("experiments service", () => {
         retry_of_experiment_id: null,
       }),
     });
-    expect(String(connectionQuery.mock.calls[0]?.[0])).toContain("users");
-    expect(String(connectionQuery.mock.calls[0]?.[0])).toContain("FOR UPDATE");
-    expect(String(connectionQuery.mock.calls[1]?.[0])).toContain("ORDER BY experiment_id DESC");
-    expect(String(connectionQuery.mock.calls[2]?.[0])).toContain("INSERT INTO experiment_status");
-    expect(connectionQuery.mock.calls[2]?.[1]).toEqual(["制造业", 20240002]);
+    expect(connectionQuery.mock.calls[0]?.[0]).toBe("SET TRANSACTION ISOLATION LEVEL READ COMMITTED");
+    expect(String(connectionQuery.mock.calls[1]?.[0])).toContain("users");
+    expect(String(connectionQuery.mock.calls[1]?.[0])).toContain("FOR UPDATE");
+    expect(String(connectionQuery.mock.calls[2]?.[0])).toContain("ORDER BY experiment_id DESC");
+    expect(String(connectionQuery.mock.calls[3]?.[0])).toContain("INSERT INTO experiment_status");
+    expect(connectionQuery.mock.calls[3]?.[1]).toEqual(["制造业", 20240002]);
     expect(commit).toHaveBeenCalledTimes(1);
+  });
+
+  const prepareCreationQueries = (beforeInsert?: () => void) => {
+    connectionQuery.mockImplementation(async (sql: string) => {
+      if (sql.includes("FROM users")) return [[{ user_id: 20240002 }]];
+      if (sql.includes("ORDER BY experiment_id")) return [[]];
+      if (sql.startsWith("INSERT INTO experiment_status")) {
+        beforeInsert?.();
+        return [{ insertId: 990002 }];
+      }
+      if (sql.includes("SELECT * FROM experiment_status")) {
+        return [[{ experiment_id: 990002, student_id: 20240002, state_version: 0 }]];
+      }
+      return [[]];
+    });
+  };
+
+  test("retries creation only after a transaction has rolled back", async () => {
+    let inserts = 0;
+    prepareCreationQueries(() => {
+      if (++inserts === 1) throw Object.assign(new Error("deadlocked insert"), { code: "ER_LOCK_DEADLOCK" });
+    });
+    const result = await createExperiment(20240002, {});
+    expect(result).toMatchObject({ data: { experiment_id: 990002 } });
+    expect(getConnection).toHaveBeenCalledTimes(2);
+    expect(rollback).toHaveBeenCalledTimes(1);
+    expect(commit).toHaveBeenCalledTimes(1);
+    expect(release).toHaveBeenCalledTimes(2);
+    expect(inserts).toBe(2);
+  });
+
+  test("does not retry creation after an ambiguous commit acknowledgement", async () => {
+    prepareCreationQueries();
+    commit.mockRejectedValueOnce(Object.assign(new Error("commit connection lost"), { code: "ER_LOCK_DEADLOCK" }));
+    await expect(createExperiment(20240002, {})).rejects.toMatchObject({ code: "MODEL_COMMIT_OUTCOME_UNKNOWN" });
+    expect(getConnection).toHaveBeenCalledTimes(1);
+    expect(commit).toHaveBeenCalledTimes(1);
+    expect(rollback).not.toHaveBeenCalled();
+    expect(destroy).toHaveBeenCalledTimes(1);
+    expect(release).not.toHaveBeenCalled();
+  });
+
+  test("destroys the connection and stops retrying if rollback fails", async () => {
+    prepareCreationQueries();
+    beginTransaction.mockRejectedValueOnce(Object.assign(new Error("deadlock"), { code: "ER_LOCK_DEADLOCK" }));
+    rollback.mockRejectedValueOnce(new Error("rollback connection lost"));
+    await expect(createExperiment(20240002, {})).rejects.toThrow("事务回滚失败");
+    expect(getConnection).toHaveBeenCalledTimes(1);
+    expect(destroy).toHaveBeenCalledTimes(1);
+    expect(release).not.toHaveBeenCalled();
   });
 
   test("blocks ordinary creation when any official experiment already exists", async () => {
     connectionQuery
+      .mockResolvedValueOnce([[]])
       .mockResolvedValueOnce([[{ user_id: 20240002 }]])
       .mockResolvedValueOnce([[
         {
@@ -236,6 +292,7 @@ describe("experiments service", () => {
 
   test("creates a blank retry only for the student's latest rejected report", async () => {
     connectionQuery
+      .mockResolvedValueOnce([[]])
       .mockResolvedValueOnce([[{ user_id: 20240002 }]])
       .mockResolvedValueOnce([[
         {
@@ -283,13 +340,13 @@ describe("experiments service", () => {
         selected_industry: null,
       }),
     });
-    expect(String(connectionQuery.mock.calls[1]?.[0])).toContain("experiment_reports");
-    expect(String(connectionQuery.mock.calls[1]?.[0])).toContain("FOR UPDATE");
-    expect(connectionQuery.mock.calls[1]?.[1]).toEqual([77]);
-    expect(String(connectionQuery.mock.calls[4]?.[0])).toContain(
+    expect(String(connectionQuery.mock.calls[2]?.[0])).toContain("experiment_reports");
+    expect(String(connectionQuery.mock.calls[2]?.[0])).toContain("FOR UPDATE");
+    expect(connectionQuery.mock.calls[2]?.[1]).toEqual([77]);
+    expect(String(connectionQuery.mock.calls[5]?.[0])).toContain(
       "INSERT INTO experiment_status (student_id, retry_of_experiment_id)",
     );
-    expect(connectionQuery.mock.calls[4]?.[1]).toEqual([20240002, 990002]);
+    expect(connectionQuery.mock.calls[5]?.[1]).toEqual([20240002, 990002]);
     expect(commit).toHaveBeenCalledTimes(1);
   });
 
@@ -302,6 +359,7 @@ describe("experiments service", () => {
       current_step: 2,
     };
     connectionQuery
+      .mockResolvedValueOnce([[]])
       .mockResolvedValueOnce([[{ user_id: 20240002 }]])
       .mockResolvedValueOnce([[
         {
@@ -325,10 +383,10 @@ describe("experiments service", () => {
       created: false,
       data: expect.objectContaining({ experiment_id: 990003, retry_of_experiment_id: 990002 }),
     });
-    expect(connectionQuery).toHaveBeenCalledTimes(5);
-    expect(String(connectionQuery.mock.calls[4]?.[0])).toContain("FROM experiment_reports");
-    expect(String(connectionQuery.mock.calls[4]?.[0])).toContain("FOR UPDATE");
-    expect(connectionQuery.mock.calls[4]?.[1]).toEqual([990003, 20240002]);
+    expect(connectionQuery).toHaveBeenCalledTimes(6);
+    expect(String(connectionQuery.mock.calls[5]?.[0])).toContain("FROM experiment_reports");
+    expect(String(connectionQuery.mock.calls[5]?.[0])).toContain("FOR UPDATE");
+    expect(connectionQuery.mock.calls[5]?.[1]).toEqual([990003, 20240002]);
     expect(commit).toHaveBeenCalledTimes(1);
     expect(rollback).not.toHaveBeenCalled();
   });
@@ -342,6 +400,7 @@ describe("experiments service", () => {
       current_step: 7,
     };
     connectionQuery
+      .mockResolvedValueOnce([[]])
       .mockResolvedValueOnce([[{ user_id: 20240002 }]])
       .mockResolvedValueOnce([[
         {
@@ -380,7 +439,8 @@ describe("experiments service", () => {
         current_step: 7,
       };
       connectionQuery
-        .mockResolvedValueOnce([[{ user_id: 20240002 }]])
+        .mockResolvedValueOnce([[]])
+      .mockResolvedValueOnce([[{ user_id: 20240002 }]])
         .mockResolvedValueOnce([[
           {
             report_id: 77,
@@ -406,9 +466,9 @@ describe("experiments service", () => {
             status: "Completed",
           }),
         });
-      expect(String(connectionQuery.mock.calls[4]?.[0])).toContain("FROM experiment_reports");
-      expect(String(connectionQuery.mock.calls[4]?.[0])).toContain("FOR UPDATE");
-      expect(connectionQuery.mock.calls[4]?.[1]).toEqual([990003, 20240002]);
+      expect(String(connectionQuery.mock.calls[5]?.[0])).toContain("FROM experiment_reports");
+      expect(String(connectionQuery.mock.calls[5]?.[0])).toContain("FOR UPDATE");
+      expect(connectionQuery.mock.calls[5]?.[1]).toEqual([990003, 20240002]);
       expect(rollback).toHaveBeenCalledTimes(1);
       expect(commit).not.toHaveBeenCalled();
     });
@@ -430,6 +490,7 @@ describe("experiments service", () => {
       current_step: 2,
     };
     connectionQuery
+      .mockResolvedValueOnce([[]])
       .mockResolvedValueOnce([[{ user_id: 20240002 }]])
       .mockResolvedValueOnce([[
         {
@@ -454,13 +515,14 @@ describe("experiments service", () => {
       });
     // A later descendant remains the decisive stale-request signal; do not
     // query the older child's report after that lineage check has failed.
-    expect(connectionQuery).toHaveBeenCalledTimes(4);
+    expect(connectionQuery).toHaveBeenCalledTimes(5);
     expect(rollback).toHaveBeenCalledTimes(1);
     expect(commit).not.toHaveBeenCalled();
   });
 
   test("rejects retrying another student's report without leaking its state", async () => {
     connectionQuery
+      .mockResolvedValueOnce([[]])
       .mockResolvedValueOnce([[{ user_id: 20240002 }]])
       .mockResolvedValueOnce([[
         {
@@ -481,6 +543,7 @@ describe("experiments service", () => {
 
   test("rejects a rejected report once another official attempt is latest", async () => {
     connectionQuery
+      .mockResolvedValueOnce([[]])
       .mockResolvedValueOnce([[{ user_id: 20240002 }]])
       .mockResolvedValueOnce([[
         {

@@ -14,6 +14,7 @@ import {
 } from "./models.schema";
 import type { BaseModelType, EnsembleModelType, GuidedModelType } from "./model-types";
 import { ModelValidationError } from "./model-errors";
+import { withDeadlockRetry } from "../../utils/db-retry";
 
 const BASE_MODELS: BaseModelType[] = ["ma", "es", "arima", "lstm"];
 const ENSEMBLE_MODELS: EnsembleModelType[] = ["weighted_avg", "boosting", "stacking"];
@@ -797,6 +798,14 @@ const assertTrainingRequestStillCurrent = async (
 export async function commitModelTrainingRun(
   input: CommitModelTrainingRunInput,
 ): Promise<CommitModelTrainingRunResult> {
+  // Retry only the transaction. The completed Python result/receipt stays the
+  // same; the outcome guard below excludes ambiguous COMMIT acknowledgements.
+  return withDeadlockRetry(() => commitModelTrainingRunAttempt(input));
+}
+
+async function commitModelTrainingRunAttempt(
+  input: CommitModelTrainingRunInput,
+): Promise<CommitModelTrainingRunResult> {
   const connection = await acquireConnectionWithTimeout(pool);
   let transactionPhase: "before-commit" | "commit-attempted" | "committed" = "before-commit";
   let disposed = false;
@@ -811,6 +820,9 @@ export async function commitModelTrainingRun(
     transactionPhase = "committed";
   };
   try {
+    // Empty active-run/session ranges must not lock other students' INSERTs.
+    // Current-state checks remain protected by users -> experiment row locks.
+    await connection.query("SET TRANSACTION ISOLATION LEVEL READ COMMITTED");
     await connection.beginTransaction();
     // Keep every transaction that can create a student-owned FK row on the
     // same users -> experiment_status order as report submission, step events,
@@ -1058,7 +1070,13 @@ export async function commitModelTrainingRun(
     return { runId, stateVersion, reusedExistingRun: Boolean(existingRun) };
   } catch (error) {
     if (transactionPhase === "before-commit") {
-      await connection.rollback().catch(() => {});
+      try {
+        await connection.rollback();
+      } catch (rollbackError) {
+        disposed = true;
+        connection.destroy();
+        throw new Error("模型结果事务回滚失败", { cause: rollbackError });
+      }
     }
     throw error;
   } finally {
