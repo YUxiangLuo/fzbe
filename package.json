@@ -93,7 +93,7 @@
   "dependencies": {
     "@hono/zod-validator": "^0.7.6",
     "csv-parser": "^3.2.0",
-    "hono": "^4.13.1",
+    "hono": "^4.13.5",
     "marked": "^17.0.0",
     "mysql2": "^3.24.3",
     "pino": "^10.1.0",
