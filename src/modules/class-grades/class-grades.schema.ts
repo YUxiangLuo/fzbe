@@ -100,13 +100,19 @@ const expFlowWeightFieldSchemas = EXP_FLOW_FIELDS.reduce((acc, field) => {
   return acc;
 }, {} as Record<(typeof EXP_FLOW_FIELDS)[number], ReturnType<typeof createOptionalWeightValue>>);
 
-export const updateGradeWeightsSchema = z.object({
+const gradeWeightPatchSchema = z.object({
   exp_flow_weight: createOptionalWeightValue(),
   ...expFlowWeightFieldSchemas,
   model_quality_weight: createOptionalWeightValue(),
   knowledge_test_weight: createOptionalWeightValue(),
   report_quality_weight: createOptionalWeightValue(),
-}).refine((data) => Object.values(data).some((v) => v !== undefined), { message: "至少需要提供一个权重字段" });
+});
+
+// A complete numeric snapshot is required, including flow details. Comparing it
+// under the row lock prevents old full forms from silently undoing other edits.
+export const updateGradeWeightsSchema = gradeWeightPatchSchema.extend({
+  expected_weights: gradeWeightPatchSchema.required(),
+}).refine(({ expected_weights: _expected, ...patch }) => Object.values(patch).some((v) => v !== undefined), { message: "至少需要提供一个权重字段" });
 
 export type ClassIdParam = z.infer<typeof classIdParamSchema>;
 export type TeacherIdParam = z.infer<typeof teacherIdParamSchema>;

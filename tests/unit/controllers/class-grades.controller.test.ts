@@ -13,6 +13,7 @@ const VALID_REVIEW_REVISION = "a".repeat(64);
 
 mock.restore();
 
+const updateGradingPolicy = mock(async () => ({ error: 'conflict' as const }));
 const gradeReport = mock(async () => ({
   error: "status_conflict" as const,
   current_status: "graded",
@@ -24,7 +25,7 @@ mock.module("../../../src/modules/class-grades/class-grades.service", () => ({
   gradeReport,
   getClassExperimentRuns: mock(async () => []),
   getGradingPolicy: mock(async () => null),
-  updateGradingPolicy: mock(async () => ({ error: "not_found" })),
+  updateGradingPolicy,
   getGradeSummaries: mock(async () => ({ data: [] })),
   getTeacherClassGradeSummaries: mock(async () => ({ data: [] })),
   getAssistantClassGradeSummaries: mock(async () => ({ data: [] })),
@@ -51,7 +52,30 @@ const authHeaders = async () => ({
 });
 
 describe("class grades controller", () => {
-  beforeEach(() => gradeReport.mockClear());
+  beforeEach(() => { gradeReport.mockClear(); updateGradingPolicy.mockClear(); });
+
+  test('requires a weight snapshot before invoking the writer', async () => {
+    const response = await app.request('/api/v1/classes/1/grading-policy', {
+      method: 'PUT', headers: await authHeaders(), body: JSON.stringify({ exp_flow_weight: 40 }),
+    });
+    expect(response.status).toBe(400);
+    expect(updateGradingPolicy).not.toHaveBeenCalled();
+  });
+
+  test('maps a stale grading policy to HTTP 409', async () => {
+    const { EXP_FLOW_FIELDS } = await import('../../../src/modules/class-grades/class-grades.schema');
+    const expected_weights = {
+      ...Object.fromEntries(EXP_FLOW_FIELDS.map((field, i) => [field, i === 0 ? 100 : 0])),
+      exp_flow_weight: 40, knowledge_test_weight: 20, model_quality_weight: 20, report_quality_weight: 20,
+    };
+    const body = { exp_flow_weight: 40, expected_weights };
+    const response = await app.request('/api/v1/classes/1/grading-policy', {
+      method: 'PUT', headers: await authHeaders(), body: JSON.stringify(body),
+    });
+    expect(response.status).toBe(409);
+    expect(await response.json()).toEqual({ error: '成绩权重已被其他操作修改，请重新加载后再编辑保存' });
+    expect(updateGradingPolicy).toHaveBeenCalledWith(1, body);
+  });
 
   test("maps a terminal report state conflict to HTTP 409", async () => {
     const response = await app.request("/api/v1/reports/9", {

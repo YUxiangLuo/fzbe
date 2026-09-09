@@ -246,13 +246,18 @@ describe("Class Grades Schemas", () => {
   });
 
   describe("updateGradeWeightsSchema", () => {
+    const expected_weights = {
+      ...Object.fromEntries(EXP_FLOW_FIELDS.map((field, i) => [field, i === 0 ? 100 : 0])),
+      exp_flow_weight: 40, model_quality_weight: 20, knowledge_test_weight: 20, report_quality_weight: 20,
+    };
     test("should accept single weight field", () => {
-      const result = updateGradeWeightsSchema.safeParse({ exp_flow_weight: 40 });
+      const result = updateGradeWeightsSchema.safeParse({ exp_flow_weight: 40, expected_weights });
       expect(result.success).toBe(true);
     });
 
     test("should accept all weight fields", () => {
       const result = updateGradeWeightsSchema.safeParse({
+        expected_weights,
         exp_flow_weight: 40,
         model_quality_weight: 20,
         knowledge_test_weight: 20,
@@ -262,12 +267,12 @@ describe("Class Grades Schemas", () => {
     });
 
     test("should reject weight below 0", () => {
-      const result = updateGradeWeightsSchema.safeParse({ exp_flow_weight: -1 });
+      const result = updateGradeWeightsSchema.safeParse({ exp_flow_weight: -1, expected_weights });
       expect(result.success).toBe(false);
     });
 
     test("should reject weight above 100", () => {
-      const result = updateGradeWeightsSchema.safeParse({ exp_flow_weight: 101 });
+      const result = updateGradeWeightsSchema.safeParse({ exp_flow_weight: 101, expected_weights });
       expect(result.success).toBe(false);
     });
 

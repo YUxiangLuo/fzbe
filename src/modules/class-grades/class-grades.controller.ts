@@ -76,6 +76,9 @@ classGradesController.put("/api/v1/classes/:classId/grading-policy", jwtAuth, zV
     const input = c.req.valid("json");
     const result = await updateGradingPolicy(parseInt(classId, 10), input);
     if ("error" in result) {
+      if (result.error === "conflict") {
+        return c.json({ error: "成绩权重已被其他操作修改，请重新加载后再编辑保存" }, 409);
+      }
       if (result.error === "invalid_weight_total") {
         return c.json({ error: "顶层权重和流程细节权重总和必须分别为 100%" }, 400);
       }

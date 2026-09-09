@@ -2404,8 +2404,34 @@ components:
               maximum: 100
 
     UpdateGradeWeightsRequest:
+      description: 必须携带最近读取的完整 expected_weights，且至少修改一个权重字段；服务端锁内比较快照，冲突返回409，不自动覆盖。
+      allOf:
+        - $ref: '#/components/schemas/GradeWeightValues'
+        - type: object
+          minProperties: 2
+          required: [expected_weights]
+          properties:
+            expected_weights:
+              type: object
+              allOf:
+                - $ref: '#/components/schemas/GradeWeightValues'
+              required:
+                - exp_flow_weight
+                - knowledge_test_weight
+                - model_quality_weight
+                - report_quality_weight
+                - exp_flow_demand_data_preparation
+                - exp_flow_demand_descriptive_stats
+                - exp_flow_demand_model_selection
+                - exp_flow_demand_generate_results
+                - exp_flow_production_inventory_calc
+                - exp_flow_production_service_level
+                - exp_flow_production_variable_calc
+                - exp_flow_production_plan_creation
+                - exp_flow_report_submission
+
+    GradeWeightValues:
       type: object
-      minProperties: 1
       properties:
         exp_flow_weight:
           type: number
@@ -5163,8 +5189,14 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/DataEnvelope'
+        '409':
+          description: 权重快照已过期，重新GET后再编辑；本次未写入
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
         '400':
-          description: 权重总和无效
+          description: 缺少完整expected_weights、没有修改字段或权重总和无效
           content:
             application/json:
               schema:

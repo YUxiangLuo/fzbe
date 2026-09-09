@@ -796,12 +796,19 @@ export async function updateGradingPolicy(classId: number, input: UpdateGradeWei
     const [existing] = await connection.query<RowDataPacket[]>(
       "SELECT * FROM grade_weights WHERE class_id = ? FOR UPDATE", [classId],
     );
-    if (existing.length === 0) {
+    const currentWeights = existing[0];
+    if (!currentWeights) {
       await connection.rollback();
       return { error: "not_found" as const };
     }
 
-    const weightValidation = validateGradeWeightTotals({ ...existing[0], ...input });
+    const editableFields = [...TOP_LEVEL_WEIGHT_FIELDS, ...EXP_FLOW_FIELDS];
+    if (editableFields.some(field => Number(currentWeights[field]) !== input.expected_weights[field])) {
+      await connection.rollback();
+      return { error: "conflict" as const };
+    }
+
+    const weightValidation = validateGradeWeightTotals({ ...currentWeights, ...input });
     if (!weightValidation.valid) {
       await connection.rollback();
       return { error: "invalid_weight_total" as const, details: weightValidation };
