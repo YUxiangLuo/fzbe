@@ -54,6 +54,22 @@ describe("auth rate limit guards", () => {
       .toBe("198.51.100.10");
   });
 
+  test("allows 50 classroom accounts ten attempts each behind one NAT", async () => {
+    expect(RATE_LIMITS.AUTH_LOGIN_MAX_PER_IP).toBe(500);
+    for (let student = 1; student <= 50; student += 1) {
+      for (let attempt = 0; attempt < 10; attempt += 1) {
+        expect(enforceLoginRateLimit(
+          createContext("203.0.113.50"),
+          { username: `student-${student}` },
+        )).toBeNull();
+      }
+    }
+
+    const blockedContext = createContext("203.0.113.50");
+    const response = enforceLoginRateLimit(blockedContext, { username: "student-51" });
+    await expectRateLimitResponse(response, "登录尝试过于频繁，请稍后再试");
+  });
+
   test("blocks repeated login attempts for the same account before service execution", async () => {
     for (let i = 0; i < RATE_LIMITS.AUTH_LOGIN_MAX_PER_ACCOUNT; i += 1) {
       const response = enforceLoginRateLimit(

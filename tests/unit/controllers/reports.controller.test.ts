@@ -8,6 +8,7 @@ process.env.PORT = "3001";
 import { beforeEach, describe, expect, mock, test } from "bun:test";
 import { Hono } from "hono";
 import { sign } from "hono/jwt";
+import { SemaphoreQueueFullError } from "../../../src/utils/semaphore";
 
 mock.restore();
 
@@ -84,6 +85,23 @@ describe("reports controller", () => {
 
     expect(response.status).toBe(504);
     expect(await response.json()).toEqual({ error: "PDF 生成超时，请稍后重试" });
+  });
+
+  test("returns retryable 503 when the bounded PDF wait queue is full", async () => {
+    submitReport.mockRejectedValueOnce(new SemaphoreQueueFullError(50));
+    const response = await app.request("/api/v1/experiment-runs/990022/report", {
+      method: "POST",
+      headers: {
+        ...await authHeaders(),
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({ report_content: "足够长的测试报告内容".repeat(20) }),
+    });
+
+    expect(response.status).toBe(503);
+    expect(await response.json()).toEqual({
+      error: "PDF 生成服务繁忙，等待队列已满，请稍后再试",
+    });
   });
 
   test("returns stable rejection context for a redo in progress", async () => {

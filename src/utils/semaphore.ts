@@ -4,6 +4,12 @@ export class SemaphoreTimeoutError extends Error {
   }
 }
 
+export class SemaphoreQueueFullError extends Error {
+  constructor(public readonly maxPending: number) {
+    super(`Semaphore wait queue is full at ${maxPending} pending acquisitions`);
+  }
+}
+
 export class Semaphore {
   private running = 0;
   private readonly queue: Array<{
@@ -12,9 +18,18 @@ export class Semaphore {
     timerId?: ReturnType<typeof setTimeout>;
   }> = [];
 
-  constructor(private readonly max: number) {
+  constructor(
+    private readonly max: number,
+    private readonly maxPending = Number.POSITIVE_INFINITY,
+  ) {
     if (!Number.isInteger(max) || max <= 0) {
       throw new Error(`Semaphore max must be a positive integer, got: ${max}`);
+    }
+    if (
+      maxPending !== Number.POSITIVE_INFINITY
+      && (!Number.isInteger(maxPending) || maxPending <= 0)
+    ) {
+      throw new Error(`Semaphore maxPending must be a positive integer, got: ${maxPending}`);
     }
   }
 
@@ -46,6 +61,9 @@ export class Semaphore {
     if (this.running < this.max) {
       this.running++;
       return;
+    }
+    if (this.queue.length >= this.maxPending) {
+      throw new SemaphoreQueueFullError(this.maxPending);
     }
     return new Promise<void>((resolve, reject) => {
       const entry: (typeof this.queue)[number] = { resolve, reject };

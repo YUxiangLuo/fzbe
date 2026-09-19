@@ -28,7 +28,10 @@ import { resolveExistingManagedFile } from "../../utils/managed-file";
 import { fitFilenameToStoragePathLimits } from "../../utils/file-validator";
 import { databaseDatetimeToIsoString } from "../../utils/database-datetime";
 
-const pdfSemaphore = new Semaphore(CONCURRENCY_LIMITS.MAX_CONCURRENT_PDF_JOBS);
+const pdfSemaphore = new Semaphore(
+  CONCURRENCY_LIMITS.MAX_CONCURRENT_PDF_JOBS,
+  CONCURRENCY_LIMITS.MAX_PENDING_PDF_JOBS,
+);
 const reportsManagedRoot = path.resolve(import.meta.dir, "../../../uploads", "reports");
 const PDF_BROWSER_CLOSE_GRACE_MS = 2_000;
 
@@ -49,6 +52,7 @@ export function getPdfQueueStats() {
     activeJobs: pdfSemaphore.active,
     pendingJobs: pdfSemaphore.pending,
     maxConcurrentJobs: CONCURRENCY_LIMITS.MAX_CONCURRENT_PDF_JOBS,
+    maxPendingJobs: CONCURRENCY_LIMITS.MAX_PENDING_PDF_JOBS,
     queueTimeoutMs: TIMEOUTS.PDF_QUEUE,
     generationTimeoutMs: TIMEOUTS.PDF_GENERATION,
   };

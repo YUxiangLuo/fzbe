@@ -8,7 +8,10 @@ import {
   HTMLSanitizationError,
   PdfGenerationTimeoutError,
 } from "./reports.service";
-import { SemaphoreTimeoutError } from "../../utils/semaphore";
+import {
+  SemaphoreQueueFullError,
+  SemaphoreTimeoutError,
+} from "../../utils/semaphore";
 import { handleUnexpectedError } from "../../utils/error-handler";
 import type { JwtPayload } from "../../types";
 
@@ -38,6 +41,9 @@ reportsController.post(
 
       return c.json(result.data, result.isUpdate ? 200 : 201);
     } catch (error) {
+      if (error instanceof SemaphoreQueueFullError) {
+        return c.json({ error: "PDF 生成服务繁忙，等待队列已满，请稍后再试" }, 503);
+      }
       if (error instanceof SemaphoreTimeoutError) {
         return c.json({ error: `PDF 生成服务繁忙，排队等待超过 ${Math.ceil(error.timeoutMs / 1000)} 秒，请稍后再试` }, 503);
       }

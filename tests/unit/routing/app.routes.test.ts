@@ -504,6 +504,7 @@ describe("app route smoke tests", () => {
       activeJobs: 0,
       pendingJobs: 0,
       maxConcurrentJobs: payload.data?.concurrency?.maxConcurrentPdfJobs,
+      maxPendingJobs: 50,
       queueTimeoutMs: payload.data?.timeouts?.pdfQueueMs,
       generationTimeoutMs: payload.data?.timeouts?.pdfGenerationMs,
     });

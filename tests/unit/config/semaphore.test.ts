@@ -1,5 +1,9 @@
 import { describe, expect, test } from "bun:test";
-import { Semaphore, SemaphoreTimeoutError } from "../../../src/utils/semaphore";
+import {
+  Semaphore,
+  SemaphoreQueueFullError,
+  SemaphoreTimeoutError,
+} from "../../../src/utils/semaphore";
 
 describe("Semaphore", () => {
   test("tryAcquire is immediate and never enters the wait queue", () => {
@@ -46,6 +50,20 @@ describe("Semaphore", () => {
     expect(sem.active).toBe(1);
     expect(sem.pending).toBe(0);
 
+    sem.release();
+  });
+
+  test("rejects immediately when the bounded wait queue is full", async () => {
+    const sem = new Semaphore(1, 1);
+    await sem.acquire();
+    const pending = sem.acquire();
+
+    await expect(sem.acquire()).rejects.toBeInstanceOf(SemaphoreQueueFullError);
+    expect(sem.active).toBe(1);
+    expect(sem.pending).toBe(1);
+
+    sem.release();
+    await pending;
     sem.release();
   });
 
@@ -169,5 +187,9 @@ describe("Semaphore", () => {
 
   test("constructor rejects non-integer", () => {
     expect(() => new Semaphore(1.5)).toThrow("positive integer");
+  });
+
+  test("constructor rejects an invalid bounded queue size", () => {
+    expect(() => new Semaphore(1, 0)).toThrow("maxPending must be a positive integer");
   });
 });

@@ -8,6 +8,7 @@ const CONFIG_ENV_NAMES = [
   "MODEL_CONCURRENCY",
   "MAX_CONCURRENT_PDF_JOBS",
   "PDF_CONCURRENCY",
+  "MAX_PENDING_PDF_JOBS",
   "PDF_QUEUE_TIMEOUT_MS",
   "PDF_GENERATION_TIMEOUT_MS",
   "MODEL_TRAINING_TIMEOUT_MS",
@@ -44,6 +45,7 @@ interface ConstantsSnapshot {
     DEFAULT_PDF_JOB_CAP: number;
     MAX_CONCURRENT_MODEL_JOBS: number;
     MAX_CONCURRENT_PDF_JOBS: number;
+    MAX_PENDING_PDF_JOBS: number;
   };
   DB_POOL_CONFIG: {
     MIN_CONNECTION_LIMIT: number;
@@ -128,6 +130,7 @@ describe("concurrency safeguards", () => {
     expect(CONCURRENCY_LIMITS.MAX_CONCURRENT_PDF_JOBS).toBe(
       Math.min(12, Math.max(1, Math.ceil(CONCURRENCY_LIMITS.SYSTEM_PARALLELISM / 4))),
     );
+    expect(CONCURRENCY_LIMITS.MAX_PENDING_PDF_JOBS).toBe(50);
     expect(TIMEOUTS.PDF_QUEUE).toBe(60_000);
     expect(TIMEOUTS.PDF_GENERATION).toBe(30_000);
     expect(TIMEOUTS.MODEL_EXECUTION_HARD_CAP).toBe(600_000);
@@ -144,7 +147,7 @@ describe("concurrency safeguards", () => {
     expect(PYTHON_RUNTIME_CONFIG.MODEL_PROCESS_THREADS).toBe(1);
     expect(PYTHON_RUNTIME_CONFIG.TF_INTER_OP_THREADS).toBe(1);
     expect(RATE_LIMITS.AUTH_LOGIN_WINDOW_MS).toBe(15 * 60 * 1000);
-    expect(RATE_LIMITS.AUTH_LOGIN_MAX_PER_IP).toBe(100);
+    expect(RATE_LIMITS.AUTH_LOGIN_MAX_PER_IP).toBe(500);
     expect(RATE_LIMITS.AUTH_LOGIN_MAX_PER_ACCOUNT).toBe(10);
     expect(RATE_LIMITS.AUTH_REGISTER_WINDOW_MS).toBe(60 * 60 * 1000);
     expect(RATE_LIMITS.AUTH_REGISTER_MAX_PER_IP).toBe(50);
@@ -173,6 +176,7 @@ describe("concurrency safeguards", () => {
       await loadConstantsSnapshot({
         MAX_CONCURRENT_MODEL_JOBS: "37",
         MAX_CONCURRENT_PDF_JOBS: "9",
+        MAX_PENDING_PDF_JOBS: "27",
         PDF_QUEUE_TIMEOUT_MS: "70000",
         PDF_GENERATION_TIMEOUT_MS: "45000",
         MODEL_TRAINING_TIMEOUT_MS: "240000",
@@ -192,6 +196,7 @@ describe("concurrency safeguards", () => {
 
     expect(CONCURRENCY_LIMITS.MAX_CONCURRENT_MODEL_JOBS).toBe(37);
     expect(CONCURRENCY_LIMITS.MAX_CONCURRENT_PDF_JOBS).toBe(9);
+    expect(CONCURRENCY_LIMITS.MAX_PENDING_PDF_JOBS).toBe(27);
     expect(TIMEOUTS.PDF_QUEUE).toBe(70_000);
     expect(TIMEOUTS.PDF_GENERATION).toBe(45_000);
     expect(TIMEOUTS.MODEL_EXECUTION_HARD_CAP).toBe(600_000);
@@ -237,6 +242,10 @@ describe("concurrency safeguards", () => {
   test("invalid positive-integer environment values fail fast", async () => {
     await expect(loadConstantsSnapshot({ MAX_CONCURRENT_MODEL_JOBS: "0" })).rejects.toThrow(
       "MAX_CONCURRENT_MODEL_JOBS must be a positive integer",
+    );
+
+    await expect(loadConstantsSnapshot({ MAX_PENDING_PDF_JOBS: "0" })).rejects.toThrow(
+      "MAX_PENDING_PDF_JOBS must be a positive integer",
     );
 
     await expect(loadConstantsSnapshot({ PDF_QUEUE_TIMEOUT_MS: "30s" })).rejects.toThrow(
