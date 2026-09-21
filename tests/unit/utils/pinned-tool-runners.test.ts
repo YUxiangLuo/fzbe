@@ -38,7 +38,7 @@ if [[ "\${1-}" == "--version" ]]; then
   exit 0
 fi
 printf '%s\\n' "$*" > "$PINNED_TOOL_TEST_LOG"
-printf '1.4.0\\n'
+printf '1.4.2\\n'
 `);
 
     const result = Bun.spawnSync([bunRunner, "--version"], {
@@ -52,8 +52,8 @@ printf '1.4.0\\n'
       stderr: "pipe",
     });
 
-    expect([result.exitCode, result.stdout.toString().trim()]).toEqual([0, "1.4.0"]);
-    expect((await Bun.file(invocationLog).text()).trim()).toBe("x bun@1.4.0 --version");
+    expect([result.exitCode, result.stdout.toString().trim()]).toEqual([0, "1.4.2"]);
+    expect((await Bun.file(invocationLog).text()).trim()).toBe("x bun@1.4.2 --version");
   });
 
   test("uses a versioned uv tool environment instead of replacing the bootstrap", async () => {
