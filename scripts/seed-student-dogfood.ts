@@ -721,6 +721,12 @@ async function seedScenarioExperiments(
         fixture.feedback,
       ],
     );
+    await conn.query(
+      `UPDATE experiment_grade
+          SET report_quality = ?
+        WHERE experiment_id = ? AND student_id = ?`,
+      [fixture.grade, fixture.experimentId, id(fixture.username)],
+    );
   }
 }
 

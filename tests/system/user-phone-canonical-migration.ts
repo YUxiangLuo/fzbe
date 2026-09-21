@@ -17,7 +17,25 @@ function assertDisposableTarget(): void {
 }
 
 async function resetUsersTable(connection: Connection): Promise<void> {
-  await connection.query("DROP TABLE IF EXISTS users");
+  const [tables] = await connection.query<RowDataPacket[]>(
+    `SELECT TABLE_NAME
+       FROM information_schema.tables
+      WHERE table_schema = DATABASE()
+        AND table_type = 'BASE TABLE'`,
+  );
+  if (tables.length > 0) {
+    const tableNames = tables.map((row) =>
+      "`" + String(row.TABLE_NAME).replaceAll("`", "``") + "`"
+    );
+    await connection.query("SET FOREIGN_KEY_CHECKS = 0");
+    try {
+      await connection.query(
+        `DROP TABLE IF EXISTS ${tableNames.join(", ")}`,
+      );
+    } finally {
+      await connection.query("SET FOREIGN_KEY_CHECKS = 1");
+    }
+  }
   await connection.query(`
     CREATE TABLE users (
       user_id INT AUTO_INCREMENT PRIMARY KEY,

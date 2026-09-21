@@ -91,8 +91,7 @@ describe("parallel seed managed-path safety", () => {
 
   test("allows child paths inside every managed fixture root", () => {
     const uploadsChild = path.join(
-      getUploadsRoot(),
-      "reports",
+      getReportsRoot(),
       "parallel-report.pdf",
     );
     const modelChild = path.join(

@@ -35,6 +35,7 @@ interface ReportFileRow extends RowDataPacket {
   experiment_id: number;
   report_status: "submitted" | "rejected" | "graded";
   grade: number | null;
+  report_quality: number | null;
   pdf_file_path: string | null;
 }
 
@@ -244,9 +245,13 @@ async function main() {
               report.experiment_id,
               report.status AS report_status,
               report.grade,
+              experiment_grade.report_quality,
               report.pdf_file_path
          FROM experiment_reports report
          JOIN users user ON user.user_id = report.student_id
+         JOIN experiment_grade
+           ON experiment_grade.experiment_id = report.experiment_id
+          AND experiment_grade.student_id = report.student_id
         WHERE user.username IN (?, ?, ?)
         ORDER BY user.username`,
       EXPECTED_REPORT_FIXTURES.map((fixture) => fixture.username),
@@ -274,6 +279,14 @@ async function main() {
       ) {
         throw new Error(
           `${expected.username}: expected report grade ${expectedGrade ?? "null"}, found ${row.grade ?? "null"}.`,
+        );
+      }
+      if (
+        (expectedGrade === null && row.report_quality !== null)
+        || (expectedGrade !== null && Number(row.report_quality) !== expectedGrade)
+      ) {
+        throw new Error(
+          `${expected.username}: expected report quality ${expectedGrade ?? "null"}, found ${row.report_quality ?? "null"}.`,
         );
       }
       const filePath = String(row.pdf_file_path ?? "");
