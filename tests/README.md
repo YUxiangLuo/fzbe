@@ -1,6 +1,6 @@
 # 后端测试结构
 
-后端测试按执行层级和失败含义分成三类。新增测试应进入对应层级，不再向一个笼统目录或 CI YAML 里追加零散命令。
+后端测试按执行层级和失败含义分成三类。新增测试应进入对应层级，不再向一个笼统入口里追加零散命令。
 
 | 层级 | 位置 | 作用 | 常用入口 |
 | --- | --- | --- | --- |
@@ -24,7 +24,7 @@ bun run test:check              # typecheck + OpenAPI + inventory + 全部单测
 
 # Python 端到端工作流
 bun run test:workflow:quick       # contract
-bun run test:workflow            # CI: contract + smoke + parity + regression
+bun run test:workflow            # contract + smoke + parity + regression
 bun run test:workflow:full        # 再加入 diagnostic + stress
 
 # 独立算法深测
@@ -45,12 +45,24 @@ bun run test:system:model-edge
 
 # 本地完整回归（耗时）
 bun run test:full
+
+# 原远端 push 门禁的完整本地替代（含 SQL、Python、审计和 deep full）
+bun run ci
+
+# 原定时/手动 deep-test 档位
+bun run ci:nightly
+bun run ci:resource
 ```
 
 `test:workflow:*` 由 `py/test/run.py` 的清单统一编排。可用
-`py/venv/bin/python py/test/run.py --list` 查看 CI 精确包含哪些脚本，或用
+`py/venv/bin/python py/test/run.py --list` 查看各 profile 精确包含哪些脚本，或用
 `--suite contract|smoke|parity|regression|diagnostic|stress` 单独运行一层。
-CI 只调用 runner，不再逐项复制脚本路径。
+本地 CI 只调用 runner，不再逐项复制脚本路径。
+
+`bun run ci` 使用仓库固定的 Bun、Python 和 uv 版本，并从当前 shell
+读取 `DB_*`、`JWT_SECRET` 等配置。两个 SQL gate 要求本机 MySQL/MariaDB、
+初始为空的可丢弃测试库、`E2E_ALLOW_DB_RESET=1`，以及符合下述 guard 的
+测试库名；绝不能指向业务库。Python 虚拟环境由脚本按 lock 自动准备。
 
 `test:system:model-edge:python` 不访问数据库，不需要重置授权。API/all
 档只有在 `E2E_ALLOW_DB_RESET=1` 且数据库名为 `fangzhen_e2e`、
@@ -61,7 +73,7 @@ CI 只调用 runner，不再逐项复制脚本路径。
 进程时，分别显式设置 `DB_RESET_ALLOW_REMOTE=1`、`DB_RESET_ALLOW_PROD=1`；
 旧的 `DB_SETUP_ALLOW_REMOTE`/`DB_SETUP_ALLOW_PROD` 只作为兼容别名保留。
 
-`test:system:concurrency` 额外要求本地且初始为空的专用测试库；只创建并清理自己拥有的表，不替换已有数据。它固定池大小 40、等待队列 100，将会话基线设为 RR 后验证局部 RC 不泄漏。CI 在 canonical-phone SQL gate 清空测试表后执行它。Python、HTTP 预览和混合负载另由相应回归覆盖，不能用 SQL gate 替代。
+`test:system:concurrency` 额外要求本地且初始为空的专用测试库；只创建并清理自己拥有的表，不替换已有数据。它固定池大小 40、等待队列 100，将会话基线设为 RR 后验证局部 RC 不泄漏。本地 CI 在 canonical-phone SQL gate 清空测试表后执行它。Python、HTTP 预览和混合负载另由相应回归覆盖，不能用 SQL gate 替代。
 
 ## Bun 单测领域
 
@@ -87,5 +99,5 @@ tests/unit/
 - 需要启动真实 Python CLI 或验证 artifact 生命周期的场景进入 `py/test/`，并登记到 `WORKFLOWS`。
 - 算法性质、更多数据形状、随机稳定性和资源清理进入 `py/deep_tests/`，并标注对应 profile。
 - 需要真实应用路由和数据库的跨层矩阵进入 `tests/system/`；这类破坏性测试不并入默认 `test:full`。
-- 诊断脚本不能混入默认 CI；只有能明确判定成功/失败的脚本才能登记为 workflow。
+- 诊断脚本不能混入默认本地 CI；只有能明确判定成功/失败的脚本才能登记为 workflow。
 - 提交前至少运行 `bun run test:list` 和受影响的最小套件。

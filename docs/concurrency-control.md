@@ -256,6 +256,6 @@ bun run test:e2e:concurrency:ui
 
 并发 E2E 必须通过真实 HTTP hold 请求占用同一 Bun 进程的 admission/execution mutex，不能再通过外部数据库 named lock 模拟容量。
 
-`test:system:concurrency` 在真实 MySQL/MariaDB 上测试三轮 50 人创建、50 人重做、同学生竞争、三轮 12 人 run 提交、50 个学期写入和连接隔离恢复；后端 CI 将其作为 MySQL 8.4 gate。它不运行 Python。
+`test:system:concurrency` 在真实 MySQL/MariaDB 上测试三轮 50 人创建、50 人重做、同学生竞争、三轮 12 人 run 提交、50 个学期写入和连接隔离恢复；`bun run ci` 将其作为本地 SQL gate。它不运行 Python。
 
 前端默认并发命令依次执行 `protocols`（容量拒绝及恢复）与 `classroom`（50 人真实创建、提交两项测验、复用页面函数预览）。原来的 `all` 已更名为 `protocols`，避免将小规模协议测试误当整班负载验收。`mixed` 仍为独立的 MA/LSTM、预测和 PDF 混合测量。`E2E_CONCURRENCY_EXPECT_PDF_503=0` 严格要求所有 PDF 首轮成功，出现 503 即失败，不能靠串行补发变绿。
