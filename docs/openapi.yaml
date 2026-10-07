@@ -1268,6 +1268,7 @@ components:
         - period_label
         - demand_forecast
         - safety_stock
+        - forecast_quantity
         - planned_production
         - beginning_inventory
         - production_output
@@ -1288,6 +1289,10 @@ components:
         safety_stock:
           type: number
           minimum: 0
+        forecast_quantity:
+          type: number
+          minimum: 0
+          description: 预测量 = 需求预测结果 + 安全库存。
         planned_production:
           type: number
           minimum: 0
@@ -1965,7 +1970,7 @@ components:
           type: number
           nullable: true
         production_mps_table:
-          description: 当前 v2 计划返回严格 MPS 行；已完成的 v1 历史快照可能返回旧版对象行。
+          description: 当前计划返回带 forecast_quantity（预测量）的严格 MPS 行；已完成的 v1 历史快照可能返回旧版对象行。
           anyOf:
             - type: array
               nullable: true

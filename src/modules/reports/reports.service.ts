@@ -773,7 +773,9 @@ export async function submitReport(
         // row creates a state that can neither be repaired nor submitted.
         const productionPlanValidation = validateCompletedProductionPlan(
           experiment,
-          { allowLegacyV1Write: env.ALLOW_LEGACY_PRODUCTION_PLAN_WRITES },
+          {
+            allowLegacyV1Write: env.ALLOW_LEGACY_PRODUCTION_PLAN_WRITES,
+          },
         );
         if (!productionPlanValidation.ok) {
           await connection.rollback();

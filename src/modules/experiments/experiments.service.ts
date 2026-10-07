@@ -222,8 +222,8 @@ export function normalizeExperimentRow(row: RowDataPacket) {
           row.production_forecast_results,
         );
         // The original MPS payload had no row-level contract.  Keep that
-        // payload available alongside a completed v1 forecast, while v2 (and
-        // every active draft) continues to use the strict current schema.
+        // payload available alongside a completed v1 forecast, while every
+        // other table must satisfy the strict row schema.
         result[key] = forecasts?.version === "v1" && row.status === "Completed"
           ? parseJsonField(value)
           : parseProductionMpsTable(value);

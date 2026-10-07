@@ -1,3 +1,5 @@
+import { buildCanonicalProductionMps as buildServerCanonicalProductionMps } from "../src/modules/experiments/experiments.schema";
+
 const NORMAL_95 = 1.959963984540054;
 const NORMAL_99 = 2.3263478740408408;
 
@@ -26,6 +28,7 @@ export interface CanonicalProductionMpsRow {
   period_label: string;
   demand_forecast: number;
   safety_stock: number;
+  forecast_quantity: number;
   planned_production: number;
   beginning_inventory: number;
   production_output: number;
@@ -107,50 +110,24 @@ export function buildCanonicalProductionMps(
     throw new Error("production capacity must be an integer");
   }
 
-  const rows: CanonicalProductionMpsRow[] = [];
-  forecasts.forEach((forecast, index) => {
-    const demand = Math.max(
-      0,
-      Math.round(requireNonnegativeFinite(
-        forecast.prediction,
-        `production forecast ${index + 1} prediction`,
-      )),
-    );
-    const stdDev = requireNonnegativeFinite(
+  const validatedForecasts = forecasts.map((forecast, index) => ({
+    prediction: requireNonnegativeFinite(
+      forecast.prediction,
+      `production forecast ${index + 1} prediction`,
+    ),
+    std_dev: requireNonnegativeFinite(
       forecast.std_dev,
       `production forecast ${index + 1} std_dev`,
-    );
-    const previous = rows[index - 1];
-    const safetyStock = index === 0
-      ? 0
-      : Math.max(0, Math.round(zScore * stdDev));
-    const beginningInventory = previous?.ending_inventory ?? initialInventory;
-    const productionOutput = previous
-      ? Math.max(0, Math.min(previous.planned_production, capacity))
-      : demand;
-    const availableInventory = beginningInventory + productionOutput;
-    const endingInventory = Math.max(0, availableInventory - demand);
-    const stockout = Math.max(0, demand - availableInventory);
-    const plannedProduction = previous
-      ? Math.max(
-        0,
-        demand + safetyStock + previous.stockout - beginningInventory,
-      )
-      : demand;
-    rows.push({
-      period: index + 1,
-      period_label: `期 ${index + 1}`,
-      demand_forecast: demand,
-      safety_stock: safetyStock,
-      planned_production: plannedProduction,
-      beginning_inventory: beginningInventory,
-      production_output: productionOutput,
-      ending_inventory: endingInventory,
-      stockout,
-      service_level: demand > 0 ? Math.max(0, 1 - stockout / demand) : 1,
-    });
+    ),
+  }));
+  // Single source of truth: the server-side canonical formula.  Seeds must
+  // never drift from what `validateCompletedProductionPlan` replays.
+  return buildServerCanonicalProductionMps({
+    forecasts: validatedForecasts,
+    zScore,
+    initialInventory,
+    capacity,
   });
-  return rows;
 }
 
 export function buildCanonicalProductionPlanSnapshot(

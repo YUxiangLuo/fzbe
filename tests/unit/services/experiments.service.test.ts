@@ -33,6 +33,7 @@ const validProductionMpsRow = {
   period_label: "期 1",
   demand_forecast: 100,
   safety_stock: 0,
+  forecast_quantity: 100,
   planned_production: 100,
   beginning_inventory: 0,
   production_output: 100,
@@ -870,6 +871,11 @@ describe("experiments service", () => {
     expect(normalizeExperimentRow({
       production_mps_table: JSON.stringify([validProductionMpsRow]),
     } as any).production_mps_table).toEqual([validProductionMpsRow]);
+    const { forecast_quantity: _omitted, ...rowWithoutForecastQuantity } = validProductionMpsRow;
+    expect(normalizeExperimentRow({
+      status: "In Progress",
+      production_mps_table: JSON.stringify([rowWithoutForecastQuantity]),
+    } as any).production_mps_table).toBeNull();
     expect(normalizeExperimentRow({
       production_mps_table: JSON.stringify([{ period: 1 }]),
     } as any).production_mps_table).toBeNull();

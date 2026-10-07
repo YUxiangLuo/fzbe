@@ -278,11 +278,27 @@ const optionalProductionForecastResults = compatibleProductionForecastResultsWri
   .nullable()
   .optional();
 
+/**
+ * Current (v3) MPS row.  Field ↔ 需求文档第五章 名词：
+ *
+ *   demand_forecast      需求量（需求预测结果）
+ *   safety_stock         安全库存（首期为 0）
+ *   forecast_quantity    预测量 = 需求预测结果 + 安全库存
+ *   planned_production   投入量 = 预测量 - 上月库存量 + 上月缺货量
+ *   beginning_inventory  上月库存量（首期为期初库存）
+ *   production_output    产出量 = 上月投入量（受产能约束；首期 = 需求量）
+ *   ending_inventory     库存量 = max(0, 余额)
+ *   stockout             缺货量 = max(0, -余额)，连续缺货时含上期未补部分
+ *   service_level        服务水平 = max(0, 1 - 缺货量 / 需求量)
+ *
+ * 余额_t = 余额_{t-1} + 产出量_t - 需求量_t，余额_0 = 期初库存。
+ */
 export const productionMpsRowSchema = z.object({
   period: z.number().int().min(1).max(PRODUCTION_FORECAST_PERIODS_MAX),
   period_label: z.string().trim().min(1),
   demand_forecast: z.number().finite().min(0),
   safety_stock: z.number().finite().min(0),
+  forecast_quantity: z.number().finite().min(0),
   planned_production: z.number().finite().min(0),
   beginning_inventory: z.number().finite().min(0),
   production_output: z.number().finite().min(0),
@@ -292,29 +308,29 @@ export const productionMpsRowSchema = z.object({
 }).strict();
 
 export const productionMpsTableSchema = z.preprocess(
-  jsonPreprocess,
-  z.array(productionMpsRowSchema)
-    .max(PRODUCTION_FORECAST_PERIODS_MAX)
-    .superRefine((rows, context) => {
-      rows.forEach((row, index) => {
-        const expectedPeriod = index + 1;
-        if (row.period !== expectedPeriod) {
-          context.addIssue({
-            code: z.ZodIssueCode.custom,
-            message: `MPS 第 ${expectedPeriod} 行的 period 必须为 ${expectedPeriod}`,
-            path: [index, "period"],
-          });
-        }
-        if (row.period_label !== `期 ${expectedPeriod}`) {
-          context.addIssue({
-            code: z.ZodIssueCode.custom,
-            message: `MPS 第 ${expectedPeriod} 行的 period_label 必须为“期 ${expectedPeriod}”`,
-            path: [index, "period_label"],
-          });
-        }
-      });
-    }),
-);
+    jsonPreprocess,
+    z.array(productionMpsRowSchema)
+      .max(PRODUCTION_FORECAST_PERIODS_MAX)
+      .superRefine((rows, context) => {
+        rows.forEach((row, index) => {
+          const expectedPeriod = index + 1;
+          if (row.period !== expectedPeriod) {
+            context.addIssue({
+              code: z.ZodIssueCode.custom,
+              message: `MPS 第 ${expectedPeriod} 行的 period 必须为 ${expectedPeriod}`,
+              path: [index, "period"],
+            });
+          }
+          if (row.period_label !== `期 ${expectedPeriod}`) {
+            context.addIssue({
+              code: z.ZodIssueCode.custom,
+              message: `MPS 第 ${expectedPeriod} 行的 period_label 必须为“期 ${expectedPeriod}”`,
+              path: [index, "period_label"],
+            });
+          }
+        });
+      }),
+  );
 
 export const parseProductionMpsTable = (
   value: unknown,
@@ -457,36 +473,53 @@ export const buildProductionCapacityScenarios = (
   } as const;
 };
 
-export const buildCanonicalProductionMps = (input: {
+export interface ProductionMpsInput {
   forecasts: Array<{ prediction: number; std_dev: number }>;
   zScore: number;
   initialInventory: number;
   capacity: number;
-}) => {
+}
+
+/**
+ * Canonical (v3) MPS formula, following 需求文档第五章 with a backorder
+ * inventory balance.  With 期初库存 = 0 and unconstrained capacity every cell
+ * matches the document's worked formulas:
+ *
+ *   第一个月标准化：产出量 = 需求量，安全库存 = 0，库存量 = 缺货量 = 0，
+ *                   投入量 = 预测量
+ *   预测量 = 需求预测结果 + 安全库存                       （5.4）
+ *   投入量 = 预测量 - 上月库存量 + 上月缺货量               （5.5）
+ *   产出量 = 上月投入量（提前期 1 个月，受产能约束）          （5.2）
+ *   库存量 / 缺货量 来自余额 = 上月余额 + 产出量 - 需求量     （5.2 的通式）
+ *   服务水平 = 1 - 缺货量 / 实际需求量                       （5.3）
+ */
+export const buildCanonicalProductionMps = (input: ProductionMpsInput) => {
   const rows: z.infer<typeof productionMpsRowSchema>[] = [];
+  let previousBalance = input.initialInventory;
   input.forecasts.forEach((forecast, index) => {
     const previous = index > 0 ? rows[index - 1]! : null;
     const demand = Math.max(0, Math.round(forecast.prediction));
     const safetyStock = index === 0
       ? 0
       : Math.max(0, Math.round(input.zScore * forecast.std_dev));
-    const beginningInventory = previous?.ending_inventory ?? input.initialInventory;
+    const forecastQuantity = demand + safetyStock;
+    const beginningInventory = Math.max(0, previousBalance);
     const productionOutput = previous
       ? Math.max(0, Math.min(previous.planned_production, input.capacity))
       : demand;
-    const availableInventory = beginningInventory + productionOutput;
-    const endingInventory = Math.max(0, availableInventory - demand);
-    const stockout = Math.max(0, demand - availableInventory);
+    const balance = previousBalance + productionOutput - demand;
+    const endingInventory = Math.max(0, balance);
+    const stockout = Math.max(0, -balance);
     const serviceLevel = demand > 0 ? Math.max(0, 1 - stockout / demand) : 1;
-    const plannedProduction = previous
-      ? Math.max(0, demand + safetyStock + previous.stockout - beginningInventory)
-      : demand;
+    // 投入量 = 预测量 - 上月库存量 + 上月缺货量 = 预测量 - 上月余额
+    const plannedProduction = Math.max(0, forecastQuantity - previousBalance);
 
     rows.push({
       period: index + 1,
       period_label: `期 ${index + 1}`,
       demand_forecast: demand,
       safety_stock: safetyStock,
+      forecast_quantity: forecastQuantity,
       planned_production: plannedProduction,
       beginning_inventory: beginningInventory,
       production_output: productionOutput,
@@ -494,6 +527,7 @@ export const buildCanonicalProductionMps = (input: {
       stockout,
       service_level: serviceLevel,
     });
+    previousBalance = balance;
   });
   return rows;
 };

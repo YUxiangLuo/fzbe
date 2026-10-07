@@ -325,6 +325,7 @@ describe("OpenAPI model contracts", () => {
       "period_label",
       "demand_forecast",
       "safety_stock",
+      "forecast_quantity",
       "planned_production",
       "beginning_inventory",
       "production_output",

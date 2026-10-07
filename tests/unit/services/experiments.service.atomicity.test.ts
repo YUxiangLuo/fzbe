@@ -177,6 +177,7 @@ describe("updateExperiment transaction atomicity", () => {
         period_label: "期 1",
         demand_forecast: 100,
         safety_stock: 0,
+        forecast_quantity: 100,
         planned_production: 100,
         beginning_inventory: 0,
         production_output: 100,
