@@ -386,23 +386,12 @@ export const encodeCsvCell = (value: unknown) => {
 };
 
 /**
- * Format a database date-time string without changing its wall-clock value.
- * Date instances are an instant rather than a wall-clock value, so their
- * deterministic fallback representation is UTC. Export queries should prefer
- * a DATE_FORMAT alias when the database wall-clock value is required.
+ * Export the same instant as the API, with an explicit UTC timezone.
+ * Timezone-free database values use the configured connection timezone.
  */
 export const formatCsvDateTime = (value: unknown) => {
   if (value === null || value === undefined || value === "") return "";
-
-  const rawValue = String(value).trim();
-  const databaseDateTime = rawValue.match(
-    /^(\d{4}-\d{2}-\d{2})[ T](\d{2}:\d{2}:\d{2})(?:\.\d+)?$/,
-  );
-  if (databaseDateTime) return `${databaseDateTime[1]} ${databaseDateTime[2]}`;
-
-  const date = value instanceof Date ? value : new Date(rawValue);
-  if (Number.isNaN(date.getTime())) return rawValue;
-  return date.toISOString().replace("T", " ").slice(0, 19);
+  return toIsoString(value) ?? String(value).trim();
 };
 
 const formatNumeric = (value: unknown) => {
@@ -1152,7 +1141,7 @@ export function buildReportCsvLines(reportRows: Array<Record<string, unknown>>) 
       encodeCsvCell(row.experiment_id),
       encodeCsvCell(row.report_id),
       encodeCsvCell(reportStatusText(row.status)),
-      encodeCsvCell(formatCsvDateTime(row.submitted_at_text ?? row.submitted_at)),
+      encodeCsvCell(formatCsvDateTime(row.submitted_at)),
       row.status === "graded" ? formatNumeric(row.grade) : "",
       encodeCsvCell(row.grader_name),
       encodeCsvCell(row.feedback),
@@ -1178,7 +1167,6 @@ export async function exportReportCsv(classId: number) {
              ELSE er.status
            END AS status,
            er.submitted_at,
-           DATE_FORMAT(er.submitted_at, '%Y-%m-%d %H:%i:%s') AS submitted_at_text,
            er.pdf_file_path,
            er.grade,
            CASE

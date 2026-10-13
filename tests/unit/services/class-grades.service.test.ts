@@ -84,12 +84,27 @@ describe("encodeCsvCell", () => {
 });
 
 describe("formatCsvDateTime", () => {
-  test("preserves database wall-clock strings without applying a timezone conversion", () => {
-    expect(formatCsvDateTime("2026-01-11 10:40:00")).toBe("2026-01-11 10:40:00");
+  test("uses the configured database timezone, including across midnight", () => {
+    const originalTimezone = env.DB_TIMEZONE;
+    try {
+      env.DB_TIMEZONE = "+09:00";
+      expect(formatCsvDateTime("2026-01-21 00:55:00")).toBe("2026-01-20T15:55:00.000Z");
+      env.DB_TIMEZONE = "-05:00";
+      expect(formatCsvDateTime("2026-01-21 23:55:00.123")).toBe("2026-01-22T04:55:00.123Z");
+    } finally {
+      env.DB_TIMEZONE = originalTimezone;
+    }
   });
 
-  test("formats Date instances as the same UTC instant regardless of the server timezone", () => {
-    expect(formatCsvDateTime(new Date("2026-01-11T10:40:05.000Z"))).toBe("2026-01-11 10:40:05");
+  test("preserves Date and explicit-offset instants regardless of the database timezone", () => {
+    const originalTimezone = env.DB_TIMEZONE;
+    try {
+      env.DB_TIMEZONE = "-05:00";
+      expect(formatCsvDateTime(new Date("2026-01-11T10:40:05.123Z"))).toBe("2026-01-11T10:40:05.123Z");
+      expect(formatCsvDateTime("2026-01-21T09:55:00+09:00")).toBe("2026-01-21T00:55:00.000Z");
+    } finally {
+      env.DB_TIMEZONE = originalTimezone;
+    }
   });
 
   test("keeps invalid values inspectable and leaves empty values blank", () => {
@@ -422,6 +437,24 @@ describe("buildGradeCsvLines", () => {
 });
 
 describe("buildReportCsvLines", () => {
+  test("exports explicit UTC submission instants without a wall-clock override", () => {
+    const originalTimezone = env.DB_TIMEZONE;
+    try {
+      env.DB_TIMEZONE = "+09:00";
+      const lines = buildReportCsvLines([
+        { submitted_at: "2026-01-21 00:55:00", submitted_at_text: "ignored" },
+        { submitted_at: new Date("2026-01-20T15:55:00.000Z") },
+        { submitted_at: "2026-01-21T00:55:00+09:00" },
+      ]);
+      for (const line of lines.slice(1)) {
+        expect(line.split(",")[5]).toBe("2026-01-20T15:55:00.000Z");
+        expect(line.split(",")).toHaveLength(9);
+      }
+    } finally {
+      env.DB_TIMEZONE = originalTimezone;
+    }
+  });
+
   test("only exports report grades for graded reports and preserves real zero", () => {
     const [, gradedRow, submittedRow, rejectedRow] = buildReportCsvLines([
       {
@@ -430,7 +463,7 @@ describe("buildReportCsvLines", () => {
         experiment_id: 1,
         report_id: 10,
         status: "graded",
-        submitted_at_text: "2026-08-02 10:00:00",
+        submitted_at: "2026-08-02T10:00:00.000Z",
         grade: 0,
         grader_name: "教师",
         feedback: "正式零分",
@@ -441,7 +474,7 @@ describe("buildReportCsvLines", () => {
         experiment_id: 2,
         report_id: 20,
         status: "submitted",
-        submitted_at_text: "2026-08-02 11:00:00",
+        submitted_at: "2026-08-02T11:00:00.000Z",
         grade: 88,
       },
       {
@@ -450,7 +483,7 @@ describe("buildReportCsvLines", () => {
         experiment_id: 3,
         report_id: 30,
         status: "rejected",
-        submitted_at_text: "2026-08-02 12:00:00",
+        submitted_at: "2026-08-02T12:00:00.000Z",
         grade: 99,
         grader_name: "教师",
         feedback: "请重做",
