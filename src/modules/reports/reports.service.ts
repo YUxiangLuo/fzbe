@@ -856,11 +856,18 @@ export async function submitReport(
           `INSERT INTO experiment_reports (experiment_id, student_id, report_content, pdf_file_path, status, submitted_at)
            VALUES (?, ?, ?, ?, 'submitted', NOW())
            ON DUPLICATE KEY UPDATE
-             report_content = VALUES(report_content),
-             pdf_file_path = VALUES(pdf_file_path),
+             report_content = ?,
+             pdf_file_path = ?,
              status = 'submitted',
              submitted_at = NOW()`,
-          [experimentId, studentId, sanitizedReportContent, pdfPath],
+          [
+            experimentId,
+            studentId,
+            sanitizedReportContent,
+            pdfPath,
+            sanitizedReportContent,
+            pdfPath,
+          ],
         );
 
         const calculatedBest = getBestModel(experiment);

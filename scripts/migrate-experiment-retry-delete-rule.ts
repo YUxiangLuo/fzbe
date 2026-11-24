@@ -89,9 +89,15 @@ try {
       // 009 was already ledgered by an early rollout that used CASCADE. A new
       // migration id is required because the coordinator correctly skips that
       // historical ledger row.
+      // Split DROP and ADD into separate ALTER statements: MySQL 8 rejects
+      // dropping and re-adding the same foreign key constraint name in a single
+      // ALTER TABLE with ER_FK_DUP_NAME (1826).
       await connection.query(
         `ALTER TABLE experiment_status
-           DROP FOREIGN KEY experiment_status_retry_parent_fk,
+           DROP FOREIGN KEY experiment_status_retry_parent_fk`,
+      );
+      await connection.query(
+        `ALTER TABLE experiment_status
            ADD CONSTRAINT experiment_status_retry_parent_fk
            FOREIGN KEY (retry_of_experiment_id)
            REFERENCES experiment_status(experiment_id)

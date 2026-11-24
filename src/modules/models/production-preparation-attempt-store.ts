@@ -13,6 +13,7 @@ import {
   parseProductionPreparationStepPlan,
   hasValidProductionStepProgress,
   jsonColumnCasValue,
+  jsonColumnEqualsSql,
 } from "./production-preparation-state";
 
 // Owns attempt transactions, lock ordering and commit-outcome handling.
@@ -145,8 +146,8 @@ export const claimProductionPreparationReceiptReplay = async (
         AND status = ?
         AND active_attempt_id = ?
         AND current_step_id <=> ?
-        AND completed_step_ids = ?
-        AND step_plan = ?
+        AND ${jsonColumnEqualsSql("completed_step_ids")}
+        AND ${jsonColumnEqualsSql("step_plan")}
         AND committed_state_path <=> ?
         AND committed_state_sha256 <=> ?
         AND status IN ('ready', 'running', 'failed')`,

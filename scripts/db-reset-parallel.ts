@@ -1,5 +1,9 @@
 import mysql from "mysql2/promise";
 import path from "path";
+import {
+  buildDatabaseConnectionOptions,
+  loadDatabaseEnvironment,
+} from "../src/config/database-connection-options";
 
 const { DB_HOST, DB_USER, DB_PASSWORD, DB_DATABASE } = process.env;
 
@@ -43,7 +47,7 @@ function assertDbResetSafety(force: boolean) {
 
   const dbHost = requireNonEmptyEnv("DB_HOST", DB_HOST);
   const dbDatabase = requireNonEmptyEnv("DB_DATABASE", DB_DATABASE);
-  requireNonEmptyEnv("DB_USER", DB_USER);
+  const dbUser = requireNonEmptyEnv("DB_USER", DB_USER);
 
   if (SYSTEM_DATABASES.has(dbDatabase.toLowerCase())) {
     exitWithSafetyError(`Refusing to run against system database "${dbDatabase}".`);
@@ -67,7 +71,7 @@ function assertDbResetSafety(force: boolean) {
     );
   }
 
-  return { dbHost, dbDatabase };
+  return { dbHost, dbUser, dbDatabase };
 }
 
 async function executeSqlFile(connection: mysql.Connection, filePath: string) {
@@ -91,7 +95,7 @@ async function executeSqlFile(connection: mysql.Connection, filePath: string) {
 
 async function dropAllTables(connection: mysql.Connection, database: string) {
   const [rows] = await connection.query<mysql.RowDataPacket[]>(
-    'SELECT TABLE_NAME FROM information_schema.tables WHERE table_schema = ? AND table_type = "BASE TABLE"',
+    "SELECT TABLE_NAME AS table_name FROM information_schema.tables WHERE table_schema = ? AND table_type = 'BASE TABLE'",
     [database],
   );
 
@@ -100,13 +104,16 @@ async function dropAllTables(connection: mysql.Connection, database: string) {
     return;
   }
 
-  const tableNames = rows.map((row) => row.TABLE_NAME as string);
+  const tableNames = rows.map((row) => row.table_name as string);
   console.log(`Dropping ${tableNames.length} tables...`);
   await connection.query("SET FOREIGN_KEY_CHECKS = 0;");
-  await connection.query(
-    `DROP TABLE IF EXISTS ${tableNames.map((name) => `\`${name}\``).join(", ")};`,
-  );
-  await connection.query("SET FOREIGN_KEY_CHECKS = 1;");
+  try {
+    await connection.query(
+      `DROP TABLE IF EXISTS ${tableNames.map((name) => `\`${name.replaceAll("`", "``")}\``).join(", ")};`,
+    );
+  } finally {
+    await connection.query("SET FOREIGN_KEY_CHECKS = 1;");
+  }
   console.log("✅ All existing tables dropped.");
 }
 
@@ -114,23 +121,32 @@ async function resetDatabase() {
   let connection: mysql.Connection | null = null;
 
   try {
-    const { dbHost, dbDatabase } = assertDbResetSafety(hasForceFlag());
+    const { dbHost, dbUser, dbDatabase } = assertDbResetSafety(hasForceFlag());
+    const escapedDatabase = dbDatabase.replaceAll("`", "``");
+    const { database: _ignoredDatabase, ...serverOptions } = buildDatabaseConnectionOptions(
+      loadDatabaseEnvironment({
+        ...process.env,
+        DB_HOST: dbHost,
+        DB_USER: dbUser,
+        DB_PASSWORD: DB_PASSWORD ?? "",
+        DB_DATABASE: dbDatabase,
+      }),
+    );
 
     console.log(`Connecting to MySQL server at ${dbHost}...`);
     connection = await mysql.createConnection({
-      host: dbHost,
-      user: DB_USER,
-      password: DB_PASSWORD,
+      ...serverOptions,
       multipleStatements: true,
-      charset: "utf8mb4",
     });
     console.log("✅ Connection successful.");
 
     console.log(`Creating database '${dbDatabase}' if it doesn't exist...`);
-    await connection.query(`CREATE DATABASE IF NOT EXISTS \`${dbDatabase}\`;`);
+    await connection.query(
+      `CREATE DATABASE IF NOT EXISTS \`${escapedDatabase}\` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;`,
+    );
     console.log(`✅ Database '${dbDatabase}' is ready.`);
 
-    await connection.changeUser({ database: dbDatabase });
+    await connection.query(`USE \`${escapedDatabase}\`;`);
     console.log(`Switched to database '${dbDatabase}'.`);
 
     await dropAllTables(connection, dbDatabase);

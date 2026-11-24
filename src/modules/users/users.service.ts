@@ -500,7 +500,10 @@ export async function searchUsers(query: UserSearchQuery) {
   if (!term) return { error: "empty_search" as const };
 
   const offset = (page - 1) * limit;
-  const useFullText = term.length > 4 && /^[\w\s@.-]+$/.test(term);
+  // Exclude '@' and '-' from InnoDB FULLTEXT boolean mode: '@' triggers
+  // ERROR 1064 ("syntax error, unexpected '@'") on both MySQL 8 and MariaDB,
+  // and '-' acts as a boolean negation operator.
+  const useFullText = term.length > 4 && /^[\w\s.]+$/.test(term);
 
   let countQuery: string;
   let dataQuery: string;
@@ -664,9 +667,24 @@ export async function batchCreateTeachers(file: File, password: unknown) {
       }
 
       const teacherValues = teacherRows.map((r, i) => [r.username, hashedPasswords[i], r.fullName, r.email, "Teacher", r.phone]);
-      const [result] = await connection.query<ResultSetHeader>("INSERT INTO users (username, password_hash, full_name, email, role, phone_number) VALUES ?", [teacherValues]);
-      const firstInsertId = result.insertId;
-      const createdTeachers = teacherRows.map((r, i) => ({ user_id: firstInsertId + i, username: r.username, full_name: r.fullName, phone_number: r.phone, email: r.email }));
+      await connection.query<ResultSetHeader>("INSERT INTO users (username, password_hash, full_name, email, role, phone_number) VALUES ?", [teacherValues]);
+      const [insertedTeachers] = await connection.query<RowDataPacket[]>(
+        `SELECT user_id, username FROM users WHERE username IN (${usernames.map(() => "?").join(", ")})`,
+        usernames,
+      );
+      const teacherIdByUsername = new Map(
+        insertedTeachers.map((row) => [String(row.username), Number(row.user_id)]),
+      );
+      if (teacherIdByUsername.size !== teacherRows.length) {
+        throw new Error("Created teachers could not be reloaded before commit");
+      }
+      const createdTeachers = teacherRows.map((r) => {
+        const userId = teacherIdByUsername.get(r.username);
+        if (userId === undefined) {
+          throw new Error("Created teachers could not be reloaded before commit");
+        }
+        return { user_id: userId, username: r.username, full_name: r.fullName, phone_number: r.phone, email: r.email };
+      });
       await connection.commit();
       return { data: { created: createdTeachers.length, teachers: createdTeachers } };
     } catch (error) {
@@ -760,9 +778,24 @@ export async function batchCreateAssistants(file: File, password: unknown) {
       }
 
       const assistantValues = assistantRows.map((r, i) => [r.username, hashedPasswords[i], r.fullName, r.email, "Assistant", r.phone]);
-      const [result] = await connection.query<ResultSetHeader>("INSERT INTO users (username, password_hash, full_name, email, role, phone_number) VALUES ?", [assistantValues]);
-      const firstInsertId = result.insertId;
-      const createdAssistants = assistantRows.map((r, i) => ({ user_id: firstInsertId + i, username: r.username, full_name: r.fullName, phone_number: r.phone, email: r.email }));
+      await connection.query<ResultSetHeader>("INSERT INTO users (username, password_hash, full_name, email, role, phone_number) VALUES ?", [assistantValues]);
+      const [insertedAssistants] = await connection.query<RowDataPacket[]>(
+        `SELECT user_id, username FROM users WHERE username IN (${usernames.map(() => "?").join(", ")})`,
+        usernames,
+      );
+      const assistantIdByUsername = new Map(
+        insertedAssistants.map((row) => [String(row.username), Number(row.user_id)]),
+      );
+      if (assistantIdByUsername.size !== assistantRows.length) {
+        throw new Error("Created assistants could not be reloaded before commit");
+      }
+      const createdAssistants = assistantRows.map((r) => {
+        const userId = assistantIdByUsername.get(r.username);
+        if (userId === undefined) {
+          throw new Error("Created assistants could not be reloaded before commit");
+        }
+        return { user_id: userId, username: r.username, full_name: r.fullName, phone_number: r.phone, email: r.email };
+      });
       await connection.commit();
       return { data: { created: createdAssistants.length, assistants: createdAssistants } };
     } catch (error) {

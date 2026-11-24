@@ -1305,5 +1305,12 @@ describe("reports service", () => {
     expect(htmlDocument).toContain(".report-content tr { break-inside: avoid; page-break-inside: avoid; }");
     expect(htmlDocument).toContain(".report-content .report-appendix-break { break-before: page; page-break-before: always; height: 0; }");
     expect(htmlDocument).toContain('<div class="report-appendix-break"></div>');
+
+    const reportInsertCall = connectionQuery.mock.calls.find(([sql]) =>
+      String(sql).includes("INSERT INTO experiment_reports")
+    );
+    expect(String(reportInsertCall?.[0])).not.toContain("VALUES(report_content)");
+    expect(String(reportInsertCall?.[0])).not.toContain("VALUES(pdf_file_path)");
+    expect(reportInsertCall?.[1]).toHaveLength(6);
   });
 });

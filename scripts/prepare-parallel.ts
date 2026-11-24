@@ -338,7 +338,7 @@ async function hasParallelBaseReady() {
 
   try {
     const [tableRows] = await connection.query<TableRow[]>(
-      `SELECT table_name
+      `SELECT TABLE_NAME AS table_name
          FROM information_schema.tables
         WHERE table_schema = DATABASE()
           AND table_name IN (${REQUIRED_TABLES.map(() => "?").join(", ")})`,
@@ -356,7 +356,7 @@ async function hasParallelBaseReady() {
     }
 
     const [columnRows] = await connection.query<ColumnRow[]>(
-      `SELECT table_name, column_name
+      `SELECT TABLE_NAME AS table_name, COLUMN_NAME AS column_name
          FROM information_schema.columns
         WHERE table_schema = DATABASE()
           AND table_name IN (${REQUIRED_TABLES.map(() => "?").join(", ")})`,

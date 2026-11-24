@@ -25,7 +25,10 @@ const nestedQuery = mock(async () => { throw new Error("Pool exhausted while the
 mock.module("../../../src/config", () => ({
   env: { DB_TIMEZONE: "Z" }, pool: { getConnection: borrow, query: nestedQuery },
 }));
-const { enrollExistingStudent } = await import("../../../src/modules/class-members/class-members.service");
+const {
+  createStudentInClass,
+  enrollExistingStudent,
+} = await import("../../../src/modules/class-members/class-members.service");
 
 test("duplicate enrollment recovers with the owned connection when the pool is exhausted", async () => {
   expect(await enrollExistingStudent(2, 1, 10, "Teacher")).toEqual({
@@ -35,4 +38,33 @@ test("duplicate enrollment recovers with the owned connection when the pool is e
   expect(nestedQuery).not.toHaveBeenCalled();
   expect(connection.commit).not.toHaveBeenCalled();
   expect(calls.slice(-3)).toEqual(["rollback", "read-enrollment", "release"]);
+});
+
+test.each([
+  { message: "Duplicate entry '20240001' for key 'username'", expected: "dup_username" },
+  { message: "Duplicate entry '20240001' for key 'users.username'", expected: "dup_username" },
+  { message: "Duplicate entry 'a@b.edu' for key 'email'", expected: "dup_email" },
+  { message: "Duplicate entry 'a@b.edu' for key 'users.email'", expected: "dup_email" },
+  { message: "Duplicate entry '13800138000' for key 'users_phone_number_unique'", expected: "dup_phone" },
+  { message: "Duplicate entry '13800138000' for key 'users.users_phone_number_canonical_unique'", expected: "dup_phone" },
+])("createStudentInClass maps MariaDB and MySQL 8 duplicate keys ($expected)", async ({ message, expected }) => {
+  const originalQuery = connection.query;
+  connection.query = async (sql: string) => {
+    if (sql.includes("FROM classes")) return [[{ teacher_id: 10 }]];
+    if (sql.startsWith("INSERT INTO users")) {
+      throw Object.assign(new Error(message), { code: "ER_DUP_ENTRY" });
+    }
+    throw new Error(`Unexpected SQL: ${sql}`);
+  };
+  try {
+    const result = await createStudentInClass(2, 10, "Teacher", {
+      username: "20240001",
+      full_name: "测试学生",
+      email: "a@b.edu",
+      phone_number: "13800138000",
+    });
+    expect(result).toEqual({ error: expected });
+  } finally {
+    connection.query = originalQuery;
+  }
 });

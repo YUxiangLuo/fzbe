@@ -10,7 +10,9 @@ import {
   buildProductionPreparationPayload,
   buildProductionStepLabel,
   expandProductionPreparationPlan,
+  hasProductionPreparationCasRowChanged,
   jsonColumnCasValue,
+  jsonColumnEqualsSql,
 } from "./production-preparation-state";
 import {
   fetchProductionPreparationAttempt,
@@ -296,8 +298,8 @@ const markProductionPreparationSessionSuperseded = async (
         AND session.active_attempt_id <=> ?
         AND session.expires_at <=> ?
         AND session.current_step_id <=> ?
-        AND session.completed_step_ids = ?
-        AND session.step_plan = ?
+        AND ${jsonColumnEqualsSql("session.completed_step_ids")}
+        AND ${jsonColumnEqualsSql("session.step_plan")}
         AND session.committed_state_path <=> ?
         AND session.committed_state_sha256 <=> ?
         AND session.status IN ('ready', 'running', 'failed')
@@ -335,8 +337,8 @@ const claimAlreadySupersededProductionPreparationSession = async (
       WHERE session_id = ?
         AND status = 'superseded'
         AND active_attempt_id <=> ?
-        AND completed_step_ids = ?
-        AND step_plan = ?
+        AND ${jsonColumnEqualsSql("completed_step_ids")}
+        AND ${jsonColumnEqualsSql("step_plan")}
         AND committed_state_path <=> ?
         AND committed_state_sha256 <=> ?`,
     [
@@ -355,6 +357,33 @@ const claimAlreadySupersededProductionPreparationSession = async (
 const hasLiveProductionPreparationAttempt = (
   row: Pick<ProductionPreparationSessionRow, "active_attempt_lease_is_live">,
 ) => Number(row.active_attempt_lease_is_live) === 1;
+
+const resolveRetainedProductionPreparationAfterCasMiss = async (
+  before: ProductionPreparationSessionRow,
+  context: { modelType: ModelType; stepId?: string; message: string },
+): Promise<ProductionPreparationSessionPayload | null> => {
+  const retained = await fetchProductionPreparationSession(before.session_id);
+  if (!retained || retained.status === "superseded") {
+    return null;
+  }
+  if (
+    hasProductionPreparationCasRowChanged(before, retained)
+    || hasLiveProductionPreparationAttempt(retained)
+  ) {
+    return buildProductionPreparationPayload(retained);
+  }
+  logger.error(
+    {
+      sessionId: before.session_id,
+      modelType: context.modelType,
+      ...(context.stepId ? { stepId: context.stepId } : {}),
+      status: before.status,
+      activeAttemptId: before.active_attempt_id,
+    },
+    context.message,
+  );
+  throw new Error("生产准备会话状态更新异常，请稍后重试");
+};
 
 const classifyProductionPreparationSessionHealth = async (
   row: ProductionPreparationSessionRow,
@@ -646,9 +675,15 @@ export async function createOrResumeProductionPreparationSession(
           retirementReason,
         );
         if (!retirementClaimed) {
-          const retained = await fetchProductionPreparationSession(existing.session_id);
-          if (retained && retained.status !== "superseded") {
-            return buildProductionPreparationPayload(retained);
+          const retainedPayload = await resolveRetainedProductionPreparationAfterCasMiss(
+            existing,
+            {
+              modelType,
+              message: "重建生产准备会话时失效标记 CAS 未命中且行状态未变化",
+            },
+          );
+          if (retainedPayload) {
+            return retainedPayload;
           }
           throw new ModelConflictError(
             "生产准备会话状态已变化，请重试",
@@ -678,8 +713,8 @@ export async function createOrResumeProductionPreparationSession(
               AND session.status = 'completed'
               AND session.active_attempt_id <=> ?
               AND session.production_revision <=> ?
-              AND session.completed_step_ids = ?
-              AND session.step_plan = ?`,
+              AND ${jsonColumnEqualsSql("session.completed_step_ids")}
+              AND ${jsonColumnEqualsSql("session.step_plan")}`,
           [
             existing.session_id,
             existing.active_attempt_id,
@@ -695,9 +730,15 @@ export async function createOrResumeProductionPreparationSession(
           );
         }
         if (!retirementClaimed) {
-          const retained = await fetchProductionPreparationSession(existing.session_id);
-          if (retained && retained.status !== "superseded") {
-            return buildProductionPreparationPayload(retained);
+          const retainedPayload = await resolveRetainedProductionPreparationAfterCasMiss(
+            existing,
+            {
+              modelType,
+              message: "重建生产准备会话时失效标记 CAS 未命中且行状态未变化",
+            },
+          );
+          if (retainedPayload) {
+            return retainedPayload;
           }
           throw new ModelConflictError(
             "生产准备会话状态已变化，请重试",
@@ -710,8 +751,8 @@ export async function createOrResumeProductionPreparationSession(
             WHERE session.session_id = ?
               AND session.status = 'superseded'
               AND session.active_attempt_id IS NULL
-              AND session.completed_step_ids = ?
-              AND session.step_plan = ?
+              AND ${jsonColumnEqualsSql("session.completed_step_ids")}
+              AND ${jsonColumnEqualsSql("session.step_plan")}
               AND session.committed_state_path <=> ?
               AND session.committed_state_sha256 <=> ?`,
           [
@@ -724,9 +765,15 @@ export async function createOrResumeProductionPreparationSession(
         );
       }
       if (Number((deleteResult as { affectedRows?: number }).affectedRows ?? 0) !== 1) {
-        const retained = await fetchProductionPreparationSession(existing.session_id);
-        if (retained && retained.status !== "superseded") {
-          return buildProductionPreparationPayload(retained);
+        const retainedPayload = await resolveRetainedProductionPreparationAfterCasMiss(
+          existing,
+          {
+            modelType,
+            message: "重建生产准备会话时删除 CAS 未命中且行状态未变化",
+          },
+        );
+        if (retainedPayload) {
+          return retainedPayload;
         }
         throw new ModelConflictError(
           "生产准备会话状态已变化，请重试",
@@ -1128,9 +1175,16 @@ export async function runProductionPreparationStep(
           const reason = currentHealth.reason ?? "生产准备会话工件已失效";
           const claimed = await markProductionPreparationSessionSuperseded(currentRow, reason);
           if (!claimed) {
-            const retained = await fetchProductionPreparationSession(sessionId);
-            if (retained && retained.status !== "superseded") {
-              return buildProductionPreparationPayload(retained);
+            const retainedPayload = await resolveRetainedProductionPreparationAfterCasMiss(
+              currentRow,
+              {
+                modelType,
+                stepId,
+                message: "生产准备会话失效标记 CAS 未命中且行状态未变化",
+              },
+            );
+            if (retainedPayload) {
+              return retainedPayload;
             }
           }
           throw new ModelConflictError(reason, "PRODUCTION_PREPARATION_STALE");
@@ -1149,8 +1203,8 @@ export async function runProductionPreparationStep(
                 AND status = ?
                 AND active_attempt_id <=> ?
                 AND expires_at <=> ?
-                AND completed_step_ids = ?
-                AND step_plan = ?
+                AND ${jsonColumnEqualsSql("completed_step_ids")}
+                AND ${jsonColumnEqualsSql("step_plan")}
                 AND status IN ('ready', 'failed', 'running')
                 AND expires_at > NOW()`,
             [
@@ -1166,9 +1220,16 @@ export async function runProductionPreparationStep(
             const reason = "生产准备会话已过期，请重新创建";
             const claimed = await markProductionPreparationSessionSuperseded(currentRow, reason);
             if (!claimed) {
-              const retained = await fetchProductionPreparationSession(sessionId);
-              if (retained && retained.status !== "superseded") {
-                return buildProductionPreparationPayload(retained);
+              const retainedPayload = await resolveRetainedProductionPreparationAfterCasMiss(
+                currentRow,
+                {
+                  modelType,
+                  stepId,
+                  message: "生产准备会话续租与失效标记 CAS 均未命中且行状态未变化",
+                },
+              );
+              if (retainedPayload) {
+                return retainedPayload;
               }
             }
             throw new ModelConflictError(reason, "PRODUCTION_PREPARATION_STALE");

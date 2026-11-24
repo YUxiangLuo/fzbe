@@ -66,6 +66,74 @@ describe("startup environment checks", () => {
     expect(destroy).not.toHaveBeenCalled();
   });
 
+  test("logs database runtime info and emits non-fatal warnings for collation or max_connections mismatches", async () => {
+    const release = mock(() => {});
+    const destroy = mock(() => {});
+    const infos: string[] = [];
+    const warnings: string[] = [];
+    const connection = {
+      query: mock(async () => [[{
+        ok: 1,
+        session_time_zone: "+00:00",
+        utc_offset_seconds: 0,
+        database_version: "8.0.40",
+        database_collation: "utf8mb4_0900_ai_ci",
+        max_connections: 30,
+      }]]),
+      release,
+      destroy,
+    };
+
+    await probeStartupDatabaseRuntime(
+      { getConnection: mock(async () => connection) } as never,
+      "Z",
+      {
+        connectionLimit: 40,
+        logInfo: (message) => infos.push(message),
+        logWarn: (message) => warnings.push(message),
+      },
+    );
+
+    expect(release).toHaveBeenCalledTimes(1);
+    expect(destroy).not.toHaveBeenCalled();
+    expect(infos).toEqual([
+      "Database runtime: version=8.0.40, collation=utf8mb4_0900_ai_ci, max_connections=30",
+    ]);
+    expect(warnings).toHaveLength(2);
+    expect(warnings[0]).toContain("utf8mb4_0900_ai_ci");
+    expect(warnings[1]).toContain("max_connections (30)");
+  });
+
+  test("stays free of runtime warnings when collation and max_connections match expectations", async () => {
+    const infos: string[] = [];
+    const warnings: string[] = [];
+    const connection = {
+      query: mock(async () => [[{
+        ok: 1,
+        session_time_zone: "+00:00",
+        utc_offset_seconds: 0,
+        database_version: "8.0.40",
+        database_collation: "utf8mb4_unicode_ci",
+        max_connections: 200,
+      }]]),
+      release: mock(() => {}),
+      destroy: mock(() => {}),
+    };
+
+    await probeStartupDatabaseRuntime(
+      { getConnection: mock(async () => connection) } as never,
+      "Z",
+      {
+        connectionLimit: 40,
+        logInfo: (message) => infos.push(message),
+        logWarn: (message) => warnings.push(message),
+      },
+    );
+
+    expect(infos).toHaveLength(1);
+    expect(warnings).toEqual([]);
+  });
+
   test("fails closed when the database wall clock is not aligned with DB_TIMEZONE", async () => {
     const destroy = mock(() => {});
     const release = mock(() => {});

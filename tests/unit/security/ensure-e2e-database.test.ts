@@ -201,4 +201,28 @@ describe("E2E database bootstrap", () => {
     ).rejects.toThrow(message);
     expect(connectionAttempts).toBe(0);
   });
+
+  test("creates disposable databases with utf8mb4_unicode_ci collation", async () => {
+    const executedSql: string[] = [];
+    const outcome = await ensureE2eDatabaseExists(
+      {
+        ...ALLOWED_ENV,
+        DB_USER: "agent",
+        DB_PASSWORD: "secret",
+      },
+      async () => ({
+        query: async (sql: string) => {
+          executedSql.push(sql);
+          if (sql.includes("information_schema.SCHEMATA")) return [[]];
+          return [{ affectedRows: 1 }];
+        },
+        end: async () => {},
+      }) as never,
+    );
+
+    expect(outcome).toBe("created");
+    expect(executedSql).toContain(
+      "CREATE DATABASE IF NOT EXISTS `fz_e2e_bootstrap` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci",
+    );
+  });
 });

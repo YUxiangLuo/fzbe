@@ -340,6 +340,7 @@ describe("database migration deployment path", () => {
     expect(migration).toContain("ON DELETE SET NULL");
     expect(migration).toContain('foreignKey.delete_rule === "CASCADE"');
     expect(migration).toContain("DROP FOREIGN KEY experiment_status_retry_parent_fk");
+    expect(migration).not.toMatch(/DROP FOREIGN KEY experiment_status_retry_parent_fk\s*,/);
     expect(migration).toContain('foreignKey.delete_rule !== "SET NULL"');
   });
 
@@ -384,6 +385,7 @@ describe("database migration deployment path", () => {
 
     expect(migration).toContain('foreignKey.delete_rule === "CASCADE"');
     expect(migration).toContain("DROP FOREIGN KEY experiment_status_retry_parent_fk");
+    expect(migration).not.toMatch(/DROP FOREIGN KEY experiment_status_retry_parent_fk\s*,/);
     expect(migration).toContain("ON DELETE SET NULL");
     expect(migration).toContain("loadForeignKeys()");
     expect(migration).toContain("delete-rule audit did not converge to SET NULL");
@@ -392,6 +394,19 @@ describe("database migration deployment path", () => {
       .toBe("bun run scripts/migrate-experiment-retry-delete-rule.ts");
     expect(documentation).toContain("011-experiment-retry-delete-rule");
     expect(documentation).toContain("already recorded migration 009");
+
+    const phoneUniqueMigration = await Bun.file(path.join(
+      projectRoot,
+      "scripts/migrate-user-phone-unique.ts",
+    )).text();
+    const canonicalPhoneMigration = await Bun.file(path.join(
+      projectRoot,
+      "scripts/migrate-user-phone-canonical-unique.ts",
+    )).text();
+    expect(phoneUniqueMigration).not.toContain("BINARY phone_number");
+    expect(canonicalPhoneMigration).not.toContain("BINARY phone_number");
+    expect(phoneUniqueMigration).toContain("CHAR_LENGTH(phone_number) <> CHAR_LENGTH(TRIM(phone_number))");
+    expect(canonicalPhoneMigration).toContain("CHAR_LENGTH(phone_number) <> CHAR_LENGTH(TRIM(phone_number))");
   });
 
   test("normalizes only official report grades for historical rejected attempts", async () => {

@@ -2,7 +2,9 @@ import { describe, expect, test } from "bun:test";
 import {
   buildProductionPreparationPayload,
   expandProductionPreparationPlan,
+  hasProductionPreparationCasRowChanged,
   hasValidProductionStepProgress,
+  jsonColumnEqualsSql,
   parseProductionCompletedStepIds,
   parseProductionPreparationStepPlan,
   type ProductionPreparationSessionRow,
@@ -62,5 +64,48 @@ describe("production preparation step protocol", () => {
       .toMatchObject({ next_step: null, preparation_token: 'revision', prepared_forecast_steps: 6, reused_existing: true });
     expect(buildProductionPreparationPayload({ ...row, status: 'superseded' }).results)
       .toMatchObject({ next_step: null, session_status: 'superseded' });
+  });
+
+  test("builds dual-engine JSON CAS equality predicates and detects snapshot changes", () => {
+    expect(jsonColumnEqualsSql("session.completed_step_ids"))
+      .toBe("JSON_EXTRACT(session.completed_step_ids, '$') = JSON_EXTRACT(?, '$')");
+
+    const baseSnapshot = {
+      status: "ready" as const,
+      active_attempt_id: null,
+      current_step_id: "initialize",
+      expires_at: "2026-08-30 00:00:00",
+      completed_step_ids: "[]",
+      step_plan: JSON.stringify(plan),
+      committed_state_path: null,
+      committed_state_sha256: null,
+      production_revision: null,
+      session_is_live: 1,
+      active_attempt_lease_is_live: 0,
+    };
+
+    // Semantically equivalent JSON (e.g., MySQL 8 key-reordered parsed objects)
+    // and clock-only expiry flips must not be treated as state progress.
+    expect(hasProductionPreparationCasRowChanged(baseSnapshot, {
+      ...baseSnapshot,
+      completed_step_ids: [],
+      step_plan: plan.map((step) => ({ label: step.label, id: step.id })),
+      session_is_live: 0,
+      active_attempt_lease_is_live: 1,
+    })).toBe(false);
+
+    // Any real CAS field change (step progress, lease renewal, active attempt) is detected.
+    expect(hasProductionPreparationCasRowChanged(baseSnapshot, {
+      ...baseSnapshot,
+      completed_step_ids: ["initialize"],
+    })).toBe(true);
+    expect(hasProductionPreparationCasRowChanged(baseSnapshot, {
+      ...baseSnapshot,
+      expires_at: "2026-09-06 00:00:00",
+    })).toBe(true);
+    expect(hasProductionPreparationCasRowChanged(baseSnapshot, {
+      ...baseSnapshot,
+      active_attempt_id: "attempt-1",
+    })).toBe(true);
   });
 });

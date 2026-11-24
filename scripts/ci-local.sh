@@ -28,6 +28,7 @@ run_dataset_check() {
 run_full() {
   "$bun" install --frozen-lockfile
   "$bun" run test:check
+  "$bun" run test:system:db-compat
   "$bun" run test:system:user-phone-canonical
   "$bun" run test:system:concurrency
   "$bun" audit
@@ -46,6 +47,9 @@ case "$profile" in
   full)
     run_full
     ;;
+  mysql8)
+    "$project_root/scripts/test-mysql8.sh"
+    ;;
   nightly)
     run_python_setup
     run_dataset_check
@@ -57,7 +61,7 @@ case "$profile" in
     "$bun" run test:deep:resource
     ;;
   *)
-    echo "Usage: $0 [full|nightly|resource]" >&2
+    echo "Usage: $0 [full|mysql8|nightly|resource]" >&2
     exit 2
     ;;
 esac

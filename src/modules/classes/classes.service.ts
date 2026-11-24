@@ -275,19 +275,40 @@ export async function createClass(
         );
 
         const studentValues = studentRecords.map((r, i) => [r.studentId, hashedPasswords[i], r.fullName, r.email, "Student"]);
-        const [userResult] = await connection.query<ResultSetHeader>(
+        await connection.query<ResultSetHeader>(
           "INSERT INTO users (username, password_hash, full_name, email, role) VALUES ?",
           [studentValues],
         );
 
-        const firstUserId = userResult.insertId;
+        const [insertedUsers] = await connection.query<RowDataPacket[]>(
+          `SELECT user_id, username FROM users WHERE username IN (${studentIds.map(() => "?").join(", ")})`,
+          studentIds,
+        );
+        const userIdByUsername = new Map(
+          insertedUsers.map((row) => [String(row.username), Number(row.user_id)]),
+        );
+        const resolveCreatedUserId = (username: string) => {
+          const userId = userIdByUsername.get(username);
+          if (userId === undefined) {
+            throw new Error("Created students could not be reloaded before enrollment");
+          }
+          return userId;
+        };
+        if (userIdByUsername.size !== studentRecords.length) {
+          throw new Error("Created students could not be reloaded before enrollment");
+        }
         createdStudentsCount = studentRecords.length;
 
-        const enrollmentValues = studentRecords.map((_, i) => [firstUserId + i, classId]);
+        const enrollmentValues = studentRecords.map((r) => [resolveCreatedUserId(r.studentId), classId]);
         await connection.query("INSERT INTO enrollments (student_id, class_id) VALUES ?", [enrollmentValues]);
 
-        studentRecords.forEach((r, i) => {
-          createdStudents.push({ user_id: firstUserId + i, username: r.studentId, full_name: r.fullName, email: r.email });
+        studentRecords.forEach((r) => {
+          createdStudents.push({
+            user_id: resolveCreatedUserId(r.studentId),
+            username: r.studentId,
+            full_name: r.fullName,
+            email: r.email,
+          });
         });
       }
     }

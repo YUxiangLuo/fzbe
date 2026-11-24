@@ -92,7 +92,9 @@ export async function ensureE2eDatabaseExists(
         // The name reached this point only after the disposable-name guard,
         // whose allow list excludes backticks and every other quoting hazard.
         createDatabase: async (name) => {
-          await connection.query(`CREATE DATABASE IF NOT EXISTS \`${name}\``);
+          await connection.query(
+            `CREATE DATABASE IF NOT EXISTS \`${name}\` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci`,
+          );
         },
       },
       env,

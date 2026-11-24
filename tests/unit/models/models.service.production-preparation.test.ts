@@ -600,17 +600,12 @@ describe("models service production preparation", () => {
       expires_at: "2026-08-30 00:00:00",
       session_is_live: 1,
     };
-    let initialSelected = false;
     poolQuery.mockImplementation(async (sql: string) => {
       if (sql.includes("FROM dataset_segments")) return [[{ file_path: datasetCsvPath }]];
       if (sql.includes("SET status = 'superseded'")) return [{ affectedRows: 0 }];
       if (sql.includes("FROM model_production_preparation_sessions")) {
         if (sql.includes("WHERE session_id = ?")) return [[renewed]];
-        if (!initialSelected) {
-          initialSelected = true;
-          return [[stale]];
-        }
-        return [[renewed]];
+        return [[stale]];
       }
       return [[buildExperimentContextRow()]];
     });
@@ -2181,6 +2176,191 @@ describe("models service production preparation", () => {
     );
     expect(spawnMock).not.toHaveBeenCalled();
     expect(unlinkSync).toHaveBeenCalledWith(sessionRow.candidate_model_path);
+  });
+
+  test("uses dual-engine JSON_EXTRACT CAS predicates and throws 500 instead of silent 200 on unchanged CAS failure", async () => {
+    const activeRun = buildActiveRun("ma");
+    const stepPlan = [
+      { id: "initialize", label: "确认生产准备材料" },
+      { id: "fit_model", label: "重拟合生产模型" },
+      { id: "finalize", label: "组装并校验生产产物" },
+    ];
+    const datasetSha = crypto.createHash("sha256").update(modelDatasetCsv).digest("hex");
+    const unchangedRow = {
+      session_id: "cas-zero-progress-session",
+      experiment_id: 990002,
+      student_id: 20240002,
+      run_id: activeRun.run_id,
+      model_type: "ma",
+      request_hash: "cas-request-hash",
+      dataset_revision: datasetSha,
+      runtime_revision: activeRun.runtime_revision,
+      protocol_version: 1,
+      forecast_steps: 6,
+      status: "ready",
+      current_step_id: "initialize",
+      completed_step_ids: [],
+      step_plan: stepPlan.map((step) => ({ label: step.label, id: step.id })),
+      artifact_dir: "/tmp/fangzhen-py/production_preparation/cas-zero-progress",
+      candidate_model_path: path.join(mockedTrainedModelsRoot, "cas-zero-progress.pkl"),
+      committed_state_path: null,
+      committed_state_sha256: null,
+      active_attempt_id: null,
+      observed_production_revision: null,
+      production_revision: null,
+      error_message: null,
+      superseded_reason: null,
+      expires_at: "2026-08-30 00:00:00",
+      session_is_live: 1,
+      active_attempt_lease_is_live: 0,
+    };
+    const datasetPath = path.join(unchangedRow.artifact_dir, "dataset.json");
+    existsSync.mockImplementation((filePath: string) => filePath === datasetPath);
+    createReadStream.mockImplementation(() =>
+      Readable.from([modelDatasetCsv]) as unknown as ReturnType<typeof createReadStream>
+    );
+    poolQuery.mockImplementation(async (sql: string) => {
+      if (sql.includes("FROM model_production_preparation_sessions")) {
+        return [[unchangedRow]];
+      }
+      if (sql.includes("SET expires_at = CASE") || sql.includes("SET status = 'superseded'")) {
+        return [{ affectedRows: 0 }];
+      }
+      return [[]];
+    });
+
+    await expect(
+      runProductionPreparationStep("ma", 20240002, unchangedRow.session_id, "initialize"),
+    ).rejects.toThrow("生产准备会话状态更新异常，请稍后重试");
+
+    const casQueries = poolQuery.mock.calls
+      .map(([sql]) => String(sql))
+      .filter((sql) => sql.includes("SET expires_at = CASE") || sql.includes("SET status = 'superseded'"));
+    expect(casQueries).toHaveLength(2);
+    for (const sql of casQueries) {
+      expect(sql).toContain("JSON_EXTRACT(");
+      expect(sql).toContain("= JSON_EXTRACT(?, '$')");
+      expect(sql).not.toContain("CAST(? AS JSON)");
+    }
+  });
+
+  test("preserves 200 payload return when a concurrent worker advances the session before CAS refresh", async () => {
+    const activeRun = buildActiveRun("ma");
+    const stepPlan = [
+      { id: "initialize", label: "确认生产准备材料" },
+      { id: "fit_model", label: "重拟合生产模型" },
+      { id: "finalize", label: "组装并校验生产产物" },
+    ];
+    const datasetSha = crypto.createHash("sha256").update(modelDatasetCsv).digest("hex");
+    const beforeRow = {
+      session_id: "cas-concurrent-progress-session",
+      experiment_id: 990002,
+      student_id: 20240002,
+      run_id: activeRun.run_id,
+      model_type: "ma",
+      request_hash: "cas-concurrent-hash",
+      dataset_revision: datasetSha,
+      runtime_revision: activeRun.runtime_revision,
+      protocol_version: 1,
+      forecast_steps: 6,
+      status: "ready",
+      current_step_id: "initialize",
+      completed_step_ids: "[]",
+      step_plan: JSON.stringify(stepPlan),
+      artifact_dir: "/tmp/fangzhen-py/production_preparation/cas-concurrent-progress",
+      candidate_model_path: path.join(mockedTrainedModelsRoot, "cas-concurrent-progress.pkl"),
+      committed_state_path: null,
+      committed_state_sha256: null,
+      active_attempt_id: null,
+      observed_production_revision: null,
+      production_revision: null,
+      error_message: null,
+      superseded_reason: null,
+      expires_at: "2026-08-30 00:00:00",
+      session_is_live: 1,
+      active_attempt_lease_is_live: 0,
+    };
+    const advancedRow = {
+      ...beforeRow,
+      current_step_id: "fit_model",
+      completed_step_ids: JSON.stringify(["initialize"]),
+      expires_at: "2026-09-06 00:00:00",
+    };
+    const datasetPath = path.join(beforeRow.artifact_dir, "dataset.json");
+    existsSync.mockImplementation((filePath: string) => filePath === datasetPath);
+    createReadStream.mockImplementation(() =>
+      Readable.from([modelDatasetCsv]) as unknown as ReturnType<typeof createReadStream>
+    );
+    let sessionReads = 0;
+    poolQuery.mockImplementation(async (sql: string) => {
+      if (sql.includes("FROM model_production_preparation_sessions")) {
+        sessionReads += 1;
+        return [[sessionReads === 1 ? beforeRow : advancedRow]];
+      }
+      if (sql.includes("SET expires_at = CASE") || sql.includes("SET status = 'superseded'")) {
+        return [{ affectedRows: 0 }];
+      }
+      return [[]];
+    });
+
+    const result = await runProductionPreparationStep("ma", 20240002, beforeRow.session_id, "initialize");
+    expect(result.results).toMatchObject({
+      session_id: beforeRow.session_id,
+      completed_step_ids: ["initialize"],
+      next_step: { id: "fit_model" },
+    });
+  });
+
+  test("throws 500 instead of returning an unchanged expired session when createOrResume retirement CAS misses", async () => {
+    const activeRun = buildActiveRun("ma");
+    const stepPlan = [
+      { id: "initialize", label: "确认生产准备材料" },
+      { id: "fit_model", label: "重拟合生产模型" },
+      { id: "finalize", label: "组装并校验生产产物" },
+    ];
+    const expiredRow = {
+      session_id: "create-or-resume-cas-miss-session",
+      experiment_id: 990002,
+      student_id: 20240002,
+      run_id: activeRun.run_id,
+      model_type: "ma",
+      request_hash: "cas-create-hash",
+      dataset_revision: activeRun.dataset_revision,
+      runtime_revision: activeRun.runtime_revision,
+      protocol_version: 1,
+      forecast_steps: 6,
+      status: "ready",
+      current_step_id: "initialize",
+      completed_step_ids: "[]",
+      step_plan: JSON.stringify(stepPlan),
+      artifact_dir: "/tmp/fangzhen-py/production_preparation/cas-create-miss",
+      candidate_model_path: path.join(mockedTrainedModelsRoot, "cas-create-miss.pkl"),
+      committed_state_path: null,
+      committed_state_sha256: null,
+      active_attempt_id: null,
+      observed_production_revision: null,
+      production_revision: null,
+      error_message: null,
+      superseded_reason: null,
+      expires_at: "2026-08-01 00:00:00",
+      session_is_live: 0,
+      active_attempt_lease_is_live: 0,
+    };
+    useActiveRuns(activeRun);
+    mockExperimentAndDatasetQueries();
+    poolQuery.mockImplementation(async (sql: string) => {
+      if (sql.includes("FROM dataset_segments")) return [[{ file_path: datasetCsvPath }]];
+      if (sql.includes("SET status = 'superseded'")) return [{ affectedRows: 0 }];
+      if (sql.includes("FROM model_production_preparation_sessions")) return [[expiredRow]];
+      return [[buildExperimentContextRow()]];
+    });
+    createReadStream.mockImplementation(() =>
+      Readable.from([modelDatasetCsv]) as unknown as ReturnType<typeof createReadStream>
+    );
+
+    await expect(
+      createOrResumeProductionPreparationSession("ma", 20240002, 990002, 6),
+    ).rejects.toThrow("生产准备会话状态更新异常，请稍后重试");
   });
 
 });

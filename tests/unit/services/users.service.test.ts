@@ -103,9 +103,13 @@ describe("users service duplicate-key handling", () => {
       return [{ insertId: 1 }];
     });
     connectionQuery.mockReset();
-    connectionQuery.mockImplementation(async (query: string) => {
+    connectionQuery.mockImplementation(async (query: string, params?: unknown[]) => {
       if (query.includes("SELECT user_id, username, email, phone_number FROM users WHERE")) {
         return [[]];
+      }
+      if (query.includes("SELECT user_id, username FROM users WHERE username IN")) {
+        const usernames = (params ?? []) as string[];
+        return [usernames.map((username, index) => ({ user_id: index + 1, username }))];
       }
       if (query.includes("SELECT class_id, teacher_id FROM classes WHERE")) {
         return [[{ class_id: 1, teacher_id: 999 }]];
@@ -393,6 +397,84 @@ describe("users service duplicate-key handling", () => {
     await expect(searchUsers({ q: "   ", page: 1, limit: 10 }))
       .resolves.toEqual({ error: "empty_search" });
     expect(poolQuery).not.toHaveBeenCalled();
+  });
+
+  test("routes email and hyphenated searches to LIKE instead of FULLTEXT boolean mode", async () => {
+    for (const term of ["alice@example.com", "prof-2026"]) {
+      poolQuery.mockReset();
+      poolQuery.mockResolvedValueOnce([[{ total: 0 }]]);
+      poolQuery.mockResolvedValueOnce([[]]);
+
+      const result = await searchUsers({ q: term, page: 1, limit: 10 });
+
+      expect(result.data.searchMethod).toBe("like");
+      expect(String(poolQuery.mock.calls[0]?.[0])).not.toContain("MATCH(");
+      expect(String(poolQuery.mock.calls[0]?.[0])).toContain("email LIKE ? ESCAPE '='");
+    }
+  });
+
+  test("batch teacher and assistant imports reload persisted user_ids when auto_increment_increment > 1", async () => {
+    connectionQuery.mockImplementation(async (query: string) => {
+      if (query.includes("SELECT DISTINCT username, phone_number, email FROM users")) return [[]];
+      if (query.includes("INSERT INTO users")) return [{ insertId: 101 }];
+      if (query.includes("SELECT user_id, username FROM users WHERE username IN")) {
+        return [[
+          { user_id: 101, username: "prof_13800138011" },
+          { user_id: 103, username: "prof_13800138012" },
+        ]];
+      }
+      return [{ insertId: 1 }];
+    });
+
+    const teacherResult = await batchCreateTeachers(
+      new File(
+        ["姓名,手机号\n教师甲,13800138011\n教师乙,13800138012"],
+        "teachers-gap.csv",
+        { type: "text/csv" },
+      ),
+      "Pass1234",
+    );
+
+    expect(teacherResult).toMatchObject({
+      data: {
+        created: 2,
+        teachers: [
+          { user_id: 101, username: "prof_13800138011" },
+          { user_id: 103, username: "prof_13800138012" },
+        ],
+      },
+    });
+
+    connectionQuery.mockImplementation(async (query: string) => {
+      if (query.includes("SELECT DISTINCT username, phone_number, email FROM users")) return [[]];
+      if (query.includes("INSERT INTO users")) return [{ insertId: 202 }];
+      if (query.includes("SELECT user_id, username FROM users WHERE username IN")) {
+        return [[
+          { user_id: 202, username: "ta_13800138021" },
+          { user_id: 204, username: "ta_13800138022" },
+        ]];
+      }
+      return [{ insertId: 1 }];
+    });
+
+    const assistantResult = await batchCreateAssistants(
+      new File(
+        ["姓名,手机号\n助教甲,13800138021\n助教乙,13800138022"],
+        "assistants-gap.csv",
+        { type: "text/csv" },
+      ),
+      "Pass1234",
+    );
+
+    expect(assistantResult).toMatchObject({
+      data: {
+        created: 2,
+        assistants: [
+          { user_id: 202, username: "ta_13800138021" },
+          { user_id: 204, username: "ta_13800138022" },
+        ],
+      },
+    });
   });
 
   test("batch teacher import accepts Windows Excel CSV encoding", async () => {

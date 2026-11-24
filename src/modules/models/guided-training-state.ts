@@ -5,6 +5,7 @@ import type { PoolConnection, RowDataPacket } from "mysql2/promise";
 import { pool } from "../../config";
 import { TIMEOUTS } from "../../utils/constants";
 import { withBoundedPoolTransaction } from "../../utils/bounded-pool-transaction";
+import { stableJsonStringify } from "../../utils/stable-json";
 import logger from "../../utils/logger";
 import {
   acquireConnectionWithTimeout,
@@ -462,19 +463,7 @@ export const computeCurrentGuidedTrainingIdentity = async (
   };
 };
 
-export const stableJsonStringify = (value: unknown): string => {
-  if (Array.isArray(value)) {
-    return `[${value.map((item) => stableJsonStringify(item)).join(",")}]`;
-  }
-  if (value && typeof value === "object") {
-    const record = value as Record<string, unknown>;
-    return `{${Object.keys(record)
-      .sort()
-      .map((key) => `${JSON.stringify(key)}:${stableJsonStringify(record[key])}`)
-      .join(",")}}`;
-  }
-  return JSON.stringify(value);
-};
+export { stableJsonStringify };
 
 export const guidedRequestPayloadMatches = (
   row: Pick<GuidedTrainingSessionRow, "request_payload">,

@@ -108,8 +108,18 @@ export async function createStudentInClass(classId: number, userId: number, user
     await connection.rollback();
     const err = error as { code?: string; message?: string };
     if (err.code === "ER_DUP_ENTRY") {
-      if (err.message?.includes("users.username")) return { error: "dup_username" as const };
-      if (err.message?.includes("users.email")) return { error: "dup_email" as const };
+      const rawMessage = err.message ?? "";
+      const keyMatch = rawMessage.match(/for key '([^']+)'/i);
+      const normalizedKey = keyMatch?.[1]?.split(".").pop()?.toLowerCase() ?? null;
+      if (normalizedKey?.includes("username") || rawMessage.includes("users.username")) {
+        return { error: "dup_username" as const };
+      }
+      if (normalizedKey?.includes("email") || rawMessage.includes("users.email")) {
+        return { error: "dup_email" as const };
+      }
+      if (normalizedKey?.includes("phone_number") || rawMessage.includes("users.phone_number")) {
+        return { error: "dup_phone" as const };
+      }
       return { error: "dup_entry" as const };
     }
     throw error;

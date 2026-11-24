@@ -18,6 +18,7 @@ import {
 } from "../models/model-run-store";
 import { withDeadlockRetry } from "../../utils/db-retry";
 import { databaseDatetimeToIsoString } from "../../utils/database-datetime";
+import { stableJsonStringify } from "../../utils/stable-json";
 import { commitConnectionWithOutcomeGuard } from "../models/model-db-guard";
 
 const BOOLEAN_FIELDS = new Set(["moving_average_completed", "exponential_smoothing_completed", "arima_completed", "lstm_completed", "ensemble_weighted_completed", "ensemble_boosting_completed", "ensemble_stacking_completed", "quiz_about_model_completed", "quiz_about_plan_completed", "production_plan_completed"]);
@@ -601,13 +602,13 @@ export async function updateExperiment(experimentId: number, studentId: number, 
       return preparedUpdate;
     }
 
-    const valuesEqual = (left: unknown, right: unknown) => {
+    const valuesEqual = (field: string, left: unknown, right: unknown) => {
       if (left === right) return true;
       if (left === null || left === undefined || right === null || right === undefined) return false;
-      if (typeof left === "object" || typeof right === "object") {
+      if (JSON_FIELDS.has(field) || typeof left === "object" || typeof right === "object") {
         try {
           const parse = (value: unknown) => typeof value === "string" ? JSON.parse(value) : value;
-          return JSON.stringify(parse(left)) === JSON.stringify(parse(right));
+          return stableJsonStringify(parse(left)) === stableJsonStringify(parse(right));
         } catch {
           return false;
         }
@@ -615,7 +616,7 @@ export async function updateExperiment(experimentId: number, studentId: number, 
       return String(left) === String(right);
     };
     const changedFields = new Set(
-      Object.keys(sanitized).filter((field) => !valuesEqual(sanitized[field], row[field])),
+      Object.keys(sanitized).filter((field) => !valuesEqual(field, sanitized[field], row[field])),
     );
     const invalidation = getServerInvalidationPatch(changedFields);
     const requestedBestModel = sanitized.selected_best_model;

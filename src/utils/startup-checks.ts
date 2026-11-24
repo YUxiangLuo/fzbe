@@ -3,18 +3,28 @@ import path from "node:path";
 import type { Pool, RowDataPacket } from "mysql2/promise";
 import puppeteer from "puppeteer-core";
 import { env, pool } from "../config";
-import { PATHS } from "./constants";
+import { DB_POOL_CONFIG, PATHS } from "./constants";
 import logger from "./logger";
 import { PY_DIR, resolvePythonExecutable } from "./python";
 import { ensureDatabaseManagedStorageRoot } from "./managed-storage";
 import { resolveDatabaseSessionTimezone } from "../config/database-session";
 
 const DEFAULT_COMMAND_TIMEOUT_MS = 30_000;
+const EXPECTED_DATABASE_COLLATION = "utf8mb4_unicode_ci";
 
 interface StartupHealthCheckRow extends RowDataPacket {
   ok?: number;
   session_time_zone?: string;
   utc_offset_seconds?: number | string;
+  database_version?: string;
+  database_collation?: string;
+  max_connections?: number | string;
+}
+
+export interface DatabaseRuntimeProbeOptions {
+  connectionLimit?: number;
+  logInfo?: (message: string) => void;
+  logWarn?: (message: string) => void;
 }
 
 export interface StartupCheckDependencies {
@@ -124,6 +134,7 @@ async function probeChromiumRuntime({
 export async function probeStartupDatabaseRuntime(
   dbPool: Pick<Pool, "getConnection"> = pool,
   databaseTimezone: string = env.DB_TIMEZONE,
+  options: DatabaseRuntimeProbeOptions = {},
 ): Promise<void> {
   const connection = await dbPool.getConnection();
   let reusable = false;
@@ -132,7 +143,10 @@ export async function probeStartupDatabaseRuntime(
     const [probeRows] = await connection.query<StartupHealthCheckRow[]>(
       `SELECT 1 AS ok,
               @@session.time_zone AS session_time_zone,
-              TIMESTAMPDIFF(SECOND, UTC_TIMESTAMP(6), NOW(6)) AS utc_offset_seconds`,
+              TIMESTAMPDIFF(SECOND, UTC_TIMESTAMP(6), NOW(6)) AS utc_offset_seconds,
+              VERSION() AS database_version,
+              @@collation_database AS database_collation,
+              @@max_connections AS max_connections`,
     );
     const probe = probeRows[0];
     if (probe?.ok !== 1) {
@@ -148,6 +162,44 @@ export async function probeStartupDatabaseRuntime(
         `数据库会话时区不一致: expected=${expectedTimezone.mysqlValue}, actual=${probe.session_time_zone ?? "unknown"}, offset_seconds=${String(probe.utc_offset_seconds ?? "unknown")}`,
       );
     }
+
+    const logInfo = options.logInfo ?? ((message: string) => logger.info(message));
+    const logWarn = options.logWarn ?? ((message: string) => logger.warn({ check: "startup-database-runtime" }, message));
+    const configuredConnectionLimit = options.connectionLimit ?? DB_POOL_CONFIG.CONNECTION_LIMIT;
+
+    const databaseVersion = typeof probe.database_version === "string"
+      ? probe.database_version.trim()
+      : "";
+    const databaseCollation = typeof probe.database_collation === "string"
+      ? probe.database_collation.trim()
+      : "";
+    const maxConnections = probe.max_connections !== undefined && probe.max_connections !== null
+      ? Number(probe.max_connections)
+      : Number.NaN;
+
+    if (databaseVersion) {
+      logInfo(
+        `Database runtime: version=${databaseVersion}, collation=${databaseCollation || "unknown"}, max_connections=${Number.isFinite(maxConnections) ? String(maxConnections) : "unknown"}`,
+      );
+    }
+    if (
+      databaseCollation
+      && databaseCollation.toLowerCase() !== EXPECTED_DATABASE_COLLATION
+    ) {
+      logWarn(
+        `数据库默认排序规则为 ${databaseCollation}，与建表基线 ${EXPECTED_DATABASE_COLLATION} 不一致，建议在维护窗口执行 ALTER DATABASE 统一排序规则以避免联表冲突。`,
+      );
+    }
+    if (
+      Number.isFinite(maxConnections)
+      && maxConnections > 0
+      && maxConnections < configuredConnectionLimit
+    ) {
+      logWarn(
+        `数据库 max_connections (${maxConnections}) 小于当前连接池上限 (${configuredConnectionLimit})，高并发场景可能触发连接耗尽。`,
+      );
+    }
+
     reusable = true;
   } finally {
     if (reusable) {

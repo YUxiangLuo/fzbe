@@ -144,7 +144,7 @@ export async function migrateUserPhoneCanonicalUnique(
   }
 
   const [trimmedPhones] = await connection.query<ResultSetHeader>(
-    "UPDATE users SET phone_number = TRIM(phone_number) WHERE phone_number IS NOT NULL AND BINARY phone_number <> BINARY TRIM(phone_number)",
+    "UPDATE users SET phone_number = TRIM(phone_number) WHERE phone_number IS NOT NULL AND CHAR_LENGTH(phone_number) <> CHAR_LENGTH(TRIM(phone_number))",
   );
   if (trimmedPhones.affectedRows > 0) {
     log(`Trimmed ${trimmedPhones.affectedRows} phone number(s).`);

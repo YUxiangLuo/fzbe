@@ -1379,4 +1379,82 @@ describe("experiments service", () => {
     expect(persisted.moving_average_completed).toBe(0);
     expect(commit).toHaveBeenCalledTimes(1);
   });
+
+  test("preserves production_forecast_evidence when MySQL 8 returns key-reordered parsed JSON objects", async () => {
+    const signedPlan = buildSignedProductionPlan();
+    const {
+      production_forecast_evidence: storedEvidence,
+      ...patchWithoutEvidence
+    } = signedPlan.patch;
+
+    // Simulate MySQL 8's native JSON key ordering: shorter keys first, then lexicographical.
+    const reorderKeysLikeMySql8 = (value: unknown): unknown => {
+      if (Array.isArray(value)) return value.map(reorderKeysLikeMySql8);
+      if (value && typeof value === "object") {
+        const record = value as Record<string, unknown>;
+        return Object.fromEntries(
+          Object.keys(record)
+            .sort((left, right) => left.length - right.length || left.localeCompare(right))
+            .map((key) => [key, reorderKeysLikeMySql8(record[key])]),
+        );
+      }
+      return value;
+    };
+
+    const existingRow = {
+      experiment_id: 990002,
+      student_id: 20240002,
+      status: "In Progress",
+      selected_best_model: "arima",
+      arima_completed: 1,
+      start_time: "2026-03-08T09:00:00.000Z",
+      last_activity_at: "2026-03-08T09:30:00.000Z",
+      total_active_duration_seconds: 120,
+      state_version: 2,
+      ...patchWithoutEvidence,
+      production_forecast_results: reorderKeysLikeMySql8(signedPlan.patch.production_forecast_results),
+      production_mps_table: reorderKeysLikeMySql8(signedPlan.patch.production_mps_table),
+      production_forecast_evidence: storedEvidence,
+    };
+
+    const updatedMps = buildCanonicalProductionMps({
+      forecasts: signedPlan.patch.production_forecast_results,
+      zScore: signedPlan.patch.production_safety_stock_z_score,
+      initialInventory: 25,
+      capacity: signedPlan.patch.production_capacity,
+    });
+
+    connectionQuery
+      .mockResolvedValueOnce([[existingRow]])
+      .mockResolvedValueOnce([[{
+        run_id: signedPlan.runId,
+        production_revision: signedPlan.productionRevision,
+      }]])
+      .mockResolvedValueOnce([{ affectedRows: 1 }])
+      .mockResolvedValueOnce([[{
+        ...existingRow,
+        production_initial_inventory: 25,
+        production_mps_table: reorderKeysLikeMySql8(updatedMps),
+        state_version: 3,
+      }]]);
+
+    const result = await updateExperiment(990002, 20240002, {
+      expected_version: 2,
+      ...patchWithoutEvidence,
+      production_initial_inventory: 25,
+      production_mps_table: updatedMps,
+    });
+
+    expect(result).toMatchObject({
+      data: {
+        production_plan_completed: true,
+        production_initial_inventory: 25,
+      },
+    });
+    const updateCall = connectionQuery.mock.calls.find(([sql]) =>
+      String(sql).includes("UPDATE experiment_status SET")
+    );
+    expect(String(updateCall?.[0])).not.toContain("production_forecast_evidence = ?");
+    expect(commit).toHaveBeenCalledTimes(1);
+  });
 });

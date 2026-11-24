@@ -33,6 +33,7 @@ classMembersController.post(
         if (result.error === "forbidden") return c.json({ error: "权限不足" }, 403);
         if (result.error === "dup_username") return c.json({ error: "学号已存在" }, 409);
         if (result.error === "dup_email") return c.json({ error: "邮箱已存在" }, 409);
+        if (result.error === "dup_phone") return c.json({ error: "手机号已存在" }, 409);
         return c.json({ error: "学生创建冲突" }, 409);
       }
       return c.json(result.data, 201);

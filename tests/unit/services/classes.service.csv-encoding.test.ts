@@ -9,7 +9,7 @@ const passwordModulePath = path.join(srcRoot, "utils", "password.ts");
 const classesServiceModulePath = path.join(srcRoot, "modules", "classes", "classes.service.ts");
 const freshClassesServiceModulePath = `${classesServiceModulePath}?classes-csv-encoding-test`;
 
-const defaultConnectionQuery = async (query: string) => {
+const defaultConnectionQuery = async (query: string, params?: unknown[]) => {
   if (query.includes("FROM academic_terms") && query.includes("is_active = TRUE")) {
     return [[{
       term_id: 1,
@@ -27,6 +27,10 @@ const defaultConnectionQuery = async (query: string) => {
   }
   if (query.startsWith("INSERT INTO users")) {
     return [{ insertId: 9001 }];
+  }
+  if (query.includes("SELECT user_id, username FROM users WHERE username IN")) {
+    const usernames = (params ?? []) as string[];
+    return [usernames.map((username, index) => ({ user_id: 9001 + index, username }))];
   }
   if (query.includes("u.full_name as teacher_name")) {
     return [[{
@@ -212,5 +216,48 @@ describe("classes service CSV encoding", () => {
     });
     expect(connectionCommit).not.toHaveBeenCalled();
     expect(connectionRollback).toHaveBeenCalledTimes(1);
+  });
+
+  test("enrolls students by reloaded user_ids when auto_increment_increment > 1", async () => {
+    let insertedEnrollments: unknown = null;
+    connectionQuery.mockImplementation(async (query: string, params?: unknown[]) => {
+      if (query.includes("SELECT user_id, username FROM users WHERE username IN")) {
+        return [[
+          { user_id: 9001, username: "20240101" },
+          { user_id: 9003, username: "20240102" },
+        ]];
+      }
+      if (query.startsWith("INSERT INTO enrollments")) {
+        insertedEnrollments = params?.[0];
+        return [{ affectedRows: 2 }];
+      }
+      return defaultConnectionQuery(query, params);
+    });
+
+    const result = await createClass(
+      "步长班级",
+      "STEP002",
+      99,
+      new File(
+        ["学号,姓名\n20240101,学生甲\n20240102,学生乙"],
+        "students-step.csv",
+        { type: "text/csv" },
+      ),
+    );
+
+    expect(insertedEnrollments).toEqual([
+      [9001, 17],
+      [9003, 17],
+    ]);
+    expect(result).toMatchObject({
+      data: {
+        students_created: 2,
+        students_enrolled: 2,
+        students: [
+          { user_id: 9001, username: "20240101" },
+          { user_id: 9003, username: "20240102" },
+        ],
+      },
+    });
   });
 });

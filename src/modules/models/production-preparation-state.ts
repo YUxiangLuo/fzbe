@@ -2,6 +2,7 @@ import type { RowDataPacket } from "mysql2/promise";
 import type { ModelType } from "./models.schema";
 import { ModelValidationError } from "./model-errors";
 import { parseJsonColumn, isRecordValue } from "./model-json";
+import { stableJsonStringify } from "../../utils/stable-json";
 
 // Step protocol and response projections; no database, filesystem or Python work.
 export type ProductionPreparationStatus = "ready" | "running" | "failed" | "completed" | "superseded";
@@ -208,4 +209,59 @@ export const expandProductionPreparationPlan = (
 
 export const jsonColumnCasValue = (value: unknown) => (
   typeof value === "string" ? value : JSON.stringify(value)
+);
+
+/**
+ * Dual-engine JSON equality predicate compatible with both MySQL 8 (native JSON
+ * column type, where `col = ?` always evaluates false against a string parameter)
+ * and MariaDB (LONGTEXT JSON alias, where `CAST(? AS JSON)` is a syntax error and
+ * one-sided `col = JSON_EXTRACT(?, '$')` fails due to whitespace formatting).
+ */
+export const jsonColumnEqualsSql = (columnExpr: string) => (
+  `JSON_EXTRACT(${columnExpr}, '$') = JSON_EXTRACT(?, '$')`
+);
+
+const normalizeCasTimestamp = (value: Date | string | null | undefined): string | null => {
+  if (value === null || value === undefined) return null;
+  if (value instanceof Date) {
+    return Number.isNaN(value.getTime()) ? null : value.toISOString();
+  }
+  return String(value);
+};
+
+const normalizeCasJson = (value: unknown): string => (
+  stableJsonStringify(parseJsonColumn<unknown>(value, value))
+);
+
+type ProductionPreparationCasSnapshot = Pick<
+  ProductionPreparationSessionRow,
+  | "status"
+  | "active_attempt_id"
+  | "current_step_id"
+  | "expires_at"
+  | "completed_step_ids"
+  | "step_plan"
+  | "committed_state_path"
+  | "committed_state_sha256"
+  | "production_revision"
+>;
+
+/**
+ * Compares only persisted CAS columns (never clock-derived projections such as
+ * `session_is_live` or `active_attempt_lease_is_live`) so wall-clock expiration
+ * between reads cannot masquerade as concurrent progress and mask a broken CAS.
+ */
+export const hasProductionPreparationCasRowChanged = (
+  before: ProductionPreparationCasSnapshot,
+  after: ProductionPreparationCasSnapshot,
+): boolean => (
+  before.status !== after.status
+  || (before.active_attempt_id ?? null) !== (after.active_attempt_id ?? null)
+  || (before.current_step_id ?? null) !== (after.current_step_id ?? null)
+  || normalizeCasTimestamp(before.expires_at) !== normalizeCasTimestamp(after.expires_at)
+  || normalizeCasJson(before.completed_step_ids) !== normalizeCasJson(after.completed_step_ids)
+  || normalizeCasJson(before.step_plan) !== normalizeCasJson(after.step_plan)
+  || (before.committed_state_path ?? null) !== (after.committed_state_path ?? null)
+  || (before.committed_state_sha256 ?? null) !== (after.committed_state_sha256 ?? null)
+  || (before.production_revision ?? null) !== (after.production_revision ?? null)
 );

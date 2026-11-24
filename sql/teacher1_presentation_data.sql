@@ -3781,8 +3781,8 @@ JOIN (
       SELECT experiment_id,
              student_id,
              step_order,
-             MIN(CASE WHEN event_type = 'STARTED' THEN event_timestamp END) AS started_at,
-             MAX(CASE WHEN event_type = 'COMPLETED' THEN event_timestamp END) AS completed_at
+             MIN(CASE WHEN event_type = 'STARTED' THEN CAST(event_timestamp AS DATETIME) ELSE NULL END) AS started_at,
+             MAX(CASE WHEN event_type = 'COMPLETED' THEN CAST(event_timestamp AS DATETIME) ELSE NULL END) AS completed_at
         FROM experiment_step_events
        WHERE experiment_id BETWEEN 800001 AND 800256
          AND student_id BETWEEN 20255001 AND 20255256
